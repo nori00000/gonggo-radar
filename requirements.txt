@@ -1,0 +1,25 @@
+# Core
+requests>=2.31.0
+pyyaml>=6.0.1
+python-dotenv>=1.0.0
+
+# Crawlers
+beautifulsoup4>=4.12.0
+lxml>=5.0.0
+
+# AI Analysis (optional)
+anthropic>=0.40.0
+
+# Knowledge Layer (optional)
+sqlite-vec>=0.1.1
+openai>=1.0.0
+httpx>=0.27.0
+
+# Email
+# (uses stdlib: smtplib, email.mime)
+
+# Scheduling (for daemon mode)
+# (uses stdlib: time, datetime)
+
+# Dev/Test
+pytest>=8.0.0

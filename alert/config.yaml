@@ -1,0 +1,166 @@
+app:
+  name: "농업공고알림봇"
+  version: "1.0.0"
+  log_level: "INFO"
+  data_dir: "data"
+
+crawler:
+  timeout: 30
+  retry_count: 3
+  retry_delay: 5
+  user_agent: "AgriAlert/1.0"
+  sources:
+    bizinfo:
+      enabled: true
+      base_url: "https://www.bizinfo.go.kr/uss/rss/bizinfoApi.do"
+    mafra:
+      enabled: true
+      base_url: "https://www.mafra.go.kr/bbs/mafra/71/rss.xml"
+    smartfarm:
+      enabled: true
+      base_url: "https://www.smartfarmkorea.net"
+    goyang:
+      enabled: true
+      base_url: "https://www.goyang.go.kr/agri/index.do"
+    nongsaro:
+      enabled: true
+      base_url: "https://www.nongsaro.go.kr"
+
+analyzer:
+  keyword_threshold: 0.3
+  claude_threshold: 0.3
+  claude_model: "claude-sonnet-4-5-20250929"
+  max_claude_calls_per_run: 50
+
+keywords:
+  must_match:
+    # 이끼 재배 / 스마트팜
+    - "이끼"
+    - "스마트팜"
+    - "시설원예"
+    - "시설농업"
+    - "스마트농업"
+    # 조경 / 정원
+    - "조경"
+    - "도시녹화"
+    - "학교숲"
+    - "탄소숲"
+    # 치유산업
+    - "치유농업"
+    - "산림치유"
+    # 사회적기업
+    - "사회적기업"
+    - "소셜벤처"
+  boost:
+    # 농업 일반
+    - "농업"
+    - "영농"
+    - "귀농"
+    - "청년농"
+    - "신규농업인"
+    - "농업기술"
+    - "농업지원"
+    - "보조금"
+    - "지원사업"
+    - "공모"
+    # 지역
+    - "경기도"
+    - "고양시"
+    # 농업 세부
+    - "6차산업"
+    - "농촌"
+    - "ICT"
+    - "스마트온실"
+    - "환경제어"
+    - "식물공장"
+    - "특용작물"
+    - "관상식물"
+    # 조경 / 정원
+    - "정원"
+    - "인공지반녹화"
+    - "옥상녹화"
+    - "벽면녹화"
+    - "도시재생"
+    - "조경관리"
+    - "조경공사"
+    # 치유산업 / 복지
+    - "치유"
+    - "노인복지"
+    - "장기요양"
+    - "바우처"
+    - "산림복지"
+    # 사회적경제 / 공공조달
+    - "사회적경제"
+    - "우선구매"
+    - "벤처나라"
+    - "나라장터"
+    - "공공조달"
+    # 제조 / 굿즈
+    - "제조혁신"
+    - "소공인"
+    - "디자인"
+    # AI / 디지털
+    - "디지털전환"
+    - "AI융합"
+    - "콘텐츠"
+  exclude:
+    - "축산"
+    - "수산"
+    - "벌목"
+    - "광업"
+
+notifier:
+  telegram:
+    enabled: true
+    parse_mode: "HTML"
+    max_message_length: 4096
+  email:
+    enabled: true
+    smtp_server: "smtp.gmail.com"
+    smtp_port: 587
+    use_tls: true
+    digest_hour: 18  # 매일 18시 다이제스트
+
+schedule:
+  cron_hours: [9, 15]
+  timezone: "Asia/Seoul"
+
+knowledge:
+  enabled: true
+
+  classifier:
+    enabled: true
+    method: "keyword"
+    claude_classify_threshold: 0.6
+
+  vector:
+    enabled: true
+    embedding_provider: "openai"
+    embedding_model: "text-embedding-3-small"
+    dimensions: 256
+    similarity_threshold: 0.75
+    top_k: 5
+
+  obsidian:
+    enabled: true
+    vault_path: ""
+    announcement_folder: "11.(주)어반정글/영업/공고"
+    research_folder: "Research/공고분석"
+    min_relevance_for_sync: 0.5
+    author: "이상민"
+
+  history:
+    enabled: true
+    auto_create_on_relevant: true
+    default_priority: 2
+
+  research:
+    enabled: true
+    schedule: "quarterly"
+    claude_model: "claude-sonnet-4-5-20250929"
+    max_tokens: 4096
+
+  n8n:
+    enabled: false
+    webhook_url: ""
+    notify_on: ["new_relevant", "status_change"]

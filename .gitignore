@@ -1,0 +1,41 @@
+# Python
+venv/
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+
+# Environment
+.env
+alert/.env
+
+# Data
+alert/data/announcements.db
+alert/data/logs/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Node.js
+node_modules/
+package-lock.json
+
+# OMC state
+.omc/
+
+# Large generated files (exploration artifacts)
+*.html
+*.png
+form_info.json
+
+# Pytest cache
+.pytest_cache/
