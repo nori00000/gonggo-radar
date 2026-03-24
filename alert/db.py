@@ -100,8 +100,8 @@ class Database:
             import sqlite_vec
             sqlite_vec.load(self._conn)
             self._vec_available = True
-        except ImportError:
-            pass  # sqlite-vec not installed, vector search disabled
+        except Exception:
+            pass  # sqlite-vec not available (not installed or load_extension unsupported)
 
         self._create_tables()
 
