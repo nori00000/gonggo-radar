@@ -18,8 +18,7 @@ class SmartfarmCrawler(BaseCrawler):
     공지사항/사업안내 게시판에서 게시물 목록을 스크래핑한다.
 
     대상 URL:
-        - 공지사항: https://www.smartfarmkorea.net/board/boardList.do?menuId=M010601
-        - 사업안내: https://www.smartfarmkorea.net/board/boardList.do?menuId=M010602
+        - 공지사항: https://www.smartfarmkorea.net/board/list.do?menuId=M110502
 
     예상 HTML 구조 (일반적인 한국 공공기관 게시판):
         <div class="board_list"> 또는 <table class="board-list">
@@ -46,10 +45,9 @@ class SmartfarmCrawler(BaseCrawler):
 
     BASE_URL = "https://www.smartfarmkorea.net"
 
-    # 게시판 URL 패턴 (공지사항, 사업안내 등)
+    # 게시판 URL 패턴 (공지사항)
     BOARD_URLS = [
-        "/board/boardList.do?menuId=M010601",  # 공지사항
-        "/board/boardList.do?menuId=M010602",  # 사업안내
+        "/board/list.do?menuId=M110502",  # 공지사항
     ]
 
     def __init__(self):

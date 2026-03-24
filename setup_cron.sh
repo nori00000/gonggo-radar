@@ -14,7 +14,7 @@ echo "$CRON_ENTRY_15"
 echo ""
 
 # Add to crontab (preserve existing entries)
-(crontab -l 2>/dev/null | grep -v "alert.main"; echo "$CRON_ENTRY_09"; echo "$CRON_ENTRY_15") | crontab -
+(crontab -l 2>/dev/null | grep -vF "python -m alert.main"; echo "$CRON_ENTRY_09"; echo "$CRON_ENTRY_15") | crontab -
 
 echo "✅ Cron 설정 완료"
 echo "확인: crontab -l"

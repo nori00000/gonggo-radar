@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import sqlite3
 from datetime import datetime
 from pathlib import Path
@@ -100,8 +101,8 @@ class Database:
             import sqlite_vec
             sqlite_vec.load(self._conn)
             self._vec_available = True
-        except Exception:
-            pass  # sqlite-vec not available (not installed or load_extension unsupported)
+        except Exception as e:
+            logging.getLogger(__name__).debug("sqlite-vec not loaded: %s", e)
 
         self._create_tables()
 

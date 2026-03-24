@@ -55,10 +55,7 @@ class GoyangCrawler(BaseCrawler):
     # 게시판 경로 후보 목록
     # 실제 URL은 사이트 구조에 따라 다를 수 있으므로 여러 패턴 시도
     BOARD_PATHS = [
-        "/agri/bbs/BBSMSTR_000000000071/list.do",    # 농업기술센터 공지사항
-        "/agri/bbs/BBSMSTR_000000000072/list.do",    # 농업기술센터 사업안내
-        "/www/bbs/BBSMSTR_000000000071/list.do",     # 대체 경로
-        "/agri/board/list.do?boardId=BBS_0000071",   # 대체 경로 2
+        "/agr/user/bbs/BD_selectBbsList.do?q_bbsCode=1064",    # 농업기술센터 공지사항 (2026 업데이트)
     ]
 
     def __init__(self):

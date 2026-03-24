@@ -28,12 +28,12 @@ class MafraCrawler(BaseCrawler):
         </rss>
     """
 
-    RSS_URL = "https://www.mafra.go.kr/bbs/mafra/71/rss.xml"
+    RSS_URL = "https://www.mafra.go.kr/bbs/home/791/rssList.do?row=50"
 
     # 대체 RSS URL 목록 (구조 변경 시 폴백)
     FALLBACK_RSS_URLS = [
-        "https://www.mafra.go.kr/bbs/mafra/71/rss.xml",
-        "https://www.mafra.go.kr/bbs/mafra/68/rss.xml",
+        "https://www.mafra.go.kr/bbs/home/791/rssList.do?row=50",
+        "https://www.mafra.go.kr/bbs/home/792/rssList.do?row=50",
     ]
 
     def __init__(self):

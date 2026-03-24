@@ -15,13 +15,13 @@ crawler:
       base_url: "https://www.bizinfo.go.kr/uss/rss/bizinfoApi.do"
     mafra:
       enabled: true
-      base_url: "https://www.mafra.go.kr/bbs/mafra/71/rss.xml"
+      base_url: "https://www.mafra.go.kr/bbs/home/791/rssList.do?row=50"
     smartfarm:
       enabled: true
       base_url: "https://www.smartfarmkorea.net"
     goyang:
       enabled: true
-      base_url: "https://www.goyang.go.kr/agri/index.do"
+      base_url: "https://www.goyang.go.kr/agr"
     nongsaro:
       enabled: true
       base_url: "https://www.nongsaro.go.kr"
