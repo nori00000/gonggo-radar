@@ -69,8 +69,20 @@ class TestInsertAnnouncement:
 class TestUpdateApplicationStatus:
     """Tests for update_application_status field validation."""
 
-    def _insert_app_record(self, db, announcement_id=1):
+    def _insert_app_record(self, db, announcement_id=None):
         """Helper to insert an application record and return its ID."""
+        # First, insert a parent announcement to satisfy FK constraint
+        if announcement_id is None:
+            from datetime import datetime
+            now = datetime.now().isoformat()
+            cur = db.conn.execute(
+                """INSERT INTO announcements
+                   (source, source_id, title, url, created_at, updated_at)
+                   VALUES ('test', ?, 'FK test', 'http://test', ?, ?)""",
+                (f"fk-test-{id(self)}-{now}", now, now),
+            )
+            db.conn.commit()
+            announcement_id = cur.lastrowid
         db.conn.execute(
             """INSERT INTO application_history
                (announcement_id, status, assigned_domain, priority, created_at, updated_at)
