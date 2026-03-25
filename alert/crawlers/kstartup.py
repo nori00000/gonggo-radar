@@ -28,10 +28,7 @@ class KStartupCrawler(BaseCrawler):
         """Get API key from environment or config.
 
         Returns:
-            API key string
-
-        Raises:
-            ValueError: If API key is not found
+            API key string, or empty string if not found
         """
         # First try environment variable
         api_key = os.getenv("DATA_GO_KR_API_KEY", "")
@@ -43,9 +40,9 @@ class KStartupCrawler(BaseCrawler):
                 api_key = getattr(source_cfg, "api_key")
 
         if not api_key:
-            raise ValueError(
-                "DATA_GO_KR_API_KEY not found in environment or config. "
-                "Please set it in .env file."
+            self.logger.warning(
+                "DATA_GO_KR_API_KEY not found. Set it in alert/.env file. "
+                "Crawler will be skipped."
             )
 
         return api_key
@@ -67,6 +64,10 @@ class KStartupCrawler(BaseCrawler):
         Returns:
             List of RawAnnouncement objects
         """
+        if not self.api_key:
+            self.logger.warning("kstartup: No API key configured, skipping")
+            return []
+
         announcements = []
 
         # Prepare API request parameters

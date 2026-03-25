@@ -13,10 +13,15 @@ from alert.utils.logger import setup_logger
 class TelegramNotifier:
     """Telegram Bot API를 사용한 알림 발송."""
 
-    def __init__(self) -> None:
-        """환경변수에서 Telegram 설정을 로드하고 로거 초기화."""
+    def __init__(self, db=None) -> None:
+        """환경변수에서 Telegram 설정을 로드하고 로거 초기화.
+
+        Args:
+            db: Optional Database instance for fetching domain information.
+        """
         self.bot_token = os.getenv("TELEGRAM_BOT_TOKEN", "")
         self.chat_id = os.getenv("TELEGRAM_CHAT_ID", "")
+        self.db = db
         self.logger = setup_logger("telegram_notifier")
 
         if not self.bot_token or not self.chat_id:
@@ -100,6 +105,22 @@ class TelegramNotifier:
 📊 관련도: {score_pct:.0f}% ({reason})
 🔗 <a href="{ann.url}">상세보기</a>"""
 
+        # Add domain tag if available
+        if self.db and hasattr(ann, 'id') and ann.id:
+            domain, confidence = self.db.get_announcement_domain(ann.id)
+            if domain:
+                # Map domain key to Korean label
+                domain_labels = {
+                    "moss_agriculture": "이끼농업/스마트팜",
+                    "landscape": "조경/정원",
+                    "healing": "치유산업",
+                    "manufacturing": "제조/굿즈",
+                    "public_procurement": "공공조달",
+                    "ai_digital": "AI/디지털",
+                }
+                label = domain_labels.get(domain, domain)
+                message += f"\n🏷 도메인: {label}"
+
         return self._send_api_request(message)
 
     def send_batch(self, announcements: List[AnalyzedAnnouncement]) -> int:
@@ -175,6 +196,7 @@ class TelegramBot:
             "/apply": self.cmd_apply,
             "/appstatus": self.cmd_appstatus,
             "/apphistory": self.cmd_apphistory,
+            "/submit": self.cmd_submit,
         }
 
     def _send_message(self, text: str, parse_mode: str = "HTML") -> bool:
@@ -334,6 +356,8 @@ class TelegramBot:
   예: /search 이끼
 /run - 즉시 크롤링 실행
 /recent - 최근 공고 5건
+/submit &lt;URL&gt; [설명] - 수동 제보
+  예: /submit https://example.com 스마트팜 지원사업
 
 <b>신청 관리:</b>
 /app &lt;id&gt; - 공고 신청 현황 조회
@@ -696,3 +720,57 @@ class TelegramBot:
             msg += "\n"
 
         self._send_message(msg)
+
+    def cmd_submit(self, args: str) -> None:
+        """Submit a URL as a manual tip.
+
+        Args:
+            args: "<URL> [description]"
+        """
+        if not args.strip():
+            self._send_message(
+                "사용법: /submit &lt;URL&gt; [설명]\n"
+                "예시: /submit https://example.com 스마트팜 지원사업 공고"
+            )
+            return
+
+        parts = args.strip().split(maxsplit=1)
+        url = parts[0]
+        description = parts[1] if len(parts) > 1 else ""
+
+        # Validate URL
+        if not url.startswith(("http://", "https://")):
+            self._send_message("❌ 올바른 URL을 입력해주세요 (http:// 또는 https://로 시작)")
+            return
+
+        import hashlib
+
+        source_id = hashlib.md5(url.encode()).hexdigest()[:16]
+
+        # Check for duplicates
+        if self.db.is_duplicate("manual", source_id):
+            self._send_message("ℹ️ 이미 등록된 URL입니다.")
+            return
+
+        # Create AnalyzedAnnouncement object
+        announcement = AnalyzedAnnouncement(
+            source="manual",
+            source_id=source_id,
+            title=description or url,
+            url=url,
+            summary=description,
+            author="수동입력",
+            relevance_score=0.5,  # Default medium relevance
+            relevance_reason="수동 제보",
+        )
+
+        # Insert into DB
+        ann_id = self.db.insert_announcement(announcement)
+
+        if ann_id:
+            self._send_message(
+                f"✅ 등록 완료: {description or url}\n"
+                f"공고 ID: {ann_id}"
+            )
+        else:
+            self._send_message("⚠️ 등록 중 오류가 발생했습니다.")

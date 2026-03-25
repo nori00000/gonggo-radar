@@ -449,6 +449,39 @@ class Database:
                     inserted += 1
         return inserted
 
+    def sync_keywords_from_config(self, keywords_cfg: Optional[Any] = None) -> int:
+        """Sync keywords from config to database (additive only).
+
+        This method adds new keywords from config that don't exist in the database.
+        It never removes or modifies existing keywords.
+
+        Args:
+            keywords_cfg: A :class:`KeywordsConfig` (or compatible object with
+                          ``must_match``, ``boost``, ``exclude`` list attrs).
+                          When *None*, loads from :func:`get_config`.
+
+        Returns:
+            Number of new keywords inserted.
+        """
+        if keywords_cfg is None:
+            from .config import get_config
+            keywords_cfg = get_config().keywords
+
+        inserted = 0
+        category_weight_map = {
+            "must_match": (keywords_cfg.must_match, 0.5),
+            "boost": (keywords_cfg.boost, 0.05),
+            "exclude": (keywords_cfg.exclude, 0.0),
+        }
+
+        for category, (words, weight) in category_weight_map.items():
+            for word in words:
+                kw = Keyword(keyword=word, category=category, weight=weight, is_active=True)
+                if self.insert_keyword(kw):
+                    inserted += 1
+
+        return inserted
+
     # ------------------------------------------------------------------
     # Run history
     # ------------------------------------------------------------------
@@ -560,6 +593,31 @@ class Database:
             _sql("SELECT * FROM announcements WHERE id = ?"), (ann_id,)
         ).fetchone()
         return self._row_to_announcement(row) if row else None
+
+    def get_announcement_domain(self, ann_id: int) -> tuple:
+        """Get business_domain and domain_confidence for an announcement.
+
+        Returns:
+            Tuple of (domain_str, confidence_float). Empty string and 0.0 if not found.
+        """
+        try:
+            if self._backend == "postgresql":
+                cur = self.conn.cursor()
+                cur.execute(
+                    "SELECT business_domain, domain_confidence FROM announcements WHERE id = %s",
+                    (ann_id,),
+                )
+                row = cur.fetchone()
+            else:
+                row = self._conn.execute(
+                    "SELECT business_domain, domain_confidence FROM announcements WHERE id = ?",
+                    (ann_id,),
+                ).fetchone()
+            if row:
+                return (row["business_domain"] or "", row["domain_confidence"] or 0.0)
+        except Exception:
+            pass
+        return ("", 0.0)
 
     # ------------------------------------------------------------------
     # Knowledge Layer: Embeddings

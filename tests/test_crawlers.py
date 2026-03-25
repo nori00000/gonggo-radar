@@ -259,15 +259,16 @@ class TestBizinfoCrawler:
                 assert crawler.api_key == "env-api-key"
                 assert crawler.search_cnt == 50
 
-    def test_initialization_without_api_key_raises_error(self, mock_bizinfo_config):
-        """BizinfoCrawler should raise ValueError if API key not found."""
+    def test_initialization_without_api_key_graceful(self, mock_bizinfo_config):
+        """BizinfoCrawler should gracefully handle missing API key."""
         # Remove api_key from config
         mock_bizinfo_config.crawler.sources["bizinfo"].api_key = ""
 
         with patch("alert.crawlers.base.get_config", return_value=mock_bizinfo_config):
             with patch.dict("os.environ", {}, clear=True):
-                with pytest.raises(ValueError, match="BIZINFO_API_KEY not found"):
-                    BizinfoCrawler()
+                crawler = BizinfoCrawler()
+                assert crawler.api_key == ""
+                assert crawler.fetch() == []
 
     def test_fetch_success(self, mock_bizinfo_config):
         """fetch() should parse API response and return announcements."""
@@ -478,15 +479,15 @@ class TestG2bCrawler:
         config.crawler.sources = {"g2b": g2b_source}
         return config
 
-    def test_initialization_without_api_key_raises_error(self, mock_g2b_config):
-        """G2bCrawler should raise ValueError if API key not found."""
-        # Remove api_key from config
+    def test_initialization_without_api_key_graceful(self, mock_g2b_config):
+        """G2bCrawler should gracefully handle missing API key."""
         mock_g2b_config.crawler.sources["g2b"].api_key = ""
 
         with patch("alert.crawlers.base.get_config", return_value=mock_g2b_config):
             with patch.dict("os.environ", {}, clear=True):
-                with pytest.raises(ValueError, match="DATA_GO_KR_API_KEY not found"):
-                    G2bCrawler()
+                crawler = G2bCrawler()
+                assert crawler.api_key == ""
+                assert crawler.fetch() == []
 
     def test_initialization_with_api_key_from_env(self, mock_g2b_config):
         """G2bCrawler should get API key from environment."""
@@ -629,6 +630,198 @@ class TestG2bCrawler:
                 # Invalid format (too short)
                 assert crawler._parse_datetime("202604") is None
 
+    def test_get_filter_keywords_uses_defaults(self, mock_g2b_config):
+        """_get_filter_keywords() should return default keywords if config not set."""
+        with patch("alert.crawlers.base.get_config", return_value=mock_g2b_config):
+            with patch.dict("os.environ", {"DATA_GO_KR_API_KEY": "test-key"}):
+                crawler = G2bCrawler()
+
+                keywords = crawler._get_filter_keywords()
+
+                # Should return default keywords
+                assert len(keywords) > 0
+                assert "조경" in keywords
+                assert "녹화" in keywords
+                assert "스마트팜" in keywords
+
+    def test_get_filter_keywords_uses_config(self, mock_g2b_config):
+        """_get_filter_keywords() should use config keywords if set."""
+        # Set custom keywords in config
+        mock_g2b_config.crawler.sources["g2b"].filter_keywords = ["테스트", "키워드"]
+
+        with patch("alert.crawlers.base.get_config", return_value=mock_g2b_config):
+            with patch.dict("os.environ", {"DATA_GO_KR_API_KEY": "test-key"}):
+                crawler = G2bCrawler()
+
+                keywords = crawler._get_filter_keywords()
+
+                assert keywords == ["테스트", "키워드"]
+
+    def test_get_filter_keywords_returns_empty_when_config_empty(self, mock_g2b_config):
+        """_get_filter_keywords() should return empty list when config explicitly sets empty."""
+        # Set empty keywords in config (disable filtering)
+        mock_g2b_config.crawler.sources["g2b"].filter_keywords = []
+
+        with patch("alert.crawlers.base.get_config", return_value=mock_g2b_config):
+            with patch.dict("os.environ", {"DATA_GO_KR_API_KEY": "test-key"}):
+                crawler = G2bCrawler()
+
+                keywords = crawler._get_filter_keywords()
+
+                assert keywords == []
+
+    def test_filter_by_keywords_keeps_matching_items(self, mock_g2b_config):
+        """_filter_by_keywords() should keep items with matching keywords."""
+        with patch("alert.crawlers.base.get_config", return_value=mock_g2b_config):
+            with patch.dict("os.environ", {"DATA_GO_KR_API_KEY": "test-key"}):
+                crawler = G2bCrawler()
+
+                # Create test announcements
+                announcements = [
+                    RawAnnouncement(
+                        source="g2b",
+                        source_id="001",
+                        title="조경 공사 입찰",
+                        url="http://example.com/001",
+                        summary="공원 조경 설계",
+                        author="Test",
+                        category="공사",
+                        target="Test",
+                    ),
+                    RawAnnouncement(
+                        source="g2b",
+                        source_id="002",
+                        title="건물 신축 공사",
+                        url="http://example.com/002",
+                        summary="일반 건축물",
+                        author="Test",
+                        category="공사",
+                        target="Test",
+                    ),
+                    RawAnnouncement(
+                        source="g2b",
+                        source_id="003",
+                        title="스마트팜 시설 설치",
+                        url="http://example.com/003",
+                        summary="농업 시설 구축",
+                        author="Test",
+                        category="용역",
+                        target="Test",
+                    ),
+                ]
+
+                filtered = crawler._filter_by_keywords(announcements)
+
+                # Should keep items with matching keywords
+                assert len(filtered) == 2
+                assert filtered[0].source_id == "001"  # Has "조경"
+                assert filtered[1].source_id == "003"  # Has "스마트팜"
+
+    def test_filter_by_keywords_removes_non_matching_items(self, mock_g2b_config):
+        """_filter_by_keywords() should remove items without matching keywords."""
+        with patch("alert.crawlers.base.get_config", return_value=mock_g2b_config):
+            with patch.dict("os.environ", {"DATA_GO_KR_API_KEY": "test-key"}):
+                crawler = G2bCrawler()
+
+                announcements = [
+                    RawAnnouncement(
+                        source="g2b",
+                        source_id="001",
+                        title="일반 건축 공사",
+                        url="http://example.com/001",
+                        summary="건물 신축",
+                        author="Test",
+                        category="공사",
+                        target="Test",
+                    ),
+                    RawAnnouncement(
+                        source="g2b",
+                        source_id="002",
+                        title="도로 보수 공사",
+                        url="http://example.com/002",
+                        summary="도로 포장",
+                        author="Test",
+                        category="공사",
+                        target="Test",
+                    ),
+                ]
+
+                filtered = crawler._filter_by_keywords(announcements)
+
+                # No items should match
+                assert len(filtered) == 0
+
+    def test_filter_by_keywords_no_filtering_when_empty_keywords(self, mock_g2b_config):
+        """_filter_by_keywords() should return all items when no keywords configured."""
+        # Set empty keywords in config (disable filtering)
+        mock_g2b_config.crawler.sources["g2b"].filter_keywords = []
+
+        with patch("alert.crawlers.base.get_config", return_value=mock_g2b_config):
+            with patch.dict("os.environ", {"DATA_GO_KR_API_KEY": "test-key"}):
+                crawler = G2bCrawler()
+
+                announcements = [
+                    RawAnnouncement(
+                        source="g2b",
+                        source_id="001",
+                        title="일반 건축 공사",
+                        url="http://example.com/001",
+                        summary="건물 신축",
+                        author="Test",
+                        category="공사",
+                        target="Test",
+                    ),
+                    RawAnnouncement(
+                        source="g2b",
+                        source_id="002",
+                        title="도로 보수 공사",
+                        url="http://example.com/002",
+                        summary="도로 포장",
+                        author="Test",
+                        category="공사",
+                        target="Test",
+                    ),
+                ]
+
+                filtered = crawler._filter_by_keywords(announcements)
+
+                # All items should be returned (no filtering)
+                assert len(filtered) == 2
+
+    def test_filter_by_keywords_checks_title_and_summary(self, mock_g2b_config):
+        """_filter_by_keywords() should check both title and summary."""
+        with patch("alert.crawlers.base.get_config", return_value=mock_g2b_config):
+            with patch.dict("os.environ", {"DATA_GO_KR_API_KEY": "test-key"}):
+                crawler = G2bCrawler()
+
+                announcements = [
+                    RawAnnouncement(
+                        source="g2b",
+                        source_id="001",
+                        title="일반 공사",  # No keyword
+                        url="http://example.com/001",
+                        summary="공고종류: 녹화 공사",  # Has keyword "녹화"
+                        author="Test",
+                        category="공사",
+                        target="Test",
+                    ),
+                    RawAnnouncement(
+                        source="g2b",
+                        source_id="002",
+                        title="정원 조성 공사",  # Has keyword "정원"
+                        url="http://example.com/002",
+                        summary="일반 공사",  # No keyword
+                        author="Test",
+                        category="공사",
+                        target="Test",
+                    ),
+                ]
+
+                filtered = crawler._filter_by_keywords(announcements)
+
+                # Both should match (one in summary, one in title)
+                assert len(filtered) == 2
+
 
 class TestKStartupCrawler:
     """Test KStartupCrawler implementation."""
@@ -651,15 +844,15 @@ class TestKStartupCrawler:
         config.crawler.sources = {"kstartup": kstartup_source}
         return config
 
-    def test_initialization_without_api_key_raises_error(self, mock_kstartup_config):
-        """KStartupCrawler should raise ValueError if API key not found."""
-        # Remove api_key from config
+    def test_initialization_without_api_key_graceful(self, mock_kstartup_config):
+        """KStartupCrawler should gracefully handle missing API key."""
         mock_kstartup_config.crawler.sources["kstartup"].api_key = ""
 
         with patch("alert.crawlers.base.get_config", return_value=mock_kstartup_config):
             with patch.dict("os.environ", {}, clear=True):
-                with pytest.raises(ValueError, match="DATA_GO_KR_API_KEY not found"):
-                    KStartupCrawler()
+                crawler = KStartupCrawler()
+                assert crawler.api_key == ""
+                assert crawler.fetch() == []
 
     def test_initialization_with_api_key_from_env(self, mock_kstartup_config):
         """KStartupCrawler should get API key from environment."""

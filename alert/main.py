@@ -57,6 +57,12 @@ def _import_crawlers() -> Dict[str, Any]:
         ("kosmes", "alert.crawlers.kosmes", "KosmesCrawler"),
         ("ipet", "alert.crawlers.ipet", "IpetCrawler"),
         ("apfs", "alert.crawlers.apfs", "ApfsCrawler"),
+        ("agrohealing", "alert.crawlers.agrohealing", "AgrohealingCrawler"),
+        ("fowi", "alert.crawlers.fowi", "FowiCrawler"),
+        ("seis", "alert.crawlers.seis", "SeisCrawler"),
+        ("ggeea", "alert.crawlers.ggeea", "GgeeaCrawler"),
+        ("mois_sse", "alert.crawlers.mois_sse", "MoisSseCrawler"),
+        ("goyang_startup", "alert.crawlers.goyang_startup", "GoyangStartupCrawler"),
     ]
 
     for name, module_path, class_name in crawler_modules:
@@ -93,7 +99,7 @@ def run_pipeline(test_mode: bool = False) -> None:
     db = Database()
     keyword_analyzer = KeywordAnalyzer(db=db)
     claude_analyzer = ClaudeAnalyzer()
-    telegram = TelegramNotifier()
+    telegram = TelegramNotifier(db=db)
     email = EmailNotifier()
 
     # Load available crawlers
@@ -414,10 +420,12 @@ def run_test() -> None:
     run_pipeline(test_mode=True)
 
     # Send test telegram message
-    telegram = TelegramNotifier()
+    db = Database()
+    telegram = TelegramNotifier(db=db)
     if telegram.bot_token and telegram.chat_id:
         logger.info("Sending test Telegram message...")
         telegram.send_text("🧪 Test message from agrion-automation alert system")
+    db.close()
 
     # Send test email
     email = EmailNotifier()
@@ -476,10 +484,11 @@ def main() -> None:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  python -m alert.main              # 1회 실행 (crawl + analyze + notify)
-  python -m alert.main --daemon     # 데몬 모드 (cron_hours에 맞춰 자동 실행)
-  python -m alert.main --bot        # 텔레그램 봇 모드 (polling, Phase 5에서 구현)
-  python -m alert.main --test       # 테스트 모드 (크롤 1개만, 알림 테스트)
+  python -m alert.main                  # 1회 실행 (crawl + analyze + notify)
+  python -m alert.main --daemon         # 데몬 모드 (cron_hours에 맞춰 자동 실행)
+  python -m alert.main --bot            # 텔레그램 봇 모드 (polling, Phase 5에서 구현)
+  python -m alert.main --test           # 테스트 모드 (크롤 1개만, 알림 테스트)
+  python -m alert.main --sync-keywords  # config.yaml → DB 키워드 동기화 (추가만)
         """
     )
 
@@ -513,6 +522,12 @@ Examples:
         help="Generate research document for the current quarter"
     )
 
+    parser.add_argument(
+        "--sync-keywords",
+        action="store_true",
+        help="Sync keywords from config.yaml to database (adds new, does not remove existing)"
+    )
+
     args = parser.parse_args()
 
     # Override log level if specified
@@ -521,7 +536,13 @@ Examples:
         config.log_level = args.log_level
 
     # Determine mode
-    if args.research:
+    if args.sync_keywords:
+        db = Database()
+        count = db.sync_keywords_from_config()
+        print(f"Synced {count} new keywords to database")
+        db.close()
+        return
+    elif args.research:
         run_research()
     elif args.daemon:
         run_daemon()

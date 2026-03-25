@@ -28,6 +28,24 @@ crawler:
     g2b:
       enabled: true
       base_url: "http://apis.data.go.kr/1230000/BidPublicInfoService"
+      filter_keywords:
+        - "조경"
+        - "녹화"
+        - "정원"
+        - "이끼"
+        - "수목"
+        - "식재"
+        - "녹지"
+        - "도시숲"
+        - "학교숲"
+        - "탄소숲"
+        - "치유정원"
+        - "스마트팜"
+        - "시설원예"
+        - "농업"
+        - "산림"
+        - "치유"
+        - "사회적기업"
     kstartup:
       enabled: true
       base_url: "https://apis.data.go.kr/B552735/kisedKstartupService01"
@@ -35,8 +53,8 @@ crawler:
       enabled: true
       base_url: "https://www.smes.go.kr"
     subsidy24:
-      enabled: false
-      base_url: ""
+      enabled: true
+      base_url: "https://apis.data.go.kr/B554287/SubsidyBusinessInfoService/getSubsidyBusinessInfo"
     forest_service:
       enabled: true
       base_url: "https://www.forest.go.kr"
@@ -76,6 +94,24 @@ crawler:
     apfs:
       enabled: true
       base_url: "https://www.apfs.kr"
+    agrohealing:
+      enabled: true
+      base_url: "https://agrohealing.go.kr"
+    fowi:
+      enabled: true
+      base_url: "https://fowi.or.kr"
+    seis:
+      enabled: true
+      base_url: "https://www.seis.or.kr"
+    ggeea:
+      enabled: true
+      base_url: "https://www.ggeea.or.kr"
+    mois_sse:
+      enabled: true
+      base_url: "https://www.mois.go.kr"
+    goyang_startup:
+      enabled: true
+      base_url: "https://www.goyangstartup.kr"
 
 analyzer:
   keyword_threshold: 0.3
@@ -154,11 +190,56 @@ keywords:
     - "디지털전환"
     - "AI융합"
     - "콘텐츠"
+
+    # --- 이끼/모스 (Moss) ---
+    - "이끼재배"
+    - "모스월"
+    - "이끼테라리움"
+    - "이끼조경"
+    # --- 조경/정원 (Landscaping/Garden) ---
+    - "정원박람회"
+    - "국가정원"
+    - "조경수"
+    - "생태복원"
+    - "가로수"
+    # --- 치유농업 (Healing Agriculture) ---
+    - "치유농업사"
+    - "치유농장"
+    - "농업치유"
+    - "케어팜"
+    - "그린케어"
+    - "원예복지"
+    # --- 사회적기업/경제 (Social Enterprise) ---
+    - "사회적경제기업"
+    - "자활기업"
+    - "마을기업"
+    - "사회적협동조합"
+    - "소셜임팩트"
+    - "사회연대경제"
+    # --- AI/디지털 (AI/Digital) ---
+    - "농업AI"
+    - "스마트팜AI"
+    - "정밀농업"
+    - "작물진단"
+    - "IoT센서"
+    - "빅데이터농업"
+    # --- 소공인/공방 (Artisan/Workshop) ---
+    - "소공인지원"
+    - "제조지원"
+    - "공방지원"
+    - "상품개발"
+    - "패키지디자인"
+    - "로컬크리에이터"
   exclude:
     - "축산"
     - "수산"
     - "벌목"
     - "광업"
+    # 관련성 낮은 분야
+    - "양식"
+    - "원양"
+    - "건설장비"
+    - "중장비"
 
 notifier:
   telegram:
@@ -212,6 +293,27 @@ knowledge:
     max_tokens: 4096
 
   n8n:
+    # N8N Outbound Webhook Integration
+    # Sends events to n8n when announcements are detected or statuses change
+    # Set N8N_WEBHOOK_URL in .env to activate
+    #
+    # Payload format:
+    #   {
+    #     "event": "new_relevant_announcement" | "application_status_changed",
+    #     "timestamp": "2025-03-25T...",
+    #     "announcement": {
+    #       "id": <db_id>,
+    #       "title": "공고 제목",
+    #       "source": "bizinfo|mafra|...",
+    #       "business_domain": "스마트팜|조경|...",
+    #       "relevance_score": 0.85,
+    #       "url": "https://...",
+    #       "period_end": "2025-04-30"
+    #     },
+    #     "obsidian_path": "/path/to/note" (if created)
+    #   }
+    #
+    # Supported event categories: new_relevant, status_change
     enabled: false
     webhook_url: ""
     notify_on: ["new_relevant", "status_change"]

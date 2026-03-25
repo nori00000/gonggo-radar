@@ -50,6 +50,24 @@ def sample_raw_announcement():
     )
 
 
+@pytest.fixture
+def sample_announcement():
+    """Sample AnalyzedAnnouncement for testing."""
+    return AnalyzedAnnouncement(
+        source="test",
+        source_id="test-001",
+        title="스마트팜 혁신 지원사업",
+        url="https://example.com/test-001",
+        summary="시설원예 농가를 위한 지원",
+        author="농림축산식품부",
+        category="농업",
+        target="농업인",
+        relevance_score=0.7,
+        relevance_reason="필수 키워드 매칭",
+        matched_keywords=["스마트팜"],
+    )
+
+
 class TestKeywordAnalyzer:
     """Test KeywordAnalyzer class."""
 

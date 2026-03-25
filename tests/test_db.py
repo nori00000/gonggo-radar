@@ -121,3 +121,137 @@ class TestUpdateApplicationStatus:
                 record_id, "in_progress", **{field_name: "test_value"}
             )
             assert result is True
+
+
+class TestSyncKeywordsFromConfig:
+    """Tests for sync_keywords_from_config -- additive-only keyword sync."""
+
+    def _create_mock_config(self):
+        """Create a mock KeywordsConfig for testing."""
+        from dataclasses import dataclass, field
+
+        @dataclass
+        class MockKeywordsConfig:
+            must_match: list = field(default_factory=list)
+            boost: list = field(default_factory=list)
+            exclude: list = field(default_factory=list)
+
+        return MockKeywordsConfig(
+            must_match=["스마트팜", "시설원예", "농업"],
+            boost=["IoT", "자동화", "센서"],
+            exclude=["개발", "건설"]
+        )
+
+    def test_sync_adds_new_keywords(self, tmp_db):
+        """Sync should add new keywords from config."""
+        mock_cfg = self._create_mock_config()
+        count = tmp_db.sync_keywords_from_config(mock_cfg)
+
+        # Should insert all keywords (3 must_match + 3 boost + 2 exclude = 8)
+        assert count == 8
+
+        # Verify they exist in database
+        keywords = tmp_db.get_keywords()
+        assert len(keywords) == 8
+
+        # Verify category and weight mapping
+        must_match_kws = [k for k in keywords if k.category == "must_match"]
+        assert len(must_match_kws) == 3
+        assert all(k.weight == 0.5 for k in must_match_kws)
+
+        boost_kws = [k for k in keywords if k.category == "boost"]
+        assert len(boost_kws) == 3
+        assert all(k.weight == 0.05 for k in boost_kws)
+
+        exclude_kws = [k for k in keywords if k.category == "exclude"]
+        assert len(exclude_kws) == 2
+        assert all(k.weight == 0.0 for k in exclude_kws)
+
+    def test_sync_does_not_overwrite_existing(self, tmp_db):
+        """Sync should not modify existing keywords."""
+        # Insert a keyword with custom weight
+        from alert.models import Keyword
+        existing = Keyword(keyword="스마트팜", category="must_match", weight=0.99, is_active=True)
+        tmp_db.insert_keyword(existing)
+
+        # Sync with config that includes the same keyword
+        mock_cfg = self._create_mock_config()
+        count = tmp_db.sync_keywords_from_config(mock_cfg)
+
+        # Should only add new keywords (7 new, 1 skipped)
+        assert count == 7
+
+        # Verify existing keyword was not modified
+        keywords = tmp_db.get_keywords()
+        existing_kw = next(k for k in keywords if k.keyword == "스마트팜")
+        assert existing_kw.weight == 0.99  # Original weight preserved
+
+    def test_sync_is_idempotent(self, tmp_db):
+        """Running sync twice should not create duplicates."""
+        mock_cfg = self._create_mock_config()
+
+        # First sync
+        count1 = tmp_db.sync_keywords_from_config(mock_cfg)
+        assert count1 == 8
+
+        # Second sync (should add 0 new keywords)
+        count2 = tmp_db.sync_keywords_from_config(mock_cfg)
+        assert count2 == 0
+
+        # Total count should still be 8
+        keywords = tmp_db.get_keywords()
+        assert len(keywords) == 8
+
+    def test_sync_works_with_empty_db(self, tmp_db):
+        """Sync should work on fresh database."""
+        # Verify DB is empty
+        keywords = tmp_db.get_keywords()
+        assert len(keywords) == 0
+
+        # Run sync
+        mock_cfg = self._create_mock_config()
+        count = tmp_db.sync_keywords_from_config(mock_cfg)
+
+        assert count == 8
+        keywords = tmp_db.get_keywords()
+        assert len(keywords) == 8
+
+    def test_sync_partial_overlap(self, tmp_db):
+        """Sync should only add keywords that don't exist."""
+        from alert.models import Keyword
+
+        # Pre-populate with 2 keywords
+        tmp_db.insert_keyword(Keyword(keyword="스마트팜", category="must_match", weight=0.5))
+        tmp_db.insert_keyword(Keyword(keyword="IoT", category="boost", weight=0.05))
+
+        # Sync with config
+        mock_cfg = self._create_mock_config()
+        count = tmp_db.sync_keywords_from_config(mock_cfg)
+
+        # Should add 6 new keywords (8 total - 2 existing)
+        assert count == 6
+
+        keywords = tmp_db.get_keywords()
+        assert len(keywords) == 8
+
+    def test_sync_uses_correct_weight_mapping(self, tmp_db):
+        """Sync should use correct weight for each category."""
+        mock_cfg = self._create_mock_config()
+        tmp_db.sync_keywords_from_config(mock_cfg)
+
+        keywords = tmp_db.get_keywords()
+
+        # Check must_match keywords have weight 0.5
+        must_match = [k for k in keywords if k.keyword in ["스마트팜", "시설원예", "농업"]]
+        assert all(k.weight == 0.5 for k in must_match)
+        assert all(k.category == "must_match" for k in must_match)
+
+        # Check boost keywords have weight 0.05
+        boost = [k for k in keywords if k.keyword in ["IoT", "자동화", "센서"]]
+        assert all(k.weight == 0.05 for k in boost)
+        assert all(k.category == "boost" for k in boost)
+
+        # Check exclude keywords have weight 0.0
+        exclude = [k for k in keywords if k.keyword in ["개발", "건설"]]
+        assert all(k.weight == 0.0 for k in exclude)
+        assert all(k.category == "exclude" for k in exclude)

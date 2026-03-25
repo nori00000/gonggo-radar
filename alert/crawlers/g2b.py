@@ -30,6 +30,13 @@ class G2bCrawler(BaseCrawler):
         "공사": "/getBidPblancListInfoCnstwk",
     }
 
+    # Default landscape keywords (can be overridden by config)
+    DEFAULT_FILTER_KEYWORDS = [
+        "조경", "녹화", "정원", "이끼", "수목", "식재", "녹지",
+        "도시숲", "학교숲", "탄소숲", "치유정원", "스마트팜",
+        "시설원예", "농업", "산림", "치유", "사회적기업",
+    ]
+
     def __init__(self):
         super().__init__(source_name="g2b")
         self.api_key = self._get_api_key()
@@ -39,10 +46,7 @@ class G2bCrawler(BaseCrawler):
         """Get API key from environment or config.
 
         Returns:
-            API key string
-
-        Raises:
-            ValueError: If API key is not found
+            API key string, or empty string if not found
         """
         # First try environment variable
         api_key = os.getenv("DATA_GO_KR_API_KEY", "")
@@ -54,9 +58,9 @@ class G2bCrawler(BaseCrawler):
                 api_key = getattr(source_cfg, "api_key")
 
         if not api_key:
-            raise ValueError(
-                "DATA_GO_KR_API_KEY not found in environment or config. "
-                "Please set it in .env file."
+            self.logger.warning(
+                "DATA_GO_KR_API_KEY not found. Set it in alert/.env file. "
+                "Crawler will be skipped."
             )
 
         return api_key
@@ -72,6 +76,25 @@ class G2bCrawler(BaseCrawler):
             return getattr(source_cfg, "lookback_days")
         return 7
 
+    def _get_filter_keywords(self) -> List[str]:
+        """Get filter keywords from config or use defaults.
+
+        Returns:
+            List of filter keywords, empty list if filtering disabled
+        """
+        source_cfg = self.config.crawler.sources.get("g2b")
+        if source_cfg:
+            try:
+                keywords = source_cfg.filter_keywords
+                # If config explicitly sets a list (even if empty), use it
+                if isinstance(keywords, list):
+                    return keywords
+            except AttributeError:
+                # Attribute doesn't exist, use defaults
+                pass
+        # Default to standard landscape keywords
+        return self.DEFAULT_FILTER_KEYWORDS
+
     def fetch(self) -> List[RawAnnouncement]:
         """Fetch announcements from G2B API.
 
@@ -80,6 +103,10 @@ class G2bCrawler(BaseCrawler):
         Returns:
             List of RawAnnouncement objects
         """
+        if not self.api_key:
+            self.logger.warning("g2b: No API key configured, skipping")
+            return []
+
         announcements = []
 
         # Calculate date range (default: last 7 days)
@@ -110,7 +137,10 @@ class G2bCrawler(BaseCrawler):
                 if announcement:
                     announcements.append(announcement)
 
-        return announcements
+        # Apply keyword filtering
+        filtered_announcements = self._filter_by_keywords(announcements)
+
+        return filtered_announcements
 
     def _fetch_operation(
         self,
@@ -313,3 +343,32 @@ class G2bCrawler(BaseCrawler):
 
         self.logger.warning(f"Unrecognized datetime format: {dt_str}")
         return None
+
+    def _filter_by_keywords(self, announcements: List[RawAnnouncement]) -> List[RawAnnouncement]:
+        """Filter announcements by keywords in title or summary.
+
+        Args:
+            announcements: List of RawAnnouncement objects
+
+        Returns:
+            Filtered list where title or summary contains at least one keyword
+        """
+        keywords = self._get_filter_keywords()
+
+        # No filtering if no keywords configured
+        if not keywords:
+            return announcements
+
+        filtered = []
+        for announcement in announcements:
+            # Check if any keyword appears in title or summary
+            title = announcement.title or ""
+            summary = announcement.summary or ""
+            combined_text = f"{title} {summary}"
+
+            # Match if any keyword found
+            if any(keyword in combined_text for keyword in keywords):
+                filtered.append(announcement)
+
+        self.logger.info(f"G2B: Filtered {len(filtered)}/{len(announcements)} by keywords")
+        return filtered

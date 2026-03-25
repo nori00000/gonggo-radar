@@ -29,6 +29,7 @@ class SourceConfig:
 
     enabled: bool = True
     base_url: str = ""
+    filter_keywords: list[str] = field(default_factory=list)
 
 
 @dataclass

@@ -39,7 +39,7 @@ class KnowledgeLayer:
                 from .vectordb import VectorStore
                 self.vectordb = VectorStore(db, self.config.vector)
             except Exception as e:
-                logger.warning(f"Vector store init failed: {e}")
+                logger.info(f"Vector store init failed: {e} -- Set OPENAI_API_KEY in alert/.env to enable vector embeddings")
 
         self.obsidian = None
         if self.config.obsidian.enabled and self.config.obsidian.vault_path:
@@ -47,7 +47,7 @@ class KnowledgeLayer:
                 from .obsidian import ObsidianSync
                 self.obsidian = ObsidianSync(self.config.obsidian)
             except Exception as e:
-                logger.warning(f"Obsidian sync init failed: {e}")
+                logger.info(f"Obsidian sync init failed: {e} -- Set OBSIDIAN_VAULT_PATH in alert/.env to enable Obsidian sync")
 
         self.n8n = None
         if self.config.n8n.enabled and self.config.n8n.webhook_url:

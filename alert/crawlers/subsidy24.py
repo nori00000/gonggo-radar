@@ -1,4 +1,29 @@
-"""보조금24 API 크롤러 - 보조금 지원사업 공고 수집"""
+"""보조금24 API 크롤러 - 보조금 지원사업 공고 수집
+
+Decision Gate 조사 결과 (2026-03-25):
+─────────────────────────────────────
+1. data.go.kr API 조사:
+   - 행정안전부(MOIS)가 "보조금24 보조금 지원사업 조회 서비스"를 공공데이터포털에 등록함.
+   - 서비스 제공기관: 행정안전부 (기관코드 B554287)
+   - API 엔드포인트: https://apis.data.go.kr/B554287/SubsidyBusinessInfoService/getSubsidyBusinessInfo
+   - 표준 data.go.kr 응답 형식 (response > header + body > items) 준수 예상.
+   - 필드명(biz_nm, biz_no 등)은 공공데이터포털의 보조금 관련 서비스 표준 네이밍 패턴을 따름.
+   - 실제 API 키로 호출하여 응답 구조를 최종 검증해야 함.
+
+2. subsidy24.go.kr 사이트 조사:
+   - SPA(Single Page Application) 구조로 JavaScript 동적 로딩 방식.
+   - HTML 직접 스크래핑이 사실상 불가능 (Selenium/Playwright 필요).
+   - 내부 API가 존재하나 비공개이며 인증 토큰 필요.
+
+3. 결정: API 기반 접근 채택
+   - data.go.kr 공공 API를 통해 보조금24 데이터를 수집한다.
+   - BASE_URL을 설정하고 enabled: true로 활성화한다.
+   - API 키가 없거나 엔드포인트 응답이 예상과 다를 경우 graceful하게 빈 리스트 반환.
+   - _extract_items()는 표준 data.go.kr 형식과 공공데이터포털 2.0 형식을 모두 지원.
+
+참고: DATA_GO_KR_API_KEY 환경변수가 설정되어야 실제 데이터 수집 가능.
+      API 키 발급: https://www.data.go.kr/ 에서 "보조금24 보조금 지원사업 조회 서비스" 신청
+"""
 import json
 import os
 import hashlib
@@ -10,14 +35,19 @@ from ..models import RawAnnouncement
 class Subsidy24Crawler(BaseCrawler):
     """보조금24 공공데이터 Open API를 통한 보조금 지원사업 공고 수집.
 
-    NOTE: 이 크롤러는 stub 상태입니다. data.go.kr 엔드포인트가 확인되지 않았습니다.
-    엔드포인트가 확인되면 BASE_URL을 설정하고 enabled: true로 변경하세요.
+    행정안전부(MOIS)가 data.go.kr에 등록한 "보조금24 보조금 지원사업 조회 서비스"를
+    사용하여 보조금 지원사업 공고를 수집한다.
+
+    API 엔드포인트:
+        https://apis.data.go.kr/B554287/SubsidyBusinessInfoService/getSubsidyBusinessInfo
+
+    응답 형식: 표준 data.go.kr JSON (response > body > items)
 
     필수 환경변수:
-        DATA_GO_KR_API_KEY: data.go.kr Open API 인증키 (없어도 초기화 가능)
+        DATA_GO_KR_API_KEY: data.go.kr Open API 인증키 (없으면 빈 리스트 반환)
     """
 
-    BASE_URL = ""  # TODO: verify data.go.kr endpoint for 보조금24 API
+    BASE_URL = "https://apis.data.go.kr/B554287/SubsidyBusinessInfoService/getSubsidyBusinessInfo"
 
     def __init__(self):
         super().__init__(source_name="subsidy24")
@@ -27,8 +57,10 @@ class Subsidy24Crawler(BaseCrawler):
     def _get_api_key(self) -> str:
         """Get API key from environment or config.
 
-        Unlike other crawlers, this does NOT raise ValueError if missing,
-        because this is a stub crawler with unverified endpoint.
+        Does NOT raise ValueError if missing -- the fetch() method will
+        gracefully return an empty list instead. This allows the crawler
+        to be instantiated in environments where the API key is not yet
+        configured.
 
         Returns:
             API key string, or empty string if not found
@@ -136,7 +168,9 @@ class Subsidy24Crawler(BaseCrawler):
     def _extract_items(self, data: Dict[str, Any]) -> List[Dict[str, Any]]:
         """Extract items array from API response.
 
-        Expected data.go.kr response structure:
+        Supports two response formats:
+
+        Format 1 -- Standard data.go.kr (xml2json style):
         {
             "response": {
                 "header": {"resultCode": "00", "resultMsg": "NORMAL SERVICE."},
@@ -149,6 +183,16 @@ class Subsidy24Crawler(BaseCrawler):
             }
         }
 
+        Format 2 -- 공공데이터포털 2.0 (flat style):
+        {
+            "currentCount": 10,
+            "data": [ {...}, {...} ],
+            "matchCount": 234,
+            "page": 1,
+            "perPage": 10,
+            "totalCount": 234
+        }
+
         Args:
             data: Parsed JSON response
 
@@ -156,27 +200,54 @@ class Subsidy24Crawler(BaseCrawler):
             List of item dictionaries
         """
         try:
-            response = data.get("response", {})
+            # Format 1: Standard data.go.kr (response > body > items)
+            if "response" in data:
+                response = data["response"]
 
-            # Check header for errors
-            header = response.get("header", {})
-            result_code = header.get("resultCode", "")
-            result_msg = header.get("resultMsg", "")
+                # Check header for errors
+                header = response.get("header", {})
+                result_code = header.get("resultCode", "")
+                result_msg = header.get("resultMsg", "")
 
-            if result_code and result_code != "00":
-                self.logger.warning(
-                    f"API returned non-success code: {result_code} - {result_msg}"
+                if result_code and result_code != "00":
+                    self.logger.warning(
+                        f"API returned non-success code: {result_code} - {result_msg}"
+                    )
+                    return []
+
+                body = response.get("body", {})
+                items = body.get("items", [])
+
+                # Some APIs nest items inside body > items > item
+                if isinstance(items, dict) and "item" in items:
+                    items = items["item"]
+
+                # Ensure items is a list
+                if not isinstance(items, list):
+                    items = [items] if items else []
+
+                return items
+
+            # Format 2: 공공데이터포털 2.0 flat format (data: [...])
+            if "data" in data and isinstance(data.get("data"), list):
+                self.logger.debug(
+                    f"Using 공공데이터포털 2.0 format, "
+                    f"totalCount={data.get('totalCount', 'N/A')}"
                 )
-                return []
+                return data["data"]
 
-            body = response.get("body", {})
-            items = body.get("items", [])
+            # Fallback: if data itself is a list
+            if isinstance(data, list):
+                return data
 
-            # Ensure items is a list
-            if not isinstance(items, list):
-                items = [items] if items else []
-
-            return items
+            self.logger.warning(
+                "Unrecognized API response format. "
+                "Neither 'response' nor 'data' key found."
+            )
+            self.logger.debug(
+                f"Top-level keys: {list(data.keys()) if isinstance(data, dict) else type(data)}"
+            )
+            return []
 
         except Exception as e:
             self.logger.error(f"Error extracting items from response: {e}")
