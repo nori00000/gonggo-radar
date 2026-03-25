@@ -24,7 +24,10 @@ class IpetCrawler(BaseCrawler):
     """
 
     BASE_URL = "https://www.ipet.re.kr"
-    BOARD_PATHS = ["/index.do?boardId=notice"]
+    BOARD_PATHS = [
+        "/Notice/bizNoticeLV.asp",    # 사업공고
+        "/Notice/NoticeLV.asp",       # 공지사항
+    ]
 
     def __init__(self):
         super().__init__(source_name="ipet")
@@ -111,6 +114,7 @@ class IpetCrawler(BaseCrawler):
 
         table = None
         for selector in [
+            "table.sub-table", "table.no-bor",
             "table.board_list", "table.board-list", "table.tbl_list",
             "table.list_table", "table.tbl_board", "table.bbsList",
             "table.table_list", "table.list_tbl",
@@ -150,7 +154,9 @@ class IpetCrawler(BaseCrawler):
             for cell in cells:
                 css_class = " ".join(cell.get("class", []))
 
-                if any(kw in css_class for kw in ["title", "subject", "sbj"]):
+                if any(kw in css_class for kw in [
+                    "title", "subject", "sbj", "taxt-lt",
+                ]):
                     a_tag = cell.find("a")
                     if a_tag:
                         title_link = a_tag.get("href", "")
@@ -266,11 +272,14 @@ class IpetCrawler(BaseCrawler):
         seen_links = set()
 
         view_patterns = [
+            re.compile(r"NoticeVP\.asp", re.I),
+            re.compile(r"bizNoticeVP\.asp", re.I),
             re.compile(r"view", re.I),
             re.compile(r"detail", re.I),
             re.compile(r"boardView", re.I),
             re.compile(r"seq=", re.I),
             re.compile(r"nttId=", re.I),
+            re.compile(r"tbl_id=", re.I),
         ]
 
         for a_tag in soup.find_all("a", href=True):
@@ -304,6 +313,7 @@ class IpetCrawler(BaseCrawler):
             return ""
 
         id_params = [
+            r"tbl_id=(\w+)",
             r"announcementId=(\d+)", r"notifyId=(\d+)", r"nttId=(\d+)",
             r"seq=(\d+)", r"idx=(\d+)", r"no=(\d+)",
             r"articleId=(\d+)", r"artclId=(\d+)",
@@ -329,6 +339,9 @@ class IpetCrawler(BaseCrawler):
             return f"https:{link}"
         if link.startswith("/"):
             return f"{base_url}{link}"
+        # 상대 경로 (예: bizNoticeVP.asp?...) -> /Notice/ 기반 경로로 변환
+        if link.endswith(".asp") or ".asp?" in link:
+            return f"{base_url}/Notice/{link}"
         return f"{base_url}/{link}"
 
     def _normalize_date(self, date_str: str) -> Optional[str]:

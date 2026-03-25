@@ -23,7 +23,10 @@ class SemasCrawler(BaseCrawler):
     """
 
     BASE_URL = "https://www.semas.or.kr"
-    BOARD_PATHS: List[str] = []  # TODO: discover announcement board URL path
+    BOARD_PATHS = [
+        "/web/board/webBoardList.kmdc?bCd=1",   # 공지사항 (bCd=1)
+        "/web/board/webBoardList.kmdc?bCd=2",   # 사업공고 (bCd=2)
+    ]
 
     def __init__(self):
         super().__init__(source_name="semas")
@@ -312,12 +315,29 @@ class SemasCrawler(BaseCrawler):
 
         return items
 
+    def _resolve_js_link(self, link: str) -> str:
+        """JavaScript 링크를 실제 URL 경로로 변환한다.
+
+        SEMAS는 javascript:fncGoDetail('b_idx') 형태의 링크를 사용하며,
+        이를 /web/board/webBoardView.kmdc?b_idx=ID 형태로 변환한다.
+        """
+        if not link:
+            return ""
+
+        match = re.search(r"fncGoDetail\(['\"](\d+)['\"]\)", link)
+        if match:
+            b_idx = match.group(1)
+            return f"/web/board/webBoardView.kmdc?b_idx={b_idx}"
+
+        return link
+
     def _extract_post_id(self, link: str) -> str:
         """URL에서 공고 ID를 추출한다."""
         if not link:
             return ""
 
         id_params = [
+            r"b_idx=(\d+)",
             r"announcementId=(\d+)", r"notifyId=(\d+)", r"nttId=(\d+)",
             r"seq=(\d+)", r"idx=(\d+)", r"no=(\d+)",
             r"articleId=(\d+)", r"artclId=(\d+)",
@@ -337,6 +357,13 @@ class SemasCrawler(BaseCrawler):
         """상대 URL을 절대 URL로 변환한다."""
         if not link:
             return ""
+
+        # JavaScript 링크를 실제 URL로 변환
+        if link.startswith("javascript:"):
+            link = self._resolve_js_link(link)
+            if not link or link.startswith("javascript:"):
+                return ""
+
         if link.startswith("http://") or link.startswith("https://"):
             return link
         if link.startswith("//"):

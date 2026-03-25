@@ -24,7 +24,15 @@ class SeisCrawler(BaseCrawler):
     """
 
     BASE_URL = "https://www.seis.or.kr"
-    BOARD_PATHS = ["/front/board/boardList.do?boardId=BBS_0000001"]
+    # SEIS는 사회적기업 포털로 사이트가 전면 개편됨.
+    # 기존 /front/board/ URL은 모두 mainPage.do로 리다이렉트됨.
+    # 사업공고는 /subPage.do?menuId=30200 에서 확인 가능하며,
+    # 메인 페이지에 사업공고 링크가 포함되어 있음.
+    BOARD_PATHS = [
+        "/mainPage.do",               # 메인 페이지 (사업공고 링크 포함)
+        "/subPage.do?menuId=30200",    # 사업공고
+        "/subPage.do?menuId=30400",    # 통합사업신청
+    ]
 
     def __init__(self):
         super().__init__(source_name="seis")
@@ -254,6 +262,11 @@ class SeisCrawler(BaseCrawler):
         seen_links = set()
 
         view_patterns = [
+            re.compile(r"pbancMainView", re.I),
+            re.compile(r"fncPbofrSn=", re.I),
+            re.compile(r"tabId=view", re.I),
+            re.compile(r"tabId=certPageView", re.I),
+            re.compile(r"itgrdAplyPbancSn=", re.I),
             re.compile(r"boardView", re.I),
             re.compile(r"view\.do", re.I),
             re.compile(r"nttId=", re.I),
@@ -291,6 +304,7 @@ class SeisCrawler(BaseCrawler):
             return ""
 
         id_params = [
+            r"fncPbofrSn=(\d+)", r"itgrdAplyPbancSn=(\d+)",
             r"announcementId=(\d+)", r"notifyId=(\d+)", r"nttId=(\d+)",
             r"seq=(\d+)", r"idx=(\d+)", r"no=(\d+)",
             r"articleId=(\d+)", r"artclId=(\d+)",
@@ -316,6 +330,7 @@ class SeisCrawler(BaseCrawler):
             return f"https:{link}"
         if link.startswith("/"):
             return f"{base_url}{link}"
+        # 상대 경로 (예: subPage.do?menuId=...) -> 절대 경로로 변환
         return f"{base_url}/{link}"
 
     def _normalize_date(self, date_str: str) -> Optional[str]:

@@ -23,7 +23,14 @@ class SocialenterpriseCrawler(BaseCrawler):
     """
 
     BASE_URL = "https://www.socialenterprise.or.kr"
-    BOARD_PATHS: List[str] = []  # TODO: discover announcement board URL path
+    # 공지사항 게시판 (AJAX JSON API)
+    BOARD_API_URL = "/homepage/bbs/ajax/boardList.do"
+    BOARD_CONFIGS = [
+        {"bsIdx": "10002", "menuId": "822"},   # 공지사항/소식·자료
+    ]
+    BOARD_PATHS: List[str] = [
+        "/homepage/bbs/board.do?bsIdx=10002&menuId=822",  # 공지사항
+    ]
 
     def __init__(self):
         super().__init__(source_name="socialenterprise")
@@ -42,39 +49,104 @@ class SocialenterpriseCrawler(BaseCrawler):
         announcements: List[RawAnnouncement] = []
         base_url = self.get_base_url() or self.BASE_URL
 
-        if self.BOARD_PATHS:
-            for board_path in self.BOARD_PATHS:
-                url = f"{base_url}{board_path}"
-                self.logger.info(
-                    f"Fetching from SocialEnterprise announcement board: {url}"
-                )
-
-                items = self._fetch_board_listing(url)
-                if items:
-                    self.logger.info(
-                        f"Successfully fetched {len(items)} items from {url}"
-                    )
-                    for item in items:
-                        announcement = self._to_announcement(item, base_url)
-                        if announcement:
-                            announcements.append(announcement)
-                    break
-        else:
-            # BOARD_PATHS가 비어있으므로 홈페이지에서 링크 추출 시도
+        # 전략 1: AJAX JSON API로 게시물 목록 조회
+        for config in self.BOARD_CONFIGS:
+            url = f"{base_url}{self.BOARD_API_URL}"
             self.logger.info(
-                f"No board paths configured, trying homepage: {base_url}"
+                f"Fetching SocialEnterprise board via AJAX API: "
+                f"bsIdx={config['bsIdx']}"
             )
-            items = self._fetch_board_listing(base_url)
+
+            items = self._fetch_ajax_board(url, config, base_url)
             if items:
                 self.logger.info(
-                    f"Successfully fetched {len(items)} items from homepage"
+                    f"Successfully fetched {len(items)} items via AJAX API"
                 )
                 for item in items:
                     announcement = self._to_announcement(item, base_url)
                     if announcement:
                         announcements.append(announcement)
+                return announcements
+
+        # 전략 2: 폴백 - 게시판 페이지 HTML 파싱
+        for board_path in self.BOARD_PATHS:
+            url = f"{base_url}{board_path}"
+            self.logger.info(
+                f"Fallback: fetching SocialEnterprise board page: {url}"
+            )
+
+            items = self._fetch_board_listing(url)
+            if items:
+                self.logger.info(
+                    f"Successfully fetched {len(items)} items from {url}"
+                )
+                for item in items:
+                    announcement = self._to_announcement(item, base_url)
+                    if announcement:
+                        announcements.append(announcement)
+                break
 
         return announcements
+
+    def _fetch_ajax_board(
+        self, url: str, config: dict, base_url: str
+    ) -> List[dict]:
+        """AJAX JSON API를 통해 게시물 목록을 가져온다.
+
+        socialenterprise.or.kr은 /homepage/bbs/ajax/boardList.do 엔드포인트로
+        POST 요청하여 JSON 응답(resultList 배열)을 반환한다.
+        """
+        data = {
+            "menuId": config["menuId"],
+            "bsIdx": config["bsIdx"],
+            "page": "1",
+        }
+
+        response = self.post(url, data=data)
+        if response is None:
+            return []
+
+        try:
+            json_data = response.json()
+        except Exception as e:
+            self.logger.warning(f"Failed to parse JSON from {url}: {e}")
+            return []
+
+        result_list = json_data.get("resultList", [])
+        if not result_list:
+            self.logger.warning("Empty resultList from AJAX API")
+            return []
+
+        items: List[dict] = []
+        for entry in result_list:
+            title = entry.get("SUBJECT", "").strip()
+            if not title:
+                continue
+
+            b_idx = entry.get("B_IDX", "")
+            bs_idx = config["bsIdx"]
+            menu_id = config["menuId"]
+            bc_idx = entry.get("BC_IDX", "")
+
+            link = (
+                f"/homepage/bbs/boardView.do"
+                f"?bsIdx={bs_idx}&bIdx={b_idx}"
+                f"&page=1&menuId={menu_id}&bcIdx={bc_idx}"
+            )
+
+            date_str = entry.get("WRITE_DATE", "")
+            author = entry.get("WRITER", "")
+            category = entry.get("CATEGORY_NAME", "")
+
+            items.append({
+                "title": title,
+                "link": link,
+                "author": author,
+                "category": category,
+                "date": date_str,
+            })
+
+        return items
 
     def _fetch_board_listing(self, url: str) -> List[dict]:
         """공고 목록 페이지를 파싱하여 공고 목록을 추출한다."""

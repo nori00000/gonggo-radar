@@ -16,18 +16,35 @@ class ApfsCrawler(BaseCrawler):
     """농업정책보험금융원(apfs.kr) 공고 게시판 크롤러.
 
     대상 URL:
-        - https://www.apfs.kr/usr/inform/bbs/BBSMSTR_000000000001/list.do
+        - https://www.apfs.kr/front/board/boardContentsListPage.do?boardId=10026&menuId=41 (공지사항)
+        - https://www.apfs.kr/front/board/boardContentsListPage.do?boardId=12&menuId=16 (사업실명제)
+        - https://www.apfs.kr/front/board/boardContentsListPage.do?boardId=43&menuId=43 (채용공고)
 
     HTML 파싱 방식:
         GET 요청을 통해 공고 목록 페이지를 가져오고, 테이블 또는 리스트 구조를
         파싱하여 공고 정보를 추출한다.
+
+    주의:
+        이 사이트는 JavaScript로 동적으로 컨텐츠를 로드합니다. 현재 정적 HTML
+        파싱으로는 공고 목록을 가져올 수 없습니다. 향후 Selenium이나 Playwright
+        같은 headless browser를 사용한 동적 크롤링이 필요합니다.
     """
 
     BASE_URL = "https://www.apfs.kr"
-    BOARD_PATHS = ["/usr/inform/bbs/BBSMSTR_000000000001/list.do"]
+    BOARD_PATHS = [
+        "/front/board/boardContentsListPage.do?boardId=10026&menuId=41",  # 공지사항
+        "/front/board/boardContentsListPage.do?boardId=12&menuId=16",     # 사업실명제
+        "/front/board/boardContentsListPage.do?boardId=43&menuId=43",     # 채용공고
+    ]
 
     def __init__(self):
         super().__init__(source_name="apfs")
+        # Add browser-like headers to avoid blocking
+        self.session.headers.update({
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language": "ko-KR,ko;q=0.9",
+            "Referer": "https://www.apfs.kr/",
+        })
         if BeautifulSoup is None:
             self.logger.error(
                 "BeautifulSoup4 is not installed. "
@@ -80,6 +97,19 @@ class ApfsCrawler(BaseCrawler):
 
         response.encoding = response.apparent_encoding or "utf-8"
         soup = BeautifulSoup(response.text, "html.parser")
+
+        # Check for JavaScript-based content loading
+        scripts = soup.find_all("script")
+        has_board_js = any(
+            "boardContentsView" in (script.string or "")
+            for script in scripts
+        )
+        if has_board_js:
+            self.logger.warning(
+                "Page appears to load content via JavaScript. "
+                "Static HTML parsing may not work. "
+                "Consider using Selenium or Playwright for dynamic content."
+            )
 
         # 전략 1: table 기반 게시판
         items = self._parse_table_board(soup)

@@ -23,7 +23,12 @@ class KosmesCrawler(BaseCrawler):
     """
 
     BASE_URL = "https://www.kosmes.or.kr"
-    BOARD_PATHS: List[str] = []  # TODO: discover announcement board URL path
+    # 공지사항 게시판 (JSON API, 세션 필요)
+    NOTICE_PAGE_URL = "/nsh/SH/NTS/SHNTS001M0.do"
+    NOTICE_API_URL = "/sh/nts/notice_list.json"
+    BOARD_PATHS = [
+        "/nsh/SH/NTS/SHNTS001M0.do",  # 공지사항
+    ]
 
     def __init__(self):
         super().__init__(source_name="kosmes")
@@ -36,7 +41,9 @@ class KosmesCrawler(BaseCrawler):
     def fetch(self) -> List[RawAnnouncement]:
         """중소벤처기업진흥공단 공고를 수집한다.
 
-        BOARD_PATHS가 비어있으므로 메인 페이지에서 범용 링크 추출을 시도한다.
+        KOSMES는 SPA 기반 사이트로 JSON API를 사용한다.
+        세션 쿠키가 필요하므로 먼저 공지사항 페이지를 방문하여 세션을 확보한 후
+        JSON API를 호출한다.
 
         Returns:
             RawAnnouncement 리스트
@@ -48,36 +55,158 @@ class KosmesCrawler(BaseCrawler):
         announcements: List[RawAnnouncement] = []
         base_url = self.get_base_url() or self.BASE_URL
 
-        # BOARD_PATHS가 있으면 순회
-        if self.BOARD_PATHS:
-            for board_path in self.BOARD_PATHS:
-                url = f"{base_url}{board_path}"
-                self.logger.info(f"Fetching from KOSMES board: {url}")
+        # 전략 1: JSON API로 공지사항 조회 (세션 쿠키 필요)
+        items = self._fetch_notice_api(base_url)
+        if items:
+            self.logger.info(f"Successfully fetched {len(items)} items via JSON API")
+            for item in items:
+                announcement = self._to_announcement(item, base_url)
+                if announcement:
+                    announcements.append(announcement)
+            return announcements
 
-                items = self._fetch_board_listing(url)
-                if items:
-                    self.logger.info(
-                        f"Successfully fetched {len(items)} items from {url}"
-                    )
-                    for item in items:
-                        announcement = self._to_announcement(item, base_url)
-                        if announcement:
-                            announcements.append(announcement)
-                    break
-        else:
-            # BOARD_PATHS 비어있으면 메인 페이지에서 generic link extraction
-            self.logger.info(f"No board paths configured, trying homepage: {base_url}")
-            items = self._fetch_board_listing(base_url)
-            if items:
-                self.logger.info(
-                    f"Successfully fetched {len(items)} items from homepage"
-                )
-                for item in items:
-                    announcement = self._to_announcement(item, base_url)
-                    if announcement:
-                        announcements.append(announcement)
+        # 전략 2: 폴백 - 메인 페이지에서 공지사항 미리보기 링크 추출
+        self.logger.info("Trying to parse main page for notice previews")
+        items = self._fetch_main_page_notices(base_url)
+        if items:
+            self.logger.info(f"Fetched {len(items)} items from main page")
+            for item in items:
+                announcement = self._to_announcement(item, base_url)
+                if announcement:
+                    announcements.append(announcement)
+
+        if not announcements:
+            self.logger.warning(
+                "KOSMES is SPA-based and requires JavaScript execution. "
+                "The JSON API (/sh/nts/notice_list.json) needs active JS session. "
+                "Consider using a headless browser for this crawler."
+            )
 
         return announcements
+
+    def _fetch_main_page_notices(self, base_url: str) -> List[dict]:
+        """메인 페이지에서 공지사항 미리보기 항목을 추출한다.
+
+        KOSMES 메인 페이지는 JS로 렌더링되지만, 일부 공지사항 데이터가
+        JavaScript 코드 내에 포함되어 있을 수 있다.
+        """
+        url = f"{base_url}/nsh/map/main.do"
+        response = self.get(url)
+        if response is None:
+            return []
+
+        response.encoding = response.apparent_encoding or "utf-8"
+        html = response.text
+        items: List[dict] = []
+
+        # JavaScript 코드에서 공지사항 데이터 추출 시도
+        # fn_noticeDetail(SLNO) 호출 패턴에서 제목 추출
+        notice_pattern = re.compile(
+            r"fn_noticeDetail\((\d+)\)[^>]*>[^<]*<dl>[^<]*<dt>"
+            r"\[([^\]]*)\]\s*([^<]+)</dt>",
+            re.S
+        )
+        for match in notice_pattern.finditer(html):
+            slno = match.group(1)
+            category = match.group(2).strip()
+            title = match.group(3).strip()
+            items.append({
+                "title": f"[{category}] {title}" if category else title,
+                "link": f"/nsh/SH/NTS/SHNTS001M0.do?seqNo={slno}",
+                "author": "",
+                "category": category,
+                "date": "",
+            })
+
+        return items
+
+    def _fetch_notice_api(self, base_url: str) -> List[dict]:
+        """JSON API를 통해 공지사항 목록을 가져온다.
+
+        KOSMES는 SPA 기반으로 /sh/nts/notice_list.json 엔드포인트를 사용한다.
+        세션 쿠키가 없으면 리다이렉트되므로 먼저 페이지를 방문한다.
+        """
+        # 1단계: 공지사항 페이지 방문하여 세션 확보
+        page_url = f"{base_url}{self.NOTICE_PAGE_URL}"
+        self.logger.info(f"Establishing session with KOSMES: {page_url}")
+
+        page_response = self.get(page_url)
+        if page_response is None:
+            self.logger.warning("Failed to establish session with KOSMES")
+            return []
+
+        # 2단계: JSON API 호출
+        api_url = f"{base_url}{self.NOTICE_API_URL}"
+        self.logger.info(f"Calling KOSMES notice API: {api_url}")
+
+        data = {
+            "nowPage": "1",
+            "rowCount": "20",
+            "searchC": "",
+            "searchG": "",
+            "searchT": "",
+        }
+
+        try:
+            response = self.post(
+                api_url,
+                data=data,
+                headers={
+                    "Referer": page_url,
+                    "Accept": "application/json",
+                }
+            )
+        except Exception as e:
+            self.logger.warning(f"KOSMES API call failed: {e}")
+            return []
+
+        if response is None:
+            return []
+
+        try:
+            json_data = response.json()
+        except Exception:
+            self.logger.warning(
+                "KOSMES API did not return JSON (session may be invalid)"
+            )
+            return []
+
+        notice_list = json_data.get("ds_noticeList", [])
+        if not notice_list:
+            # 다른 키 이름 시도
+            for key in json_data:
+                if isinstance(json_data[key], list) and len(json_data[key]) > 0:
+                    first = json_data[key][0]
+                    if isinstance(first, dict) and ("TITL_NM" in first or "SLNO" in first):
+                        notice_list = json_data[key]
+                        break
+
+        if not notice_list:
+            self.logger.warning("No notice items found in KOSMES API response")
+            return []
+
+        items: List[dict] = []
+        for entry in notice_list:
+            title = entry.get("TITL_NM", "").strip()
+            if not title:
+                continue
+
+            slno = entry.get("SLNO", "")
+            category = entry.get("CATEGORY", "")
+            date_str = entry.get("REG_DTM", "")
+
+            # 상세 페이지 URL 구성
+            link = f"/nsh/SH/NTS/SHNTS001M0.do?seqNo={slno}"
+
+            items.append({
+                "title": f"[{category}] {title}" if category else title,
+                "link": link,
+                "author": "",
+                "category": category,
+                "date": date_str,
+            })
+
+        return items
 
     def _fetch_board_listing(self, url: str) -> List[dict]:
         """공고 목록 페이지를 파싱하여 공고 목록을 추출한다.
@@ -281,10 +410,10 @@ class KosmesCrawler(BaseCrawler):
         seen_links = set()
 
         view_patterns = [
-            re.compile(r"view", re.I),
+            re.compile(r"SHNTS\d+M\d+\.do\?seqNo=", re.I),
+            re.compile(r"noticeDetail", re.I),
+            re.compile(r"view\.do", re.I),
             re.compile(r"detail", re.I),
-            re.compile(r"nsh", re.I),
-            re.compile(r"SH", re.I),
         ]
 
         for a_tag in soup.find_all("a", href=True):

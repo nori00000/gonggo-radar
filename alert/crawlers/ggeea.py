@@ -16,7 +16,8 @@ class GgeeaCrawler(BaseCrawler):
     """경기환경에너지진흥원(ggeea.or.kr) 공고 게시판 크롤러.
 
     대상 URL:
-        - https://www.ggeea.or.kr/front/board/boardList.do?boardId=BBS_0000001
+        - https://www.ggeea.or.kr/bbs/board.php?bo_table=notice (공지사항)
+        - https://www.ggeea.or.kr/news (사업공고)
 
     HTML 파싱 방식:
         GET 요청을 통해 공고 목록 페이지를 가져오고, 테이블 또는 리스트 구조를
@@ -24,7 +25,10 @@ class GgeeaCrawler(BaseCrawler):
     """
 
     BASE_URL = "https://www.ggeea.or.kr"
-    BOARD_PATHS = ["/front/board/boardList.do?boardId=BBS_0000001"]
+    BOARD_PATHS = [
+        "/bbs/board.php?bo_table=notice",  # 공지사항
+        "/news",                            # 사업공고
+    ]
 
     def __init__(self):
         super().__init__(source_name="ggeea")

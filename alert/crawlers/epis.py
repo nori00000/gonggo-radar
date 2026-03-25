@@ -16,15 +16,19 @@ class EpisCrawler(BaseCrawler):
     """농림수산식품교육문화정보원(epis.or.kr) 공고 게시판 크롤러.
 
     대상 URL:
-        - https://www.epis.or.kr/board/list?boardManagementNo=4&level=2&menuNo=3
+        - https://www.epis.or.kr/home/kor/M373320876/board.do (공지사항)
+        - https://www.epis.or.kr/home/kor/M163278324/board.do (청년 지원 사업)
 
     HTML 파싱 방식:
-        GET 요청(page= 파라미터)을 통해 공고 목록 페이지를 가져오고,
+        GET 요청을 통해 공고 목록 페이지를 가져오고,
         테이블 또는 리스트 구조를 파싱하여 공고 정보를 추출한다.
     """
 
     BASE_URL = "https://www.epis.or.kr"
-    BOARD_PATHS = ["/board/list?boardManagementNo=4&level=2&menuNo=3"]
+    BOARD_PATHS = [
+        "/home/kor/M373320876/board.do",   # 공지사항
+        "/home/kor/M163278324/board.do",    # 청년 지원 사업
+    ]
 
     def __init__(self):
         super().__init__(source_name="epis")

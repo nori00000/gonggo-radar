@@ -56,16 +56,18 @@ class NongsaroCrawler(BaseCrawler):
     BASE_URL = "https://www.nongsaro.go.kr"
 
     # 게시판 URL 후보 목록
+    # 농사로는 농촌진흥청의 농업기술 포털로, 독자적 공고 게시판이 제한적임.
+    # 일부 하위 페이지가 '서비스 이용 불가'로 차단되는 경우가 있어
+    # 메인 포털에서 공지/뉴스 링크를 추출하는 방식을 병행함.
     BOARD_PATHS = [
-        # 알림마당 > 공지사항
-        "/portal/ps/psb/psbx/selectNewsList.ps",
+        # 메인 포털 (공지/뉴스 링크 포함)
+        "/portal/portalMain.ps?menuId=PS00001",
+        # 알림마당 > 공지사항 (하위 도메인 접근 시도)
+        "/portal/ps/psb/psbx/selectNewsList.ps?menuId=PS00066",
         # 알림마당 > 사업공고
         "/portal/ps/psb/psbx/selectAnnoList.ps",
-        # 농업기술 > 사업안내
-        "/portal/ps/psn/psnb/selectBizAnnoList.ps",
-        # 대체 경로
+        # 콘텐츠 파일 목록
         "/portal/contentsFileList.do?menuId=PS03010",
-        "/portal/contentsFileList.do?menuId=PS03020",
     ]
 
     def __init__(self):
@@ -137,6 +139,12 @@ class NongsaroCrawler(BaseCrawler):
                 response.encoding = "utf-8"
 
         html = response.text
+
+        # '서비스 이용 불가' 페이지 감지
+        if "서비스 이용 불가" in html and len(html) < 5000:
+            self.logger.warning(f"Service unavailable page returned from {url}")
+            return []
+
         soup = BeautifulSoup(html, "html.parser")
 
         # 전략 1: 테이블 기반 파싱
@@ -382,6 +390,9 @@ class NongsaroCrawler(BaseCrawler):
             re.compile(r"selectNews", re.I),
             re.compile(r"contentsFileView", re.I),
             re.compile(r"cntntsNo=", re.I),
+            re.compile(r"contentSub\.ps", re.I),
+            re.compile(r"selectNewsDtl", re.I),
+            re.compile(r"bbsId=", re.I),
         ]
 
         for a_tag in soup.find_all("a", href=True):

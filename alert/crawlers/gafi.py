@@ -24,6 +24,9 @@ class GafiCrawler(BaseCrawler):
     """
 
     BASE_URL = "https://www.gafi.or.kr"
+    # 입찰/공모 게시판 (AJAX 방식 - boardContentsList.do)
+    BOARD_LIST_URL = "/web/board/boardContentsList.do"
+    BOARD_IDS = [42]  # board_id=42: 입찰/공모
     BOARD_PATHS = [
         "/web/board/boardContentsListPage.do?board_id=42&menu_id=9d7a4fa3cd784b2ea1ab192315847444"
     ]
@@ -45,9 +48,24 @@ class GafiCrawler(BaseCrawler):
         announcements: List[RawAnnouncement] = []
         base_url = self.get_base_url() or self.BASE_URL
 
+        # 전략 1: AJAX API로 게시물 목록 조회 (boardContentsList.do)
+        for board_id in self.BOARD_IDS:
+            url = f"{base_url}{self.BOARD_LIST_URL}"
+            self.logger.info(f"Fetching GAFI board via AJAX: board_id={board_id}")
+
+            items = self._fetch_ajax_board(url, board_id)
+            if items:
+                self.logger.info(f"Successfully fetched {len(items)} items via AJAX")
+                for item in items:
+                    announcement = self._to_announcement(item, base_url)
+                    if announcement:
+                        announcements.append(announcement)
+                return announcements
+
+        # 전략 2: 폴백 - 기존 게시판 페이지 파싱
         for board_path in self.BOARD_PATHS:
             url = f"{base_url}{board_path}"
-            self.logger.info(f"Fetching from GAFI announcement board: {url}")
+            self.logger.info(f"Fallback: fetching GAFI board page: {url}")
 
             items = self._fetch_board_listing(url)
             if items:
@@ -59,6 +77,77 @@ class GafiCrawler(BaseCrawler):
                 break
 
         return announcements
+
+    def _fetch_ajax_board(self, url: str, board_id: int) -> List[dict]:
+        """AJAX API를 통해 게시판 목록을 가져온다.
+
+        GAFI는 boardContentsList.do 엔드포인트로 POST 요청하여
+        게시물 목록 HTML fragment를 반환한다.
+        링크는 javascript:contentsView('contents_id') 형태이다.
+        """
+        data = {
+            "board_id": str(board_id),
+            "pageIndex": "1",
+            "recordCountPerPage": "50",
+        }
+
+        response = self.post(
+            url,
+            data=data,
+            headers={
+                "X-Requested-With": "XMLHttpRequest",
+                "Accept": "*/*",
+                "User-Agent": (
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/120.0.0.0 Safari/537.36"
+                ),
+            },
+        )
+        if response is None:
+            return []
+
+        response.encoding = response.apparent_encoding or "utf-8"
+        soup = BeautifulSoup(response.text, "html.parser")
+        items: List[dict] = []
+
+        # contentsView('id') 형태의 JavaScript 링크 파싱
+        for a_tag in soup.find_all("a", href=True):
+            href = a_tag.get("href", "")
+            title_text = a_tag.get_text(strip=True)
+
+            if not title_text or len(title_text) < 5:
+                continue
+
+            # javascript:contentsView('uuid') 패턴 추출
+            match = re.search(r"contentsView\(['\"]([^'\"]+)['\"]\)", href)
+            if not match:
+                continue
+
+            contents_id = match.group(1)
+            view_url = (
+                f"/web/board/boardContentsView.do"
+                f"?board_id={board_id}&contents_id={contents_id}"
+            )
+
+            # 날짜 추출: 링크의 부모/형제 요소에서 날짜 찾기
+            date_str = ""
+            parent = a_tag.find_parent("tr") or a_tag.find_parent("li") or a_tag.find_parent("div")
+            if parent:
+                text = parent.get_text()
+                date_match = re.search(r"\d{4}[-./]\d{1,2}[-./]\d{1,2}", text)
+                if date_match:
+                    date_str = date_match.group()
+
+            items.append({
+                "title": title_text,
+                "link": view_url,
+                "author": "",
+                "category": "",
+                "date": date_str,
+            })
+
+        return items
 
     def _fetch_board_listing(self, url: str) -> List[dict]:
         """공고 목록 페이지를 파싱하여 공고 목록을 추출한다."""

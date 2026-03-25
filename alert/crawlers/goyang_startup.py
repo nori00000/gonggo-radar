@@ -16,7 +16,7 @@ class GoyangStartupCrawler(BaseCrawler):
     """고양스타트업(goyangstartup.kr) 공고 게시판 크롤러.
 
     대상 URL:
-        - https://www.goyangstartup.kr/front/board/boardList.do?boardId=BBS_0000001
+        - https://www.goyangstartup.kr/community/01.php (공지사항)
 
     HTML 파싱 방식:
         GET 요청을 통해 공고 목록 페이지를 가져오고, 테이블 또는 리스트 구조를
@@ -24,7 +24,7 @@ class GoyangStartupCrawler(BaseCrawler):
     """
 
     BASE_URL = "https://www.goyangstartup.kr"
-    BOARD_PATHS = ["/front/board/boardList.do?boardId=BBS_0000001"]
+    BOARD_PATHS = ["/community/01.php"]
 
     def __init__(self):
         super().__init__(source_name="goyang_startup")

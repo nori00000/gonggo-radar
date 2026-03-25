@@ -16,7 +16,8 @@ class AgrohealingCrawler(BaseCrawler):
     """치유농업ON(agrohealing.go.kr) 공고 게시판 크롤러.
 
     대상 URL:
-        - https://agrohealing.go.kr/front/board/boardList.do?boardId=BBS_0000001
+        - https://agrohealing.go.kr/sf/ntcm/pblanc/retrieveSfPblanc.do (공고)
+        - https://agrohealing.go.kr/sf/ntcm/ntc/retrieveSfNtc.do (공지사항)
 
     HTML 파싱 방식:
         GET 요청을 통해 공고 목록 페이지를 가져오고, 테이블 또는 리스트 구조를
@@ -24,7 +25,10 @@ class AgrohealingCrawler(BaseCrawler):
     """
 
     BASE_URL = "https://agrohealing.go.kr"
-    BOARD_PATHS = ["/front/board/boardList.do?boardId=BBS_0000001"]
+    BOARD_PATHS = [
+        "/sf/ntcm/pblanc/retrieveSfPblanc.do",   # 공고
+        "/sf/ntcm/ntc/retrieveSfNtc.do",          # 공지사항
+    ]
 
     def __init__(self):
         super().__init__(source_name="agrohealing")

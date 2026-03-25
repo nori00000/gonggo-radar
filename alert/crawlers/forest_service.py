@@ -18,7 +18,8 @@ class ForestServiceCrawler(BaseCrawler):
     산림청의 산림사업 관련 공지사항 및 공고를 수집한다.
 
     대상 URL:
-        - https://www.forest.go.kr/kfsweb/cop/bbs/selectBoardList.do?bbsId=BBSMSTR_1036
+        - https://www.forest.go.kr/kfsweb/cop/bbs/selectBoardList.do?bbsId=BBSMSTR_1032&mn=NKFS_04_01_02 (공고)
+        - https://www.forest.go.kr/kfsweb/cop/bbs/selectBoardList.do?bbsId=BBSMSTR_1031&mn=NKFS_04_01_01 (알립니다)
 
     HTML 파싱 방식:
         GET 요청을 통해 공고 목록 페이지를 가져오고, 테이블 또는 리스트 구조를
@@ -28,7 +29,8 @@ class ForestServiceCrawler(BaseCrawler):
     BASE_URL = "https://www.forest.go.kr"
 
     BOARD_PATHS = [
-        "/kfsweb/cop/bbs/selectBoardList.do?bbsId=BBSMSTR_1036",  # 산림청 공지사항
+        "/kfsweb/cop/bbs/selectBoardList.do?bbsId=BBSMSTR_1032&mn=NKFS_04_01_02",  # 산림청 공고
+        "/kfsweb/cop/bbs/selectBoardList.do?bbsId=BBSMSTR_1031&mn=NKFS_04_01_01",  # 산림청 알립니다
     ]
 
     def __init__(self):
