@@ -12,6 +12,7 @@ build/
 alert/.env
 
 # Data
+data/
 alert/data/announcements.db
 alert/data/logs/
 
