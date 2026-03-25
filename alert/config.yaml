@@ -25,6 +25,57 @@ crawler:
     nongsaro:
       enabled: true
       base_url: "https://www.nongsaro.go.kr"
+    g2b:
+      enabled: true
+      base_url: "http://apis.data.go.kr/1230000/BidPublicInfoService"
+    kstartup:
+      enabled: true
+      base_url: "https://apis.data.go.kr/B552735/kisedKstartupService01"
+    smes:
+      enabled: true
+      base_url: "https://www.smes.go.kr"
+    subsidy24:
+      enabled: false
+      base_url: ""
+    forest_service:
+      enabled: true
+      base_url: "https://www.forest.go.kr"
+    gyeonggi:
+      enabled: true
+      base_url: "https://www.gg.go.kr"
+    gafi:
+      enabled: true
+      base_url: "https://www.gafi.or.kr"
+    gbsa:
+      enabled: true
+      base_url: "https://www.gbsa.or.kr"
+    socialenterprise:
+      enabled: true
+      base_url: "https://www.socialenterprise.or.kr"
+    ekr:
+      enabled: true
+      base_url: "https://www.ekr.or.kr"
+    epis:
+      enabled: true
+      base_url: "https://www.epis.or.kr"
+    nongup_gg:
+      enabled: true
+      base_url: "https://nongup.gg.go.kr"
+    rda:
+      enabled: true
+      base_url: "https://www.rda.go.kr"
+    semas:
+      enabled: true
+      base_url: "https://www.semas.or.kr"
+    kosmes:
+      enabled: true
+      base_url: "https://www.kosmes.or.kr"
+    ipet:
+      enabled: true
+      base_url: "https://www.ipet.re.kr"
+    apfs:
+      enabled: true
+      base_url: "https://www.apfs.kr"
 
 analyzer:
   keyword_threshold: 0.3

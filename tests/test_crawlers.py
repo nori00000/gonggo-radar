@@ -8,6 +8,9 @@ import requests
 
 from alert.crawlers.base import BaseCrawler
 from alert.crawlers.bizinfo import BizinfoCrawler
+from alert.crawlers.g2b import G2bCrawler
+from alert.crawlers.kstartup import KStartupCrawler
+from alert.crawlers.smes import SmesCrawler
 from alert.models import RawAnnouncement
 
 
@@ -452,3 +455,512 @@ class TestBizinfoCrawler:
 
                 # Invalid format
                 assert crawler._normalize_date("invalid") is None
+
+
+class TestG2bCrawler:
+    """Test G2bCrawler implementation."""
+
+    @pytest.fixture
+    def mock_g2b_config(self):
+        """Mock config for G2bCrawler."""
+        config = MagicMock()
+        config.crawler.timeout = 10
+        config.crawler.retry_count = 3
+        config.crawler.retry_delay = 1.0
+        config.crawler.user_agent = "test-agent"
+
+        g2b_source = MagicMock()
+        g2b_source.enabled = True
+        g2b_source.base_url = "http://www.g2b.go.kr"
+        g2b_source.api_key = "test-api-key"
+        g2b_source.lookback_days = 7
+
+        config.crawler.sources = {"g2b": g2b_source}
+        return config
+
+    def test_initialization_without_api_key_raises_error(self, mock_g2b_config):
+        """G2bCrawler should raise ValueError if API key not found."""
+        # Remove api_key from config
+        mock_g2b_config.crawler.sources["g2b"].api_key = ""
+
+        with patch("alert.crawlers.base.get_config", return_value=mock_g2b_config):
+            with patch.dict("os.environ", {}, clear=True):
+                with pytest.raises(ValueError, match="DATA_GO_KR_API_KEY not found"):
+                    G2bCrawler()
+
+    def test_initialization_with_api_key_from_env(self, mock_g2b_config):
+        """G2bCrawler should get API key from environment."""
+        with patch("alert.crawlers.base.get_config", return_value=mock_g2b_config):
+            with patch.dict("os.environ", {"DATA_GO_KR_API_KEY": "env-api-key"}):
+                crawler = G2bCrawler()
+
+                assert crawler.source_name == "g2b"
+                assert crawler.api_key == "env-api-key"
+                assert crawler.lookback_days == 7
+
+    def test_fetch_queries_all_operations(self, mock_g2b_config):
+        """fetch() should query all 3 operation types (용역/물품/공사)."""
+        with patch("alert.crawlers.base.get_config", return_value=mock_g2b_config):
+            with patch.dict("os.environ", {"DATA_GO_KR_API_KEY": "test-key"}):
+                crawler = G2bCrawler()
+
+                # Mock API responses for all operations
+                mock_response = MagicMock()
+                mock_response.json.return_value = {
+                    "response": {
+                        "header": {"resultCode": "00"},
+                        "body": {"items": []},
+                    }
+                }
+
+                with patch.object(crawler, "get", return_value=mock_response) as mock_get:
+                    results = crawler.fetch()
+
+                    # Should call get 3 times (once for each operation)
+                    assert mock_get.call_count == 3
+                    # Verify all operation paths are called
+                    called_urls = [call.args[0] for call in mock_get.call_args_list]
+                    assert all("BidPublicInfoService" in url for url in called_urls)
+
+    def test_extract_items_with_valid_response(self, mock_g2b_config):
+        """_extract_items() should extract items from valid API response."""
+        with patch("alert.crawlers.base.get_config", return_value=mock_g2b_config):
+            with patch.dict("os.environ", {"DATA_GO_KR_API_KEY": "test-key"}):
+                crawler = G2bCrawler()
+
+                data = {
+                    "response": {
+                        "header": {"resultCode": "00", "resultMsg": "NORMAL SERVICE."},
+                        "body": {
+                            "items": [
+                                {"bidNtceNo": "001", "bidNtceNm": "Test Bid 1"},
+                                {"bidNtceNo": "002", "bidNtceNm": "Test Bid 2"},
+                            ],
+                            "totalCount": 2,
+                        }
+                    }
+                }
+
+                items = crawler._extract_items(data)
+                assert len(items) == 2
+                assert items[0]["bidNtceNo"] == "001"
+                assert items[1]["bidNtceNo"] == "002"
+
+    def test_extract_items_with_error_response(self, mock_g2b_config):
+        """_extract_items() should return empty list for non-00 resultCode."""
+        with patch("alert.crawlers.base.get_config", return_value=mock_g2b_config):
+            with patch.dict("os.environ", {"DATA_GO_KR_API_KEY": "test-key"}):
+                crawler = G2bCrawler()
+
+                data = {
+                    "response": {
+                        "header": {"resultCode": "99", "resultMsg": "Service Error"},
+                        "body": {"items": []},
+                    }
+                }
+
+                items = crawler._extract_items(data)
+                assert items == []
+
+    def test_parse_item_with_valid_data(self, mock_g2b_config):
+        """_parse_item() should parse valid item data."""
+        with patch("alert.crawlers.base.get_config", return_value=mock_g2b_config):
+            with patch.dict("os.environ", {"DATA_GO_KR_API_KEY": "test-key"}):
+                crawler = G2bCrawler()
+
+                item = {
+                    "bidNtceNo": "20260101-001",
+                    "bidNtceNm": "스마트팜 설치 입찰",
+                    "bidNtceUrl": "http://www.g2b.go.kr/test/001",
+                    "ntceKindNm": "일반경쟁입찰",
+                    "presmptPrce": "100,000,000",
+                    "ntceInsttNm": "농림축산식품부",
+                    "dminsttNm": "농업기술센터",
+                    "bidBeginDt": "202604010900",
+                    "bidClseDt": "202604301800",
+                }
+
+                announcement = crawler._parse_item(item, "용역")
+
+                assert announcement is not None
+                assert announcement.source == "g2b"
+                assert announcement.source_id == "20260101-001"
+                assert announcement.title == "스마트팜 설치 입찰"
+                assert announcement.url == "http://www.g2b.go.kr/test/001"
+                assert announcement.category == "용역"
+                assert announcement.author == "농림축산식품부"
+                assert announcement.target == "농업기술센터"
+                assert announcement.period_start == "2026-04-01"
+                assert announcement.period_end == "2026-04-30"
+
+    def test_parse_item_missing_required_fields(self, mock_g2b_config):
+        """_parse_item() should return None if required fields are missing."""
+        with patch("alert.crawlers.base.get_config", return_value=mock_g2b_config):
+            with patch.dict("os.environ", {"DATA_GO_KR_API_KEY": "test-key"}):
+                crawler = G2bCrawler()
+
+                # Missing title (bidNtceNm)
+                item = {
+                    "bidNtceNo": "001",
+                    "bidNtceUrl": "http://www.g2b.go.kr/test/001",
+                }
+
+                result = crawler._parse_item(item, "용역")
+                assert result is None
+
+    def test_parse_datetime_with_various_formats(self, mock_g2b_config):
+        """_parse_datetime() should handle various datetime formats."""
+        with patch("alert.crawlers.base.get_config", return_value=mock_g2b_config):
+            with patch.dict("os.environ", {"DATA_GO_KR_API_KEY": "test-key"}):
+                crawler = G2bCrawler()
+
+                # YYYYMMDDHHmm format
+                assert crawler._parse_datetime("202604010900") == "2026-04-01"
+
+                # YYYYMMDD format (no time)
+                assert crawler._parse_datetime("20260401") == "2026-04-01"
+
+                # With non-digit characters
+                assert crawler._parse_datetime("2026-04-01 09:00") == "2026-04-01"
+
+                # Empty string
+                assert crawler._parse_datetime("") is None
+
+                # Invalid format (too short)
+                assert crawler._parse_datetime("202604") is None
+
+
+class TestKStartupCrawler:
+    """Test KStartupCrawler implementation."""
+
+    @pytest.fixture
+    def mock_kstartup_config(self):
+        """Mock config for KStartupCrawler."""
+        config = MagicMock()
+        config.crawler.timeout = 10
+        config.crawler.retry_count = 3
+        config.crawler.retry_delay = 1.0
+        config.crawler.user_agent = "test-agent"
+
+        kstartup_source = MagicMock()
+        kstartup_source.enabled = True
+        kstartup_source.base_url = "https://www.k-startup.go.kr"
+        kstartup_source.api_key = "test-api-key"
+        kstartup_source.per_page = 100
+
+        config.crawler.sources = {"kstartup": kstartup_source}
+        return config
+
+    def test_initialization_without_api_key_raises_error(self, mock_kstartup_config):
+        """KStartupCrawler should raise ValueError if API key not found."""
+        # Remove api_key from config
+        mock_kstartup_config.crawler.sources["kstartup"].api_key = ""
+
+        with patch("alert.crawlers.base.get_config", return_value=mock_kstartup_config):
+            with patch.dict("os.environ", {}, clear=True):
+                with pytest.raises(ValueError, match="DATA_GO_KR_API_KEY not found"):
+                    KStartupCrawler()
+
+    def test_initialization_with_api_key_from_env(self, mock_kstartup_config):
+        """KStartupCrawler should get API key from environment."""
+        with patch("alert.crawlers.base.get_config", return_value=mock_kstartup_config):
+            with patch.dict("os.environ", {"DATA_GO_KR_API_KEY": "env-api-key"}):
+                crawler = KStartupCrawler()
+
+                assert crawler.source_name == "kstartup"
+                assert crawler.api_key == "env-api-key"
+                assert crawler.per_page == 100
+
+    def test_fetch_with_mocked_api_response(self, mock_kstartup_config):
+        """fetch() should parse API response and return announcements."""
+        with patch("alert.crawlers.base.get_config", return_value=mock_kstartup_config):
+            with patch.dict("os.environ", {"DATA_GO_KR_API_KEY": "test-key"}):
+                crawler = KStartupCrawler()
+
+                # Mock API response
+                mock_response = MagicMock()
+                mock_response.json.return_value = {
+                    "currentCount": 2,
+                    "totalCount": 2,
+                    "data": [
+                        {
+                            "pbanc_sn": "12345",
+                            "biz_pbanc_nm": "창업지원사업 공고",
+                            "detl_pg_url": "https://www.k-startup.go.kr/detail/12345",
+                            "aply_trgt_ctnt": "예비창업자, 초기창업자",
+                            "sprv_inst": "중소벤처기업부",
+                            "supt_biz_clsfc": "창업지원",
+                            "aply_trgt": "예비창업자",
+                            "pbanc_rcpt_bgng_dt": "20260401",
+                            "pbanc_rcpt_end_dt": "20260430",
+                        }
+                    ]
+                }
+
+                with patch.object(crawler, "get", return_value=mock_response):
+                    results = crawler.fetch()
+
+                    assert len(results) == 1
+                    assert results[0].source == "kstartup"
+                    assert results[0].source_id == "12345"
+                    assert results[0].title == "창업지원사업 공고"
+                    assert results[0].period_start == "2026-04-01"
+                    assert results[0].period_end == "2026-04-30"
+
+    def test_extract_items_from_data_key(self, mock_kstartup_config):
+        """_extract_items() should extract items from 'data' key."""
+        with patch("alert.crawlers.base.get_config", return_value=mock_kstartup_config):
+            with patch.dict("os.environ", {"DATA_GO_KR_API_KEY": "test-key"}):
+                crawler = KStartupCrawler()
+
+                data = {
+                    "currentCount": 2,
+                    "totalCount": 2,
+                    "data": [
+                        {"pbanc_sn": "001", "biz_pbanc_nm": "Test 1"},
+                        {"pbanc_sn": "002", "biz_pbanc_nm": "Test 2"},
+                    ]
+                }
+
+                items = crawler._extract_items(data)
+                assert len(items) == 2
+                assert items[0]["pbanc_sn"] == "001"
+                assert items[1]["pbanc_sn"] == "002"
+
+    def test_parse_item_with_valid_data(self, mock_kstartup_config):
+        """_parse_item() should parse valid item data."""
+        with patch("alert.crawlers.base.get_config", return_value=mock_kstartup_config):
+            with patch.dict("os.environ", {"DATA_GO_KR_API_KEY": "test-key"}):
+                crawler = KStartupCrawler()
+
+                item = {
+                    "pbanc_sn": "12345",
+                    "biz_pbanc_nm": "창업지원사업 공고",
+                    "detl_pg_url": "https://www.k-startup.go.kr/detail/12345",
+                    "aply_trgt_ctnt": "예비창업자, 초기창업자",
+                    "sprv_inst": "중소벤처기업부",
+                    "supt_biz_clsfc": "창업지원",
+                    "aply_trgt": "예비창업자",
+                    "pbanc_rcpt_bgng_dt": "20260401",
+                    "pbanc_rcpt_end_dt": "20260430",
+                }
+
+                announcement = crawler._parse_item(item)
+
+                assert announcement is not None
+                assert announcement.source == "kstartup"
+                assert announcement.source_id == "12345"
+                assert announcement.title == "창업지원사업 공고"
+                assert announcement.url == "https://www.k-startup.go.kr/detail/12345"
+                assert announcement.summary == "예비창업자, 초기창업자"
+                assert announcement.author == "중소벤처기업부"
+                assert announcement.category == "창업지원"
+                assert announcement.target == "예비창업자"
+
+    def test_parse_item_generates_hash_source_id_when_empty(self, mock_kstartup_config):
+        """_parse_item() should generate hash source_id when pbanc_sn is empty."""
+        with patch("alert.crawlers.base.get_config", return_value=mock_kstartup_config):
+            with patch.dict("os.environ", {"DATA_GO_KR_API_KEY": "test-key"}):
+                crawler = KStartupCrawler()
+
+                item = {
+                    "pbanc_sn": "",  # Empty source ID
+                    "biz_pbanc_nm": "창업지원사업 공고",
+                    "detl_pg_url": "https://www.k-startup.go.kr/detail/12345",
+                    "pbanc_rcpt_bgng_dt": "20260401",
+                    "pbanc_rcpt_end_dt": "20260430",
+                }
+
+                announcement = crawler._parse_item(item)
+
+                assert announcement is not None
+                assert announcement.source_id != ""
+                assert len(announcement.source_id) == 16  # MD5 hash truncated to 16 chars
+
+    def test_normalize_date_with_yyyymmdd_format(self, mock_kstartup_config):
+        """_normalize_date() should handle YYYYMMDD format."""
+        with patch("alert.crawlers.base.get_config", return_value=mock_kstartup_config):
+            with patch.dict("os.environ", {"DATA_GO_KR_API_KEY": "test-key"}):
+                crawler = KStartupCrawler()
+
+                # YYYYMMDD format
+                assert crawler._normalize_date("20260401") == "2026-04-01"
+
+                # Already ISO format
+                assert crawler._normalize_date("2026-04-01") == "2026-04-01"
+
+                # Empty string
+                assert crawler._normalize_date("") is None
+
+                # Invalid format
+                assert crawler._normalize_date("invalid") is None
+
+
+class TestSmesCrawler:
+    """Test SmesCrawler implementation."""
+
+    @pytest.fixture
+    def mock_smes_config(self):
+        """Mock config for SmesCrawler."""
+        config = MagicMock()
+        config.crawler.timeout = 10
+        config.crawler.retry_count = 3
+        config.crawler.retry_delay = 1.0
+        config.crawler.user_agent = "test-agent"
+
+        smes_source = MagicMock()
+        smes_source.enabled = True
+        smes_source.base_url = "https://www.smes.go.kr"
+
+        config.crawler.sources = {"smes": smes_source}
+        return config
+
+    def test_initialization_without_api_key(self, mock_smes_config):
+        """SmesCrawler should initialize without API key (HTML scraper)."""
+        with patch("alert.crawlers.base.get_config", return_value=mock_smes_config):
+            # Should not raise error even without API key
+            crawler = SmesCrawler()
+
+            assert crawler.source_name == "smes"
+
+    def test_extract_post_id_with_various_patterns(self, mock_smes_config):
+        """_extract_post_id() should extract ID from various URL patterns."""
+        with patch("alert.crawlers.base.get_config", return_value=mock_smes_config):
+            crawler = SmesCrawler()
+
+            # Parameter-based ID
+            assert crawler._extract_post_id("https://example.com?announcementId=12345") == "12345"
+            assert crawler._extract_post_id("https://example.com?notifyId=67890") == "67890"
+            assert crawler._extract_post_id("https://example.com?seq=54321") == "54321"
+
+            # Path-based ID
+            assert crawler._extract_post_id("https://example.com/view/123456") == "123456"
+
+            # Empty link should return empty string
+            assert crawler._extract_post_id("") == ""
+
+    def test_normalize_url_with_relative_and_absolute_urls(self, mock_smes_config):
+        """_normalize_url() should handle relative and absolute URLs."""
+        with patch("alert.crawlers.base.get_config", return_value=mock_smes_config):
+            crawler = SmesCrawler()
+
+            base_url = "https://www.smes.go.kr"
+
+            # Absolute URL
+            assert crawler._normalize_url("https://example.com/test", base_url) == "https://example.com/test"
+            assert crawler._normalize_url("http://example.com/test", base_url) == "http://example.com/test"
+
+            # Protocol-relative URL
+            assert crawler._normalize_url("//example.com/test", base_url) == "https://example.com/test"
+
+            # Absolute path
+            assert crawler._normalize_url("/test/path", base_url) == "https://www.smes.go.kr/test/path"
+
+            # Relative path
+            assert crawler._normalize_url("test/path", base_url) == "https://www.smes.go.kr/test/path"
+
+            # Empty link
+            assert crawler._normalize_url("", base_url) == ""
+
+    def test_parse_period_with_separator(self, mock_smes_config):
+        """_parse_period() should parse period with ~ separator."""
+        with patch("alert.crawlers.base.get_config", return_value=mock_smes_config):
+            crawler = SmesCrawler()
+
+            # Standard ~ separator
+            start, end = crawler._parse_period("2026-04-01 ~ 2026-04-30")
+            assert start == "2026-04-01"
+            assert end == "2026-04-30"
+
+            # Dot separator
+            start, end = crawler._parse_period("2026.04.01~2026.04.30")
+            assert start == "2026-04-01"
+            assert end == "2026-04-30"
+
+            # YYYYMMDD format
+            start, end = crawler._parse_period("20260401~20260430")
+            assert start == "2026-04-01"
+            assert end == "2026-04-30"
+
+    def test_parse_period_with_single_date(self, mock_smes_config):
+        """_parse_period() should handle single date."""
+        with patch("alert.crawlers.base.get_config", return_value=mock_smes_config):
+            crawler = SmesCrawler()
+
+            # Single date
+            start, end = crawler._parse_period("2026-04-01")
+            assert start == "2026-04-01"
+            assert end == "2026-04-01"
+
+            # Empty string
+            start, end = crawler._parse_period("")
+            assert start is None
+            assert end is None
+
+    def test_normalize_date_with_various_formats(self, mock_smes_config):
+        """_normalize_date() should handle various date formats."""
+        with patch("alert.crawlers.base.get_config", return_value=mock_smes_config):
+            crawler = SmesCrawler()
+
+            # YYYY-MM-DD format
+            assert crawler._normalize_date("2026-04-01") == "2026-04-01"
+
+            # YYYY.MM.DD format
+            assert crawler._normalize_date("2026.04.01") == "2026-04-01"
+
+            # YYYY/MM/DD format
+            assert crawler._normalize_date("2026/04/01") == "2026-04-01"
+
+            # YYYYMMDD format
+            assert crawler._normalize_date("20260401") == "2026-04-01"
+
+            # With single-digit month/day
+            assert crawler._normalize_date("2026-4-1") == "2026-04-01"
+
+            # Empty string
+            assert crawler._normalize_date("") is None
+
+            # Invalid format
+            assert crawler._normalize_date("invalid") is None
+
+    def test_to_announcement_with_valid_item(self, mock_smes_config):
+        """_to_announcement() should convert valid item to RawAnnouncement."""
+        with patch("alert.crawlers.base.get_config", return_value=mock_smes_config):
+            crawler = SmesCrawler()
+
+            item = {
+                "title": "중소기업 지원사업 공고",
+                "link": "/main/front/notify/view.do?announcementId=12345",
+                "author": "중소벤처기업부",
+                "category": "지원사업",
+                "date": "2026-04-01 ~ 2026-04-30",
+            }
+
+            announcement = crawler._to_announcement(item, "https://www.smes.go.kr")
+
+            assert announcement is not None
+            assert announcement.source == "smes"
+            assert announcement.title == "중소기업 지원사업 공고"
+            assert announcement.url == "https://www.smes.go.kr/main/front/notify/view.do?announcementId=12345"
+            assert announcement.author == "중소벤처기업부"
+            assert announcement.category == "지원사업"
+            assert announcement.period_start == "2026-04-01"
+            assert announcement.period_end == "2026-04-30"
+            assert announcement.source_id == "12345"
+
+    def test_to_announcement_with_empty_title_returns_none(self, mock_smes_config):
+        """_to_announcement() should return None if title is empty."""
+        with patch("alert.crawlers.base.get_config", return_value=mock_smes_config):
+            crawler = SmesCrawler()
+
+            item = {
+                "title": "",
+                "link": "/main/front/notify/view.do?announcementId=12345",
+                "author": "중소벤처기업부",
+                "category": "지원사업",
+                "date": "2026-04-01 ~ 2026-04-30",
+            }
+
+            announcement = crawler._to_announcement(item, "https://www.smes.go.kr")
+
+            assert announcement is None

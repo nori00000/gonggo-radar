@@ -40,6 +40,23 @@ def _import_crawlers() -> Dict[str, Any]:
         ("smartfarm", "alert.crawlers.smartfarm", "SmartfarmCrawler"),
         ("goyang", "alert.crawlers.goyang", "GoyangCrawler"),
         ("nongsaro", "alert.crawlers.nongsaro", "NongsaroCrawler"),
+        ("g2b", "alert.crawlers.g2b", "G2bCrawler"),
+        ("kstartup", "alert.crawlers.kstartup", "KStartupCrawler"),
+        ("smes", "alert.crawlers.smes", "SmesCrawler"),
+        ("subsidy24", "alert.crawlers.subsidy24", "Subsidy24Crawler"),
+        ("forest_service", "alert.crawlers.forest_service", "ForestServiceCrawler"),
+        ("gyeonggi", "alert.crawlers.gyeonggi", "GyeonggiCrawler"),
+        ("gafi", "alert.crawlers.gafi", "GafiCrawler"),
+        ("gbsa", "alert.crawlers.gbsa", "GbsaCrawler"),
+        ("socialenterprise", "alert.crawlers.socialenterprise", "SocialenterpriseCrawler"),
+        ("ekr", "alert.crawlers.ekr", "EkrCrawler"),
+        ("epis", "alert.crawlers.epis", "EpisCrawler"),
+        ("nongup_gg", "alert.crawlers.nongup_gg", "NongupGgCrawler"),
+        ("rda", "alert.crawlers.rda", "RdaCrawler"),
+        ("semas", "alert.crawlers.semas", "SemasCrawler"),
+        ("kosmes", "alert.crawlers.kosmes", "KosmesCrawler"),
+        ("ipet", "alert.crawlers.ipet", "IpetCrawler"),
+        ("apfs", "alert.crawlers.apfs", "ApfsCrawler"),
     ]
 
     for name, module_path, class_name in crawler_modules:

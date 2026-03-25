@@ -269,6 +269,13 @@ def _load_env_secrets(cfg: AppConfig) -> None:
         # Attach as an extra attribute -- crawlers can read it.
         cfg.crawler.sources["bizinfo"].api_key = bizinfo_key  # type: ignore[attr-defined]
 
+    # data.go.kr API key (shared by G2B, K-Startup, etc.)
+    data_go_kr_key = os.getenv("DATA_GO_KR_API_KEY", "")
+    if data_go_kr_key:
+        for source_name in ("g2b", "kstartup", "subsidy24", "forest_service"):
+            if source_name in cfg.crawler.sources:
+                cfg.crawler.sources[source_name].api_key = data_go_kr_key  # type: ignore[attr-defined]
+
     # Knowledge Layer secrets
     openai_key = os.getenv("OPENAI_API_KEY", "")
     if openai_key:
