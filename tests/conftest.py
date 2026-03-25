@@ -1,4 +1,4 @@
-"""Shared pytest fixtures for agrion-automation tests."""
+"""Shared pytest fixtures for gonggo-radar tests."""
 
 import sqlite3
 import pytest

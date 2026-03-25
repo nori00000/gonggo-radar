@@ -411,7 +411,7 @@ function sleep(ms) {
       } else if (saveResult.reason === 'validation_failed') {
         console.log('  [!] 유효성 검사 실패');
         // 스크린샷 저장
-        await page.screenshot({ path: `/Users/leesangmin/agrion-automation/fail_${entry.no}.png` });
+        await page.screenshot({ path: `/Users/leesangmin/gonggo-radar/fail_${entry.no}.png` });
         failCount++;
       } else {
         console.log(`  [!] 저장 실패: ${saveResult.reason} (code: ${saveResult.code})`);
@@ -441,7 +441,7 @@ function sleep(ms) {
   console.log('======================================');
 
   // 결과 파일 저장
-  fs.writeFileSync('/Users/leesangmin/agrion-automation/result.json', JSON.stringify({
+  fs.writeFileSync('/Users/leesangmin/gonggo-radar/result.json', JSON.stringify({
     total: schedule.length,
     success: successCount,
     fail: failCount,

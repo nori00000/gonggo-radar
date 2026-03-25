@@ -1,4 +1,4 @@
-"""Main entry point for the agrion-automation alert system.
+"""Main entry point for the gonggo-radar alert system.
 
 Pipeline: crawl → analyze → notify
 Modes: single run, daemon, bot, test
@@ -424,7 +424,7 @@ def run_test() -> None:
     telegram = TelegramNotifier(db=db)
     if telegram.bot_token and telegram.chat_id:
         logger.info("Sending test Telegram message...")
-        telegram.send_text("🧪 Test message from agrion-automation alert system")
+        telegram.send_text("🧪 Test message from gonggo-radar alert system")
     db.close()
 
     # Send test email

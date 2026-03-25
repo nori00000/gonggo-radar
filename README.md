@@ -26,7 +26,7 @@
 ```bash
 # 1. 저장소 클론
 git clone <repo-url>
-cd agrion-automation
+cd gonggo-radar
 
 # 2. 가상환경 생성 및 활성화
 python -m venv venv
@@ -132,7 +132,7 @@ pytest tests/
 ### 프로젝트 구조
 
 ```
-agrion-automation/
+gonggo-radar/
 ├── alert/                          # 메인 패키지
 │   ├── __init__.py
 │   ├── __main__.py                 # python -m alert 진입점
@@ -350,8 +350,8 @@ After=network.target
 [Service]
 Type=simple
 User=agrion
-WorkingDirectory=/opt/agrion-automation
-ExecStart=/opt/agrion-automation/venv/bin/python -m alert.main --daemon
+WorkingDirectory=/opt/gonggo-radar
+ExecStart=/opt/gonggo-radar/venv/bin/python -m alert.main --daemon
 Restart=on-failure
 RestartSec=10
 

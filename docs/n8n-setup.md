@@ -2,12 +2,12 @@
 
 ## 개요
 
-agrion-automation의 Knowledge Layer가 관련성 높은 공고를 발견하면 n8n 웹훅으로 이벤트를 전송합니다.
+gonggo-radar의 Knowledge Layer가 관련성 높은 공고를 발견하면 n8n 웹훅으로 이벤트를 전송합니다.
 
 ## 사전 요구사항
 
 - n8n 서버가 실행 중이어야 합니다 (M1 Mac Mini #3)
-- agrion-automation의 `.env`에 `N8N_WEBHOOK_URL` 설정 필요
+- gonggo-radar의 `.env`에 `N8N_WEBHOOK_URL` 설정 필요
 
 ## 1단계: n8n 웹훅 노드 생성
 

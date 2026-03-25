@@ -1,4 +1,4 @@
--- PostgreSQL 초기 스키마 (agrion-automation)
+-- PostgreSQL 초기 스키마 (gonggo-radar)
 -- pgvector/pgvector:pg16 이미지에서 자동 실행됨
 
 -- pgvector 확장 활성화
