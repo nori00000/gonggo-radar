@@ -1,0 +1,46 @@
+version: "3.8"
+
+services:
+  postgres:
+    image: pgvector/pgvector:pg16
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: agrion_db
+      POSTGRES_USER: agrion
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./docker/init-db.sql:/docker-entrypoint-initdb.d/01-init.sql:ro
+    ports:
+      - "${PG_PORT:-5432}:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U agrion -d agrion_db"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  app:
+    build: .
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql://agrion:${POSTGRES_PASSWORD}@postgres:5432/agrion_db
+      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}
+      TELEGRAM_CHAT_ID: ${TELEGRAM_CHAT_ID:-}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      OBSIDIAN_VAULT_PATH: ${OBSIDIAN_VAULT_PATH:-}
+      N8N_WEBHOOK_URL: ${N8N_WEBHOOK_URL:-}
+      BIZINFO_API_KEY: ${BIZINFO_API_KEY:-}
+      DATA_GO_KR_API_KEY: ${DATA_GO_KR_API_KEY:-}
+      EMAIL_SENDER: ${EMAIL_SENDER:-}
+      EMAIL_PASSWORD: ${EMAIL_PASSWORD:-}
+      EMAIL_RECIPIENTS: ${EMAIL_RECIPIENTS:-}
+    volumes:
+      - appdata:/app/alert/data
+
+volumes:
+  pgdata:
+  appdata:

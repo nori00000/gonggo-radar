@@ -2,10 +2,17 @@
 
 import json
 import logging
+import os
 import struct
+from datetime import datetime
+from typing import Optional
 
 __all__ = ["VectorStore"]
-from typing import Optional
+
+_BACKEND = "sqlite"
+_DATABASE_URL = os.getenv("DATABASE_URL", "")
+if _DATABASE_URL.startswith(("postgresql://", "postgres://")):
+    _BACKEND = "postgresql"
 
 logger = logging.getLogger(__name__)
 
@@ -33,6 +40,7 @@ class VectorStore:
         """
         self.db = db
         self._config = config
+        self._backend = getattr(db, '_backend', 'sqlite')
 
         # OpenAI client (lazy init)
         self._client = None
@@ -40,7 +48,7 @@ class VectorStore:
         self._dimensions = config.dimensions if config else 256
         self._top_k = config.top_k if config else 5
 
-        if not db._vec_available:
+        if self._backend == "sqlite" and not db._vec_available:
             logger.warning("sqlite-vec not available, vector operations will fail")
 
     def _get_client(self):
@@ -88,26 +96,53 @@ class VectorStore:
         """
         try:
             vector = self.embed_text(text)
-            vector_bytes = _floats_to_bytes(vector)
 
-            # Store in embeddings table via db method
-            emb_id = self.db.insert_embedding(
-                announcement_id, vector_bytes, self._model, self._dimensions
-            )
-
-            # Also insert into vec_announcements virtual table for similarity search
-            if self.db._vec_available:
+            if self._backend == "postgresql":
+                # Store in embeddings table
+                now = datetime.now().isoformat()
+                cur = self.db.conn.cursor()
+                cur.execute(
+                    """INSERT INTO embeddings (announcement_id, model_name, embedding, dimensions, created_at)
+                       VALUES (%s, %s, %s, %s, %s) RETURNING id""",
+                    (announcement_id, self._model, _floats_to_bytes(vector), self._dimensions, now),
+                )
+                emb_id = cur.fetchone()["id"]
+                # Update announcement reference
+                cur.execute(
+                    "UPDATE announcements SET embedding_id = %s, updated_at = %s WHERE id = %s",
+                    (emb_id, now, announcement_id),
+                )
+                # Store in pgvector table
                 try:
-                    self.db.conn.execute(
-                        "INSERT INTO vec_announcements(rowid, embedding) VALUES (?, ?)",
-                        (emb_id, vector_bytes),
+                    # Convert float list to PostgreSQL vector literal
+                    vec_literal = "[" + ",".join(str(f) for f in vector) + "]"
+                    cur.execute(
+                        "INSERT INTO vec_announcements (id, embedding) VALUES (%s, %s::vector)",
+                        (emb_id, vec_literal),
                     )
-                    self.db.conn.commit()
                 except Exception as e:
                     logger.warning(f"vec_announcements insert failed (non-fatal): {e}")
 
-            logger.debug(f"Stored embedding {emb_id} for announcement {announcement_id}")
-            return emb_id
+                logger.debug(f"Stored embedding {emb_id} for announcement {announcement_id}")
+                return emb_id
+            else:
+                # SQLite path - unchanged
+                vector_bytes = _floats_to_bytes(vector)
+                emb_id = self.db.insert_embedding(
+                    announcement_id, vector_bytes, self._model, self._dimensions
+                )
+                if self.db._vec_available:
+                    try:
+                        self.db.conn.execute(
+                            "INSERT INTO vec_announcements(rowid, embedding) VALUES (?, ?)",
+                            (emb_id, vector_bytes),
+                        )
+                        self.db.conn.commit()
+                    except Exception as e:
+                        logger.warning(f"vec_announcements insert failed (non-fatal): {e}")
+
+                logger.debug(f"Stored embedding {emb_id} for announcement {announcement_id}")
+                return emb_id
 
         except Exception as e:
             logger.error(f"Failed to store embedding for announcement {announcement_id}: {e}")
@@ -126,43 +161,73 @@ class VectorStore:
         if top_k <= 0:
             top_k = self._top_k
 
-        # Get the embedding for this announcement
-        row = self.db.conn.execute(
-            "SELECT id, embedding FROM embeddings WHERE announcement_id = ? LIMIT 1",
-            (announcement_id,),
-        ).fetchone()
+        if self._backend == "postgresql":
+            # Get embedding for this announcement
+            cur = self.db.conn.cursor()
+            cur.execute(
+                "SELECT id, embedding FROM embeddings WHERE announcement_id = %s LIMIT 1",
+                (announcement_id,),
+            )
+            row = cur.fetchone()
+            if not row:
+                return []
 
-        if not row:
-            return []
+            emb_id = row["id"]
+            # Get the vector from vec_announcements
+            cur.execute("SELECT embedding FROM vec_announcements WHERE id = %s", (emb_id,))
+            vec_row = cur.fetchone()
+            if not vec_row:
+                return []
 
-        emb_id = row["id"]
-        vector_bytes = row["embedding"]
+            # Query pgvector for similar (excluding self)
+            cur.execute(
+                """SELECT id, embedding <=> %s::vector AS distance
+                     FROM vec_announcements
+                    WHERE id != %s
+                    ORDER BY embedding <=> %s::vector
+                    LIMIT %s""",
+                (str(vec_row["embedding"]), emb_id, str(vec_row["embedding"]), top_k),
+            )
+            results = cur.fetchall()
 
-        # Query sqlite-vec for similar vectors (excluding self)
-        results = self.db.conn.execute(
-            """
-            SELECT rowid, distance
-              FROM vec_announcements
-             WHERE embedding MATCH ?
-               AND k = ?
-            """,
-            (vector_bytes, top_k + 1),  # +1 to account for self
-        ).fetchall()
-
-        # Map embedding IDs back to announcement IDs, exclude self
-        similar = []
-        for r in results:
-            if r["rowid"] == emb_id:
-                continue
-            # Look up announcement_id from embedding ID
-            ann_row = self.db.conn.execute(
-                "SELECT announcement_id FROM embeddings WHERE id = ?",
-                (r["rowid"],),
+            similar = []
+            for r in results:
+                cur.execute("SELECT announcement_id FROM embeddings WHERE id = %s", (r["id"],))
+                ann_row = cur.fetchone()
+                if ann_row:
+                    similar.append((ann_row["announcement_id"], r["distance"]))
+            return similar
+        else:
+            # SQLite path - unchanged
+            row = self.db.conn.execute(
+                "SELECT id, embedding FROM embeddings WHERE announcement_id = ? LIMIT 1",
+                (announcement_id,),
             ).fetchone()
-            if ann_row:
-                similar.append((ann_row["announcement_id"], r["distance"]))
+            if not row:
+                return []
 
-        return similar[:top_k]
+            emb_id = row["id"]
+            vector_bytes = row["embedding"]
+
+            results = self.db.conn.execute(
+                """SELECT rowid, distance
+                  FROM vec_announcements
+                 WHERE embedding MATCH ?
+                   AND k = ?""",
+                (vector_bytes, top_k + 1),
+            ).fetchall()
+
+            similar = []
+            for r in results:
+                if r["rowid"] == emb_id:
+                    continue
+                ann_row = self.db.conn.execute(
+                    "SELECT announcement_id FROM embeddings WHERE id = ?",
+                    (r["rowid"],),
+                ).fetchone()
+                if ann_row:
+                    similar.append((ann_row["announcement_id"], r["distance"]))
+            return similar[:top_k]
 
     def find_similar_by_text(self, query: str, top_k: int = 0) -> list[tuple[int, float]]:
         """Ad-hoc text similarity search.
@@ -179,28 +244,46 @@ class VectorStore:
 
         try:
             vector = self.embed_text(query)
-            vector_bytes = _floats_to_bytes(vector)
 
-            results = self.db.conn.execute(
-                """
-                SELECT rowid, distance
-                  FROM vec_announcements
-                 WHERE embedding MATCH ?
-                   AND k = ?
-                """,
-                (vector_bytes, top_k),
-            ).fetchall()
+            if self._backend == "postgresql":
+                vec_literal = "[" + ",".join(str(f) for f in vector) + "]"
+                cur = self.db.conn.cursor()
+                cur.execute(
+                    """SELECT id, embedding <=> %s::vector AS distance
+                         FROM vec_announcements
+                        ORDER BY embedding <=> %s::vector
+                        LIMIT %s""",
+                    (vec_literal, vec_literal, top_k),
+                )
+                results = cur.fetchall()
 
-            similar = []
-            for r in results:
-                ann_row = self.db.conn.execute(
-                    "SELECT announcement_id FROM embeddings WHERE id = ?",
-                    (r["rowid"],),
-                ).fetchone()
-                if ann_row:
-                    similar.append((ann_row["announcement_id"], r["distance"]))
+                similar = []
+                for r in results:
+                    cur.execute("SELECT announcement_id FROM embeddings WHERE id = %s", (r["id"],))
+                    ann_row = cur.fetchone()
+                    if ann_row:
+                        similar.append((ann_row["announcement_id"], r["distance"]))
+                return similar
+            else:
+                # SQLite path - unchanged
+                vector_bytes = _floats_to_bytes(vector)
+                results = self.db.conn.execute(
+                    """SELECT rowid, distance
+                      FROM vec_announcements
+                     WHERE embedding MATCH ?
+                       AND k = ?""",
+                    (vector_bytes, top_k),
+                ).fetchall()
 
-            return similar
+                similar = []
+                for r in results:
+                    ann_row = self.db.conn.execute(
+                        "SELECT announcement_id FROM embeddings WHERE id = ?",
+                        (r["rowid"],),
+                    ).fetchone()
+                    if ann_row:
+                        similar.append((ann_row["announcement_id"], r["distance"]))
+                return similar
 
         except Exception as e:
             logger.error(f"Text similarity search failed: {e}")

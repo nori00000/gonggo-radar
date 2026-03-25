@@ -1,15 +1,39 @@
-"""SQLite 데이터베이스 -- 공고, 키워드, 실행 이력 관리."""
+"""데이터베이스 -- 공고, 키워드, 실행 이력 관리 (SQLite / PostgreSQL 듀얼 백엔드)."""
 
 from __future__ import annotations
 
 import json
 import logging
+import os
 import sqlite3
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Union
 
 from .models import AnalyzedAnnouncement, ApplicationRecord, Keyword, ResearchDocument
+
+# ---------------------------------------------------------------------------
+# Backend detection
+# ---------------------------------------------------------------------------
+_DATABASE_URL = os.getenv("DATABASE_URL", "")
+
+if _DATABASE_URL.startswith(("postgresql://", "postgres://")):
+    import psycopg2
+    import psycopg2.extras
+    _BACKEND = "postgresql"
+    _IntegrityError: type = psycopg2.IntegrityError
+    _OperationalError: type = psycopg2.OperationalError
+else:
+    _BACKEND = "sqlite"
+    _IntegrityError = sqlite3.IntegrityError
+    _OperationalError = sqlite3.OperationalError
+
+
+def _sql(query: str) -> str:
+    """Convert SQLite placeholders to PostgreSQL if needed."""
+    if _BACKEND == "postgresql":
+        return query.replace("?", "%s")
+    return query
 
 # ---------------------------------------------------------------------------
 # SQL Definitions
@@ -72,46 +96,116 @@ _CREATE_INDEXES = [
     "CREATE INDEX IF NOT EXISTS idx_kw_category ON keywords(category);",
 ]
 
+# ---------------------------------------------------------------------------
+# PostgreSQL SQL Definitions
+# ---------------------------------------------------------------------------
+
+_PG_CREATE_ANNOUNCEMENTS = """
+CREATE TABLE IF NOT EXISTS announcements (
+    id              SERIAL PRIMARY KEY,
+    source          TEXT    NOT NULL,
+    source_id       TEXT    NOT NULL,
+    title           TEXT    NOT NULL,
+    summary         TEXT    DEFAULT '',
+    url             TEXT    NOT NULL,
+    author          TEXT    DEFAULT '',
+    category        TEXT    DEFAULT '',
+    target          TEXT    DEFAULT '',
+    period_start    TEXT,
+    period_end      TEXT,
+    relevance_score DOUBLE PRECISION DEFAULT 0.0,
+    relevance_reason TEXT   DEFAULT '',
+    matched_keywords TEXT   DEFAULT '[]',
+    is_notified     INTEGER DEFAULT 0,
+    raw_data        TEXT    DEFAULT '',
+    created_at      TEXT    NOT NULL,
+    updated_at      TEXT    NOT NULL,
+    UNIQUE(source, source_id)
+);
+"""
+
+_PG_CREATE_KEYWORDS = """
+CREATE TABLE IF NOT EXISTS keywords (
+    id        SERIAL PRIMARY KEY,
+    keyword   TEXT    NOT NULL UNIQUE,
+    category  TEXT    NOT NULL DEFAULT 'boost',
+    weight    DOUBLE PRECISION NOT NULL DEFAULT 1.0,
+    is_active INTEGER NOT NULL DEFAULT 1
+);
+"""
+
+_PG_CREATE_RUN_HISTORY = """
+CREATE TABLE IF NOT EXISTS run_history (
+    id            SERIAL PRIMARY KEY,
+    started_at    TEXT    NOT NULL,
+    finished_at   TEXT,
+    source        TEXT    NOT NULL,
+    total_fetched INTEGER DEFAULT 0,
+    new_count     INTEGER DEFAULT 0,
+    relevant_count INTEGER DEFAULT 0,
+    notified_count INTEGER DEFAULT 0,
+    status        TEXT    DEFAULT 'running',
+    error_message TEXT    DEFAULT ''
+);
+"""
+
+_PG_CREATE_INDEXES = [
+    "CREATE INDEX IF NOT EXISTS idx_ann_source ON announcements(source);",
+    "CREATE INDEX IF NOT EXISTS idx_ann_notified ON announcements(is_notified);",
+    "CREATE INDEX IF NOT EXISTS idx_ann_score ON announcements(relevance_score);",
+    "CREATE INDEX IF NOT EXISTS idx_ann_created ON announcements(created_at);",
+    "CREATE INDEX IF NOT EXISTS idx_kw_category ON keywords(category);",
+]
+
 
 class Database:
-    """SQLite persistence layer for the alert bot."""
+    """Persistence layer for the alert bot (SQLite / PostgreSQL)."""
 
-    def __init__(self, db_path: str | Path | None = None) -> None:
-        """Open (or create) the database at *db_path*.
+    def __init__(self, db_path: str | Path | None = None, database_url: str = "") -> None:
+        """Open (or create) the database.
 
         Args:
-            db_path: Path to the SQLite file.  Defaults to
-                     ``<alert_package>/data/announcements.db``.
+            db_path: Path to the SQLite file. Ignored when using PostgreSQL.
+            database_url: PostgreSQL connection URL. If empty, falls back to
+                          DATABASE_URL env var, then SQLite.
         """
-        if db_path is None:
-            db_path = Path(__file__).resolve().parent / "data" / "announcements.db"
+        url = database_url or _DATABASE_URL
+        self._backend = "postgresql" if url.startswith(("postgresql://", "postgres://")) else "sqlite"
+
+        if self._backend == "postgresql":
+            import psycopg2
+            import psycopg2.extras
+            self._conn = psycopg2.connect(url, cursor_factory=psycopg2.extras.RealDictCursor)
+            self._conn.autocommit = True
+            self.db_path = None
+            self._vec_available = False  # pgvector handled separately
         else:
-            db_path = Path(db_path)
-
-        db_path.parent.mkdir(parents=True, exist_ok=True)
-        self.db_path = db_path
-        self._conn = sqlite3.connect(str(db_path))
-        self._conn.row_factory = sqlite3.Row
-        self._conn.execute("PRAGMA journal_mode=WAL;")
-        self._conn.execute("PRAGMA foreign_keys=ON;")
-
-        # Load sqlite-vec extension (if available) BEFORE creating tables
-        self._vec_available = False
-        try:
-            import sqlite_vec
-            sqlite_vec.load(self._conn)
-            self._vec_available = True
-        except Exception as e:
-            logging.getLogger(__name__).debug("sqlite-vec not loaded: %s", e)
+            if db_path is None:
+                db_path = Path(__file__).resolve().parent / "data" / "announcements.db"
+            else:
+                db_path = Path(db_path)
+            db_path.parent.mkdir(parents=True, exist_ok=True)
+            self.db_path = db_path
+            self._conn = sqlite3.connect(str(db_path))
+            self._conn.row_factory = sqlite3.Row
+            self._conn.execute("PRAGMA journal_mode=WAL;")
+            self._conn.execute("PRAGMA foreign_keys=ON;")
+            self._vec_available = False
+            try:
+                import sqlite_vec
+                sqlite_vec.load(self._conn)
+                self._vec_available = True
+            except Exception as e:
+                logging.getLogger(__name__).debug("sqlite-vec not loaded: %s", e)
 
         self._create_tables()
 
         # Run knowledge layer migrations
         from .migrations import run_migrations
-        run_migrations(self._conn, vec_available=self._vec_available)
+        run_migrations(self._conn, vec_available=self._vec_available, backend=self._backend)
 
     @property
-    def conn(self) -> sqlite3.Connection:
+    def conn(self) -> Any:
         """Public access to the underlying connection (for vector operations)."""
         return self._conn
 
@@ -122,12 +216,49 @@ class Database:
     def _create_tables(self) -> None:
         """Create tables and indexes if they do not already exist."""
         cur = self._conn.cursor()
-        cur.execute(_CREATE_ANNOUNCEMENTS)
-        cur.execute(_CREATE_KEYWORDS)
-        cur.execute(_CREATE_RUN_HISTORY)
-        for idx_sql in _CREATE_INDEXES:
-            cur.execute(idx_sql)
-        self._conn.commit()
+        if self._backend == "postgresql":
+            cur.execute(_PG_CREATE_ANNOUNCEMENTS)
+            cur.execute(_PG_CREATE_KEYWORDS)
+            cur.execute(_PG_CREATE_RUN_HISTORY)
+            for idx_sql in _PG_CREATE_INDEXES:
+                cur.execute(idx_sql)
+        else:
+            cur.execute(_CREATE_ANNOUNCEMENTS)
+            cur.execute(_CREATE_KEYWORDS)
+            cur.execute(_CREATE_RUN_HISTORY)
+            for idx_sql in _CREATE_INDEXES:
+                cur.execute(idx_sql)
+            self._conn.commit()
+
+    # ------------------------------------------------------------------
+    # Insert helpers
+    # ------------------------------------------------------------------
+
+    def _insert_returning_id(self, sql: str, params: tuple) -> int:
+        """Execute INSERT and return the new row ID.
+
+        PostgreSQL: appends RETURNING id to the query.
+        SQLite: uses cursor.lastrowid.
+        """
+        if self._backend == "postgresql":
+            cur = self._conn.cursor()
+            cur.execute(sql + " RETURNING id", params)
+            row = cur.fetchone()
+            return row["id"]
+        else:
+            cur = self._conn.execute(sql, params)
+            self._conn.commit()
+            return cur.lastrowid
+
+    def _row_get(self, row: Any, key: str, default: Any = None) -> Any:
+        """Get value from a row (works with both sqlite3.Row and RealDictRow)."""
+        if isinstance(row, dict):
+            return row.get(key, default)
+        try:
+            val = row[key]
+            return val if val is not None else default
+        except (KeyError, IndexError):
+            return default
 
     # ------------------------------------------------------------------
     # Announcements
@@ -147,47 +278,41 @@ class Database:
         """
         now = datetime.now().isoformat()
         try:
-            cur = self._conn.execute(
-                """
+            sql = _sql("""
                 INSERT INTO announcements
                     (source, source_id, title, summary, url, author, category,
                      target, period_start, period_end, relevance_score,
                      relevance_reason, matched_keywords, is_notified,
                      raw_data, created_at, updated_at)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?)
-                """,
-                (
-                    ann.source,
-                    ann.source_id,
-                    ann.title,
-                    ann.summary,
-                    ann.url,
-                    ann.author,
-                    ann.category,
-                    ann.target,
-                    ann.period_start,
-                    ann.period_end,
-                    ann.relevance_score,
-                    ann.relevance_reason,
-                    json.dumps(ann.matched_keywords, ensure_ascii=False),
-                    ann.raw_data,
-                    now,
-                    now,
-                ),
+                """)
+            params = (
+                ann.source, ann.source_id, ann.title, ann.summary, ann.url,
+                ann.author, ann.category, ann.target, ann.period_start,
+                ann.period_end, ann.relevance_score, ann.relevance_reason,
+                json.dumps(ann.matched_keywords, ensure_ascii=False),
+                ann.raw_data, now, now,
             )
-            self._conn.commit()
-            return cur.lastrowid
-        except sqlite3.IntegrityError:
+            if self._backend == "postgresql":
+                cur = self._conn.cursor()
+                cur.execute(sql + " RETURNING id", params)
+                row = cur.fetchone()
+                return row["id"]
+            else:
+                cur = self._conn.execute(sql, params)
+                self._conn.commit()
+                return cur.lastrowid
+        except _IntegrityError:
             # Duplicate (source, source_id) -- update score/reason and return existing ID.
             self._conn.execute(
-                """
+                _sql("""
                 UPDATE announcements
                    SET relevance_score  = ?,
                        relevance_reason = ?,
                        matched_keywords = ?,
                        updated_at       = ?
                  WHERE source = ? AND source_id = ?
-                """,
+                """),
                 (
                     ann.relevance_score,
                     ann.relevance_reason,
@@ -197,13 +322,16 @@ class Database:
                     ann.source_id,
                 ),
             )
-            self._conn.commit()
+            if self._backend == "sqlite":
+                self._conn.commit()
             if return_existing:
                 row = self._conn.execute(
-                    "SELECT id FROM announcements WHERE source = ? AND source_id = ?",
+                    _sql("SELECT id FROM announcements WHERE source = ? AND source_id = ?"),
                     (ann.source, ann.source_id),
                 ).fetchone()
-                return row["id"] if row else None
+                if row:
+                    return row["id"] if isinstance(row, dict) else row[0]
+                return None
             return None
 
     def get_unnotified(self) -> List[AnalyzedAnnouncement]:
@@ -220,15 +348,16 @@ class Database:
     def mark_notified(self, source_id: str) -> None:
         """Mark an announcement as notified by its *source_id*."""
         self._conn.execute(
-            "UPDATE announcements SET is_notified = 1, updated_at = ? WHERE source_id = ?",
+            _sql("UPDATE announcements SET is_notified = 1, updated_at = ? WHERE source_id = ?"),
             (datetime.now().isoformat(), source_id),
         )
-        self._conn.commit()
+        if self._backend == "sqlite":
+            self._conn.commit()
 
     def is_duplicate(self, source: str, source_id: str) -> bool:
         """Check whether an announcement with *source* + *source_id* already exists."""
         row = self._conn.execute(
-            "SELECT 1 FROM announcements WHERE source = ? AND source_id = ?",
+            _sql("SELECT 1 FROM announcements WHERE source = ? AND source_id = ?"),
             (source, source_id),
         ).fetchone()
         return row is not None
@@ -236,16 +365,16 @@ class Database:
     def search_announcements(self, query: str, limit: int = 20) -> List[AnalyzedAnnouncement]:
         """Full-text search across title and summary.
 
-        Uses SQLite ``LIKE`` for simplicity; upgrade to FTS5 if needed.
+        Uses ``LIKE`` for simplicity; upgrade to FTS5 / tsvector if needed.
         """
         pattern = f"%{query}%"
         rows = self._conn.execute(
-            """
+            _sql("""
             SELECT * FROM announcements
              WHERE title LIKE ? OR summary LIKE ?
              ORDER BY relevance_score DESC, created_at DESC
              LIMIT ?
-            """,
+            """),
             (pattern, pattern, limit),
         ).fetchall()
         return [self._row_to_announcement(r) for r in rows]
@@ -258,12 +387,13 @@ class Database:
         """Insert a keyword. Returns ``True`` on success, ``False`` on duplicate."""
         try:
             self._conn.execute(
-                "INSERT INTO keywords (keyword, category, weight, is_active) VALUES (?, ?, ?, ?)",
+                _sql("INSERT INTO keywords (keyword, category, weight, is_active) VALUES (?, ?, ?, ?)"),
                 (kw.keyword, kw.category, kw.weight, int(kw.is_active)),
             )
-            self._conn.commit()
+            if self._backend == "sqlite":
+                self._conn.commit()
             return True
-        except sqlite3.IntegrityError:
+        except _IntegrityError:
             return False
 
     def get_keywords(self) -> List[Keyword]:
@@ -281,8 +411,9 @@ class Database:
 
     def remove_keyword(self, keyword: str) -> bool:
         """Delete a keyword by value. Returns ``True`` if it existed."""
-        cur = self._conn.execute("DELETE FROM keywords WHERE keyword = ?", (keyword,))
-        self._conn.commit()
+        cur = self._conn.execute(_sql("DELETE FROM keywords WHERE keyword = ?"), (keyword,))
+        if self._backend == "sqlite":
+            self._conn.commit()
         return cur.rowcount > 0
 
     def init_default_keywords(self, keywords_cfg: Optional[Any] = None) -> int:
@@ -334,22 +465,19 @@ class Database:
     ) -> int:
         """Record a crawler run and return the new row id."""
         now = datetime.now().isoformat()
-        cur = self._conn.execute(
-            """
+        sql = _sql("""
             INSERT INTO run_history
                 (started_at, finished_at, source, total_fetched, new_count,
                  relevant_count, notified_count, status, error_message)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (now, now, source, total, new, relevant, notified, status, error_msg),
-        )
-        self._conn.commit()
-        return cur.lastrowid  # type: ignore[return-value]
+            """)
+        params = (now, now, source, total, new, relevant, notified, status, error_msg)
+        return self._insert_returning_id(sql, params)
 
     def get_recent_runs(self, limit: int = 10) -> List[Dict[str, Any]]:
         """Return the most recent run history entries."""
         rows = self._conn.execute(
-            "SELECT * FROM run_history ORDER BY id DESC LIMIT ?", (limit,)
+            _sql("SELECT * FROM run_history ORDER BY id DESC LIMIT ?"), (limit,)
         ).fetchall()
         return [dict(r) for r in rows]
 
@@ -374,15 +502,26 @@ class Database:
         ).fetchall()
         by_source = {r["source"]: r["cnt"] for r in by_source_rows}
 
-        by_month_rows = self._conn.execute(
-            """
-            SELECT strftime('%Y-%m', created_at) AS month, COUNT(*) AS cnt
-              FROM announcements
-             GROUP BY month
-             ORDER BY month DESC
-             LIMIT 12
-            """
-        ).fetchall()
+        if self._backend == "postgresql":
+            by_month_rows = self._conn.execute(
+                """
+                SELECT TO_CHAR(created_at::timestamp, 'YYYY-MM') AS month, COUNT(*) AS cnt
+                  FROM announcements
+                 GROUP BY month
+                 ORDER BY month DESC
+                 LIMIT 12
+                """
+            ).fetchall()
+        else:
+            by_month_rows = self._conn.execute(
+                """
+                SELECT strftime('%Y-%m', created_at) AS month, COUNT(*) AS cnt
+                  FROM announcements
+                 GROUP BY month
+                 ORDER BY month DESC
+                 LIMIT 12
+                """
+            ).fetchall()
         by_month = {r["month"]: r["cnt"] for r in by_month_rows}
 
         return {
@@ -400,23 +539,25 @@ class Database:
     def update_announcement_domain(self, ann_id: int, domain: str, confidence: float) -> None:
         """Update the business domain classification for an announcement."""
         self._conn.execute(
-            "UPDATE announcements SET business_domain = ?, domain_confidence = ?, updated_at = ? WHERE id = ?",
+            _sql("UPDATE announcements SET business_domain = ?, domain_confidence = ?, updated_at = ? WHERE id = ?"),
             (domain, confidence, datetime.now().isoformat(), ann_id),
         )
-        self._conn.commit()
+        if self._backend == "sqlite":
+            self._conn.commit()
 
     def update_announcement_obsidian_path(self, ann_id: int, path: str) -> None:
         """Update the Obsidian vault path for an announcement."""
         self._conn.execute(
-            "UPDATE announcements SET obsidian_path = ?, updated_at = ? WHERE id = ?",
+            _sql("UPDATE announcements SET obsidian_path = ?, updated_at = ? WHERE id = ?"),
             (path, datetime.now().isoformat(), ann_id),
         )
-        self._conn.commit()
+        if self._backend == "sqlite":
+            self._conn.commit()
 
     def get_announcement_by_id(self, ann_id: int) -> Optional[AnalyzedAnnouncement]:
         """Fetch a single announcement by its row ID."""
         row = self._conn.execute(
-            "SELECT * FROM announcements WHERE id = ?", (ann_id,)
+            _sql("SELECT * FROM announcements WHERE id = ?"), (ann_id,)
         ).fetchone()
         return self._row_to_announcement(row) if row else None
 
@@ -427,20 +568,19 @@ class Database:
     def insert_embedding(self, announcement_id: int, vector_bytes: bytes, model: str = "text-embedding-3-small", dims: int = 256) -> int:
         """Store an embedding vector. Returns the embedding row ID."""
         now = datetime.now().isoformat()
-        cur = self._conn.execute(
-            """
+        sql = _sql("""
             INSERT INTO embeddings (announcement_id, model_name, embedding, dimensions, created_at)
             VALUES (?, ?, ?, ?, ?)
-            """,
-            (announcement_id, model, vector_bytes, dims, now),
-        )
-        emb_id = cur.lastrowid
+            """)
+        params = (announcement_id, model, vector_bytes, dims, now)
+        emb_id = self._insert_returning_id(sql, params)
         # Update announcement's embedding_id reference
         self._conn.execute(
-            "UPDATE announcements SET embedding_id = ?, updated_at = ? WHERE id = ?",
+            _sql("UPDATE announcements SET embedding_id = ?, updated_at = ? WHERE id = ?"),
             (emb_id, now, announcement_id),
         )
-        self._conn.commit()
+        if self._backend == "sqlite":
+            self._conn.commit()
         return emb_id
 
     # ------------------------------------------------------------------
@@ -450,23 +590,20 @@ class Database:
     def insert_application_record(self, record: ApplicationRecord) -> int:
         """Insert an application history record. Returns the row ID."""
         now = datetime.now().isoformat()
-        cur = self._conn.execute(
-            """
+        sql = _sql("""
             INSERT INTO application_history
                 (announcement_id, status, applied_date, result_date, result,
                  prepared_docs, notes, assigned_domain, priority, created_at, updated_at)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                record.announcement_id, record.status, record.applied_date,
-                record.result_date, record.result,
-                json.dumps(record.prepared_docs, ensure_ascii=False),
-                record.notes, record.assigned_domain, record.priority,
-                now, now,
-            ),
+            """)
+        params = (
+            record.announcement_id, record.status, record.applied_date,
+            record.result_date, record.result,
+            json.dumps(record.prepared_docs, ensure_ascii=False),
+            record.notes, record.assigned_domain, record.priority,
+            now, now,
         )
-        self._conn.commit()
-        return cur.lastrowid
+        return self._insert_returning_id(sql, params)
 
     _ALLOWED_APP_FIELDS = frozenset({
         "applied_date", "result_date", "result", "notes", "priority",
@@ -494,16 +631,17 @@ class Database:
 
         params.append(record_id)
         cur = self._conn.execute(
-            f"UPDATE application_history SET {', '.join(updates)} WHERE id = ?",
+            _sql(f"UPDATE application_history SET {', '.join(updates)} WHERE id = ?"),
             params,
         )
-        self._conn.commit()
+        if self._backend == "sqlite":
+            self._conn.commit()
         return cur.rowcount > 0
 
     def get_application_history(self, announcement_id: int) -> List[ApplicationRecord]:
         """Get all application records for an announcement."""
         rows = self._conn.execute(
-            "SELECT * FROM application_history WHERE announcement_id = ? ORDER BY created_at DESC",
+            _sql("SELECT * FROM application_history WHERE announcement_id = ? ORDER BY created_at DESC"),
             (announcement_id,),
         ).fetchall()
         return [self._row_to_application_record(r) for r in rows]
@@ -511,7 +649,7 @@ class Database:
     def get_applications_by_status(self, status: str, limit: int = 20) -> List[ApplicationRecord]:
         """Get application records filtered by status."""
         rows = self._conn.execute(
-            "SELECT * FROM application_history WHERE status = ? ORDER BY updated_at DESC LIMIT ?",
+            _sql("SELECT * FROM application_history WHERE status = ? ORDER BY updated_at DESC LIMIT ?"),
             (status, limit),
         ).fetchall()
         return [self._row_to_application_record(r) for r in rows]
@@ -519,7 +657,7 @@ class Database:
     def get_applications_by_domain(self, domain: str, limit: int = 20) -> List[ApplicationRecord]:
         """Get application records filtered by assigned domain."""
         rows = self._conn.execute(
-            "SELECT * FROM application_history WHERE assigned_domain = ? ORDER BY updated_at DESC LIMIT ?",
+            _sql("SELECT * FROM application_history WHERE assigned_domain = ? ORDER BY updated_at DESC LIMIT ?"),
             (domain, limit),
         ).fetchall()
         return [self._row_to_application_record(r) for r in rows]
@@ -527,7 +665,7 @@ class Database:
     def get_recent_applications(self, limit: int = 10) -> List[ApplicationRecord]:
         """Get the most recent application records."""
         rows = self._conn.execute(
-            "SELECT * FROM application_history ORDER BY updated_at DESC LIMIT ?",
+            _sql("SELECT * FROM application_history ORDER BY updated_at DESC LIMIT ?"),
             (limit,),
         ).fetchall()
         return [self._row_to_application_record(r) for r in rows]
@@ -539,37 +677,36 @@ class Database:
     def insert_research_document(self, doc: ResearchDocument) -> int:
         """Insert a research document. Returns the row ID."""
         now = datetime.now().isoformat()
-        cur = self._conn.execute(
-            """
+        sql = _sql("""
             INSERT INTO research_documents
                 (title, doc_type, period_start, period_end, content,
                  metadata, obsidian_path, version, created_at, updated_at)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                doc.title, doc.doc_type, doc.period_start, doc.period_end,
-                doc.content, json.dumps(doc.metadata, ensure_ascii=False),
-                doc.obsidian_path, doc.version, now, now,
-            ),
+            """)
+        params = (
+            doc.title, doc.doc_type, doc.period_start, doc.period_end,
+            doc.content, json.dumps(doc.metadata, ensure_ascii=False),
+            doc.obsidian_path, doc.version, now, now,
         )
-        self._conn.commit()
-        return cur.lastrowid
+        return self._insert_returning_id(sql, params)
 
     def update_research_document(self, doc_id: int, content: str, version: int, obsidian_path: str = "") -> None:
         """Update a research document's content, version, and optionally obsidian_path."""
         now = datetime.now().isoformat()
         if obsidian_path:
             self._conn.execute(
-                "UPDATE research_documents SET content = ?, version = ?, obsidian_path = ?, updated_at = ? WHERE id = ?",
+                _sql("UPDATE research_documents SET content = ?, version = ?, obsidian_path = ?, updated_at = ? WHERE id = ?"),
                 (content, version, obsidian_path, now, doc_id),
             )
-            self._conn.commit()
+            if self._backend == "sqlite":
+                self._conn.commit()
             return
         self._conn.execute(
-            "UPDATE research_documents SET content = ?, version = ?, updated_at = ? WHERE id = ?",
+            _sql("UPDATE research_documents SET content = ?, version = ?, updated_at = ? WHERE id = ?"),
             (content, version, now, doc_id),
         )
-        self._conn.commit()
+        if self._backend == "sqlite":
+            self._conn.commit()
 
     # ------------------------------------------------------------------
     # Knowledge Layer: Queries
@@ -578,11 +715,11 @@ class Database:
     def get_announcements_by_period(self, start: str, end: str) -> List[AnalyzedAnnouncement]:
         """Get announcements created within a date range."""
         rows = self._conn.execute(
-            """
+            _sql("""
             SELECT * FROM announcements
              WHERE created_at >= ? AND created_at <= ?
              ORDER BY relevance_score DESC, created_at DESC
-            """,
+            """),
             (start, end),
         ).fetchall()
         return [self._row_to_announcement(r) for r in rows]
@@ -590,14 +727,14 @@ class Database:
     def get_domain_stats(self, start: str, end: str) -> Dict[str, int]:
         """Get announcement counts by business domain for a period."""
         rows = self._conn.execute(
-            """
+            _sql("""
             SELECT business_domain, COUNT(*) AS cnt
               FROM announcements
              WHERE created_at >= ? AND created_at <= ?
                AND business_domain != ''
              GROUP BY business_domain
              ORDER BY cnt DESC
-            """,
+            """),
             (start, end),
         ).fetchall()
         return {r["business_domain"]: r["cnt"] for r in rows}
@@ -607,8 +744,9 @@ class Database:
     # ------------------------------------------------------------------
 
     @staticmethod
-    def _row_to_announcement(row: sqlite3.Row) -> AnalyzedAnnouncement:
+    def _row_to_announcement(row: Any) -> AnalyzedAnnouncement:
         """Convert a database row into an :class:`AnalyzedAnnouncement`."""
+        # Works with both sqlite3.Row and dict (RealDictRow)
         matched = row["matched_keywords"]
         try:
             matched_list = json.loads(matched) if matched else []
@@ -621,21 +759,21 @@ class Database:
             source_id=row["source_id"],
             title=row["title"],
             url=row["url"],
-            summary=row["summary"],
-            author=row["author"],
-            category=row["category"],
-            target=row["target"],
+            summary=row["summary"] or "",
+            author=row["author"] or "",
+            category=row["category"] or "",
+            target=row["target"] or "",
             period_start=row["period_start"],
             period_end=row["period_end"],
-            raw_data=row["raw_data"],
+            raw_data=row["raw_data"] or "",
             fetched_at=row["created_at"],
-            relevance_score=row["relevance_score"],
-            relevance_reason=row["relevance_reason"],
+            relevance_score=row["relevance_score"] or 0.0,
+            relevance_reason=row["relevance_reason"] or "",
             matched_keywords=matched_list,
         )
 
     @staticmethod
-    def _row_to_application_record(row: sqlite3.Row) -> ApplicationRecord:
+    def _row_to_application_record(row: Any) -> ApplicationRecord:
         """Convert a database row into an ApplicationRecord."""
         docs = row["prepared_docs"]
         try:

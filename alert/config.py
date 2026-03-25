@@ -178,6 +178,7 @@ class AppConfig:
     version: str = "1.0.0"
     log_level: str = "INFO"
     data_dir: str = "data"
+    database_url: str = ""
 
     crawler: CrawlerConfig = field(default_factory=CrawlerConfig)
     notifier: NotifierConfig = field(default_factory=NotifierConfig)
@@ -275,6 +276,9 @@ def _load_env_secrets(cfg: AppConfig) -> None:
         for source_name in ("g2b", "kstartup", "subsidy24", "forest_service"):
             if source_name in cfg.crawler.sources:
                 cfg.crawler.sources[source_name].api_key = data_go_kr_key  # type: ignore[attr-defined]
+
+    # Database URL (PostgreSQL)
+    cfg.database_url = os.getenv("DATABASE_URL", "")
 
     # Knowledge Layer secrets
     openai_key = os.getenv("OPENAI_API_KEY", "")
