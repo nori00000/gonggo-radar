@@ -40,3 +40,5 @@ form_info.json
 
 # Pytest cache
 .pytest_cache/
+logs/
+.omc/

@@ -85,6 +85,9 @@ class AnalyzerConfig:
     claude_model: str = "claude-sonnet-4-5-20250929"
     max_claude_calls_per_run: int = 50
     api_key: str = ""
+    llm_backend: str = "auto"
+    ollama_base_url: str = "http://localhost:11434"
+    ollama_model: str = "qwen2.5:70b"
 
 
 @dataclass
@@ -321,6 +324,9 @@ def _build_config() -> AppConfig:
             claude_threshold=analyzer_raw.get("claude_threshold", 0.3),
             claude_model=analyzer_raw.get("claude_model", "claude-sonnet-4-5-20250929"),
             max_claude_calls_per_run=analyzer_raw.get("max_claude_calls_per_run", 50),
+            llm_backend=analyzer_raw.get("llm_backend", "auto"),
+            ollama_base_url=analyzer_raw.get("ollama_base_url", "http://localhost:11434"),
+            ollama_model=analyzer_raw.get("ollama_model", "qwen2.5:70b"),
         ),
         keywords=KeywordsConfig(
             must_match=keywords_raw.get("must_match", []),

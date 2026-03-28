@@ -7,6 +7,8 @@ import logging
 import os
 from typing import List, Optional
 
+import requests
+
 from .config import get_config
 from .db import Database
 from .models import AnalyzedAnnouncement, Keyword, RawAnnouncement
@@ -217,49 +219,56 @@ class KeywordAnalyzer:
 # ---------------------------------------------------------------------------
 
 class ClaudeAnalyzer:
-    """Stage 2: AI-powered relevance analysis using Claude API.
+    """Stage 2: AI-powered relevance analysis using Claude API or Ollama.
 
     Refines keyword-matched announcements with contextual understanding.
+    Supports two backends: 'claude' (Anthropic API) and 'ollama' (OpenAI-compatible).
+    Backend is selected via LLM_BACKEND env var, config llm_backend field, or auto-detection.
     """
 
     def __init__(self):
-        """Initialize Claude analyzer with API key from config."""
+        """Initialize analyzer with auto-detected or configured backend."""
         self.config = get_config()
         self.api_key = self.config.analyzer.api_key or os.getenv("ANTHROPIC_API_KEY", "")
         self.model = self.config.analyzer.claude_model
 
-        if not ANTHROPIC_AVAILABLE:
-            logger.warning("Claude analysis unavailable: anthropic SDK not installed")
-            self.client = None
-        elif not self.api_key:
-            logger.warning("Claude analysis unavailable: ANTHROPIC_API_KEY not set")
-            self.client = None
-        else:
-            self.client = anthropic.Anthropic(api_key=self.api_key)
-            logger.info(f"Claude analyzer initialized with model: {self.model}")
+        # Determine backend: env var overrides config, config overrides auto
+        backend = (
+            os.getenv("LLM_BACKEND")
+            or self.config.analyzer.llm_backend
+            or "auto"
+        )
+        if backend == "auto":
+            backend = "claude" if self.api_key else "ollama"
 
-    def analyze(
+        self.backend = backend
+        self.client = None  # Used for claude backend
+        self._ollama_base_url: str = self.config.analyzer.ollama_base_url
+        self._ollama_model: str = self.config.analyzer.ollama_model
+
+        if self.backend == "claude":
+            if not ANTHROPIC_AVAILABLE:
+                logger.warning("Claude analysis unavailable: anthropic SDK not installed")
+            elif not self.api_key:
+                logger.warning("Claude analysis unavailable: ANTHROPIC_API_KEY not set")
+            else:
+                self.client = anthropic.Anthropic(api_key=self.api_key)
+                logger.info(f"Claude analyzer initialized with model: {self.model}")
+        elif self.backend == "ollama":
+            logger.info(
+                f"Ollama analyzer initialized: model={self._ollama_model}, "
+                f"url={self._ollama_base_url}"
+            )
+        else:
+            logger.warning(f"Unknown LLM backend '{self.backend}', analysis will be skipped")
+
+    def _build_prompts(
         self,
         announcement: AnalyzedAnnouncement,
-        user_context: str = USER_CONTEXT
-    ) -> AnalyzedAnnouncement:
-        """Analyze a single announcement using Claude API.
-
-        Args:
-            announcement: Announcement with keyword score.
-            user_context: Description of user's situation and interests.
-
-        Returns:
-            Updated announcement with Claude's score and reason.
-            Falls back to keyword score if API fails.
-        """
-        if not self.client:
-            logger.debug(f"Skipping Claude analysis for: {announcement.title}")
-            return announcement
-
-        try:
-            # Build prompt
-            system_prompt = f"""당신은 정부 및 지자체 공고의 관련성을 평가하는 전문가입니다.
+        user_context: str,
+    ) -> tuple[str, str]:
+        """Build system and user prompts for LLM analysis."""
+        system_prompt = f"""당신은 정부 및 지자체 공고의 관련성을 평가하는 전문가입니다.
 
 다음은 사용자의 상황입니다:
 {user_context}
@@ -287,7 +296,7 @@ matched_aspects 필드에는 매칭된 비즈니스 도메인을 포함하세요
   "matched_aspects": ["매칭된 도메인1", "매칭된 도메인2"]
 }}"""
 
-            user_prompt = f"""다음 공고를 평가해주세요:
+        user_prompt = f"""다음 공고를 평가해주세요:
 
 제목: {announcement.title}
 요약: {announcement.summary}
@@ -298,16 +307,69 @@ matched_aspects 필드에는 매칭된 비즈니스 도메인을 포함하세요
 키워드 매칭 점수: {announcement.relevance_score:.2f}
 매칭된 키워드: {', '.join(announcement.matched_keywords)}"""
 
-            # Call Claude API
-            message = self.client.messages.create(
-                model=self.model,
-                max_tokens=1024,
-                system=system_prompt,
-                messages=[{"role": "user", "content": user_prompt}]
-            )
+        return system_prompt, user_prompt
+
+    def _call_claude(self, system_prompt: str, user_prompt: str) -> str:
+        """Call Claude API and return response text."""
+        message = self.client.messages.create(
+            model=self.model,
+            max_tokens=1024,
+            system=system_prompt,
+            messages=[{"role": "user", "content": user_prompt}]
+        )
+        return message.content[0].text
+
+    def _call_ollama(self, system_prompt: str, user_prompt: str) -> str:
+        """Call Ollama OpenAI-compatible API and return response text."""
+        response = requests.post(
+            f"{self._ollama_base_url}/v1/chat/completions",
+            json={
+                "model": self._ollama_model,
+                "messages": [
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt},
+                ],
+                "temperature": 0.3,
+                "response_format": {"type": "json_object"},
+            },
+            timeout=120,
+        )
+        response.raise_for_status()
+        result = response.json()
+        return result["choices"][0]["message"]["content"]
+
+    def analyze(
+        self,
+        announcement: AnalyzedAnnouncement,
+        user_context: str = USER_CONTEXT
+    ) -> AnalyzedAnnouncement:
+        """Analyze a single announcement using the configured LLM backend.
+
+        Args:
+            announcement: Announcement with keyword score.
+            user_context: Description of user's situation and interests.
+
+        Returns:
+            Updated announcement with LLM score and reason.
+            Falls back to keyword score if API fails.
+        """
+        # Check availability per backend
+        if self.backend == "claude" and not self.client:
+            logger.debug(f"Skipping Claude analysis for: {announcement.title}")
+            return announcement
+        if self.backend not in ("claude", "ollama"):
+            logger.debug(f"Skipping LLM analysis (unknown backend): {announcement.title}")
+            return announcement
+
+        try:
+            system_prompt, user_prompt = self._build_prompts(announcement, user_context)
+
+            if self.backend == "claude":
+                response_text = self._call_claude(system_prompt, user_prompt)
+            else:
+                response_text = self._call_ollama(system_prompt, user_prompt)
 
             # Parse response
-            response_text = message.content[0].text
             result = json.loads(response_text)
 
             # Update announcement
@@ -320,14 +382,16 @@ matched_aspects 필드에는 매칭된 비즈니스 도메인을 포함하세요
                 announcement.relevance_reason += f" (매칭: {', '.join(matched_aspects)})"
 
             logger.debug(
-                f"Claude analysis complete: {announcement.title} -> "
+                f"{self.backend} analysis complete: {announcement.title} -> "
                 f"score={announcement.relevance_score:.2f}"
             )
 
         except json.JSONDecodeError as e:
-            logger.error(f"Failed to parse Claude response: {e}")
+            logger.error(f"Failed to parse LLM response: {e}")
+        except requests.RequestException as e:
+            logger.error(f"Ollama connection error for '{announcement.title}': {e}")
         except Exception as e:
-            logger.error(f"Claude API error for '{announcement.title}': {e}")
+            logger.error(f"LLM API error for '{announcement.title}': {e}")
 
         return announcement
 
@@ -348,8 +412,12 @@ matched_aspects 필드에는 매칭된 비즈니스 도메인을 포함하세요
         Returns:
             Updated announcements sorted by score descending.
         """
-        if not self.client:
-            logger.info("Claude analysis skipped (client not available)")
+        # Skip if backend is unavailable
+        if self.backend == "claude" and not self.client:
+            logger.info("LLM analysis skipped (Claude client not available)")
+            return announcements
+        if self.backend not in ("claude", "ollama"):
+            logger.info(f"LLM analysis skipped (unknown backend: {self.backend})")
             return announcements
 
         threshold = self.config.analyzer.claude_threshold
@@ -362,14 +430,14 @@ matched_aspects 필드에는 매칭된 비즈니스 도메인을 포함하세요
         to_analyze = candidates[:max_calls]
 
         logger.info(
-            f"Claude analysis: {len(to_analyze)} candidates "
+            f"{self.backend} analysis: {len(to_analyze)} candidates "
             f"(threshold={threshold}, max_calls={max_calls})"
         )
 
         # Analyze each candidate
         results = []
         for i, ann in enumerate(to_analyze, 1):
-            logger.debug(f"Claude analyzing {i}/{len(to_analyze)}: {ann.title}")
+            logger.debug(f"{self.backend} analyzing {i}/{len(to_analyze)}: {ann.title}")
             analyzed = self.analyze(ann, user_context)
             results.append(analyzed)
 
@@ -384,5 +452,5 @@ matched_aspects 필드에는 매칭된 비즈니스 도메인을 포함하세요
         # Sort by final score
         results.sort(key=lambda x: x.relevance_score, reverse=True)
 
-        logger.info(f"Claude analysis complete: {len(to_analyze)} analyzed")
+        logger.info(f"{self.backend} analysis complete: {len(to_analyze)} analyzed")
         return results
