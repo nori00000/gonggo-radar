@@ -7,9 +7,10 @@ Modes: single run, daemon, bot, test
 import argparse
 import logging
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Tuple
 
 from .config import get_config
 from .db import Database
@@ -78,6 +79,32 @@ def _import_crawlers() -> Dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
+# Pipeline helpers
+# ---------------------------------------------------------------------------
+
+def _crawl_single(
+    crawler_name: str,
+    CrawlerClass: Any,
+    logger: logging.Logger,
+) -> Tuple[str, list, str]:
+    """단일 크롤러 실행 (스레드에서 호출).
+
+    Returns:
+        (crawler_name, raw_announcements, status)
+        status: "success" | "disabled" | "error"
+    """
+    try:
+        crawler = CrawlerClass()
+        if not crawler.is_enabled():
+            return crawler_name, [], "disabled"
+        raw = crawler.safe_fetch()
+        return crawler_name, raw, "success"
+    except Exception as e:
+        logger.error(f"{crawler_name}: {e}")
+        return crawler_name, [], "error"
+
+
+# ---------------------------------------------------------------------------
 # Pipeline
 # ---------------------------------------------------------------------------
 
@@ -122,27 +149,50 @@ def run_pipeline(test_mode: bool = False) -> None:
     all_new_announcements: List[AnalyzedAnnouncement] = []
     run_stats: Dict[str, Dict[str, int]] = {}
 
-    for crawler_name, CrawlerClass in available_crawlers.items():
-        logger.info(f"\n--- Crawling: {crawler_name} ---")
+    # ---------------------------------------------------------------------------
+    # Stage 1: Crawl from all enabled sources (parallel)
+    # ---------------------------------------------------------------------------
+
+    logger.info(f"Starting parallel crawl with max_workers=5 for {len(available_crawlers)} crawlers")
+
+    crawl_results: Dict[str, Any] = {}
+
+    with ThreadPoolExecutor(max_workers=5) as pool:
+        futures = {
+            pool.submit(_crawl_single, name, cls, logger): name
+            for name, cls in available_crawlers.items()
+        }
+        for future in as_completed(futures):
+            crawler_name, raw_announcements, status = future.result()
+            crawl_results[crawler_name] = (raw_announcements, status)
+            logger.info(f"\n--- Crawled: {crawler_name} ({status}, {len(raw_announcements)} items) ---")
+
+    # Process crawl results sequentially (analysis/DB are not thread-safe)
+    for crawler_name, (raw_announcements, status) in crawl_results.items():
+        logger.info(f"\n--- Processing: {crawler_name} ---")
+
+        if status == "disabled":
+            logger.info(f"{crawler_name} is disabled in config, skipping")
+            run_stats[crawler_name] = {
+                "total_fetched": 0,
+                "new_count": 0,
+                "relevant_count": 0,
+                "status": "disabled",
+            }
+            continue
+
+        if status == "error":
+            run_stats[crawler_name] = {
+                "total_fetched": 0,
+                "new_count": 0,
+                "relevant_count": 0,
+                "status": "error",
+                "error_message": "crawl failed (see log above)",
+            }
+            continue
 
         try:
-            crawler = CrawlerClass()
-
-            # Check if enabled
-            if not crawler.is_enabled():
-                logger.info(f"{crawler_name} is disabled in config, skipping")
-                run_stats[crawler_name] = {
-                    "total_fetched": 0,
-                    "new_count": 0,
-                    "relevant_count": 0,
-                    "status": "disabled",
-                }
-                continue
-
-            # Fetch announcements
-            raw_announcements = crawler.safe_fetch()
             total_fetched = len(raw_announcements)
-
             logger.info(f"{crawler_name}: Fetched {total_fetched} announcements")
 
             # Filter out duplicates

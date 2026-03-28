@@ -69,6 +69,19 @@ class GoyangStartupCrawler(BaseCrawler):
         soup = BeautifulSoup(response.text, "html.parser")
         items: List[dict] = []
 
+        # 전략 0: goyangstartup.kr 전용 - ul.notice_list 구조
+        # <ul class="notice_list">
+        #   <li><a href="/community/01.php?admin_mode=read&no=NNN...">
+        #     <strong class="txt_t">제목</strong>
+        #     <span class="txt_s">요약</span>
+        #     <span class="date"><strong>일</strong>YYYY.MM.</span>
+        #   </a></li>
+        # </ul>
+        items = self._parse_notice_list(soup)
+        if items:
+            self.logger.info(f"Parsed {len(items)} items using notice_list strategy")
+            return items
+
         # 전략 1: table 기반 게시판
         items = self._parse_table_board(soup)
         if items:
@@ -92,6 +105,72 @@ class GoyangStartupCrawler(BaseCrawler):
             "HTML structure may have changed."
         )
         return []
+
+    def _parse_notice_list(self, soup: "BeautifulSoup") -> List[dict]:
+        """goyangstartup.kr 전용 ul.notice_list 파싱.
+
+        HTML 구조 예시:
+            <ul class="notice_list">
+              <li>
+                <a href="/community/01.php?admin_mode=read&no=542&...">
+                  <strong class="txt_t">제목</strong>
+                  <span class="txt_s">요약</span>
+                  <span class="date"><strong>12</strong>2026.01.</span>
+                </a>
+              </li>
+            </ul>
+        날짜는 <strong>일</strong> + 'YYYY.MM.' 텍스트로 분리되어 있으므로
+        전체 텍스트를 합쳐서 'YYYY.MM.DD' 형식으로 재구성한다.
+        """
+        notice_ul = soup.find("ul", class_="notice_list")
+        if not notice_ul:
+            return []
+
+        items = []
+        for li in notice_ul.find_all("li"):
+            a_tag = li.find("a", href=True)
+            if not a_tag:
+                continue
+
+            # 제목
+            title_elem = a_tag.find("strong", class_="txt_t")
+            title_text = title_elem.get_text(strip=True) if title_elem else a_tag.get_text(strip=True)
+            if not title_text:
+                continue
+
+            # 링크
+            link = a_tag.get("href", "")
+
+            # 요약
+            summary_elem = a_tag.find("span", class_="txt_s")
+            summary = summary_elem.get_text(strip=True) if summary_elem else ""
+
+            # 날짜: <span class="date"><strong>12</strong>2026.01.</span>
+            # → strong 텍스트(일) + 나머지 텍스트(YYYY.MM.) 조합
+            date_str = ""
+            date_elem = a_tag.find("span", class_="date")
+            if date_elem:
+                day_strong = date_elem.find("strong")
+                if day_strong:
+                    day = day_strong.get_text(strip=True)
+                    # strong을 제거한 나머지 텍스트에서 YYYY.MM. 추출
+                    day_strong.extract()
+                    rest = date_elem.get_text(strip=True)  # 예: '2026.01.'
+                    # rest 형식: 'YYYY.MM.' → 'YYYY.MM.DD'
+                    date_str = f"{rest}{day}" if rest else day
+                else:
+                    date_str = date_elem.get_text(strip=True)
+
+            items.append({
+                "title": title_text,
+                "link": link,
+                "author": "",
+                "category": "",
+                "date": date_str,
+                "summary": summary,
+            })
+
+        return items
 
     def _parse_table_board(self, soup: "BeautifulSoup") -> List[dict]:
         """table 기반 게시판 파싱."""

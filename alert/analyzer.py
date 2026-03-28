@@ -148,15 +148,15 @@ class KeywordAnalyzer:
                 matched_keywords.append(kw.keyword)
 
         # Step 3: boost keywords
-        boost_keywords = []
+        matched_boost = []
         for kw in self.keywords_by_category["boost"]:
             if kw.keyword.lower() in search_text:
-                boost_keywords.append(kw.keyword)
+                matched_boost.append(kw)
                 matched_keywords.append(kw.keyword)
 
-        # Calculate boost score: 0.05 per keyword, max 0.5
-        if boost_keywords:
-            boost_score = min(0.05 * len(boost_keywords), 0.5)
+        # Calculate boost score: 0.05 * weight per keyword, max 0.5
+        if matched_boost:
+            boost_score = min(sum(0.05 * kw.weight for kw in matched_boost), 0.5)
 
         # Total score
         total_score = min(must_match_score + boost_score, 1.0)
@@ -168,8 +168,8 @@ class KeywordAnalyzer:
             reason_parts = []
             if must_match_score > 0:
                 reason_parts.append("필수 키워드 매칭")
-            if boost_keywords:
-                reason_parts.append(f"추가 키워드 {len(boost_keywords)}개")
+            if matched_boost:
+                reason_parts.append(f"추가 키워드 {len(matched_boost)}개")
             reason = " + ".join(reason_parts)
 
         return AnalyzedAnnouncement(

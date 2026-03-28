@@ -340,6 +340,7 @@ class Database:
             """
             SELECT * FROM announcements
              WHERE is_notified = 0
+               AND (period_end IS NULL OR period_end = '' OR period_end >= date('now'))
              ORDER BY relevance_score DESC, created_at DESC
             """
         ).fetchall()
