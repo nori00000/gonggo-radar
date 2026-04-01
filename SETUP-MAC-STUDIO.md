@@ -39,11 +39,11 @@ TELEGRAM_CHAT_ID=1401666801
 # 모델 확인
 ollama list
 
-# qwen2.5:70b 없으면 설치
-ollama pull qwen2.5:70b
+# qwen2.5:72b 없으면 설치
+ollama pull qwen2.5:72b
 
 # 동작 테스트
-ollama run qwen2.5:70b "안녕" --verbose
+ollama run qwen2.5:72b "안녕" --verbose
 ```
 
 config에서 모델 변경하려면 `alert/config.yaml`:
@@ -51,7 +51,7 @@ config에서 모델 변경하려면 `alert/config.yaml`:
 analyzer:
   llm_backend: "auto"           # auto | claude | ollama
   ollama_base_url: "http://localhost:11434"
-  ollama_model: "qwen2.5:70b"   # 여기서 모델명 변경 가능
+  ollama_model: "qwen2.5:72b"   # 여기서 모델명 변경 가능
 ```
 
 ## 4. 테스트 실행

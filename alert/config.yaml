@@ -122,7 +122,7 @@ analyzer:
   # auto: ANTHROPIC_API_KEY 있으면 claude, 없으면 ollama
   llm_backend: "auto"
   ollama_base_url: "http://localhost:11434"
-  ollama_model: "qwen2.5:70b"
+  ollama_model: "qwen2.5:72b"
 
 keywords:
   must_match:
