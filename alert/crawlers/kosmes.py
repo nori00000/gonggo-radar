@@ -241,6 +241,46 @@ class KosmesCrawler(BaseCrawler):
             return match.group(1)
         return ""
 
+    def _extract_post_id(self, link: str) -> str:
+        """URL에서 공고 ID를 추출한다."""
+        if not link:
+            return ""
+
+        id_params = [
+            r"seq=(\d+)", r"seqNo=(\d+)", r"nttId=(\d+)",
+            r"idx=(\d+)", r"no=(\d+)", r"articleId=(\d+)",
+        ]
+        for pattern in id_params:
+            match = re.search(pattern, link, re.I)
+            if match:
+                return match.group(1)
+
+        path_match = re.search(r"/(\d{3,})", link)
+        if path_match:
+            return path_match.group(1)
+
+        return hashlib.md5(link.encode("utf-8")).hexdigest()[:16]
+
+    def _parse_period(self, period_str: str) -> tuple:
+        """기간 문자열을 시작일과 종료일로 파싱한다."""
+        if not period_str:
+            return None, None
+
+        try:
+            if "~" in period_str:
+                parts = re.split(r"~", period_str)
+                if len(parts) == 2:
+                    start = self._normalize_date(parts[0].strip())
+                    end = self._normalize_date(parts[1].strip())
+                    return start, end
+
+            normalized = self._normalize_date(period_str.strip())
+            return normalized, normalized
+
+        except Exception as e:
+            self.logger.warning(f"Failed to parse period '{period_str}': {e}")
+            return None, None
+
     def _to_announcements(
         self, items: List[dict], base_url: str
     ) -> List[RawAnnouncement]:
@@ -289,20 +329,20 @@ class KosmesCrawler(BaseCrawler):
 
             link = self._normalize_url(item.get("link", ""), base_url)
 
-            # source_id: seq_no 우선, 없으면 URL 해시
+            # source_id: seq_no 우선, 없으면 URL에서 추출, 없으면 해시
             seq_no = item.get("seq_no", "")
             if seq_no:
                 source_id = seq_no
-            elif link:
-                source_id = hashlib.md5(link.encode("utf-8")).hexdigest()[:16]
             else:
+                source_id = self._extract_post_id(link)
+            if not source_id:
                 source_id = hashlib.md5(title.encode("utf-8")).hexdigest()[:16]
 
             author = item.get("author", "").strip()
             category = item.get("category", "").strip()
 
             date_str = item.get("date", "").strip()
-            period_start = self._normalize_date(date_str)
+            period_start, period_end = self._parse_period(date_str)
 
             raw_data = json.dumps(item, ensure_ascii=False)
 
@@ -316,7 +356,7 @@ class KosmesCrawler(BaseCrawler):
                 category=category,
                 target="",
                 period_start=period_start,
-                period_end=None,
+                period_end=period_end,
                 raw_data=raw_data,
             )
 

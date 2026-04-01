@@ -32,6 +32,7 @@ def mock_config():
     config.analyzer.max_claude_calls_per_run = 5
     config.analyzer.api_key = ""
     config.analyzer.claude_model = "claude-3-5-sonnet-20241022"
+    config.analyzer.llm_backend = "claude"
     return config
 
 

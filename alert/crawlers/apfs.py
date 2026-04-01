@@ -236,6 +236,59 @@ class ApfsCrawler(BaseCrawler):
     # Conversion helpers
     # ------------------------------------------------------------------
 
+    def _extract_post_id(self, link: str) -> str:
+        """URL에서 공고 ID를 추출한다."""
+        if not link:
+            return ""
+
+        id_params = [
+            r"nttId=(\d+)", r"contId=(\d+)", r"seq=(\d+)",
+            r"idx=(\d+)", r"no=(\d+)", r"bbsId=(\w+)",
+            r"articleId=(\d+)",
+        ]
+        for pattern in id_params:
+            match = re.search(pattern, link, re.I)
+            if match:
+                return match.group(1)
+
+        path_match = re.search(r"/(\d{3,})", link)
+        if path_match:
+            return path_match.group(1)
+
+        return hashlib.md5(link.encode("utf-8")).hexdigest()[:16]
+
+    def _normalize_url(self, link: str, base_url: str) -> str:
+        """상대 URL을 절대 URL로 변환한다."""
+        if not link:
+            return ""
+        if link.startswith("http://") or link.startswith("https://"):
+            return link
+        if link.startswith("//"):
+            return f"https:{link}"
+        if link.startswith("/"):
+            return f"{base_url}{link}"
+        return f"{base_url}/{link}"
+
+    def _parse_period(self, period_str: str) -> tuple:
+        """기간 문자열을 시작일과 종료일로 파싱한다."""
+        if not period_str:
+            return None, None
+
+        try:
+            if "~" in period_str:
+                parts = re.split(r"~", period_str)
+                if len(parts) == 2:
+                    start = self._normalize_date(parts[0].strip())
+                    end = self._normalize_date(parts[1].strip())
+                    return start, end
+
+            normalized = self._normalize_date(period_str.strip())
+            return normalized, normalized
+
+        except Exception as e:
+            self.logger.warning(f"Failed to parse period '{period_str}': {e}")
+            return None, None
+
     def _normalize_date(self, date_str: str) -> Optional[str]:
         """날짜 문자열을 ISO 형식(YYYY-MM-DD)으로 정규화한다."""
         if not date_str:
@@ -256,20 +309,20 @@ class ApfsCrawler(BaseCrawler):
             if not title:
                 return None
 
-            link = item.get("link", "").strip()
+            link = self._normalize_url(item.get("link", "").strip(), base_url)
             view_id = item.get("view_id", "").strip()
 
-            # source_id: viewId 우선, 없으면 URL 해시
+            # source_id: viewId 우선, 없으면 URL에서 추출, 없으면 해시
             if view_id:
                 source_id = f"apfs_{view_id}"
-            elif link:
-                source_id = hashlib.md5(link.encode("utf-8")).hexdigest()[:16]
             else:
+                source_id = self._extract_post_id(link)
+            if not source_id:
                 source_id = hashlib.md5(title.encode("utf-8")).hexdigest()[:16]
 
             author = item.get("author", "").strip() or "농업정책보험금융원"
             date_str = item.get("date", "").strip()
-            published_date = self._normalize_date(date_str)
+            period_start, period_end = self._parse_period(date_str)
 
             raw_data = json.dumps(item, ensure_ascii=False)
 
@@ -282,8 +335,8 @@ class ApfsCrawler(BaseCrawler):
                 author=author,
                 category=item.get("category", ""),
                 target="",
-                period_start=published_date,
-                period_end=None,
+                period_start=period_start,
+                period_end=period_end,
                 raw_data=raw_data,
             )
 
