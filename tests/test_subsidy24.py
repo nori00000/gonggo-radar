@@ -6,7 +6,6 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from alert.crawlers.subsidy24 import Subsidy24Crawler
-from alert.models import RawAnnouncement
 
 
 class TestSubsidy24Crawler:

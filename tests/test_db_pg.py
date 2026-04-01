@@ -5,7 +5,6 @@ Run with:
     pytest tests/test_db_pg.py -v
 """
 
-import json
 import os
 
 import pytest
@@ -20,7 +19,7 @@ pytestmark = pytest.mark.skipif(
 def _pg_available() -> bool:
     """Check if psycopg2 is importable and DATABASE_URL is set."""
     try:
-        import psycopg2
+        import psycopg2  # noqa: F401
         url = os.getenv("DATABASE_URL", "")
         return url.startswith(("postgresql://", "postgres://"))
     except ImportError:

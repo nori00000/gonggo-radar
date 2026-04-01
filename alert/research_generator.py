@@ -188,7 +188,7 @@ class ResearchGenerator:
         period_label = self._period_label(period_start, period_end)
 
         lines = [
-            f"## 1. 분기 개요",
+            "## 1. 분기 개요",
             "",
             f"**{period_label}** 기간 동안 총 **{stats['total_announcements']}건**의 공고가 수집되었습니다.",
             f"평균 관련성 점수: **{stats['average_relevance']:.1%}**",

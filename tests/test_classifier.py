@@ -1,7 +1,7 @@
 """Tests for alert.classifier -- keyword matching and domain classification."""
 
 import pytest
-from alert.classifier import DomainClassifier, DOMAIN_KOREAN_MAP, DOMAIN_KEYWORDS
+from alert.classifier import DomainClassifier, DOMAIN_KEYWORDS
 
 
 class TestMatchKeyword:

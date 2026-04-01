@@ -15,7 +15,7 @@ from typing import Any, List, Tuple
 import sqlite3
 
 try:
-    import psycopg2
+    import psycopg2  # noqa: F401
     _PG_AVAILABLE = True
 except ImportError:
     _PG_AVAILABLE = False

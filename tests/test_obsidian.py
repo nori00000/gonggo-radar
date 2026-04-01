@@ -1,6 +1,5 @@
 """Tests for alert.obsidian -- filename sanitization and CMDS compliance."""
 
-import pytest
 from alert.obsidian import ObsidianSync
 
 

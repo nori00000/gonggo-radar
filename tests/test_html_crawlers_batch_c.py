@@ -8,7 +8,6 @@ import pytest
 from alert.crawlers.nongup_gg import NongupGgCrawler
 from alert.crawlers.rda import RdaCrawler
 from alert.crawlers.semas import SemasCrawler
-from alert.models import RawAnnouncement
 
 
 # ============================================================

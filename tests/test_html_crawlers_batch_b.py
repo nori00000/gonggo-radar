@@ -1,6 +1,5 @@
 """Tests for HTML crawlers Batch B: SocialenterpriseCrawler, EkrCrawler, EpisCrawler."""
 
-import json
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -8,7 +7,6 @@ import pytest
 from alert.crawlers.socialenterprise import SocialenterpriseCrawler
 from alert.crawlers.ekr import EkrCrawler
 from alert.crawlers.epis import EpisCrawler
-from alert.models import RawAnnouncement
 
 
 # ---------------------------------------------------------------------------

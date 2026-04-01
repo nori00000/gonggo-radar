@@ -1,7 +1,7 @@
 """Tests for alert/crawlers/ (BaseCrawler and specific crawlers)."""
 
 import json
-from unittest.mock import MagicMock, Mock, patch, PropertyMock
+from unittest.mock import MagicMock, patch
 
 import pytest
 import requests
@@ -515,7 +515,7 @@ class TestG2bCrawler:
                 }
 
                 with patch.object(crawler, "get", return_value=mock_response) as mock_get:
-                    results = crawler.fetch()
+                    crawler.fetch()
 
                     # Should call get 3 times (once for each operation)
                     assert mock_get.call_count == 3

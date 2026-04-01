@@ -1,13 +1,8 @@
 """Tests for alert.db -- insert, duplicate handling, field validation."""
 
-import json
-import sqlite3
-import tempfile
-from pathlib import Path
 
 import pytest
 from alert.db import Database
-from alert.models import AnalyzedAnnouncement, ApplicationRecord
 
 
 @pytest.fixture

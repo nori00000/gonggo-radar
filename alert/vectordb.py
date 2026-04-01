@@ -1,6 +1,5 @@
 """벡터 임베딩 저장 및 유사도 검색 -- sqlite-vec + OpenAI."""
 
-import json
 import logging
 import os
 import struct

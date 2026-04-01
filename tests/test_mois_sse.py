@@ -1,6 +1,5 @@
 """Tests for MoisSseCrawler (행정안전부 사회연대경제)."""
 
-import json
 from unittest.mock import MagicMock, patch
 
 import pytest

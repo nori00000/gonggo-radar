@@ -1,7 +1,6 @@
 """Tests for alert.config -- YAML loading and knowledge config."""
 
-import pytest
-from alert.config import get_config, KnowledgeConfig, ObsidianConfig, ClassifierConfig
+from alert.config import get_config, KnowledgeConfig, ObsidianConfig
 
 
 class TestConfigLoads:

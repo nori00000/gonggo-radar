@@ -1,7 +1,6 @@
 """로깅 유틸리티 -- RotatingFileHandler + StreamHandler 설정."""
 
 import logging
-import os
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 

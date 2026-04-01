@@ -8,7 +8,7 @@ import os
 import sqlite3
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional
 
 from .models import AnalyzedAnnouncement, ApplicationRecord, Keyword, ResearchDocument
 

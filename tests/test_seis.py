@@ -1,6 +1,5 @@
 """Tests for SeisCrawler (사회적기업포털 SEIS)."""
 
-import json
 from unittest.mock import MagicMock, patch
 
 import pytest

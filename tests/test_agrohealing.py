@@ -1,12 +1,10 @@
 """Tests for AgrohealingCrawler."""
 
-import json
 from unittest.mock import MagicMock, patch
 
 import pytest
 
 from alert.crawlers.agrohealing import AgrohealingCrawler
-from alert.models import RawAnnouncement
 
 
 class TestAgrohealingCrawler:

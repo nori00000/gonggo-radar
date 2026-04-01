@@ -1,7 +1,6 @@
 """Tests for alert/n8n_hook.py (N8nHook class)."""
 
 from unittest.mock import MagicMock, Mock, patch
-from datetime import datetime
 
 import pytest
 

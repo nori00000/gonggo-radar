@@ -1,11 +1,10 @@
 """n8n 웹훅 연동 -- HTTP POST 이벤트 발송."""
 
-import json
 import logging
 
 __all__ = ["N8nHook"]
 from datetime import datetime
-from typing import Any, Optional
+from typing import Any
 
 logger = logging.getLogger(__name__)
 

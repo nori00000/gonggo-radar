@@ -8,7 +8,6 @@ import pytest
 from alert.crawlers.kosmes import KosmesCrawler
 from alert.crawlers.ipet import IpetCrawler
 from alert.crawlers.apfs import ApfsCrawler
-from alert.models import RawAnnouncement
 
 
 # ============================================================

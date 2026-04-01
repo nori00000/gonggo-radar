@@ -1,7 +1,6 @@
 """Tests for alert/analyzer.py (KeywordAnalyzer and ClaudeAnalyzer)."""
 
-import json
-from unittest.mock import MagicMock, Mock, patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -95,7 +94,7 @@ class TestKeywordAnalyzer:
         mock_db.init_default_keywords.return_value = None
 
         with patch("alert.analyzer.get_config", return_value=mock_config):
-            analyzer = KeywordAnalyzer(db=mock_db)
+            KeywordAnalyzer(db=mock_db)
 
             # Should call init_default_keywords when empty
             mock_db.init_default_keywords.assert_called_once()
@@ -407,7 +406,7 @@ class TestClaudeAnalyzer:
             with patch("alert.analyzer.ANTHROPIC_AVAILABLE", True):
                 with patch("alert.analyzer.anthropic.Anthropic", return_value=mock_client):
                     analyzer = ClaudeAnalyzer()
-                    results = analyzer.analyze_batch(announcements)
+                    analyzer.analyze_batch(announcements)
 
                     # Should only analyze first announcement (score >= 0.5)
                     assert mock_client.messages.create.call_count == 1

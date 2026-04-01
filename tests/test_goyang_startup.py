@@ -1,12 +1,10 @@
 """Tests for GoyangStartupCrawler."""
 
-import json
 from unittest.mock import MagicMock, patch
 
 import pytest
 
 from alert.crawlers.goyang_startup import GoyangStartupCrawler
-from alert.models import RawAnnouncement
 
 
 class TestGoyangStartupCrawler:

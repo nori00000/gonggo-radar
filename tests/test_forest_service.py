@@ -1,12 +1,10 @@
 """Tests for alert/crawlers/forest_service.py (ForestServiceCrawler)."""
 
-import json
 from unittest.mock import MagicMock, patch
 
 import pytest
 
 from alert.crawlers.forest_service import ForestServiceCrawler
-from alert.models import RawAnnouncement
 
 
 class TestForestServiceCrawler:

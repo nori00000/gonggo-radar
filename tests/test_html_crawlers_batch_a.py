@@ -1,6 +1,5 @@
 """Tests for HTML crawlers Batch A: GyeonggiCrawler, GafiCrawler, GbsaCrawler."""
 
-import json
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -8,7 +7,6 @@ import pytest
 from alert.crawlers.gyeonggi import GyeonggiCrawler
 from alert.crawlers.gafi import GafiCrawler
 from alert.crawlers.gbsa import GbsaCrawler
-from alert.models import RawAnnouncement
 
 
 # ---------------------------------------------------------------------------
