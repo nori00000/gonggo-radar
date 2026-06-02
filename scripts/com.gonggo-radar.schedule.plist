@@ -11,7 +11,7 @@
         <string>alert.main</string>
     </array>
     <key>WorkingDirectory</key>
-    <string>/Users/leesangmin/gonggo-radar</string>
+    <string>/gonggo-radar</string>
     <key>StartCalendarInterval</key>
     <array>
         <dict>
@@ -34,9 +34,9 @@
         </dict>
     </array>
     <key>StandardOutPath</key>
-    <string>/Users/leesangmin/gonggo-radar/logs/schedule.log</string>
+    <string>/gonggo-radar/logs/schedule.log</string>
     <key>StandardErrorPath</key>
-    <string>/Users/leesangmin/gonggo-radar/logs/schedule-error.log</string>
+    <string>/gonggo-radar/logs/schedule-error.log</string>
     <key>EnvironmentVariables</key>
     <dict>
         <key>PATH</key>

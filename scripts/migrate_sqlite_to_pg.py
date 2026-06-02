@@ -2,7 +2,7 @@
 """SQLite → PostgreSQL 데이터 이관 스크립트.
 
 사용법:
-    DATABASE_URL=postgresql://agrion:pass@localhost:5432/agrion_db \
+    DATABASE_URL=postgresql://gonggo_user:change_me@localhost:5432/gonggo_db \
     python scripts/migrate_sqlite_to_pg.py [--sqlite-path alert/data/announcements.db]
 
 멱등성 보장: ON CONFLICT DO NOTHING으로 중복 실행 안전.

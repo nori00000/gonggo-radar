@@ -5,10 +5,16 @@
   "scripts": {
     "test": "echo \"Error: no test specified\" && exit 1"
   },
-  "keywords": [],
-  "author": "",
-  "license": "ISC",
-  "description": "",
+  "keywords": [
+    "crawler",
+    "public-announcements",
+    "agriculture",
+    "landscaping",
+    "n8n"
+  ],
+  "author": "nori00000",
+  "license": "MIT",
+  "description": "Crawler and analysis pipeline for agriculture, landscaping, healing-industry, and public-support announcements.",
   "dependencies": {
     "puppeteer": "^24.40.0",
     "xlsx": "^0.18.5"

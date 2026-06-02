@@ -72,7 +72,7 @@ const fs = require('fs');
 
   // Dump the page HTML
   const html = await page.content();
-  fs.writeFileSync('/Users/leesangmin/gonggo-radar/page_dump.html', html);
+  fs.writeFileSync('/gonggo-radar/page_dump.html', html);
   console.log('페이지 HTML 저장 완료');
 
   // Comprehensive form analysis
@@ -181,7 +181,7 @@ const fs = require('fs');
     return info;
   });
 
-  fs.writeFileSync('/Users/leesangmin/gonggo-radar/form_info.json',
+  fs.writeFileSync('/gonggo-radar/form_info.json',
     JSON.stringify(formInfo, null, 2));
 
   console.log('\n========== 분석 결과 ==========');
@@ -233,7 +233,7 @@ const fs = require('fs');
   console.log(formInfo.bodyText?.substring(0, 2000));
 
   // Take screenshots
-  await page.screenshot({ path: '/Users/leesangmin/gonggo-radar/page_screenshot.png', fullPage: true });
+  await page.screenshot({ path: '/gonggo-radar/page_screenshot.png', fullPage: true });
   console.log('\n스크린샷 저장 완료');
 
   console.log('\n15초 후 브라우저를 닫습니다...');

@@ -1,7 +1,7 @@
 """Tests for PostgreSQL backend -- skipped when DATABASE_URL is not set.
 
 Run with:
-    DATABASE_URL=postgresql://agrion:pass@localhost:5432/agrion_test \
+    DATABASE_URL=postgresql://gonggo_user:change_me@localhost:5432/gonggo_test \
     pytest tests/test_db_pg.py -v
 """
 

@@ -2,10 +2,10 @@ const XLSX = require('xlsx');
 const fs = require('fs');
 
 // 원본 템플릿 읽기
-const wb = XLSX.readFile('/Users/leesangmin/Downloads/영농일지+일괄등록_20260323.xlsx');
+const wb = XLSX.readFile('/Downloads/영농일지+일괄등록_20260323.xlsx');
 
 // 작업 스케줄 데이터
-const schedule = JSON.parse(fs.readFileSync('/Users/leesangmin/.omc/scientist/work_schedule.json', 'utf8'));
+const schedule = JSON.parse(fs.readFileSync('/.omc/scientist/work_schedule.json', 'utf8'));
 
 // 날짜를 Excel 시리얼 번호로 변환
 function dateToExcelSerial(dateStr) {
@@ -160,7 +160,7 @@ newWs['!merges'] = [
 wb.Sheets['작업일지'] = newWs;
 
 // 파일 저장
-const outputPath = '/Users/leesangmin/Downloads/영농일지_일괄등록_완성본.xlsx';
+const outputPath = '/Downloads/영농일지_일괄등록_완성본.xlsx';
 XLSX.writeFile(wb, outputPath);
 
 console.log(`\n========================================`);

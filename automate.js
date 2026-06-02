@@ -2,7 +2,7 @@ const puppeteer = require('puppeteer');
 const fs = require('fs');
 
 // 작업 스케줄 데이터
-const schedule = JSON.parse(fs.readFileSync('/Users/leesangmin/.omc/scientist/work_schedule.json', 'utf8'));
+const schedule = JSON.parse(fs.readFileSync('/.omc/scientist/work_schedule.json', 'utf8'));
 
 // 작업단계 매핑 (한국어 → 사이트에서 사용하는 값)
 const TASK_STEP_MAP = {
@@ -411,7 +411,7 @@ function sleep(ms) {
       } else if (saveResult.reason === 'validation_failed') {
         console.log('  [!] 유효성 검사 실패');
         // 스크린샷 저장
-        await page.screenshot({ path: `/Users/leesangmin/gonggo-radar/fail_${entry.no}.png` });
+        await page.screenshot({ path: `/gonggo-radar/fail_${entry.no}.png` });
         failCount++;
       } else {
         console.log(`  [!] 저장 실패: ${saveResult.reason} (code: ${saveResult.code})`);
@@ -441,7 +441,7 @@ function sleep(ms) {
   console.log('======================================');
 
   // 결과 파일 저장
-  fs.writeFileSync('/Users/leesangmin/gonggo-radar/result.json', JSON.stringify({
+  fs.writeFileSync('/gonggo-radar/result.json', JSON.stringify({
     total: schedule.length,
     success: successCount,
     fail: failCount,

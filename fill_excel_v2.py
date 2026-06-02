@@ -6,14 +6,14 @@ import copy
 import random
 
 # 원본 템플릿 읽기
-src = '/Users/leesangmin/Downloads/영농일지+일괄등록_20260323.xlsx'
-dst = '/Users/leesangmin/Downloads/영농일지_일괄등록_완성본_v2.xlsx'
+src = '/Downloads/영농일지+일괄등록_20260323.xlsx'
+dst = '/Downloads/영농일지_일괄등록_완성본_v2.xlsx'
 
 wb = openpyxl.load_workbook(src)
 ws = wb['작업일지']
 
 # 스케줄 데이터 읽기
-with open('/Users/leesangmin/.omc/scientist/work_schedule.json', 'r') as f:
+with open('/.omc/scientist/work_schedule.json', 'r') as f:
     schedule = json.load(f)
 
 # Data2에서 정확한 필지명 확인

@@ -1,5 +1,12 @@
 # 공고알림봇 (Agricultural Announcement Alert Bot)
 
+> **한눈에 / At a glance**
+>
+> A crawler and analysis pipeline for agricultural, landscape, healing-industry, and public-support announcements.
+>
+> 한영 프로젝트 설명, 검색 키워드, 저작권 범위: [PROJECT.md](./PROJECT.md) · [NOTICE.md](./NOTICE.md) · [PUBLICATION_REVIEW.md](./PUBLICATION_REVIEW.md)
+
+
 [![Python 3.11+](https://img.shields.io/badge/python-3.11+-blue.svg)](https://www.python.org/downloads/)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 [![Tests: 53 passed](https://img.shields.io/badge/tests-53%20passed-brightgreen.svg)](tests/)
