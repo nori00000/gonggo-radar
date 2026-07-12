@@ -231,10 +231,11 @@ def run_pipeline(test_mode: bool = False) -> None:
             )
 
             # ---------------------------------------------------------------------------
-            # Stage 3: Claude analysis (if available and configured)
+            # Stage 3: LLM analysis (Claude API or Ollama fallback, if available)
             # ---------------------------------------------------------------------------
 
-            if relevant_count > 0 and claude_analyzer.client:
+            llm_available = claude_analyzer.client or claude_analyzer.backend == "ollama"
+            if relevant_count > 0 and llm_available:
                 logger.info(f"{crawler_name}: Running Claude analysis on {relevant_count} announcements")
                 analyzed = claude_analyzer.analyze_batch(analyzed)
 
@@ -306,41 +307,55 @@ def run_pipeline(test_mode: bool = False) -> None:
     # Get unnotified announcements from database
     unnotified = db.get_unnotified()
 
+    notified_count = 0
+
     if not unnotified:
         logger.info("No new announcements to notify")
     else:
         logger.info(f"Found {len(unnotified)} unnotified announcements")
+        batch = unnotified[:1] if test_mode else unnotified
 
         # Send Telegram notifications
+        telegram_ok = True
         if config.notifier.telegram.enabled:
-            logger.info("Sending Telegram notifications...")
-            if test_mode:
-                # In test mode, only send first announcement
-                test_batch = unnotified[:1]
-                telegram.send_batch(test_batch)
+            if telegram.bot_token and telegram.chat_id:
+                logger.info("Sending Telegram notifications...")
+                telegram_sent = telegram.send_batch(batch)
+                telegram_ok = telegram_sent == len(batch)
             else:
-                telegram.send_batch(unnotified)
+                logger.info("Telegram not configured (missing token/chat_id), skipping")
         else:
             logger.info("Telegram notifications disabled")
 
         # Send Email digest
+        email_ok = True
         if config.notifier.email.enabled:
-            logger.info("Sending Email digest...")
-            today = datetime.now().strftime("%Y-%m-%d")
-            if test_mode:
-                # In test mode, only send first announcement
-                test_batch = unnotified[:1]
-                email.send_digest(test_batch, today)
+            if email.sender and email.password:
+                logger.info("Sending Email digest...")
+                today = datetime.now().strftime("%Y-%m-%d")
+                email_ok = email.send_digest(batch, today)
             else:
-                email.send_digest(unnotified, today)
+                logger.info("Email not configured (missing credentials), skipping")
         else:
             logger.info("Email notifications disabled")
 
-        # Mark all as notified
+        # Mark as notified only when every enabled channel actually delivered.
+        # Previously this ran unconditionally, so a Telegram failure (e.g. a
+        # revoked bot token returning 401) still marked announcements as
+        # notified and reported them as "sent" -- silently losing them with
+        # no retry and no visible signal that delivery had stopped working.
         if not test_mode:
-            for ann in unnotified:
-                db.mark_notified(ann.source_id)
-            logger.info(f"Marked {len(unnotified)} announcements as notified")
+            if telegram_ok and email_ok:
+                for ann in unnotified:
+                    db.mark_notified(ann.source_id)
+                notified_count = len(unnotified)
+                logger.info(f"Marked {notified_count} announcements as notified")
+            else:
+                logger.error(
+                    f"Notification delivery failed (telegram_ok={telegram_ok}, "
+                    f"email_ok={email_ok}) - {len(unnotified)} announcements left "
+                    "unnotified for retry on next run"
+                )
 
     # ---------------------------------------------------------------------------
     # Stage 6: Record run history
@@ -352,7 +367,7 @@ def run_pipeline(test_mode: bool = False) -> None:
             total=stats["total_fetched"],
             new=stats["new_count"],
             relevant=stats["relevant_count"],
-            notified=len(unnotified) if stats["status"] == "success" else 0,
+            notified=notified_count if stats["status"] == "success" else 0,
             status=stats["status"],
             error_msg=stats.get("error_message", ""),
         )
@@ -372,7 +387,7 @@ def run_pipeline(test_mode: bool = False) -> None:
     logger.info(f"Total announcements fetched: {total_fetched}")
     logger.info(f"Total new announcements: {total_new}")
     logger.info(f"Total relevant announcements: {total_relevant}")
-    logger.info(f"Notifications sent: {len(unnotified)}")
+    logger.info(f"Notifications sent: {notified_count}")
 
     logger.info("\nPer-source breakdown:")
     for crawler_name, stats in run_stats.items():
@@ -535,7 +550,7 @@ def main() -> None:
 Examples:
   python -m alert.main                  # 1회 실행 (crawl + analyze + notify)
   python -m alert.main --daemon         # 데몬 모드 (cron_hours에 맞춰 자동 실행)
-  python -m alert.main --bot            # 텔레그램 봇 모드 (polling, Phase 5에서 구현)
+  python -m alert.main --bot            # 텔레그램 봇 모드 (polling, 13개 커맨드 지원)
   python -m alert.main --test           # 테스트 모드 (크롤 1개만, 알림 테스트)
   python -m alert.main --sync-keywords  # config.yaml → DB 키워드 동기화 (추가만)
         """
