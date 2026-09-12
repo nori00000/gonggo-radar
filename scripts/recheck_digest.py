@@ -86,7 +86,7 @@ def recheck(markdown_path: Path, db_path: str, check_path: Path):
 def write_failure(check_path: Path, markdown_path: Path, reason: str) -> None:
     """재검증 실패를 check.json 에 착지 (과거 pass 를 남겨두지 않는다)."""
     try:
-        md_sha = markdown_sha256(markdown_path.read_text(encoding="utf-8"))
+        md_sha = markdown_sha256(markdown_path.read_bytes())
     except OSError:
         md_sha = ""
     write_check_result(check_path, {
@@ -98,7 +98,7 @@ def write_failure(check_path: Path, markdown_path: Path, reason: str) -> None:
         "item_sections": [],
         "commentary_sections": [],
         "reason": f"재검증 실패: {reason}",
-        "md_sha256": md_sha,
+        "markdown_sha256": md_sha,
     })
 
 

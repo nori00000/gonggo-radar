@@ -261,10 +261,19 @@ def revert_sending(state: Dict) -> Dict:
 def release_sending(state: Dict) -> Dict:
     """사람의 `/digest 해제` — 미확정 발송 표시를 수동으로 푼다 (사이클2 #1).
 
+    사이클3 판정: **draft 로 되돌리고 미리보기·카드도 무효화한다.** 해제 후에는
+    새 미리보기·새 카드 없이는 발송할 수 없다(preview_sha 삭제 → 게이트가 거부).
     사유는 호출자가 로그에 남긴다(상태 파일 스키마는 늘리지 않는다).
     apply_state(..., escape=True) 로만 저장된다.
     """
-    return revert_sending(state)
+    if state.get("status") != "sending":
+        raise TransitionError("sending 상태가 아닙니다")
+    updated = dict(state)
+    updated["status"] = "draft"
+    updated["sending_at"] = None
+    updated["preview_sha"] = None
+    updated["card_message_id"] = None
+    return updated
 
 
 def mark_draft(state: Dict) -> Dict:

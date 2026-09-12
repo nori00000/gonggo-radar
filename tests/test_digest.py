@@ -794,7 +794,7 @@ class TestSendDigest:
             "pass": True,
             "network_checked": True,
             "reason": "",
-            "md_sha256": markdown_sha256(body),
+            "markdown_sha256": markdown_sha256(md_path.read_bytes()),
         }))
 
         # dry_run=True가 기본값이므로 발송 안 함
@@ -831,7 +831,7 @@ class TestSendDigest:
             "pass": True,
             "network_checked": True,
             "reason": "",
-            "md_sha256": markdown_sha256(body),
+            "markdown_sha256": markdown_sha256(md_path.read_bytes()),
         }))
 
         smtp_mock = mock.MagicMock()
@@ -859,7 +859,7 @@ class TestSendDigest:
             "pass": True,
             "network_checked": True,
             "reason": "",
-            "md_sha256": markdown_sha256(body),
+            "markdown_sha256": markdown_sha256(md_path.read_bytes()),
         }))
 
         monkeypatch.setenv("EMAIL_SENDER", "sender@x.com")
@@ -895,11 +895,11 @@ class TestSendDigest:
         state_path = state_mod.state_path_for_markdown(md_path)
         state_mod.save_state(state_path, state_mod.record_preview(
             state_mod.default_state(state_mod.week_from_markdown(md_path)),
-            [2014], [], markdown_sha256(body),
+            [2014], [], markdown_sha256(md_path.read_bytes()),
         ))
 
         rc = send_digest(md_path, to_email="third@example.com", dry_run=False,
-                         approved_sha=markdown_sha256(body)[:8])
+                         approved_sha=markdown_sha256(md_path.read_bytes())[:8])
 
         assert rc == 0
         assert sent["to"] == "third@example.com"

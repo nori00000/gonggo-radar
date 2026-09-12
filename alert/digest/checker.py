@@ -12,15 +12,6 @@ from alert.digest import prune
 from alert.digest import sections as sections_mod
 
 
-def markdown_sha256(markdown_text: str) -> str:
-    """검증한 본문의 지문 (계약 W10 크리틱 #3).
-
-    check.json 에 이 값을 남기면 "과거 검증 재사용"을 발송 게이트가 잡아낼 수 있다 —
-    본문이 한 글자라도 바뀌면 해시가 달라지므로 재검증 없이는 발송되지 않는다.
-    """
-    return hashlib.sha256((markdown_text or "").encode("utf-8")).hexdigest()
-
-
 def dead_urls(result: Dict) -> List[str]:
     """검증 결과에서 아직 본문에 남아 있는 죽은 URL 목록."""
     return [
@@ -28,6 +19,16 @@ def dead_urls(result: Dict) -> List[str]:
         for item in (result or {}).get("items") or []
         if not item.get("url_alive")
     ]
+
+
+def markdown_sha256(markdown_bytes: bytes) -> str:
+    """검증 결과를 **원시 파일 바이트**에 결속하는 SHA-256 (계약 W10 · PR #1).
+
+    정본은 파일 바이트다 — CRLF 만 바뀐 본문도 해시가 달라져 재검증을 요구한다.
+    check.json 의 키는 `markdown_sha256` 하나이고, 텍스트 정규화 해시는 쓰지 않는다.
+    미리보기 지문(state.preview_sha)·승인 카드 지문·`--approved-sha` 도 모두 이 값이다.
+    """
+    return hashlib.sha256(markdown_bytes).hexdigest()
 
 
 def parse_period_end(period_end_str: Optional[str]) -> bool:
@@ -142,7 +143,7 @@ def check_digest(
 
     Returns:
         {"items": [...], "dropped": [...], "pass": bool, "network_checked": bool,
-        "reason": str} 형태의 검증 결과.
+        "reason": str, "markdown_sha256": str} 형태의 검증 결과.
 
         계약 v1.2: deadline_parsed는 정보 필드이며 게이트가 아니다. url_alive=False
         항목은 dropped에 기록되고 다이제스트에서 제외된다. pass=False 조건은
@@ -160,15 +161,16 @@ def check_digest(
             "item_sections": [],
             "commentary_sections": [],
             "reason": "마크다운 파일 없음",
-            "md_sha256": "",
+            "markdown_sha256": "",
         }
         result = _apply_warnings(result, warnings)
         write_check_result(output_path, result)
         return result
 
-    # 마크다운에서 URL 추출
-    with open(markdown_path, "r", encoding="utf-8") as f:
-        markdown_text = f.read()
+    # Markdown text and its binding hash must derive from the same source bytes.
+    markdown_bytes = markdown_path.read_bytes()
+    markdown_text = markdown_bytes.decode("utf-8")
+    content_hash = markdown_sha256(markdown_bytes)
 
     # [텍스트](URL) 형식에서 URL 추출
     url_pattern = r'\[([^\]]+)\]\(([^)]+)\)'
@@ -185,7 +187,7 @@ def check_digest(
             "item_sections": list(sections_mod.classify(markdown_text)[0]),
             "commentary_sections": list(sections_mod.classify(markdown_text)[1]),
             "reason": "항목 없음",
-            "md_sha256": markdown_sha256(markdown_text),
+            "markdown_sha256": content_hash,
         }
         result = _apply_warnings(result, warnings)
         write_check_result(output_path, result)
@@ -284,7 +286,7 @@ def check_digest(
         # 실제로 네트워크 검사한 URL이 0건이면 False
         "network_checked": network_checked,
         "reason": reason,
-        "md_sha256": markdown_sha256(markdown_text),
+        "markdown_sha256": content_hash,
     }
     result = _apply_warnings(result, warnings)
 

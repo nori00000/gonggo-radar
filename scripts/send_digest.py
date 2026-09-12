@@ -3,6 +3,7 @@
 
 import argparse
 import html as html_module
+import hmac
 import json
 import re
 import sys
@@ -137,30 +138,19 @@ def markdown_to_html(markdown_text: str) -> str:
     return html_body
 
 
-def check_fail_closed(markdown_path: Path, check_json_path: Path) -> Tuple[bool, str]:
-    """fail-closed 조건 확인 (경로 기반 래퍼).
+def _check_fail_closed_bytes(
+    markdown_bytes: bytes, check_json_path: Path
+) -> Tuple[bool, str]:
+    """이미 읽어 둔 **원시 바이트**로 fail-closed 판정 (계약 W10 · PR #1).
 
-    Args:
-        markdown_path: 마크다운 파일 경로
-        check_json_path: 검증 JSON 파일 경로
-
-    Returns:
-        (통과 여부, 실패 메시지)
+    파일을 다시 읽지 않는 것이 핵심이다 — 게이트가 본 바이트와 발송하는 바이트가
+    같아야 TOCTOU(검사 통과 후 본문 교체)가 닫힌다. 해시 기준도 이 바이트다.
     """
     try:
-        with open(markdown_path, "r", encoding="utf-8") as f:
-            markdown_text = f.read()
-    except Exception as e:
-        return False, f"마크다운 읽기 실패: {e}"
-    return check_gate(markdown_text, check_json_path)
+        markdown_text = markdown_bytes.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        return False, f"마크다운 읽기 실패: {exc}"
 
-
-def check_gate(markdown_text: str, check_json_path: Path) -> Tuple[bool, str]:
-    """이미 읽어 둔 본문으로 게이트 판정 (계약 W10 사이클2 #2).
-
-    파일을 다시 읽지 않는 것이 핵심이다 — 게이트가 본 본문과 발송하는 본문이
-    같아야 TOCTOU(검사 통과 후 본문 교체)가 닫힌다.
-    """
     if "<!-- 상민 확정 필요 -->" in markdown_text:
         return False, "마크다운에 미확정 마커가 있습니다"
 
@@ -173,6 +163,14 @@ def check_gate(markdown_text: str, check_json_path: Path) -> Tuple[bool, str]:
             check_result = json.load(f)
     except (json.JSONDecodeError, OSError) as e:
         return False, f"검증 파일 손상: {e}"
+
+    # check.json은 검증한 바로 그 마크다운 바이트에만 유효하다. 사람이 검증 후
+    # 본문을 바꾸거나 다른 주차의 결과 파일을 복사해도 발송하면 안 된다.
+    recorded_hash = check_result.get("markdown_sha256")
+    if not isinstance(recorded_hash, str) or not recorded_hash:
+        return False, "검증 파일에 마크다운 SHA-256이 없음"
+    if not hmac.compare_digest(recorded_hash, markdown_sha256(markdown_bytes)):
+        return False, "마크다운이 검증 후 변경됨"
 
     # pass=false 확인
     if not check_result.get("pass", False):
@@ -192,15 +190,24 @@ def check_gate(markdown_text: str, check_json_path: Path) -> Tuple[bool, str]:
     if not check_result.get("network_checked", False):
         return False, "네트워크 검증이 실행되지 않음"
 
-    # 계약 W10 크리틱 #3: 검증이 **지금 이 본문**을 본 것인지 확인한다.
-    # 해시가 없으면(구버전 check.json) 과거 검증일 수 있으므로 거부한다.
-    recorded = check_result.get("md_sha256")
-    if not recorded:
-        return False, "검증에 본문 해시가 없음 — 재검증 필요"
-    if recorded != markdown_sha256(markdown_text):
-        return False, "검증 이후 본문이 바뀜 — 재검증 필요"
-
     return True, ""
+
+
+def check_fail_closed(markdown_path: Path, check_json_path: Path) -> Tuple[bool, str]:
+    """Read a Markdown file and check its fail-closed conditions.
+
+    Args:
+        markdown_path: 마크다운 파일 경로
+        check_json_path: 검증 JSON 파일 경로
+
+    Returns:
+        (통과 여부, 실패 메시지)
+    """
+    try:
+        markdown_bytes = markdown_path.read_bytes()
+    except OSError as e:
+        return False, f"마크다운 읽기 실패: {e}"
+    return _check_fail_closed_bytes(markdown_bytes, check_json_path)
 
 
 def send_digest(
@@ -232,15 +239,17 @@ def send_digest(
     check_json_path = markdown_path.with_suffix(".check.json")
 
     if dry_run:
+        # 드라이런도 게이트가 본 바이트를 그대로 렌더한다 (해시 기준 일치)
         try:
-            markdown_text = markdown_path.read_text(encoding="utf-8")
+            markdown_bytes = markdown_path.read_bytes()
         except OSError as exc:
             print(f"✗ 마크다운 읽기 실패: {exc}", file=sys.stderr)
             return 2
-        passed, msg = check_gate(markdown_text, check_json_path)
+        passed, msg = _check_fail_closed_bytes(markdown_bytes, check_json_path)
         if not passed:
             print(f"✗ 발송 거부: {msg}", file=sys.stderr)
             return 2
+        markdown_text = markdown_bytes.decode("utf-8")
         html_text = markdown_to_html(markdown_text)
         recipients = to_email if to_email else "[config에서 설정]"
         print(f"[DRY-RUN] 발송 대상: {recipients}")
@@ -256,7 +265,7 @@ def send_digest(
     approved = (approved_sha or "").strip().lower()
     if not APPROVED_SHA_RE.match(approved):
         try:
-            current = markdown_sha256(markdown_path.read_text(encoding="utf-8"))
+            current = markdown_sha256(markdown_path.read_bytes())
         except OSError:
             current = "?"
         problem = "없습니다" if not approved else f"형식이 아닙니다: {approved!r}"
@@ -318,16 +327,22 @@ def _send_locked(
 ) -> int:
     """잠금을 쥔 상태의 발송 본체.
 
-    본문은 **잠금 안에서 한 번만** 읽고, 그 텍스트로 게이트·렌더·발송을 모두 한다
-    (사이클2 #2 — 검사와 발송 사이에 파일이 바뀔 틈을 없앤다).
+    본문은 **잠금 안에서 한 번만** 바이트로 읽고, 그 바이트로 해시·게이트·렌더·발송을
+    모두 한다 (사이클2 #2 — 검사와 발송 사이에 파일이 바뀔 틈을 없앤다).
     """
     try:
-        markdown_text = markdown_path.read_text(encoding="utf-8")
+        markdown_bytes = markdown_path.read_bytes()
     except OSError as exc:
         print(f"✗ 발송 거부: 마크다운 읽기 실패 — {exc}", file=sys.stderr)
         return 2
 
-    current_sha = markdown_sha256(markdown_text)
+    try:
+        markdown_text = markdown_bytes.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        print(f"✗ 발송 거부: 마크다운 디코드 실패 — {exc}", file=sys.stderr)
+        return 2
+
+    current_sha = markdown_sha256(markdown_bytes)
     approved = str(approved_sha).strip().lower()
     if not current_sha.startswith(approved):
         print(
@@ -337,7 +352,7 @@ def _send_locked(
         )
         return 2
 
-    passed, msg = check_gate(markdown_text, check_json_path)
+    passed, msg = _check_fail_closed_bytes(markdown_bytes, check_json_path)
     if not passed:
         print(f"✗ 발송 거부: {msg}", file=sys.stderr)
         return 2

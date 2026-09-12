@@ -1,5 +1,6 @@
 """텔레그램 승인 게이트: 상태 파일·미리보기 렌더·해설 치환·발송 기록 테스트 (계약 W10)."""
 
+import hashlib
 import json
 import sqlite3
 from pathlib import Path
@@ -14,7 +15,7 @@ from alert.digest.checker import check_digest, markdown_sha256
 from alert.utils.redact import redact
 from scripts.apply_commentary import apply_commentary, commentary_error
 from scripts.recheck_digest import main as recheck_main
-from scripts.send_digest import send_digest
+from scripts.send_digest import check_fail_closed, send_digest
 
 
 SAMPLE_MD = """<!-- lane: Codex(gpt-5.6) -->
@@ -220,12 +221,12 @@ def test_record_preview_stores_message_ids():
 
 # ─── 발송 게이트 ─────────────────────────────────────────────────────────
 def _write_digest(tmp_path, markdown_text=None, check=None):
-    """md + check.json. check 에 md_sha256 이 없으면 이 본문의 해시를 채운다."""
+    """md + check.json. check 에 해시가 없으면 그 파일의 **원시 바이트** 해시를 채운다."""
     text = markdown_text or SAMPLE_MD
     md = tmp_path / "2026-W37.md"
     md.write_text(text, encoding="utf-8")
     payload = dict(check or PASS_CHECK)
-    payload.setdefault("md_sha256", markdown_sha256(text))
+    payload.setdefault("markdown_sha256", markdown_sha256(md.read_bytes()))
     (tmp_path / "2026-W37.check.json").write_text(
         json.dumps(payload, ensure_ascii=False), encoding="utf-8"
     )
@@ -250,9 +251,9 @@ class _OkNotifier:
 
 
 def _sha8(md):
-    """그 파일 본문의 승인 지문 (계약 W10 사이클2 #2)."""
+    """그 파일의 승인 지문 — **원시 바이트** 해시 앞 8자 (PR #1 기준)."""
     from pathlib import Path as _Path
-    return markdown_sha256(_Path(md).read_text(encoding="utf-8"))[:8]
+    return markdown_sha256(_Path(md).read_bytes())[:8]
 
 
 def _send(md, **kwargs):
@@ -260,6 +261,42 @@ def _send(md, **kwargs):
     kwargs.setdefault("approved_by", "1401666801")
     kwargs.setdefault("approved_sha", _sha8(md))
     return send_digest(md, dry_run=False, **kwargs)
+
+
+# ─── PR #1: 검증-본문 바이트 결속 (origin/main 도입 테스트) ──────────────
+def test_check_hash_binds_valid_markdown_to_a_passed_gate(tmp_path):
+    annotated, _ = apply_commentary(SAMPLE_MD, "확정 의견")
+    md = _write_digest(tmp_path, annotated)
+
+    assert check_fail_closed(md, md.with_suffix(".check.json")) == (True, "")
+
+
+def test_send_gate_rejects_markdown_changed_after_check(tmp_path):
+    annotated, _ = apply_commentary(SAMPLE_MD, "확정 의견")
+    md = _write_digest(tmp_path, annotated)
+    md.write_text(annotated + "\n사후 변경", encoding="utf-8")
+
+    assert send_digest(md, dry_run=True) == 2
+
+
+def test_send_gate_rejects_line_ending_change_after_check(tmp_path):
+    """CRLF 로만 바뀐 본문도 거부 — 해시 기준이 원시 바이트이기 때문이다."""
+    annotated, _ = apply_commentary(SAMPLE_MD, "확정 의견")
+    md = _write_digest(tmp_path, annotated)
+    md.write_bytes(annotated.replace("\n", "\r\n").encode("utf-8"))
+
+    assert send_digest(md, dry_run=True) == 2
+
+
+def test_send_gate_rejects_check_without_markdown_hash(tmp_path):
+    annotated, _ = apply_commentary(SAMPLE_MD, "확정 의견")
+    md = _write_digest(tmp_path, annotated)
+    check_path = md.with_suffix(".check.json")
+    check = json.loads(check_path.read_text(encoding="utf-8"))
+    del check["markdown_sha256"]
+    check_path.write_text(json.dumps(check), encoding="utf-8")
+
+    assert send_digest(md, dry_run=True) == 2
 
 
 def test_send_digest_refuses_already_sent_week(tmp_path, monkeypatch):
@@ -359,6 +396,7 @@ def test_recheck_digest_preserves_commentary(tmp_path, monkeypatch):
         (tmp_path / "2026-W37.check.json").read_text(encoding="utf-8")
     )
     assert check["pass"] is True
+    assert check["markdown_sha256"] == hashlib.sha256(md.read_bytes()).hexdigest()
     assert len(check["items"]) == 3
     assert md.read_text(encoding="utf-8") == annotated
     assert preview_mod.MARKER not in md.read_text(encoding="utf-8")
@@ -375,7 +413,7 @@ def _seed_preview(md, sha=None):
     state = state_mod.load_state(path, week)
     state_mod.save_state(path, state_mod.record_preview(
         state, [2014], preview_mod.item_urls(md.read_text(encoding="utf-8")),
-        sha or markdown_sha256(md.read_text(encoding="utf-8")),
+        sha or markdown_sha256(md.read_bytes()),
     ))
     return path
 
@@ -557,7 +595,7 @@ def test_send_digest_refuses_check_without_hash(tmp_path, monkeypatch):
     """본문 해시가 없는 check.json(구버전)도 거부 — 과거 검증일 수 있다."""
     annotated, _ = apply_commentary(SAMPLE_MD, "확정 의견")
     md = _write_digest(
-        tmp_path, annotated, dict(PASS_CHECK, md_sha256=None)
+        tmp_path, annotated, dict(PASS_CHECK, markdown_sha256=None)
     )
     _seed_preview(md)
     (tmp_path / "2026-W37.check.json").write_text(
@@ -576,7 +614,7 @@ def _empty_db(tmp_path):
     return db
 
 
-def test_recheck_records_md_sha256(tmp_path, monkeypatch):
+def test_recheck_records_markdown_sha256(tmp_path, monkeypatch):
     annotated, _ = apply_commentary(SAMPLE_MD, "확정 의견")
     md = tmp_path / "2026-W37.md"
     md.write_text(annotated, encoding="utf-8")
@@ -587,7 +625,7 @@ def test_recheck_records_md_sha256(tmp_path, monkeypatch):
     monkeypatch.setattr("sys.argv", ["recheck_digest.py", str(md), "--db", str(db)])
     assert recheck_main() == 0
     check = json.loads((tmp_path / "2026-W37.check.json").read_text(encoding="utf-8"))
-    assert check["md_sha256"] == markdown_sha256(md.read_text(encoding="utf-8"))
+    assert check["markdown_sha256"] == markdown_sha256(md.read_bytes())
 
 
 def test_recheck_failure_overwrites_check_as_fail(tmp_path, monkeypatch):
@@ -658,7 +696,7 @@ def test_recheck_removes_dead_item_block(tmp_path, monkeypatch):
     check = json.loads((tmp_path / "2026-W37.check.json").read_text(encoding="utf-8"))
     assert check["pass"] is True
     assert [item["url"] for item in check["dropped"]] == [dead_item]
-    assert check["md_sha256"] == markdown_sha256(body)
+    assert check["markdown_sha256"] == markdown_sha256(md.read_bytes())
 
 
 def test_recheck_strips_dead_link_inside_commentary(tmp_path, monkeypatch):
@@ -943,19 +981,42 @@ def test_apply_state_rejects_forbidden_transition(tmp_path):
 def test_release_sending_needs_escape(tmp_path):
     """`/digest 해제` 만 sending 을 푼다 — 일반 저장 경로로는 안 된다."""
     path = tmp_path / "2026-W37.state.json"
-    sending = dict(_sending_state(), commentary="확정 의견")
+    sending = dict(_sending_state(), commentary="확정 의견",
+                   preview_sha="a" * 64, card_message_id=777)
     state_mod.save_state(path, sending)
     released = state_mod.release_sending(sending)
-    assert released["status"] == "annotated" and released["sending_at"] is None
-    # 해설 기록이 없어도 annotated 로 푼다 (마커 게이트를 통과한 본문이므로)
-    assert state_mod.release_sending(_sending_state())["status"] == "annotated"
+    # 사이클3 판정: draft 로 되돌리고 미리보기·카드도 무효화한다
+    assert released["status"] == "draft"
+    assert released["sending_at"] is None
+    assert released["preview_sha"] is None
+    assert released["card_message_id"] is None
     with pytest.raises(state_mod.TransitionError):
         state_mod.apply_state(path, sending, released)          # escape 없음
     state_mod.apply_state(path, sending, released, escape=True)  # 사람의 해제
-    assert state_mod.load_state(path, "2026-W37")["status"] == "annotated"
+    assert state_mod.load_state(path, "2026-W37")["status"] == "draft"
 
     with pytest.raises(state_mod.TransitionError):
         state_mod.release_sending(state_mod.default_state("2026-W37"))
+
+
+def test_release_sending_blocks_send_until_new_preview(tmp_path, monkeypatch):
+    """해제 후에는 새 미리보기 없이 발송할 수 없다 (사이클3 판정 #3)."""
+    md = _annotated_digest(tmp_path)
+    state_path = state_mod.state_path_for_markdown(md)
+    sending = state_mod.mark_sending(
+        state_mod.load_state(state_path, "2026-W37"), "2026-09-13T01:00:00"
+    )
+    state_mod.save_state(state_path, sending)
+    state_mod.apply_state(
+        state_path, sending, state_mod.release_sending(sending), escape=True
+    )
+    _forbid_notifier(monkeypatch, "해제 후 미리보기 없이 발송했다")
+    assert _send(md) == 2
+
+    # 새 미리보기가 지문을 다시 남기면 발송 가능
+    _seed_preview(md)
+    monkeypatch.setattr("scripts.send_digest.EmailNotifier", _OkNotifier)
+    assert _send(md) == 0
 
 
 def test_update_state_rereads_under_lock(tmp_path):
@@ -1054,22 +1115,21 @@ def test_send_digest_sends_the_text_it_gated(tmp_path, monkeypatch):
     md = _annotated_digest(tmp_path)
     from scripts import send_digest as send_mod
 
-    real_gate = send_mod.check_gate
+    real_gate = send_mod._check_fail_closed_bytes
     captured = []
 
-    def gate_then_swap(markdown_text, check_json_path):
-        result = real_gate(markdown_text, check_json_path)
-        md.write_text(
-            markdown_text
-            + "\n### 몰래 끼운 항목\n\n**원문:** [x](https://evil.example/x)\n",
-            encoding="utf-8",
+    def gate_then_swap(markdown_bytes, check_json_path):
+        result = real_gate(markdown_bytes, check_json_path)
+        md.write_bytes(
+            markdown_bytes
+            + "\n### 몰래 끼운 항목\n\n**원문:** [x](https://evil.example/x)\n".encode("utf-8"),
         )
         return result
 
     class Notifier(_OkNotifier):
         bodies = captured
 
-    monkeypatch.setattr("scripts.send_digest.check_gate", gate_then_swap)
+    monkeypatch.setattr("scripts.send_digest._check_fail_closed_bytes", gate_then_swap)
     monkeypatch.setattr("scripts.send_digest.EmailNotifier", Notifier)
     assert _send(md) == 0
     assert captured and "evil.example" not in captured[0]
@@ -1393,7 +1453,7 @@ def test_notify_records_preview_sha(tmp_path, monkeypatch):
     state = state_mod.load_state(
         state_mod.state_path_for_markdown(md), "2026-W37"
     )
-    assert state["preview_sha"] == markdown_sha256(SAMPLE_MD)
+    assert state["preview_sha"] == markdown_sha256(md.read_bytes())
     assert state["card_message_id"] is None
 
 

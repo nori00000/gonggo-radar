@@ -156,7 +156,14 @@ def main():
         return 2
 
     week = state_mod.week_from_markdown(markdown_path)
-    markdown_text = markdown_path.read_text(encoding="utf-8")
+    # 미리보기 지문(preview_sha)은 발송 게이트와 같은 **원시 바이트** 해시다.
+    # 렌더에 쓰는 텍스트도 같은 읽기에서 나와야 지문과 화면이 어긋나지 않는다.
+    try:
+        markdown_bytes = markdown_path.read_bytes()
+        markdown_text = markdown_bytes.decode("utf-8")
+    except (OSError, UnicodeDecodeError) as exc:
+        print(f"✗ 마크다운 읽기 실패: {exc}", file=sys.stderr)
+        return 2
     check = load_check(markdown_path)
 
     body = preview_mod.render_preview(week, markdown_text, check)
@@ -211,7 +218,7 @@ def main():
     # 이 값으로 발급되고, 발송 게이트가 approved-sha·현재 해시·이 값의 일치를 본다.
     item_sections, _ = sections_mod.resolve(check, markdown_text)
     item_urls = preview_mod.item_urls(markdown_text, item_sections)
-    preview_sha = markdown_sha256(markdown_text)
+    preview_sha = markdown_sha256(markdown_bytes)
     try:
         state_mod.update_state(
             state_path, lock_path, week,
