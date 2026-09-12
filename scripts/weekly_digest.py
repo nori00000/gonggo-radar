@@ -32,12 +32,6 @@ def main():
         help='ISO 주 표기 (예: 2026-W13). 기본값: 현재 주',
     )
     parser.add_argument(
-        "--limit",
-        type=int,
-        default=5,
-        help="지원사업 공고 최대 항목 수 (기본: 5)",
-    )
-    parser.add_argument(
         "--forms",
         help="폼 CSV 경로 (기본: forms/responses.csv)",
     )
@@ -61,13 +55,14 @@ def main():
 
     # 다이제스트 생성
     print(f"Composing digest for {week}...")
+    warnings: list[str] = []
     try:
         compose_digest(
             db_path=args.db,
             week_str=week,
-            limit=args.limit,
             output_path=markdown_path,
             forms_csv_path=forms_csv_path,
+            warnings_out=warnings,
         )
         print(f"✓ 다이제스트 생성: {markdown_path}")
     except Exception as e:
@@ -82,6 +77,7 @@ def main():
             markdown_path=markdown_path,
             output_path=check_path,
             skip_network=False,
+            warnings=warnings,
         )
         print(f"✓ 검증 완료: {check_path}")
         if result["pass"]:

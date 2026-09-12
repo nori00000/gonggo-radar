@@ -5,10 +5,7 @@ import argparse
 import html as html_module
 import json
 import re
-import smtplib
 import sys
-from email.mime.multipart import MIMEMultipart
-from email.mime.text import MIMEText
 from pathlib import Path
 from typing import Tuple
 from urllib.parse import urlparse
@@ -17,6 +14,9 @@ from urllib.parse import urlparse
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from alert.notifiers.email_sender import EmailNotifier
+
+# [텍스트](URL) — URL 안의 괄호 한 단계까지 균형 있게 소비 (javascript:alert(1) 대응)
+LINK_PATTERN = r"\[([^\]]+)\]\(([^()\s]*(?:\([^()]*\)[^()\s]*)*)\)"
 
 
 def markdown_to_html(markdown_text: str) -> str:
@@ -82,52 +82,32 @@ def markdown_to_html(markdown_text: str) -> str:
         if not line.strip():
             continue
 
-        # 일반 텍스트는 먼저 **전체** 이스케이프
-        escaped_line = html_module.escape(line)
-
-        # 이스케이프된 라인에서 마크업 처리
-        # **굵은텍스트** (이스케이프 후: \*\*...\*\*)
-        escaped_line = re.sub(
-            r"\*\*([^*]+)\*\*",
-            r"<strong>\1</strong>",
-            escaped_line
-        )
-
-        # [텍스트](URL) → <a href>
-        # 이스케이프 후에는 ] ( 패턴으로 처리
-        def replace_link(match):
-            text_part = match.group(1)
-            url_part = match.group(2)
-            # 이미 HTML 이스케이프됨. URL 추출 후 스킴 확인
-            # 이스케이프되지 않은 원본 URL을 재추출해야 함
-            return match.group(0)  # 이스케이프 후 링크 처리 불가, 원본 필요
-
-        # 링크는 이스케이프 전에 처리해야 함. 다시 정렬:
-        # 원본 라인에서 먼저 링크 추출 및 검증
-        link_pattern = r"\[([^\]]+)\]\(([^)]+)\)"
-        link_matches = list(re.finditer(link_pattern, line))
-
-        # 링크 부분을 placeholders로 교체
+        # 링크는 이스케이프 전에 처리해야 하므로, 원문에 등장할 수 없는
+        # sentinel(\x00LINK{n}\x00)로 먼저 치환한다.
         link_placeholders = {}
         modified_line = line
-        for i, match in enumerate(link_matches):
+        for i, match in enumerate(re.finditer(LINK_PATTERN, line)):
             url = match.group(2)
             text = match.group(1)
             parsed = urlparse(url)
             if parsed.scheme in ("http", "https"):
-                placeholder = f"__LINK_{i}__"
-                link_placeholders[placeholder] = f'<a href="{html_module.escape(url, quote=True)}">{html_module.escape(text)}</a>'
+                placeholder = f"\x00LINK{i}\x00"
+                link_placeholders[placeholder] = (
+                    f'<a href="{html_module.escape(url, quote=True)}">'
+                    f"{html_module.escape(text)}</a>"
+                )
                 modified_line = modified_line.replace(match.group(0), placeholder, 1)
             else:
-                # javascript: 등 허용 안 함 - URL 제거, 텍스트만 남김
-                modified_line = modified_line.replace(match.group(0), html_module.escape(text), 1)
+                # javascript: 등 허용 안 함 - 링크 전체 제거, 텍스트만 남김
+                # (뒤에서 라인 전체를 이스케이프하므로 여기서는 원문 그대로)
+                modified_line = modified_line.replace(match.group(0), text, 1)
 
-        # 이제 이스케이프
+        # 이제 라인 전체 이스케이프 (sentinel은 이스케이프 영향 없음)
         escaped_line = html_module.escape(modified_line)
 
-        # Placeholder를 실제 링크로 교체
+        # sentinel을 실제 링크로 복원
         for placeholder, link_html in link_placeholders.items():
-            escaped_line = escaped_line.replace(html_module.escape(placeholder), link_html)
+            escaped_line = escaped_line.replace(placeholder, link_html)
 
         # **굵은텍스트** 처리 (이스케이프 후: \*\*...\*\*)
         escaped_line = re.sub(
@@ -260,37 +240,13 @@ def send_digest(
         # HTML 본문
         html_body = markdown_to_html(markdown_text)
 
-        # 수동 SMTP를 통해 수신자에게 발송
-        msg = MIMEMultipart("alternative")
-        msg["From"] = notifier.sender
-        msg["To"] = ", ".join(recipients)
-        msg["Subject"] = subject
-
-        html_part = MIMEText(html_body, "html", "utf-8")
-        msg.attach(html_part)
-
-        # SMTP 전송
-        try:
-            with smtplib.SMTP(
-                notifier.email_config.smtp_server,
-                notifier.email_config.smtp_port,
-                timeout=30
-            ) as server:
-                if notifier.email_config.use_tls:
-                    server.starttls()
-
-                server.login(notifier.sender, notifier.password)
-                server.send_message(msg)
-
-            print(f"✓ 발송 성공: {len(recipients)}명")
-            return 0
-
-        except smtplib.SMTPException as exc:
-            print(f"✗ SMTP 오류: {exc}", file=sys.stderr)
+        # 기존 EmailNotifier의 SMTP 경로 재사용
+        if not notifier.send_html(subject, html_body, recipients):
+            print("✗ 발송 실패: SMTP 전송에 실패했습니다", file=sys.stderr)
             return 2
-        except Exception as exc:
-            print(f"✗ 발송 실패: {exc}", file=sys.stderr)
-            return 2
+
+        print(f"✓ 발송 성공: {len(recipients)}명")
+        return 0
 
     except Exception as exc:
         print(f"✗ 초기화 실패: {exc}", file=sys.stderr)

@@ -4,7 +4,7 @@ import json
 import re
 import sqlite3
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Dict, List, Optional
 import requests
 
 
@@ -72,6 +72,7 @@ def check_digest(
     markdown_path: Path,
     output_path: Optional[Path] = None,
     skip_network: bool = False,
+    warnings: Optional[List[str]] = None,
 ) -> Dict:
     """다이제스트 마크다운의 항목들을 검증.
 
@@ -82,6 +83,8 @@ def check_digest(
         markdown_path: 생성된 다이제스트 마크다운 경로
         output_path: 검증 결과 JSON 경로. None이면 반환값만 사용
         skip_network: 네트워크 호출 건너뛰기 (테스트용)
+        warnings: 생성 단계 경고(예: 폼 로드 실패). 있으면 pass=False로 강등하고
+            reason에 기록한다.
 
     Returns:
         {"items": [...], "pass": bool, "network_checked": bool, "reason": str} 형태의 검증 결과
@@ -94,6 +97,7 @@ def check_digest(
             "network_checked": False,
             "reason": "마크다운 파일 없음"
         }
+        result = _apply_warnings(result, warnings)
         _write_check_result(output_path, result)
         return result
 
@@ -105,14 +109,15 @@ def check_digest(
     url_pattern = r'\[([^\]]+)\]\(([^)]+)\)'
     url_matches = re.findall(url_pattern, markdown_text)
 
-    # 항목 0건은 fail-closed
+    # 항목 0건은 fail-closed (검사한 URL이 0건이므로 network_checked=False)
     if not url_matches:
         result = {
             "items": [],
             "pass": False,
-            "network_checked": not skip_network,
+            "network_checked": False,
             "reason": "항목 없음"
         }
+        result = _apply_warnings(result, warnings)
         _write_check_result(output_path, result)
         return result
 
@@ -135,10 +140,15 @@ def check_digest(
     # 각 URL 검증
     items = []
     all_passed = True
+    network_checked_count = 0
 
     for _, url in url_matches:
         period_end = url_to_period_end.get(url)
-        url_alive = check_url_alive(url) if not skip_network else True
+        if skip_network:
+            url_alive = True
+        else:
+            url_alive = check_url_alive(url)
+            network_checked_count += 1
         deadline_parsed = parse_period_end(period_end)
 
         item_passed = url_alive and deadline_parsed
@@ -156,13 +166,36 @@ def check_digest(
     result = {
         "items": items,
         "pass": all_passed,
-        "network_checked": not skip_network,
+        # 실제로 네트워크 검사한 URL이 0건이면 False
+        "network_checked": network_checked_count > 0,
         "reason": reason
     }
+    result = _apply_warnings(result, warnings)
 
     # 파일 저장
     _write_check_result(output_path, result)
 
+    return result
+
+
+def _apply_warnings(result: Dict, warnings: Optional[List[str]]) -> Dict:
+    """생성 단계 경고를 검증 결과에 반영 (pass 강등 + reason 기록).
+
+    Args:
+        result: 검증 결과 딕셔너리
+        warnings: 경고 문자열 목록
+
+    Returns:
+        경고가 반영된 검증 결과
+    """
+    if not warnings:
+        return result
+
+    result["pass"] = False
+    reasons = list(warnings)
+    if result.get("reason"):
+        reasons.append(result["reason"])
+    result["reason"] = "; ".join(reasons)
     return result
 
 

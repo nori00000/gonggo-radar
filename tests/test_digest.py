@@ -2,10 +2,12 @@
 
 import json
 import sqlite3
+import sys
 import tempfile
 from pathlib import Path
 from unittest import mock
 from datetime import datetime, timedelta
+from html.parser import HTMLParser
 
 import pytest
 import requests.exceptions
@@ -21,6 +23,7 @@ from alert.digest.checker import (
     parse_period_end,
     check_url_alive,
 )
+import scripts.send_digest as send_digest_module
 from scripts.send_digest import check_fail_closed, markdown_to_html, send_digest
 
 
@@ -171,6 +174,93 @@ def sample_announcements(temp_db):
     return temp_db
 
 
+def _create_announcements_table(db_path) -> None:
+    """테스트용 announcements 테이블 생성."""
+    conn = sqlite3.connect(str(db_path))
+    conn.execute(
+        """
+        CREATE TABLE announcements (
+            id INTEGER PRIMARY KEY, source TEXT, source_id TEXT,
+            title TEXT, summary TEXT DEFAULT '', url TEXT, author TEXT,
+            category TEXT DEFAULT '', target TEXT DEFAULT '',
+            period_start TEXT, period_end TEXT,
+            relevance_score REAL DEFAULT 0.0,
+            relevance_reason TEXT DEFAULT '',
+            matched_keywords TEXT DEFAULT '[]',
+            is_notified INTEGER DEFAULT 0,
+            raw_data TEXT DEFAULT '', created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL, business_domain TEXT DEFAULT '',
+            domain_confidence REAL DEFAULT 0.0,
+            obsidian_path TEXT DEFAULT '', embedding_id INTEGER DEFAULT NULL,
+            UNIQUE(source, source_id)
+        )
+        """
+    )
+    conn.commit()
+    conn.close()
+
+
+def _section_body(markdown: str, heading: str) -> str:
+    """마크다운에서 '## {heading}' 섹션 본문만 추출."""
+    body = []
+    collecting = False
+    for line in markdown.split("\n"):
+        if line.startswith("## "):
+            collecting = line[3:].strip() == heading
+            continue
+        if collecting:
+            body.append(line)
+    return "\n".join(body)
+
+
+def _insert_one(db_path, **overrides) -> None:
+    """2026-W13 범위의 공고 1건 삽입."""
+    row = {
+        "source": "test",
+        "source_id": "test_001",
+        "title": "테스트 공고",
+        "summary": "요약",
+        "url": "https://example.com/test-001",
+        "author": "기관",
+        "period_end": "2026-12-31",
+        "relevance_score": 0.9,
+        "created_at": "2026-03-26T12:00:00",
+    }
+    row.update(overrides)
+
+    conn = sqlite3.connect(str(db_path))
+    conn.execute(
+        """
+        INSERT INTO announcements
+        (source, source_id, title, summary, url, author, period_end,
+         relevance_score, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            row["source"], row["source_id"], row["title"], row["summary"],
+            row["url"], row["author"], row["period_end"],
+            row["relevance_score"], row["created_at"], row["created_at"],
+        ),
+    )
+    conn.commit()
+    conn.close()
+
+
+class _TagCollector(HTMLParser):
+    """HTML 태그와 이벤트 속성(on*) 수집기."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.tags = []
+        self.event_attrs = []
+
+    def handle_starttag(self, tag, attrs):
+        self.tags.append(tag)
+        for name, _value in attrs:
+            if name.lower().startswith("on"):
+                self.event_attrs.append(name)
+
+
 class TestComposer:
     """Composer 테스트."""
 
@@ -203,7 +293,6 @@ class TestComposer:
         markdown = compose_digest(
             db_path=sample_announcements,
             week_str="2026-W13",
-            limit=5,
         )
 
         # 섹션 존재 확인
@@ -229,12 +318,141 @@ class TestComposer:
         compose_digest(
             db_path=sample_announcements,
             week_str="2026-W13",
-            limit=5,
             output_path=tmp_path / "digest.md",
         )
 
         # 파일로 저장되었는지 확인
         assert (tmp_path / "digest.md").exists()
+
+    def test_compose_digest_no_limit_kwarg(self, sample_announcements):
+        """--limit / limit 파라미터는 완전히 제거되었다."""
+        import inspect
+
+        params = inspect.signature(compose_digest).parameters
+        assert "limit" not in params
+
+        with pytest.raises(TypeError):
+            compose_digest(
+                db_path=sample_announcements,
+                week_str="2026-W13",
+                limit=2,
+            )
+
+    def test_compose_digest_forest_not_starved_by_volume(self, tmp_path):
+        """고득점 타 섹션 60건이 있어도 산림 섹션은 상한만큼 나온다 (M1 재현)."""
+        db_path = tmp_path / "starve.db"
+        _create_announcements_table(db_path)
+
+        conn = sqlite3.connect(str(db_path))
+        cursor = conn.cursor()
+        created_at = "2026-03-26T12:00:00"  # 2026-W13
+
+        # 고득점 사회연대경제 60건
+        for i in range(60):
+            cursor.execute(
+                """
+                INSERT INTO announcements
+                (source, source_id, title, url, author, period_end,
+                 relevance_score, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    "seis",
+                    f"seis_{i}",
+                    f"사회적기업 소식 {i}",
+                    f"https://example.com/seis/{i}",
+                    "경기도청",
+                    "2026-12-31",
+                    0.99,
+                    created_at,
+                    created_at,
+                ),
+            )
+
+        # 저득점 산림 정책 5건 (공고성 키워드 없음)
+        for i in range(5):
+            cursor.execute(
+                """
+                INSERT INTO announcements
+                (source, source_id, title, url, author, period_end,
+                 relevance_score, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    "fowi",
+                    f"fowi_{i}",
+                    f"국유림 경영 소식 {i}",
+                    f"https://example.com/fowi/{i}",
+                    "산림청",
+                    "2026-12-31",
+                    0.01,
+                    created_at,
+                    created_at,
+                ),
+            )
+
+        conn.commit()
+        conn.close()
+
+        markdown = compose_digest(db_path=str(db_path), week_str="2026-W13")
+
+        forest_section = _section_body(markdown, "산림 정책 동향")
+        sse_section = _section_body(markdown, "사회연대경제 동향")
+        subsidy_section = _section_body(markdown, "지원사업 공고")
+
+        assert forest_section.count("### ") == 3, f"산림 섹션 건수: {forest_section.count('### ')}"
+        assert sse_section.count("### ") == 3
+        assert subsidy_section.count("### ") == 0
+
+    def test_compose_digest_dedup_before_section_cap(self, tmp_path):
+        """중복 제거를 상한 적용 전에 수행 (계약 v1.1)."""
+        db_path = tmp_path / "dedup.db"
+        _create_announcements_table(db_path)
+
+        # 산림 섹션: 상위 2건이 같은 제목(중복) + 고유 3건
+        titles = [
+            ("dup_a", "국유림 경영 소식", 0.99),
+            ("dup_b", "국유림  경영\t소식", 0.98),
+            ("uniq_1", "숲가꾸기 현장 이야기", 0.50),
+            ("uniq_2", "산림 탄소 흡수량 보고", 0.40),
+            ("uniq_3", "임업 통계 브리프", 0.30),
+        ]
+        for source_id, title, score in titles:
+            _insert_one(
+                db_path,
+                source="fowi",
+                source_id=source_id,
+                title=title,
+                url=f"https://example.com/{source_id}",
+                relevance_score=score,
+            )
+
+        markdown = compose_digest(db_path=str(db_path), week_str="2026-W13")
+        forest_section = _section_body(markdown, "산림 정책 동향")
+
+        # 중복 1건으로 접힌 뒤 상한 3건이 채워져야 함
+        assert forest_section.count("### ") == 3
+        assert forest_section.count("### 국유림 경영 소식") == 1
+
+    def test_compose_digest_form_load_failure_warning(self, tmp_path):
+        """깨진 폼 CSV는 경고 리스트에 기록된다."""
+        db_path = tmp_path / "warn.db"
+        _create_announcements_table(db_path)
+        _insert_one(db_path)
+
+        broken_csv = tmp_path / "broken.csv"
+        broken_csv.write_bytes(b"\xff\xfe\x00\x00broken")
+
+        warnings = []
+        compose_digest(
+            db_path=str(db_path),
+            week_str="2026-W13",
+            forms_csv_path=broken_csv,
+            warnings_out=warnings,
+        )
+
+        assert warnings, "폼 로드 실패 경고가 수집되어야 함"
+        assert "폼 로드 실패" in warnings[0]
 
     def test_compose_digest_deadline_missing(self, tmp_path):
         """마감일이 없으면 명시."""
@@ -420,6 +638,90 @@ class TestChecker:
 
         assert "reason" in saved
 
+    def test_check_digest_zero_urls_network_checked_false(self, tmp_path):
+        """실제 검사한 URL이 0건이면 network_checked=false."""
+        md_path = tmp_path / "empty.md"
+        md_path.write_text("# 빈 다이제스트\n\n항목 없음")
+
+        result = check_digest(
+            db_path=":memory:",
+            markdown_path=md_path,
+            skip_network=False,
+        )
+
+        assert result["network_checked"] is False
+        assert result["pass"] is False
+
+    def test_check_digest_warnings_force_fail(self, sample_announcements, tmp_path):
+        """생성 단계 경고가 있으면 pass=false + reason 기록."""
+        md_path = tmp_path / "test.md"
+        check_path = tmp_path / "test.check.json"
+        md_path.write_text("# 테스트\n\n[test](https://example.com)")
+
+        result = check_digest(
+            db_path=sample_announcements,
+            markdown_path=md_path,
+            output_path=check_path,
+            skip_network=True,
+            warnings=["폼 로드 실패: 'utf-8' codec can't decode byte"],
+        )
+
+        assert result["pass"] is False
+        assert "폼 로드 실패" in result["reason"]
+
+        with open(check_path) as f:
+            saved = json.load(f)
+        assert saved["pass"] is False
+        assert "폼 로드 실패" in saved["reason"]
+
+
+class TestWeeklyDigestScript:
+    """weekly_digest.py 배선 테스트."""
+
+    def test_broken_form_csv_fails_gate(self, tmp_path, monkeypatch):
+        """깨진 폼 CSV → check.json pass=false + reason에 '폼 로드 실패'."""
+        import scripts.weekly_digest as weekly_digest
+
+        db_path = tmp_path / "wd.db"
+        _create_announcements_table(db_path)
+        _insert_one(db_path)
+
+        broken_csv = tmp_path / "broken.csv"
+        broken_csv.write_bytes(b"\xff\xfe\x00\x00broken")
+
+        out_dir = tmp_path / "out"
+
+        # 네트워크 호출 차단 (URL 생존 검사는 통과로 고정)
+        monkeypatch.setattr(
+            "alert.digest.checker.check_url_alive", lambda url, timeout=8: True
+        )
+        monkeypatch.setattr(
+            sys,
+            "argv",
+            [
+                "weekly_digest.py",
+                "--db", str(db_path),
+                "--week", "2026-W13",
+                "--out-dir", str(out_dir),
+                "--forms", str(broken_csv),
+            ],
+        )
+
+        rc = weekly_digest.main()
+        assert rc == 1
+
+        with open(out_dir / "2026-W13.check.json", encoding="utf-8") as f:
+            saved = json.load(f)
+
+        assert saved["pass"] is False
+        assert "폼 로드 실패" in saved["reason"]
+
+    def test_no_limit_option(self):
+        """--limit 옵션은 제거되었다."""
+        script = Path(__file__).resolve().parent.parent / "scripts" / "weekly_digest.py"
+        source = script.read_text(encoding="utf-8")
+        assert "--limit" not in source
+
 
 class TestSendDigest:
     """SendDigest 테스트."""
@@ -496,6 +798,118 @@ class TestSendDigest:
 
         # dry_run이므로 0 (성공)
         assert result == 0
+
+    def test_markdown_to_html_link_sentinel_no_collision(self):
+        """원문의 __LINK_0__ 리터럴이 링크로 둔갑하지 않는다 (M2)."""
+        md = "__LINK_0__ 라는 텍스트 [진짜](https://ok.com)"
+        html = markdown_to_html(md)
+
+        assert html.count("<a ") == 1, html
+        assert "__LINK_0__" in html
+
+    def test_markdown_to_html_javascript_no_residual_paren(self):
+        """javascript: 링크는 텍스트만 남고 잔여 ')'가 없다."""
+        html = markdown_to_html("[클릭](javascript:alert(1))")
+
+        assert "javascript:" not in html
+        assert "<p>클릭</p>" in html, html
+        assert "클릭)" not in html
+
+    def test_main_dry_run_with_send_never_opens_smtp(self, tmp_path, monkeypatch):
+        """--dry-run --send 동시 지정 시 SMTP 연결이 생성되지 않는다."""
+        md_path = tmp_path / "x.md"
+        md_path.write_text("# 테스트\n\n[원문](https://example.com)")
+        check_path = md_path.with_suffix(".check.json")
+        check_path.write_text(json.dumps({
+            "items": [{"url": "https://example.com", "url_alive": True,
+                       "deadline_parsed": True, "passed": True}],
+            "pass": True,
+            "network_checked": True,
+            "reason": "",
+        }))
+
+        smtp_mock = mock.MagicMock()
+        monkeypatch.setattr("alert.notifiers.email_sender.smtplib.SMTP", smtp_mock)
+        monkeypatch.setattr(
+            sys,
+            "argv",
+            ["send_digest.py", str(md_path), "--to", "a@b.c", "--dry-run", "--send"],
+        )
+
+        rc = send_digest_module.main()
+
+        assert rc == 0
+        assert smtp_mock.call_count == 0
+
+    def test_send_to_override_replaces_config_recipients(self, tmp_path, monkeypatch):
+        """--to 지정 시 config 수신자 2명이 아니라 제3자에게만 발송."""
+        md_path = tmp_path / "y.md"
+        md_path.write_text("# 테스트\n\n[원문](https://example.com)")
+        check_path = md_path.with_suffix(".check.json")
+        check_path.write_text(json.dumps({
+            "items": [{"url": "https://example.com", "url_alive": True,
+                       "deadline_parsed": True, "passed": True}],
+            "pass": True,
+            "network_checked": True,
+            "reason": "",
+        }))
+
+        monkeypatch.setenv("EMAIL_SENDER", "sender@x.com")
+        monkeypatch.setenv("EMAIL_PASSWORD", "pw")
+        monkeypatch.setenv("EMAIL_RECIPIENTS", "config1@x.com,config2@x.com")
+
+        sent = {}
+
+        class FakeSMTP:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+            def starttls(self):
+                pass
+
+            def login(self, *args):
+                pass
+
+            def send_message(self, msg):
+                sent["to"] = msg["To"]
+
+        monkeypatch.setattr("alert.notifiers.email_sender.smtplib.SMTP", FakeSMTP)
+
+        rc = send_digest(md_path, to_email="third@example.com", dry_run=False)
+
+        assert rc == 0
+        assert sent["to"] == "third@example.com"
+
+    def test_html_escapes_author_and_deadline_from_db(self, tmp_path):
+        """DB의 author/period_end 페이로드가 HTML에 raw로 새지 않는다."""
+        db_path = tmp_path / "xss.db"
+        _create_announcements_table(db_path)
+        _insert_one(
+            db_path,
+            author="<script>alert(1)</script>",
+            period_end="<img src=x onerror=1>",
+        )
+
+        markdown = compose_digest(db_path=str(db_path), week_str="2026-W13")
+        html = markdown_to_html(markdown)
+
+        # raw 태그가 실제 태그로 파싱되지 않아야 함
+        assert "<script" not in html
+        assert "<img" not in html
+        assert "&lt;script&gt;" in html
+        assert "&lt;img src=x onerror=1&gt;" in html  # 텍스트로만 존재
+
+        parser = _TagCollector()
+        parser.feed(html)
+        assert "script" not in parser.tags
+        assert "img" not in parser.tags
+        assert parser.event_attrs == []
 
 
 class TestIntegration:

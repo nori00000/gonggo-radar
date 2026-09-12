@@ -1,11 +1,22 @@
 """협의회 주간 정책브리핑 다이제스트 생성기."""
 
 import csv
-import re
 import sqlite3
+import sys
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Optional, List, Dict, Tuple
+
+# 섹션 분류 기준 (categorize_item과 섹션별 SQL 쿼리가 공유하는 단일 정본)
+FOREST_SOURCES = ("forest_service", "fowi", "kofpi")
+SSE_SOURCES = ("socialenterprise", "seis", "mois_sse", "coop")
+ANNOUNCEMENT_KEYWORDS = ("공고", "모집", "지원", "신청", "공모", "채용")
+
+# 섹션별 상한 (계약 v1.1: 지원사업 5, 산림 3, 사회연대경제 3)
+SECTION_LIMITS = {"산림": 3, "지원사업": 5, "사회연대경제": 3}
+
+# 렌더링 순서 = 중복 제거 우선순위
+SECTION_ORDER = ("산림", "지원사업", "사회연대경제")
 
 
 def get_week_date_range(week_str: str) -> Tuple[str, str]:
@@ -52,41 +63,78 @@ def categorize_item(source: str, title: str) -> str:
     Returns:
         섹션명 ("산림", "사회연대경제", "지원사업")
     """
-    # 산림 정책 소스
-    forest_sources = {"forest_service", "fowi", "kofpi"}
-    # 사회연대경제 소스
-    sse_sources = {"socialenterprise", "seis", "mois_sse", "coop"}
-
-    if source in forest_sources:
+    if source in FOREST_SOURCES:
         # 공고성 제목 확인 (공고, 모집, 지원사업 등)
-        announcement_keywords = ["공고", "모집", "지원", "신청", "공모", "채용"]
-        if any(kw in title for kw in announcement_keywords):
+        if any(kw in title for kw in ANNOUNCEMENT_KEYWORDS):
             return "지원사업"
         else:
             return "산림"
-    elif source in sse_sources:
+    elif source in SSE_SOURCES:
         return "사회연대경제"
     else:
         return "지원사업"
 
 
-def load_form_responses(forms_csv_path: Optional[Path] = None) -> Tuple[Dict[str, List[str]], List[str]]:
+def _section_where(section: str) -> Tuple[str, List]:
+    """섹션별 WHERE 절과 바인딩 파라미터를 생성.
+
+    categorize_item과 동일한 기준을 SQL로 표현한다.
+
+    Args:
+        section: "산림" | "지원사업" | "사회연대경제"
+
+    Returns:
+        (WHERE 절 SQL, 파라미터 리스트)
+    """
+    forest_ph = ", ".join("?" * len(FOREST_SOURCES))
+    sse_ph = ", ".join("?" * len(SSE_SOURCES))
+    kw_clause = " OR ".join(["title LIKE ?"] * len(ANNOUNCEMENT_KEYWORDS))
+    kw_params = [f"%{kw}%" for kw in ANNOUNCEMENT_KEYWORDS]
+
+    if section == "산림":
+        sql = f"source IN ({forest_ph}) AND NOT ({kw_clause})"
+        params = list(FOREST_SOURCES) + kw_params
+    elif section == "사회연대경제":
+        sql = f"source IN ({sse_ph})"
+        params = list(SSE_SOURCES)
+    elif section == "지원사업":
+        sql = (
+            f"((source IN ({forest_ph}) AND ({kw_clause}))"
+            f" OR source NOT IN ({forest_ph}, {sse_ph}))"
+        )
+        params = (
+            list(FOREST_SOURCES)
+            + kw_params
+            + list(FOREST_SOURCES)
+            + list(SSE_SOURCES)
+        )
+    else:
+        raise ValueError(f"알 수 없는 섹션: {section}")
+
+    return sql, params
+
+
+def load_form_responses(
+    forms_csv_path: Optional[Path] = None,
+) -> Tuple[Dict[str, List[str]], List[str], List[str]]:
     """forms/responses.csv에서 회원사 동정과 의견 정보 로드.
 
     Args:
         forms_csv_path: CSV 파일 경로. None이면 forms/responses.csv 시도
 
     Returns:
-        ({"회원사명": ["동정내용", ...]}, ["의견1", "의견2", ...]) 튜플
+        ({"회원사명": ["동정내용", ...]}, ["의견1", ...], ["경고문", ...]) 튜플.
+        세 번째 원소는 로드 실패 경고 목록(stderr에도 출력됨).
     """
     if forms_csv_path is None:
         forms_csv_path = Path("forms/responses.csv")
 
-    responses = {}
-    opinions = []
+    responses: Dict[str, List[str]] = {}
+    opinions: List[str] = []
+    warnings: List[str] = []
 
     if not forms_csv_path.exists():
-        return responses, opinions
+        return responses, opinions, warnings
 
     try:
         with open(forms_csv_path, "r", encoding="utf-8-sig") as f:
@@ -109,26 +157,30 @@ def load_form_responses(forms_csv_path: Optional[Path] = None) -> Tuple[Dict[str
                 elif item_type == "의견":
                     opinions.append(content)
     except Exception as e:
-        print(f"Warning: 회원사 동정 로드 실패: {e}")
+        warning = f"폼 로드 실패: {e}"
+        warnings.append(warning)
+        print(f"Warning: {warning}", file=sys.stderr)
 
-    return responses, opinions
+    return responses, opinions, warnings
 
 
 def compose_digest(
     db_path: str,
     week_str: Optional[str] = None,
-    limit: int = 5,
     output_path: Optional[Path] = None,
     forms_csv_path: Optional[Path] = None,
+    warnings_out: Optional[List[str]] = None,
 ) -> str:
     """주간 정책브리핑 다이제스트 마크다운 생성.
+
+    섹션 상한은 계약 v1.1 고정값(SECTION_LIMITS)이며 호출자가 조정할 수 없다.
 
     Args:
         db_path: announcements.db 경로
         week_str: ISO 주 표기 (기본: 현재 주, 예: "2026-W13")
-        limit: 지원사업 공고 최대 항목 수 (기본: 5)
         output_path: 출력 파일 경로. None이면 반환값만 사용
         forms_csv_path: 폼 CSV 경로
+        warnings_out: 경고 수집용 리스트. 주어지면 폼 로드 실패 등이 append됨
 
     Returns:
         생성된 마크다운 텍스트
@@ -144,64 +196,59 @@ def compose_digest(
 
     # DB 연결
     conn = sqlite3.connect(db_path)
+    # 중복 제거 기준을 SQL과 파이썬이 공유하도록 정규화 함수를 등록
+    conn.create_function("normalize_title", 1, normalize_title)
     cursor = conn.cursor()
 
-    # 주간 창 내의 항목 조회 (양끝 포함)
-    cursor.execute(
-        """
-        SELECT id, source, title, summary, url, author, period_end, relevance_score
-        FROM announcements
-        WHERE DATE(created_at) >= ? AND DATE(created_at) <= ?
-        ORDER BY relevance_score DESC
-        LIMIT ?
-        """,
-        (week_start, week_end, limit * 10)  # 버퍼로 10배 조회
-    )
+    # 섹션별로 독립 조회 (주간 창 양끝 포함, 중복 제거 후 섹션 상한만큼만)
+    section_rows: Dict[str, List] = {}
+    for section in SECTION_ORDER:
+        where_sql, where_params = _section_where(section)
+        cursor.execute(
+            f"""
+            SELECT id, source, title, summary, url, author, period_end,
+                   MAX(relevance_score) AS relevance_score
+            FROM announcements
+            WHERE {where_sql}
+              AND DATE(created_at) BETWEEN ? AND ?
+            GROUP BY normalize_title(title)
+            ORDER BY relevance_score DESC
+            LIMIT ?
+            """,
+            (*where_params, week_start, week_end, SECTION_LIMITS[section]),
+        )
+        section_rows[section] = cursor.fetchall()
 
-    rows = cursor.fetchall()
     conn.close()
 
-    # 섹션별로 분류
-    sections = {
-        "산림": [],
-        "지원사업": [],
-        "사회연대경제": [],
-    }
-
-    # 중복 제거를 위해 정규화된 제목 추적
+    # 섹션 조립 후 섹션 간 중복 제거 (렌더 순서 우선, 제목 정규화 기준)
+    sections: Dict[str, List[Dict]] = {section: [] for section in SECTION_ORDER}
     seen_normalized_titles = set()
 
-    for row in rows:
-        item_id, source, title, summary, url, author, period_end, score = row
-        category = categorize_item(source, title)
+    for section in SECTION_ORDER:
+        for row in section_rows[section]:
+            item_id, source, title, summary, url, author, period_end, score = row
+            normalized_title = normalize_title(title)
 
-        # 제목 정규화
-        normalized_title = normalize_title(title)
+            if normalized_title in seen_normalized_titles:
+                continue
+            seen_normalized_titles.add(normalized_title)
 
-        # 중복 확인
-        if normalized_title in seen_normalized_titles:
-            continue
-        seen_normalized_titles.add(normalized_title)
-
-        # 섹션별 항목 수 제한
-        section_limit = 5 if category == "지원사업" else 3
-
-        if len(sections[category]) >= section_limit:
-            continue
-
-        sections[category].append({
-            "id": item_id,
-            "source": source,
-            "title": normalized_title,
-            "summary": summary or "",
-            "url": url,
-            "author": author or "",
-            "period_end": period_end or "",
-            "score": score,
-        })
+            sections[section].append({
+                "id": item_id,
+                "source": source,
+                "title": normalized_title,
+                "summary": summary or "",
+                "url": url,
+                "author": author or "",
+                "period_end": period_end or "",
+                "score": score,
+            })
 
     # 회원사 동정 및 의견 로드
-    form_responses, opinions = load_form_responses(forms_csv_path)
+    form_responses, opinions, form_warnings = load_form_responses(forms_csv_path)
+    if warnings_out is not None:
+        warnings_out.extend(form_warnings)
 
     # 마크다운 생성
     lines = [
