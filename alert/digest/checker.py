@@ -7,9 +7,15 @@ from pathlib import Path
 from typing import Dict, List, Optional
 import requests
 
+from alert.digest.composer import parse_deadline
+
 
 def parse_period_end(period_end_str: Optional[str]) -> bool:
-    """기간_종료 날짜 파싱 가능 여부 확인.
+    """기간_종료 날짜 파싱 가능 여부 확인 (계약 v1.2: 정보 필드, 게이트 아님).
+
+    판정 정본은 composer.parse_deadline이다 — 렌더가 D-day를 계산할 수 있는
+    형식만 True다. 게이트와 렌더가 서로 다른 날짜 파서를 쓰면 "마감 파싱됨"과
+    "D-day 표기됨"이 조용히 갈라진다.
 
     Args:
         period_end_str: 기간_종료 문자열
@@ -17,22 +23,7 @@ def parse_period_end(period_end_str: Optional[str]) -> bool:
     Returns:
         파싱 가능 여부
     """
-    if not period_end_str or not isinstance(period_end_str, str):
-        return False
-
-    # 일반적인 날짜 형식 패턴들
-    patterns = [
-        r'^\d{4}-\d{2}-\d{2}',  # YYYY-MM-DD
-        r'^\d{2}/\d{2}/\d{4}',  # MM/DD/YYYY
-        r'^\d{4}/\d{2}/\d{2}',  # YYYY/MM/DD
-        r'^\d{4}년\s*\d{1,2}월\s*\d{1,2}일',  # YYYY년 M월 D일
-    ]
-
-    for pattern in patterns:
-        if re.match(pattern, period_end_str.strip()):
-            return True
-
-    return False
+    return parse_deadline(period_end_str) is not None
 
 
 # 공공기관 사이트 다수가 기본 python-requests UA를 차단하거나 HEAD를 지원하지 않는다.
@@ -47,6 +38,30 @@ PROBE_HEADERS = {
 }
 # 생존 확인에는 응답 본문이 필요 없다. 연결만 확인하고 최대 이만큼만 읽는다.
 MAX_PROBE_BYTES = 64 * 1024
+
+# [텍스트](URL)
+_LINK_RE = re.compile(r"\[([^\]]+)\]\(([^)]+)\)")
+# HTML 주석 줄 (형식 v2.1의 보류 목록). 발송본에 실리지 않으므로 게이트 대상도 아니다.
+_COMMENT_LINE_RE = re.compile(r"^\s*<!--")
+
+
+def extract_item_urls(markdown_text: str) -> List[str]:
+    """다이제스트 마크다운에서 검사 대상 URL을 문서 순서대로, 중복 없이 뽑는다.
+
+    HTML 주석 줄(보류 목록)은 발송 HTML에 실리지 않으므로 건너뛴다.
+    """
+    urls: List[str] = []
+    seen = set()
+    for line in markdown_text.splitlines():
+        if _COMMENT_LINE_RE.match(line):
+            continue
+        for _text, url in _LINK_RE.findall(line):
+            url = url.strip()
+            if not url or url in seen:
+                continue
+            seen.add(url)
+            urls.append(url)
+    return urls
 
 
 def check_url_alive(url: str, timeout: int = 8) -> bool:
@@ -144,12 +159,10 @@ def check_digest(
     with open(markdown_path, "r", encoding="utf-8") as f:
         markdown_text = f.read()
 
-    # [텍스트](URL) 형식에서 URL 추출
-    url_pattern = r'\[([^\]]+)\]\(([^)]+)\)'
-    url_matches = re.findall(url_pattern, markdown_text)
+    urls = extract_item_urls(markdown_text)
 
     # 항목 0건은 fail-closed (검사한 URL이 0건이므로 network_checked=False)
-    if not url_matches:
+    if not urls:
         result = {
             "items": [],
             "dropped": [],
@@ -167,7 +180,7 @@ def check_digest(
 
     url_to_period_end = {}
     url_to_title = {}
-    for _, url in url_matches:
+    for url in urls:
         cursor.execute(
             "SELECT period_end, title FROM announcements WHERE url = ? LIMIT 1",
             (url,)
@@ -184,7 +197,7 @@ def check_digest(
     dropped = []
     network_checked_count = 0
 
-    for _, url in url_matches:
+    for url in urls:
         period_end = url_to_period_end.get(url)
         if skip_network:
             url_alive = True

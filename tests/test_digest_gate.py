@@ -12,51 +12,33 @@ from scripts.recheck_digest import main as recheck_main
 from scripts.send_digest import send_digest
 
 
-SAMPLE_MD = """<!-- lane: Codex(gpt-5.6) -->
+SAMPLE_MD = """<!-- lane: Claude opus executor -->
 
-# 협의회 주간 정책브리핑 2026-W37
+# 📋 협의회 주간 정책브리핑 2026-W37 (9/7~9/13)
 
-**기간:** 2026-09-07 ~ 2026-09-13
+이번 주 한 줄: <!-- 상민 확정 필요 -->
 
-## 산림 정책 동향
+## ✅ 신청하세요 (마감순)
 
-### 산림 항공 점검 결과
+[D-9] 사회적협동조합·사회적기업 공공조달 1:1 컨설팅 참여기업 모집 — 협동조합포털(기재부) · 대상: 사협·사회적기업 · 마감 9/22
+  [원문](https://example.com/a)
 
-**기관:** 산림청
-**마감:** 미정
-**원문:** [https://example.com/a](https://example.com/a)
+[새 소식] 2026년도 제2차 산림형 예비사회적기업 지정 계획 공고 — 산림청 · 대상: 사회적기업·산림사업자 · 마감 원문 확인
+  [원문](https://example.com/b)
 
-요약 한 줄.
+[상시] 산양삼 등 산촌자원 활용 시제품 개발 지원 참여자 모집 — 한국임업진흥원 · 대상: 산림사업자 · 마감 연중 상시 모집
+  [원문](https://example.com/c)
 
-## 지원사업 공고
+## 👀 알아두세요
 
-### 예비사회적기업 모집 공고
+산림재난방지법 시행령 일부개정령안 입법예고 — 국민참여입법센터(산림청 소관) · 대상: 산림사업자 · 의견 10/19까지
+  [원문](https://example.com/d)
 
-**기관:** 농식품부
-**마감:** 2026-09-30
-**원문:** [https://example.com/b](https://example.com/b)
+## 🤝 협의회에서
 
-*(요약 없음)*
+· (면담·건의·수렴 현황 — 이번 주 기록 없음)
 
-### 스마트팜 의견 조사
-
-**기관:** 스마트팜코리아
-**마감:** 미정
-**원문:** [https://example.com/c](https://example.com/c)
-
-*(요약 없음)*
-
-## 사회연대경제 동향
-
-*(항목 없음)*
-
-## 회원사 동정
-
-*(항목 없음)*
-
-## 협의회 의견
-
-<!-- 상민 확정 필요 -->
+<!-- 보류: 1. 국립새만금수목원, 지역민과 함께 만든다 | 섹션 판정 불명 -->
 """
 
 PASS_CHECK = {
@@ -64,6 +46,7 @@ PASS_CHECK = {
         {"url": "https://example.com/a", "url_alive": True, "passed": True},
         {"url": "https://example.com/b", "url_alive": True, "passed": True},
         {"url": "https://example.com/c", "url_alive": True, "passed": True},
+        {"url": "https://example.com/d", "url_alive": True, "passed": True},
     ],
     "dropped": [],
     "pass": True,
@@ -75,17 +58,30 @@ PASS_CHECK = {
 # ─── 미리보기 파싱·렌더 ──────────────────────────────────────────────────
 def test_parse_digest_numbers_items_in_document_order():
     parsed = preview_mod.parse_digest(SAMPLE_MD)
-    assert [item["number"] for item in parsed["items"]] == [1, 2, 3]
+    assert [item["number"] for item in parsed["items"]] == [1, 2, 3, 4]
     assert [item["url"] for item in parsed["items"]] == [
         "https://example.com/a",
         "https://example.com/b",
         "https://example.com/c",
+        "https://example.com/d",
     ]
-    assert parsed["items"][1]["author"] == "농식품부"
-    assert parsed["items"][1]["deadline"] == "2026-09-30"
-    assert parsed["items"][0]["section"] == "산림 정책 동향"
-    assert parsed["period"] == "2026-09-07 ~ 2026-09-13"
+    assert parsed["items"][0]["label"] == "D-9"
+    assert parsed["items"][0]["author"] == "협동조합포털(기재부)"
+    assert parsed["items"][0]["target"] == "대상: 사협·사회적기업"
+    assert parsed["items"][0]["deadline"] == "마감 9/22"
+    assert parsed["items"][0]["section"] == "신청하세요"
+    assert parsed["items"][3]["section"] == "알아두세요"
+    assert parsed["items"][3]["label"] == ""
+    assert parsed["items"][3]["deadline"] == "의견 10/19까지"
+    assert parsed["period"] == "9/7~9/13"
     assert parsed["has_marker"] is True
+    assert parsed["holds"] == [
+        {
+            "number": 1,
+            "title": "국립새만금수목원, 지역민과 함께 만든다",
+            "reason": "섹션 판정 불명",
+        }
+    ]
 
 
 def test_item_urls_matches_parse_order():
@@ -99,11 +95,17 @@ def test_item_urls_matches_parse_order():
 def test_render_preview_has_header_numbers_status_usage():
     text = preview_mod.render_preview("2026-W37", SAMPLE_MD, PASS_CHECK)
     assert "협의회 주간 정책브리핑 2026-W37" in text
-    assert "기간 2026-09-07 ~ 2026-09-13 · 검증 pass · 항목 3건" in text
-    assert "2. [농식품부] 예비사회적기업 모집 공고 — 2026-09-30 — https://example.com/b" in text
-    assert "■ 산림 정책 동향" in text
+    assert "기간 9/7~9/13 · 검증 pass · 항목 4건" in text
+    # 판정 ⑦: 미리보기는 발송본 그대로 (선정 이유를 따로 붙이지 않는다)
+    assert (
+        "2. [새 소식] 2026년도 제2차 산림형 예비사회적기업 지정 계획 공고 — "
+        "산림청 · 대상: 사회적기업·산림사업자 · 마감 원문 확인"
+    ) in text
+    assert "■ ✅ 신청하세요 (마감순)" in text
+    assert "보류 1건 (핀 n으로 승격)" in text
     assert "상태: 해설 대기" in text
     assert "제외 2,5" in text
+    assert "핀 n" in text
 
 
 def test_render_preview_marks_sendable_after_commentary():
@@ -313,6 +315,6 @@ def test_recheck_digest_preserves_commentary(tmp_path, monkeypatch):
         (tmp_path / "2026-W37.check.json").read_text(encoding="utf-8")
     )
     assert check["pass"] is True
-    assert len(check["items"]) == 3
+    assert len(check["items"]) == 4
     assert md.read_text(encoding="utf-8") == annotated
     assert preview_mod.MARKER not in md.read_text(encoding="utf-8")

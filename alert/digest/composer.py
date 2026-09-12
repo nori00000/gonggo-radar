@@ -1,22 +1,280 @@
-"""협의회 주간 정책브리핑 다이제스트 생성기."""
+"""협의회 주간 정책브리핑 다이제스트 생성기 (계약 v2.1).
+
+v2.1의 뼈대 (2026-09-13 확정안, 판정 1~9):
+- 섹션은 소스가 아니라 **독자의 행동**으로 나눈다: 신청하세요 / 알아두세요 / 협의회에서 / 회원사 소식.
+- 협의회 소스 풀(COUNCIL_SOURCES) 밖의 소스는 **제목에 사회적경제 정체성 키워드가 있을 때만** 들어온다.
+- 분류는 순수 함수다: classify_item(title, summary, source) -> Classification(판정·사유·근거·대상 태그).
+- 기관은 게시자(author)가 아니라 **소스 표시명**이다 (author 필드는 표시하지 않는다).
+- 마감·자격·금액은 DB(summary/raw_data)에서 **문자 그대로 인용**할 수 있을 때만 값을 갖는다.
+  인용이 없으면 "원문 확인" — 어떤 레인도 이 필드를 창작하지 않는다.
+- 보류 항목은 발송본에 싣지 않는다. 마크다운 맨 아래 HTML 주석으로만 남는다.
+"""
 
 import csv
+import json
+import re
 import sqlite3
 import sys
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from pathlib import Path
-from typing import Optional, List, Dict, Set, Tuple
+from typing import Dict, List, NamedTuple, Optional, Sequence, Set, Tuple
 
-# 섹션 분류 기준 (categorize_item과 섹션별 SQL 쿼리가 공유하는 단일 정본)
-FOREST_SOURCES = ("forest_service", "forest_press", "fowi", "kofpi", "lawmaking")
-SSE_SOURCES = ("socialenterprise", "seis", "mois_sse", "coop")
-ANNOUNCEMENT_KEYWORDS = ("공고", "모집", "지원", "신청", "공모", "채용")
+# 이 파일을 만든 레인 (계약 v1.1: 생성 파일 머리에 항상 표기)
+LANE = "Claude opus executor"
 
-# 섹션별 상한 (계약 v1.1: 지원사업 5, 산림 3, 사회연대경제 3)
-SECTION_LIMITS = {"산림": 3, "지원사업": 5, "사회연대경제": 3}
+# 협의회 의견/"이번 주 한 줄" 확정 마커. 발송 게이트(send_digest)가 이 문자열로 막는다.
+MARKER = "<!-- 상민 확정 필요 -->"
 
-# 렌더링 순서 = 중복 제거 우선순위
-SECTION_ORDER = ("산림", "지원사업", "사회연대경제")
+# ─── 판정값 ──────────────────────────────────────────────────────────────
+VERDICT_APPLY = "신청하세요"
+VERDICT_NOTICE = "알아두세요"
+VERDICT_HOLD = "보류"
+VERDICT_EXCLUDE = "배제"
+
+SECTION_COUNCIL = "협의회에서"
+SECTION_MEMBER = "회원사 소식"
+
+# 발송본 형식 v2.1의 섹션 머리글 (마크다운 `## ` 뒤에 오는 문자열 = 정본)
+SECTION_HEADINGS = {
+    VERDICT_APPLY: "✅ 신청하세요 (마감순)",
+    VERDICT_NOTICE: "👀 알아두세요",
+    SECTION_COUNCIL: "🤝 협의회에서",
+    SECTION_MEMBER: "🏢 회원사 소식",
+}
+HEADING_TO_SECTION = {heading: name for name, heading in SECTION_HEADINGS.items()}
+
+# 항목이 실리는 섹션과 그 상한 (판정 ⑩)
+ITEM_SECTIONS = (VERDICT_APPLY, VERDICT_NOTICE)
+SECTION_LIMITS = {VERDICT_APPLY: 5, VERDICT_NOTICE: 3}
+
+# ─── 협의회 소스 풀 (판정 ②) ─────────────────────────────────────────────
+# 회사용 소스(smartfarm·ipet·nongup_gg·rda·goyang·mafra 등 농업·지자체 계열)는
+# 협의회 브리핑에서 제외한다. 예외는 아래 SSE_IDENTITY_KEYWORDS가 **제목에** 있을 때뿐.
+COUNCIL_SOURCES = (
+    "kofpi",
+    "forest_service",
+    "forest_press",
+    "fowi",
+    "lawmaking",
+    "coop",
+    "socialenterprise",
+    "seis",
+    "mois_sse",
+    "bizinfo",
+)
+
+# 기관 = 소스 표시명 고정 매핑 (판정 ⑤). author(게시자 이름) 폐기.
+SOURCE_DISPLAY_NAMES = {
+    "kofpi": "한국임업진흥원",
+    "forest_service": "산림청",
+    "forest_press": "산림청",
+    "fowi": "한국산림복지진흥원",
+    "lawmaking": "국민참여입법센터(산림청 소관)",
+    "coop": "협동조합포털(기재부)",
+    "socialenterprise": "사회적기업진흥원",
+    "seis": "사회적기업진흥원 통합정보",
+    "mois_sse": "행정안전부 마을기업",
+    "bizinfo": "기업마당",
+}
+
+# ─── 룰 v2.1 키워드 사전 (판정 ③) ────────────────────────────────────────
+# 기회 키워드 = 신청하세요 후보
+OPPORTUNITY_KEYWORDS = (
+    "공고",
+    "공모",
+    "모집",
+    "신청",
+    "지원사업",
+    "컨설팅",
+    "입주",
+    "입점",
+    "조달",
+    "설명회",
+)
+
+# 제도 키워드 = 알아두세요 후보
+INSTITUTION_KEYWORDS = (
+    "입법예고",
+    "행정예고",
+    "개정",
+    "시행",
+    "고시",
+    "제도",
+    "정책",
+    "기본계획",
+    "계획 발표",
+)
+
+# 산림 업종 키워드.
+# 판정 ③ 단서: "치유"는 `산림치유`로만 인정(치유농업 배제), "조경"은 회사 축이므로 제외.
+FOREST_INDUSTRY_KEYWORDS = (
+    "산림",
+    "임업",
+    "임산물",
+    "산촌",
+    "목재",
+    "숲",
+    "산지",
+    "임도",
+    "산양삼",
+    "산림복지",
+    "산림치유",
+)
+
+# 사회적경제 정체성 키워드 (소스 풀 예외 + 관련성 축)
+SSE_IDENTITY_KEYWORDS = (
+    "사회적기업",
+    "예비사회적기업",
+    "사회적협동조합",
+    "협동조합",
+    "마을기업",
+    "사회적경제",
+    "사회연대경제",
+    "소셜벤처",
+    "자활기업",
+)
+
+# 노이즈 사전 (판정 ③).
+# 계약에 적힌 항목 + 같은 부류의 한국어 표면형만 덧붙였다(추석=명절, 합격=합격자,
+# 공모결과/선정 결과=행사 후기·수상 부류). 새 부류는 추가하지 않았다.
+NOISE_KEYWORDS = (
+    "채용",
+    "합격",
+    "인사발령",
+    "시스템",
+    "서버",
+    "점검",
+    "진로",
+    "체험 부스",
+    "행사 후기",
+    "수상",
+    "선물",
+    "기획전",
+    "카달로그",
+    "카탈로그",
+    "명절",
+    "추석",
+    "청탁금지",
+    "공모결과",
+    "선정 결과",
+    "재난 대비 점검",
+)
+
+# ─── 대상 태그 (판정 ①) ──────────────────────────────────────────────────
+TAG_SOCIAL_COOP = "사협"          # 사회적협동조합
+TAG_COOP = "협동조합"
+TAG_SOCIAL_ENTERPRISE = "사회적기업"
+TAG_VILLAGE = "마을기업"
+TAG_FOREST_BIZ = "산림사업자"
+TAG_ALL = "전체"
+
+# 표시 순서 (좁은 태그부터)
+TAG_ORDER = (
+    TAG_SOCIAL_COOP,
+    TAG_SOCIAL_ENTERPRISE,
+    TAG_COOP,
+    TAG_VILLAGE,
+    TAG_FOREST_BIZ,
+    TAG_ALL,
+)
+
+# 지역 한정 시 붙일 도명. 긴 표기를 먼저 본다.
+REGION_PATTERNS = (
+    ("서울특별시", "서울"),
+    ("부산광역시", "부산"),
+    ("대구광역시", "대구"),
+    ("인천광역시", "인천"),
+    ("광주광역시", "광주"),
+    ("대전광역시", "대전"),
+    ("울산광역시", "울산"),
+    ("세종특별자치시", "세종"),
+    ("경기도", "경기"),
+    ("강원특별자치도", "강원"),
+    ("충청북도", "충북"),
+    ("충청남도", "충남"),
+    ("전라북도", "전북"),
+    ("전북특별자치도", "전북"),
+    ("전라남도", "전남"),
+    ("경상북도", "경북"),
+    ("경상남도", "경남"),
+    ("제주특별자치도", "제주"),
+    ("경기", "경기"),
+    ("강원", "강원"),
+    ("충북", "충북"),
+    ("충남", "충남"),
+    ("전북", "전북"),
+    ("전남", "전남"),
+    ("경북", "경북"),
+    ("경남", "경남"),
+    ("제주", "제주"),
+)
+
+# ─── 마감 라벨 (판정 ④) ──────────────────────────────────────────────────
+LABEL_NEW = "새 소식"
+LABEL_STANDING = "상시"
+NEW_WINDOW_DAYS = 7
+QUOTE_FALLBACK = "원문 확인"
+
+# 중복 병합 임계값 (판정 ⑥): 같은 소스·같은 주 제목 3-gram Jaccard
+DEDUP_JACCARD = 0.6
+NGRAM_SIZE = 3
+
+# 인용 span을 찾을 수 없는 raw_data 키 (링크는 사람이 읽는 문구가 아니다)
+_RAW_SKIP_KEYS = ("link", "url", "href")
+
+# 메타데이터 괄호: 센터명 접두사·날짜·연장 표기가 들어간다 → **내용까지** 지운다.
+# 「」『』는 한국 공문에서 사업·법령 **이름을 인용**하는 부호이므로 내용은 남기고
+# 부호만 지운다(_SYMBOL_RE가 처리). 내용까지 지우면 제목의 알맹이가 사라져서
+# "…참여자 추가모집 공고"끼리 엉뚱하게 병합된다.
+_BRACKET_RE = re.compile(r"[(\[{（【<][^)\]}）】>]*[)\]}）】>]")
+# 괄호 내용을 지우고 남은 알맹이가 이보다 짧으면 부호만 지우는 쪽으로 되돌린다.
+_MIN_DEDUP_KEY_CHARS = 8
+_DATE_TOKEN_RE = re.compile(
+    r"\d{1,4}\s*[.\-/]\s*\d{1,2}(?:\s*[.\-/]\s*\d{1,2})?\.?"
+    r"|\d{1,4}\s*년|\d{1,2}\s*월|\d{1,2}\s*일|\d{1,2}\s*차|\d{1,2}\s*분기"
+)
+_SYMBOL_RE = re.compile(r"[^0-9A-Za-z가-힣ㄱ-ㅎㅏ-ㅣ\s]")
+
+# 인용 가능한 마감 표기 (특수한 것부터). 반환값은 원문에서 잘라낸 **문자 그대로**다.
+_QUOTE_DEADLINE_PATTERNS = (
+    r"\d{4}\s*\.\s*\d{1,2}\s*\.\s*\d{1,2}\s*\.?\s*~\s*\d{4}\s*\.\s*\d{1,2}\s*\.\s*\d{1,2}\s*\.?",
+    r"~\s*\d{4}\s*[.\-/]\s*\d{1,2}\s*[.\-/]\s*\d{1,2}\s*\.?",
+    r"\d{1,2}\s*[./]\s*\d{1,2}\s*~\s*\d{1,2}\s*[./]\s*\d{1,2}",
+    r"~\s*\d{1,2}\s*[./]\s*\d{1,2}\s*\.?",
+    r"\d{4}\s*[.\-/]\s*\d{1,2}\s*[.\-/]\s*\d{1,2}\s*까지",
+    r"\d{1,2}\s*월\s*\d{1,2}\s*일\s*까지",
+    r"연중\s*상시\s*모집",
+    r"상시\s*모집",
+)
+
+_QUOTE_ELIGIBILITY_PATTERNS = (
+    r"(?:참여|신청|지원|모집)\s*(?:자격|대상)\s*[:：]\s*[^\n]{2,60}",
+    r"(?:참여|신청|지원|모집)\s*(?:자격|대상)\s*은?\s+[^\n]{2,60}",
+    r"대상\s*[:：]\s*[^\n]{2,60}",
+)
+
+_QUOTE_AMOUNT_PATTERNS = (
+    r"최대\s*\d[\d,]*\s*(?:억|천만|백만|만)?\s*원",
+    r"\d[\d,]*\s*(?:억|천만|백만|만)\s*원",
+    r"\d[\d,]*\s*원\s*(?:이내|한도|지원)",
+)
+
+
+class Classification(NamedTuple):
+    """분류 결과 (순수 함수 classify_item의 반환값).
+
+    verdict: VERDICT_APPLY | VERDICT_NOTICE | VERDICT_HOLD | VERDICT_EXCLUDE
+    reason: 판정 사유 (배제·보류 목록에 그대로 쓴다)
+    matched: 매칭 근거 키워드
+    tags: 대상 태그 (없으면 빈 튜플 → 보류)
+    region: 지역 한정 도명 (없으면 None)
+    """
+
+    verdict: str
+    reason: str
+    matched: Tuple[str, ...]
+    tags: Tuple[str, ...]
+    region: Optional[str]
 
 
 def get_week_date_range(week_str: str) -> Tuple[str, str]:
@@ -42,85 +300,278 @@ def get_week_date_range(week_str: str) -> Tuple[str, str]:
 
 
 def normalize_title(title: str) -> str:
-    """제목 정규화: 공백 정규화 (개행·탭 제거).
+    """제목 정규화: 공백 정규화 (개행·탭 제거)."""
+    return " ".join((title or "").split())
+
+
+def _strip_tokens(text: str) -> str:
+    text = _DATE_TOKEN_RE.sub(" ", text)
+    text = _SYMBOL_RE.sub(" ", text)
+    return " ".join(text.split())
+
+
+def dedup_key(title: str) -> str:
+    """중복 판정용 강한 정규화 (판정 ⑥: 괄호·기호·날짜·「」 제거)."""
+    text = normalize_title(title)
+    stripped = _strip_tokens(_BRACKET_RE.sub(" ", text))
+    if len(stripped.replace(" ", "")) >= _MIN_DEDUP_KEY_CHARS:
+        return stripped
+    # 제목이 사실상 괄호 안에만 있는 경우 — 부호만 지운다
+    return _strip_tokens(text)
+
+
+def title_ngrams(title: str, n: int = NGRAM_SIZE) -> frozenset:
+    """정규화된 제목의 문자 n-gram 집합."""
+    compact = dedup_key(title).replace(" ", "")
+    if not compact:
+        return frozenset()
+    if len(compact) <= n:
+        return frozenset([compact])
+    return frozenset(compact[i:i + n] for i in range(len(compact) - n + 1))
+
+
+def jaccard(left: frozenset, right: frozenset) -> float:
+    """두 n-gram 집합의 Jaccard 유사도."""
+    if not left or not right:
+        return 0.0
+    return len(left & right) / len(left | right)
+
+
+def _hits(text: str, keywords: Sequence[str]) -> Tuple[str, ...]:
+    """text에 포함된 키워드를 등장 순서가 아니라 사전 순서대로 반환."""
+    return tuple(kw for kw in keywords if kw in text)
+
+
+def strip_brackets(text: str) -> str:
+    """대괄호·괄호 안 내용 제거 (센터명 접두사가 지역으로 오인되는 것을 막는다)."""
+    return " ".join(_BRACKET_RE.sub(" ", normalize_title(text)).split())
+
+
+def infer_region(title: str) -> Optional[str]:
+    """제목에서 지역 한정 도명을 추론. 센터명 접두사(`[세종대전충청센터]`)는 세지 않는다."""
+    text = strip_brackets(title)
+    for pattern, display in REGION_PATTERNS:
+        if pattern in text:
+            return display
+    return None
+
+
+def infer_target_tags(text: str) -> Tuple[str, ...]:
+    """대상 태그 추론 (판정 ①). 못 붙이면 빈 튜플 → 호출자가 보류로 내린다."""
+    tags: Set[str] = set()
+
+    if "사회적협동조합" in text:
+        tags.add(TAG_SOCIAL_COOP)
+    # `사회적협동조합`을 지운 뒤에도 `협동조합`이 남으면 일반 협동조합도 대상이다.
+    if "협동조합" in text.replace("사회적협동조합", ""):
+        tags.add(TAG_COOP)
+    if "사회적기업" in text or "소셜벤처" in text:
+        tags.add(TAG_SOCIAL_ENTERPRISE)
+    if "마을기업" in text:
+        tags.add(TAG_VILLAGE)
+    if _hits(text, FOREST_INDUSTRY_KEYWORDS):
+        tags.add(TAG_FOREST_BIZ)
+
+    if not tags and ("사회적경제" in text or "사회연대경제" in text):
+        tags.add(TAG_ALL)
+
+    return tuple(tag for tag in TAG_ORDER if tag in tags)
+
+
+def classify_item(title: str, summary: str, source: str) -> Classification:
+    """제목·요약·소스만 보고 섹션/보류/배제를 결정하는 순수 함수 (룰 v2.1).
 
     Args:
-        title: 원본 제목
-
-    Returns:
-        정규화된 제목
-    """
-    return " ".join(title.split())
-
-
-def categorize_item(source: str, title: str) -> str:
-    """소스와 제목으로부터 섹션을 결정.
-
-    Args:
-        source: 데이터 소스
         title: 공고 제목
+        summary: DB summary (없으면 빈 문자열)
+        source: 크롤러 소스 키
 
     Returns:
-        섹션명 ("산림", "사회연대경제", "지원사업")
+        Classification. 마감 경과 판정은 날짜가 필요하므로 여기서 하지 않는다
+        (compose 단계에서 VERDICT_EXCLUDE "마감 경과"로 강등된다).
     """
-    if source in FOREST_SOURCES:
-        # 공고성 제목 확인 (공고, 모집, 지원사업 등)
-        if any(kw in title for kw in ANNOUNCEMENT_KEYWORDS):
-            return "지원사업"
-        else:
-            return "산림"
-    elif source in SSE_SOURCES:
-        return "사회연대경제"
-    else:
-        return "지원사업"
+    title = normalize_title(title)
+    summary = normalize_title(summary or "")
+    text = f"{title} {summary}".strip()
+
+    # ② 소스 풀. 협의회 소스가 아니면 제목의 사회적경제 정체성 키워드만이 통행권이다.
+    if source not in COUNCIL_SOURCES:
+        identity_in_title = _hits(title, SSE_IDENTITY_KEYWORDS)
+        if not identity_in_title:
+            return Classification(
+                VERDICT_EXCLUDE, "협의회 소스 풀 외", (), (), None
+            )
+
+    # ③ 노이즈 사전
+    noise = _hits(text, NOISE_KEYWORDS)
+    if noise:
+        return Classification(
+            VERDICT_EXCLUDE, f"노이즈: {noise[0]}", noise, (), None
+        )
+
+    # ③ 관련성 = 산림 업종 ∨ 사회적경제 정체성
+    forest = _hits(text, FOREST_INDUSTRY_KEYWORDS)
+    identity = _hits(text, SSE_IDENTITY_KEYWORDS)
+    if not forest and not identity:
+        return Classification(VERDICT_EXCLUDE, "관련성 없음", (), (), None)
+
+    relevance = forest + identity
+
+    # ① 대상 태그를 못 붙이면 발송본에 싣지 않는다
+    tags = infer_target_tags(text)
+    if not tags:
+        return Classification(VERDICT_HOLD, "대상 태그 없음", relevance, (), None)
+
+    region = infer_region(title)
+
+    # 기회·제도 신호는 **제목에서만** 인정한다 (룰 v2.1의 "제목/본문"을 제목으로 좁힘).
+    # 근거(W37 실측): forest_press 보도자료 요약에는 "모집"·"정책"·"시행" 같은 상용구가
+    # 늘 들어 있어서 본문까지 보면 관리소 활동 기사가 신청/제도 섹션으로 올라온다
+    # ("산림청, 국익 중심 실용외교…" 가 신청하세요에 실렸다). 제목에 없는 기회는
+    # 배제가 아니라 **보류**로 내려가므로 편집자가 `핀 n`으로 되살릴 수 있다(판정 ⑦).
+    opportunity = _hits(title, OPPORTUNITY_KEYWORDS)
+    if opportunity:
+        return Classification(
+            VERDICT_APPLY,
+            f"기회: {opportunity[0]}",
+            relevance + opportunity,
+            tags,
+            region,
+        )
+
+    institution = _hits(title, INSTITUTION_KEYWORDS)
+    if institution:
+        return Classification(
+            VERDICT_NOTICE,
+            f"제도: {institution[0]}",
+            relevance + institution,
+            tags,
+            region,
+        )
+
+    return Classification(VERDICT_HOLD, "섹션 판정 불명", relevance, tags, region)
 
 
-def _section_where(section: str) -> Tuple[str, List]:
-    """섹션별 WHERE 절과 바인딩 파라미터를 생성.
+# ─── 마감 처리 (판정 ④) ──────────────────────────────────────────────────
+_DEADLINE_FORMATS = ("%Y-%m-%d", "%Y.%m.%d", "%Y/%m/%d")
 
-    categorize_item과 동일한 기준을 SQL로 표현한다.
 
-    Args:
-        section: "산림" | "지원사업" | "사회연대경제"
+def parse_deadline(value: Optional[str]) -> Optional[date]:
+    """구조화된 마감일 문자열을 date로. 파싱 불가는 None."""
+    if not value or not isinstance(value, str):
+        return None
+    text = value.strip()
+    if not text:
+        return None
 
-    Returns:
-        (WHERE 절 SQL, 파라미터 리스트)
+    for fmt in _DEADLINE_FORMATS:
+        try:
+            return datetime.strptime(text[:10], fmt).date()
+        except ValueError:
+            continue
+
+    matched = re.match(r"^(\d{4})\s*년\s*(\d{1,2})\s*월\s*(\d{1,2})\s*일", text)
+    if matched:
+        try:
+            return date(*(int(g) for g in matched.groups()))
+        except ValueError:
+            return None
+    return None
+
+
+def effective_deadline(
+    period_start: Optional[str], period_end: Optional[str]
+) -> Optional[date]:
+    """마감일로 인정할 수 있는 date.
+
+    크롤러 다수가 **게시일을 period_start/period_end에 같은 값으로** 넣는다
+    (forest_service·fowi·socialenterprise·ipet 실측). 그것을 마감으로 믿으면
+    당일 게시된 유효 공고가 '마감 경과'로 조용히 사라진다 — 같으면 마감 없음으로 본다.
+    (구조화된 마감 추출 강화는 V2 크롤러 레인의 몫이다.)
     """
-    forest_ph = ", ".join("?" * len(FOREST_SOURCES))
-    sse_ph = ", ".join("?" * len(SSE_SOURCES))
-    kw_clause = " OR ".join(["title LIKE ?"] * len(ANNOUNCEMENT_KEYWORDS))
-    kw_params = [f"%{kw}%" for kw in ANNOUNCEMENT_KEYWORDS]
+    end = parse_deadline(period_end)
+    if end is None:
+        return None
+    start = parse_deadline(period_start)
+    if start is not None and start == end:
+        return None
+    return end
 
-    if section == "산림":
-        sql = f"source IN ({forest_ph}) AND NOT ({kw_clause})"
-        params = list(FOREST_SOURCES) + kw_params
-    elif section == "사회연대경제":
-        sql = f"source IN ({sse_ph})"
-        params = list(SSE_SOURCES)
-    elif section == "지원사업":
-        sql = (
-            f"((source IN ({forest_ph}) AND ({kw_clause}))"
-            f" OR source NOT IN ({forest_ph}, {sse_ph}))"
-        )
-        params = (
-            list(FOREST_SOURCES)
-            + kw_params
-            + list(FOREST_SOURCES)
-            + list(SSE_SOURCES)
-        )
-    else:
-        raise ValueError(f"알 수 없는 섹션: {section}")
 
-    return sql, params
+def format_month_day(value: date) -> str:
+    """9/22 형태."""
+    return f"{value.month}/{value.day}"
+
+
+def _quote_source_text(summary: Optional[str], raw_data: Optional[str]) -> str:
+    """인용 span을 찾을 대상 텍스트 (사람이 읽는 필드만)."""
+    parts: List[str] = []
+    if summary:
+        parts.append(summary)
+    if raw_data:
+        try:
+            parsed = json.loads(raw_data)
+        except (TypeError, ValueError):
+            parsed = None
+        if isinstance(parsed, dict):
+            for key, value in parsed.items():
+                if not isinstance(value, str):
+                    continue
+                if str(key).lower() in _RAW_SKIP_KEYS:
+                    continue
+                parts.append(value)
+        elif isinstance(parsed, str):
+            parts.append(parsed)
+    return "\n".join(parts)
+
+
+def _find_quote(text: str, patterns: Sequence[str]) -> Optional[str]:
+    """패턴 순서대로 처음 맞는 구간을 **문자 그대로** 잘라낸다."""
+    if not text:
+        return None
+    for pattern in patterns:
+        matched = re.search(pattern, text)
+        if matched:
+            return " ".join(matched.group(0).split())
+    return None
+
+
+def extract_quotes(
+    summary: Optional[str], raw_data: Optional[str]
+) -> Dict[str, str]:
+    """마감·자격·금액의 인용 span (판정 ⑦).
+
+    DB에서 문자 그대로 찾을 수 있을 때만 값이 들어간다. 없으면 "원문 확인".
+    필드 이름은 GLM 야간 레인(V3)이 나중에 채울 자리로 예약돼 있다.
+    """
+    text = _quote_source_text(summary, raw_data)
+    return {
+        "quote_deadline": _find_quote(text, _QUOTE_DEADLINE_PATTERNS)
+        or QUOTE_FALLBACK,
+        "quote_eligibility": _find_quote(text, _QUOTE_ELIGIBILITY_PATTERNS)
+        or QUOTE_FALLBACK,
+        "quote_amount": _find_quote(text, _QUOTE_AMOUNT_PATTERNS)
+        or QUOTE_FALLBACK,
+    }
+
+
+def source_display_name(source: str) -> str:
+    """기관 표시명 (판정 ⑤). 미등록 소스는 소스 키를 그대로 보여준다(조용히 비우지 않는다)."""
+    return SOURCE_DISPLAY_NAMES.get(source, source or "기관 미상")
+
+
+def target_display(tags: Sequence[str], region: Optional[str]) -> str:
+    """`사협·사회적기업` / `사회적기업(경기)` 형태."""
+    if not tags:
+        return ""
+    joined = "·".join(tags)
+    return f"{joined}({region})" if region else joined
 
 
 def load_form_responses(
     forms_csv_path: Optional[Path] = None,
 ) -> Tuple[Dict[str, List[str]], List[str], List[str]]:
-    """forms/responses.csv에서 회원사 동정과 의견 정보 로드.
-
-    Args:
-        forms_csv_path: CSV 파일 경로. None이면 forms/responses.csv 시도
+    """forms/responses.csv에서 회원사 소식과 의견 정보 로드.
 
     Returns:
         ({"회원사명": ["동정내용", ...]}, ["의견1", ...], ["경고문", ...]) 튜플.
@@ -151,9 +602,7 @@ def load_form_responses(
                     continue
 
                 if item_type == "동정" and company:
-                    if company not in responses:
-                        responses[company] = []
-                    responses[company].append(content)
+                    responses.setdefault(company, []).append(content)
                 elif item_type == "의견":
                     opinions.append(content)
     except Exception as e:
@@ -164,6 +613,385 @@ def load_form_responses(
     return responses, opinions, warnings
 
 
+def _parse_created_date(created_at: Optional[str]) -> Optional[date]:
+    """created_at 문자열 → date."""
+    if not created_at:
+        return None
+    return parse_deadline(str(created_at)[:10])
+
+
+def _build_item(row: Sequence, classification: Classification, today: date) -> Dict:
+    """DB 행 + 분류 결과 → 렌더에 필요한 항목 딕셔너리."""
+    (
+        item_id,
+        source,
+        title,
+        summary,
+        url,
+        period_start,
+        period_end,
+        created_at,
+        raw_data,
+    ) = row
+
+    deadline = effective_deadline(period_start, period_end)
+    # 게시일 정본은 period_start다. created_at은 **크롤 시각**이므로 정렬 보조로만 쓰고
+    # "새 소식" 판정에는 쓰지 않는다 — 크롤 날짜를 게시일로 믿으면 게시일이 없는 소스
+    # (seis·coop 실측: period_start NULL)가 전부 "새 소식"이 되어 최신 슬롯을 독식한다.
+    posted_known = _parse_created_date(period_start)
+    posted = posted_known or _parse_created_date(created_at)
+    quotes = extract_quotes(summary, raw_data)
+
+    if deadline is not None:
+        days_left = (deadline - today).days
+        label = f"D-{days_left}"
+        deadline_display = format_month_day(deadline)
+        sort_bucket = 0
+    else:
+        days_left = None
+        # 판정 ④: "새 소식"은 게시 7일 이내임을 **알 때만** 붙인다. 모르면 "상시"(보수).
+        fresh = (
+            posted_known is not None
+            and (today - posted_known).days <= NEW_WINDOW_DAYS
+        )
+        label = LABEL_NEW if fresh else LABEL_STANDING
+        deadline_display = (
+            quotes["quote_deadline"]
+            if quotes["quote_deadline"] != QUOTE_FALLBACK
+            else QUOTE_FALLBACK
+        )
+        sort_bucket = 1 if fresh else 2
+
+    item = {
+        "id": item_id,
+        "source": source,
+        "org": source_display_name(source),
+        "title": normalize_title(title),
+        "summary": normalize_title(summary or ""),
+        "url": url,
+        "verdict": classification.verdict,
+        "reason": classification.reason,
+        "matched": list(classification.matched),
+        "tags": list(classification.tags),
+        "region": classification.region,
+        "target": target_display(classification.tags, classification.region),
+        "period_end": period_end or "",
+        "deadline": deadline.isoformat() if deadline else "",
+        "deadline_display": deadline_display,
+        "days_left": days_left,
+        "label": label,
+        "posted": posted.isoformat() if posted else "",
+        "sort_bucket": sort_bucket,
+        "similar_count": 0,
+    }
+    item.update(quotes)
+    return item
+
+
+def _dedup_same_source(items: List[Dict]) -> List[Dict]:
+    """같은 소스·같은 주 안에서 제목 유사도 ≥ DEDUP_JACCARD면 대표 1건으로 병합 (판정 ⑥)."""
+    kept: List[Dict] = []
+    kept_grams: List[frozenset] = []
+    for item in items:
+        grams = title_ngrams(item["title"])
+        duplicate = False
+        for other, other_grams in zip(kept, kept_grams):
+            if other["source"] != item["source"]:
+                continue
+            if jaccard(grams, other_grams) >= DEDUP_JACCARD:
+                duplicate = True
+                break
+        if duplicate:
+            continue
+        kept.append(item)
+        kept_grams.append(grams)
+    return kept
+
+
+def _mark_cross_source_similar(items: List[Dict]) -> None:
+    """다른 소스 간 의미 중복은 자동 병합하지 않고 "유사 항목 n"으로만 표기 (판정 ⑥③)."""
+    grams = [title_ngrams(item["title"]) for item in items]
+    for i, item in enumerate(items):
+        count = 0
+        for j, other in enumerate(items):
+            if i == j or other["source"] == item["source"]:
+                continue
+            if jaccard(grams[i], grams[j]) >= DEDUP_JACCARD:
+                count += 1
+        item["similar_count"] = count
+
+
+def _posted_ordinal(item: Dict) -> int:
+    """게시일의 서수 (없으면 0 = 가장 오래된 것으로 취급)."""
+    posted = parse_deadline(item.get("posted") or "")
+    return posted.toordinal() if posted else 0
+
+
+def _sort_apply(items: List[Dict]) -> List[Dict]:
+    """신청하세요: 마감 있음 D-day 오름차순 → 새 소식 → 상시 (판정 ④)."""
+    return sorted(
+        items,
+        key=lambda item: (
+            item["sort_bucket"],
+            item["deadline"] or "9999-12-31",
+            -_posted_ordinal(item),
+        ),
+    )
+
+
+def _sort_notice(items: List[Dict]) -> List[Dict]:
+    """알아두세요: 게시일 내림차순."""
+    return sorted(items, key=lambda item: -_posted_ordinal(item))
+
+
+def compose_digest_data(
+    db_path: str,
+    week_str: Optional[str] = None,
+    forms_csv_path: Optional[Path] = None,
+    warnings_out: Optional[List[str]] = None,
+    exclude_urls: Optional[Set[str]] = None,
+    today: Optional[date] = None,
+) -> Dict:
+    """다이제스트 구조 데이터 생성 (렌더 전 단계).
+
+    Returns:
+        {"week", "week_start", "week_end", "period_label", "sections",
+         "council_notes", "member_news", "holds", "excluded", "opinions"}
+    """
+    if week_str is None:
+        iso = datetime.now().isocalendar()
+        week_str = f"{iso[0]}-W{iso[1]:02d}"
+    if today is None:
+        today = date.today()
+
+    week_start, week_end = get_week_date_range(week_str)
+
+    conn = sqlite3.connect(db_path)
+    cursor = conn.cursor()
+
+    exclude_list = sorted(exclude_urls) if exclude_urls else []
+    exclude_sql = ""
+    if exclude_list:
+        exclude_sql = " AND url NOT IN (%s)" % ", ".join("?" * len(exclude_list))
+
+    # 판정 ④의 정렬 정본. 빈 문자열도 "마감 없음"으로 취급하려고 NULLIF를 쓴다.
+    cursor.execute(
+        f"""
+        SELECT id, source, title, summary, url, period_start, period_end,
+               created_at, raw_data
+        FROM announcements
+        WHERE DATE(created_at) BETWEEN ? AND ?{exclude_sql}
+        ORDER BY (NULLIF(period_end, '') IS NULL),
+                 NULLIF(period_end, ''),
+                 created_at DESC
+        """,
+        (week_start, week_end, *exclude_list),
+    )
+    rows = cursor.fetchall()
+    conn.close()
+
+    survivors: List[Dict] = []
+    excluded: List[Dict] = []
+
+    for row in rows:
+        source, title, summary, url = row[1], row[2], row[3], row[4]
+        if exclude_urls and url in exclude_urls:
+            continue
+
+        classification = classify_item(title, summary, source)
+        item = _build_item(row, classification, today)
+
+        if classification.verdict == VERDICT_EXCLUDE:
+            excluded.append(item)
+            continue
+
+        # 마감 경과는 신청 섹션에서만 배제 사유다 (판정 ④).
+        if (
+            classification.verdict == VERDICT_APPLY
+            and item["deadline"]
+            and item["days_left"] is not None
+            and item["days_left"] < 0
+        ):
+            item["verdict"] = VERDICT_EXCLUDE
+            item["reason"] = "마감 경과"
+            excluded.append(item)
+            continue
+
+        survivors.append(item)
+
+    survivors = _dedup_same_source(survivors)
+
+    sections: Dict[str, List[Dict]] = {VERDICT_APPLY: [], VERDICT_NOTICE: []}
+    holds: List[Dict] = []
+    for item in survivors:
+        if item["verdict"] == VERDICT_APPLY:
+            sections[VERDICT_APPLY].append(item)
+        elif item["verdict"] == VERDICT_NOTICE:
+            sections[VERDICT_NOTICE].append(item)
+        else:
+            holds.append(item)
+
+    sections[VERDICT_APPLY] = _sort_apply(sections[VERDICT_APPLY])[
+        : SECTION_LIMITS[VERDICT_APPLY]
+    ]
+    sections[VERDICT_NOTICE] = _sort_notice(sections[VERDICT_NOTICE])[
+        : SECTION_LIMITS[VERDICT_NOTICE]
+    ]
+
+    published = sections[VERDICT_APPLY] + sections[VERDICT_NOTICE]
+    _mark_cross_source_similar(published)
+
+    for number, item in enumerate(holds, start=1):
+        item["number"] = number
+
+    form_responses, opinions, form_warnings = load_form_responses(forms_csv_path)
+    if warnings_out is not None:
+        warnings_out.extend(form_warnings)
+
+    start = parse_deadline(week_start)
+    end = parse_deadline(week_end)
+    period_label = (
+        f"{format_month_day(start)}~{format_month_day(end)}"
+        if start and end
+        else f"{week_start} ~ {week_end}"
+    )
+
+    return {
+        "week": week_str,
+        "week_start": week_start,
+        "week_end": week_end,
+        "period_label": period_label,
+        "sections": sections,
+        "council_notes": [],
+        "member_news": form_responses,
+        "holds": holds,
+        "excluded": excluded,
+        "opinions": opinions,
+    }
+
+
+def item_line(item: Dict) -> str:
+    """발송본 형식 v2.1의 항목 1행 (링크는 다음 줄)."""
+    parts = [f"{item['org']}"]
+    if item["target"]:
+        parts.append(f"대상: {item['target']}")
+
+    if item["verdict"] == VERDICT_NOTICE:
+        if item["deadline"]:
+            parts.append(f"의견 {item['deadline_display']}까지")
+        elif item["deadline_display"] != QUOTE_FALLBACK:
+            parts.append(f"의견 {item['deadline_display']}")
+    else:
+        parts.append(f"마감 {item['deadline_display']}")
+
+    if item["similar_count"]:
+        parts.append(f"유사 항목 {item['similar_count']}")
+
+    head = item["title"]
+    if item["verdict"] == VERDICT_APPLY:
+        head = f"[{item['label']}] {head}"
+
+    return f"{head} — " + " · ".join(parts)
+
+
+def _member_news_lines(member_news: Dict[str, List[str]]) -> List[str]:
+    lines: List[str] = []
+    for company, contents in sorted(member_news.items()):
+        lines.append(f"**{company}**")
+        for content in contents:
+            lines.append(f"- {content}")
+        lines.append("")
+    return lines
+
+
+def render_markdown(data: Dict) -> str:
+    """발송본 마크다운 (형식 v2.1).
+
+    보류 목록은 맨 아래 HTML 주석으로만 남는다 — send_digest의 마크다운→HTML
+    변환이 `<!--` 로 시작하는 줄을 건너뛰므로 발송 HTML에는 실리지 않는다.
+    """
+    lines = [
+        f"<!-- lane: {LANE} -->",
+        "",
+        f"# 📋 협의회 주간 정책브리핑 {data['week']} ({data['period_label']})",
+        "",
+        f"이번 주 한 줄: {MARKER}",
+        "",
+    ]
+
+    for section in ITEM_SECTIONS:
+        lines.append(f"## {SECTION_HEADINGS[section]}")
+        lines.append("")
+        items = data["sections"].get(section) or []
+        if not items:
+            lines.append("*(항목 없음)*")
+            lines.append("")
+            continue
+        for item in items:
+            lines.append(item_line(item))
+            lines.append(f"  [원문]({item['url']})")
+            lines.append("")
+
+    lines.append(f"## {SECTION_HEADINGS[SECTION_COUNCIL]}")
+    lines.append("")
+    if data.get("council_notes"):
+        for note in data["council_notes"]:
+            lines.append(f"· {note}")
+    else:
+        lines.append("· (면담·건의·수렴 현황 — 이번 주 기록 없음)")
+    lines.append("")
+
+    # 판정 ⑩: 회원사 소식은 없으면 섹션을 생략한다.
+    if data.get("member_news"):
+        lines.append(f"## {SECTION_HEADINGS[SECTION_MEMBER]}")
+        lines.append("")
+        lines.extend(_member_news_lines(data["member_news"]))
+
+    if data.get("holds"):
+        for item in data["holds"]:
+            title = item["title"].replace("--", "—").replace(">", "＞")
+            lines.append(f"<!-- 보류: {item['number']}. {title} | {item['reason']} -->")
+        lines.append("")
+
+    return "\n".join(lines)
+
+
+def render_kakao(data: Dict, headline: Optional[str] = None) -> str:
+    """카톡 평문 렌더 (같은 틀, 마크다운 장식·보류 주석 없음)."""
+    lines = [
+        f"📋 협의회 주간 정책브리핑 {data['week']} ({data['period_label']})",
+        f"이번 주 한 줄: {headline.strip() if headline else '(확정 필요)'}",
+        "",
+    ]
+
+    for section in ITEM_SECTIONS:
+        lines.append(SECTION_HEADINGS[section])
+        items = data["sections"].get(section) or []
+        if not items:
+            lines.append("  (항목 없음)")
+        for item in items:
+            lines.append(item_line(item))
+            lines.append(f"  {item['url']}")
+        lines.append("")
+
+    lines.append(SECTION_HEADINGS[SECTION_COUNCIL])
+    if data.get("council_notes"):
+        for note in data["council_notes"]:
+            lines.append(f"· {note}")
+    else:
+        lines.append("· (면담·건의·수렴 현황 — 이번 주 기록 없음)")
+    lines.append("")
+
+    if data.get("member_news"):
+        lines.append(SECTION_HEADINGS[SECTION_MEMBER])
+        for company, contents in sorted(data["member_news"].items()):
+            for content in contents:
+                lines.append(f"· {company}: {content}")
+        lines.append("")
+
+    return "\n".join(lines).rstrip() + "\n"
+
+
 def compose_digest(
     db_path: str,
     week_str: Optional[str] = None,
@@ -171,233 +999,57 @@ def compose_digest(
     forms_csv_path: Optional[Path] = None,
     warnings_out: Optional[List[str]] = None,
     exclude_urls: Optional[Set[str]] = None,
+    today: Optional[date] = None,
 ) -> str:
-    """주간 정책브리핑 다이제스트 마크다운 생성.
+    """주간 정책브리핑 다이제스트 마크다운 생성 (계약 v2.1).
 
-    섹션 상한은 계약 v1.1 고정값(SECTION_LIMITS)이며 호출자가 조정할 수 없다.
+    섹션 상한은 고정값(SECTION_LIMITS)이며 호출자가 조정할 수 없다.
 
     Args:
         db_path: announcements.db 경로
-        week_str: ISO 주 표기 (기본: 현재 주, 예: "2026-W13")
-        output_path: 출력 파일 경로. None이면 반환값만 사용
+        week_str: ISO 주 표기 (기본: 현재 주, 예: "2026-W37")
+        output_path: 출력 파일 경로. 주어지면 같은 이름의 `.kakao.txt`도 함께 쓴다
         forms_csv_path: 폼 CSV 경로
-        warnings_out: 경고 수집용 리스트. 주어지면 폼 로드 실패 등이 append됨
-        exclude_urls: 제외할 원문 URL 집합 (계약 v1.2: url_alive=false 항목 자동 제외).
-            제외는 조회 단계에서 적용되므로 섹션 상한이 남은 후보로 다시 채워진다.
+        warnings_out: 경고 수집용 리스트 (폼 로드 실패 등)
+        exclude_urls: 제외할 원문 URL 집합 (계약 v1.2: url_alive=false 자동 제외)
+        today: 기준 날짜 (기본: 오늘). D-day·새 소식/상시 판정에 쓰인다
 
     Returns:
         생성된 마크다운 텍스트
     """
-    # 현재 주 결정
-    if week_str is None:
-        today = datetime.now()
-        week_num = today.isocalendar()[1]
-        year = today.isocalendar()[0]
-        week_str = f"{year}-W{week_num:02d}"
+    data = compose_digest_data(
+        db_path=db_path,
+        week_str=week_str,
+        forms_csv_path=forms_csv_path,
+        warnings_out=warnings_out,
+        exclude_urls=exclude_urls,
+        today=today,
+    )
 
-    week_start, week_end = get_week_date_range(week_str)
+    markdown = render_markdown(data)
 
-    # DB 연결
-    conn = sqlite3.connect(db_path)
-    # 중복 제거 기준을 SQL과 파이썬이 공유하도록 정규화 함수를 등록
-    conn.create_function("normalize_title", 1, normalize_title)
-    cursor = conn.cursor()
-
-    # 계약 v1.2: 제외 URL은 조회 단계에서 뺀다. 그래야 LIMIT(섹션 상한)이
-    # 남은 후보로 다시 채워진다 = "제외 후 섹션 상한 재적용".
-    exclude_list = sorted(exclude_urls) if exclude_urls else []
-    if exclude_list:
-        exclude_sql = " AND url NOT IN (%s)" % ", ".join("?" * len(exclude_list))
-    else:
-        exclude_sql = ""
-
-    # 섹션별로 독립 조회 (주간 창 양끝 포함, 중복 제거 후 섹션 상한만큼만)
-    section_rows: Dict[str, List] = {}
-    for section in SECTION_ORDER:
-        where_sql, where_params = _section_where(section)
-        cursor.execute(
-            f"""
-            SELECT id, source, title, summary, url, author, period_end,
-                   MAX(relevance_score) AS relevance_score
-            FROM announcements
-            WHERE {where_sql}{exclude_sql}
-              AND DATE(created_at) BETWEEN ? AND ?
-            GROUP BY normalize_title(title)
-            ORDER BY relevance_score DESC
-            LIMIT ?
-            """,
-            (
-                *where_params,
-                *exclude_list,
-                week_start,
-                week_end,
-                SECTION_LIMITS[section],
-            ),
-        )
-        section_rows[section] = cursor.fetchall()
-
-    conn.close()
-
-    # 섹션 조립 후 섹션 간 중복 제거 (렌더 순서 우선, 제목 정규화 기준)
-    sections: Dict[str, List[Dict]] = {section: [] for section in SECTION_ORDER}
-    seen_normalized_titles = set()
-
-    for section in SECTION_ORDER:
-        for row in section_rows[section]:
-            item_id, source, title, summary, url, author, period_end, score = row
-            normalized_title = normalize_title(title)
-
-            # 조회 단계에서 이미 걸렀지만, 호출자가 SQL을 우회해도 안전하도록 방어한다.
-            if exclude_urls and url in exclude_urls:
-                continue
-
-            if normalized_title in seen_normalized_titles:
-                continue
-            seen_normalized_titles.add(normalized_title)
-
-            # 제외 후 섹션 상한 재적용
-            if len(sections[section]) >= SECTION_LIMITS[section]:
-                continue
-
-            sections[section].append({
-                "id": item_id,
-                "source": source,
-                "title": normalized_title,
-                "summary": summary or "",
-                "url": url,
-                "author": author or "",
-                "period_end": period_end or "",
-                "score": score,
-            })
-
-    # 회원사 동정 및 의견 로드
-    form_responses, opinions, form_warnings = load_form_responses(forms_csv_path)
-    if warnings_out is not None:
-        warnings_out.extend(form_warnings)
-
-    # 마크다운 생성
-    lines = [
-        "<!-- lane: Codex(gpt-5.6) -->",
-        "",
-        f"# 협의회 주간 정책브리핑 {week_str}",
-        "",
-        f"**기간:** {week_start} ~ {week_end}",
-        "",
-    ]
-
-    # 산림 정책 동향
-    lines.append("## 산림 정책 동향")
-    lines.append("")
-    if sections["산림"]:
-        for item in sections["산림"]:
-            lines.extend(_format_item(item))
-            lines.append("")
-    else:
-        lines.append("*(항목 없음)*")
-        lines.append("")
-
-    # 지원사업 공고
-    lines.append("## 지원사업 공고")
-    lines.append("")
-    if sections["지원사업"]:
-        for item in sections["지원사업"]:
-            lines.extend(_format_item(item))
-            lines.append("")
-    else:
-        lines.append("*(항목 없음)*")
-        lines.append("")
-
-    # 사회연대경제 동향
-    lines.append("## 사회연대경제 동향")
-    lines.append("")
-    if sections["사회연대경제"]:
-        for item in sections["사회연대경제"]:
-            lines.extend(_format_item(item))
-            lines.append("")
-    else:
-        lines.append("*(항목 없음)*")
-        lines.append("")
-
-    # 회원사 동정
-    lines.append("## 회원사 동정")
-    lines.append("")
-    if form_responses:
-        for company, contents in sorted(form_responses.items()):
-            lines.append(f"**{company}**")
-            for content in contents:
-                lines.append(f"- {content}")
-            lines.append("")
-    else:
-        lines.append("*(항목 없음)*")
-        lines.append("")
-
-    # 협의회 의견 (마커만)
-    lines.append("## 협의회 의견")
-    lines.append("")
-    lines.append("<!-- 상민 확정 필요 -->")
-    lines.append("")
-
-    markdown = "\n".join(lines)
-
-    # 파일 저장
     if output_path:
         output_path = Path(output_path)
         output_path.parent.mkdir(parents=True, exist_ok=True)
-        with open(output_path, "w", encoding="utf-8") as f:
-            f.write(markdown)
+        output_path.write_text(markdown, encoding="utf-8")
+        output_path.with_name(
+            output_path.name.replace(".md", "") + ".kakao.txt"
+        ).write_text(render_kakao(data), encoding="utf-8")
 
-    # 의견 파일 저장 (별도)
-    if opinions and output_path:
+    if data["opinions"] and output_path:
         opinions_path = output_path.with_name(
             output_path.name.replace(".md", ".opinions.md")
         )
         opinions_lines = [
-            "<!-- lane: Codex(gpt-5.6) -->",
+            f"<!-- lane: {LANE} -->",
             "",
-            f"# 협의회 의견 {week_str}",
+            f"# 협의회 의견 {data['week']}",
             "",
         ]
-        for opinion in opinions:
+        for opinion in data["opinions"]:
             opinions_lines.append(f"- {opinion}")
             opinions_lines.append("")
 
-        with open(opinions_path, "w", encoding="utf-8") as f:
-            f.write("\n".join(opinions_lines))
+        opinions_path.write_text("\n".join(opinions_lines), encoding="utf-8")
 
     return markdown
-
-
-def _format_item(item: Dict) -> List[str]:
-    """항목을 마크다운 형식으로 포맷.
-
-    Args:
-        item: 공고 항목 딕셔너리
-
-    Returns:
-        마크다운 줄 리스트
-    """
-    lines = []
-    lines.append(f"### {item['title']}")
-    lines.append("")
-    lines.append(f"**기관:** {item['author']}")
-
-    # 마감일 (없으면 명시)
-    if item['period_end']:
-        lines.append(f"**마감:** {item['period_end']}")
-    else:
-        lines.append("**마감:** 미정")
-
-    lines.append(f"**원문:** [{item['url']}]({item['url']})")
-    lines.append("")
-
-    # 요약 (최대 3줄, 없으면 명시)
-    if item['summary']:
-        summary = item['summary'].strip()
-        # 최대 3줄로 절단
-        summary_lines = summary.split("\n")[:3]
-        summary = "\n".join(summary_lines)
-        lines.append(summary)
-    else:
-        lines.append("*(요약 없음)*")
-
-    return lines

@@ -97,6 +97,9 @@ def main():
                 exclude_urls=dropped_urls or None,
             )
             print(f"✓ {label}: {markdown_path}")
+            kakao_path = markdown_path.with_name(f"{markdown_path.stem}.kakao.txt")
+            if kakao_path.exists():
+                print(f"✓ 카톡 평문: {kakao_path}")
         except Exception as e:
             print(f"✗ {label} 실패: {e}", file=sys.stderr)
             return 1
