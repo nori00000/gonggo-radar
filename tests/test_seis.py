@@ -7,7 +7,9 @@ from unittest.mock import MagicMock, patch
 import pytest
 from bs4 import BeautifulSoup
 
+from alert.crawlers.period_extractors import SEIS_CARD_DATE_FIELD
 from alert.crawlers.seis import SeisCrawler
+from alert.main import _finalize_periods
 from alert.models import RawAnnouncement
 
 FIXTURES = Path(__file__).parent / "fixtures"
@@ -297,10 +299,13 @@ class TestSeisMainCards:
             "https://www.seis.or.kr/subPage.do"
             "?menuId=30200&tabId=pbancMainView&fncPbofrSn=8371"
         )
-        # 13차: 카드 ``p.date`` 에는 접수 라벨이 없으므로 기간을 만들지
-        # 않는다. 목록 날짜는 병합 슬롯과 raw_data 증거로만 쓴다.
+        # 13차: 기간은 크롤러가 아니라 저장 직전 관문이 정한다. 카드
+        # ``p.date`` 는 **구조 근거**가 있는 자리이므로 관문이 다시 채운다.
         assert (announcement.period_start, announcement.period_end) == (None, None)
-        assert json.loads(announcement.raw_data)["date"] == "2026.09.01 ~ 2026.12.31"
+        gated = _finalize_periods("seis", announcement)
+        assert (gated.period_start, gated.period_end) == (
+            "2026-09-01", "2026-12-31"
+        )
         assert announcement.author == "한국사회적기업진흥원"
 
     def test_merged_links_are_auditable(self, crawler, soup):
@@ -327,11 +332,11 @@ class TestSeisMainCards:
         }
         assert {"서울특별시", "광주광역시", "전라남도", "경상북도", "산림청"} <= subjects
 
-    def test_no_card_item_gets_a_deadline(self, crawler, soup):
-        """13차: 카드 ``p.date`` 는 라벨이 없다 -> 마감을 만들지 않는다.
+    def test_every_card_item_gets_a_deadline_at_the_gate(self, crawler, soup):
+        """카드 기간은 **관문에서** 채워진다 - 크롤러는 만들지 않는다.
 
-        커버리지 14 -> 0 은 의도한 대가다. 라벨 없는 범위를 접수기간으로
-        승격하면 접수 의미가 입증되지 않은 마감을 말한다 (9차 게이트 ①).
+        크롤러 단계에서는 전부 None 이고(어떤 파서 출력도 저장되지 않는다),
+        저장 직전 관문이 구조 근거가 있는 ``p.date`` 값만 다시 읽는다.
         """
         deduped = crawler._dedupe_items(crawler._parse_main_cards(soup))
         announcements = [
@@ -339,6 +344,9 @@ class TestSeisMainCards:
         ]
         assert announcements
         assert not any(a.period_start or a.period_end for a in announcements)
+
+        gated = [_finalize_periods("seis", a) for a in announcements]
+        assert all(a.period_start and a.period_end for a in gated)
 
     def test_source_ids_are_unique_and_stable(self, crawler, soup):
         """source_id는 URL의 공고 고유번호이며 배치 내에서 충돌하지 않는다."""
@@ -441,14 +449,12 @@ class TestSeisCardRegionCritique:
         ])
         assert len(deduped) == 2
         built = [
-            crawler._to_announcement(i, "https://www.seis.or.kr") for i in deduped
+            _finalize_periods(
+                "seis", crawler._to_announcement(i, "https://www.seis.or.kr")
+            )
+            for i in deduped
         ]
-        # 기간은 만들지 않지만(라벨 없음), 목록에 적힌 종료일이 다르면
-        # 병합 슬롯이 달라 별개 공고로 남는다
-        assert all(a.period_end is None for a in built)
-        assert {json.loads(a.raw_data)["date"] for a in built} == {
-            "2026.08.01 ~ 2026.08.31", "2026.09.01 ~ 2026.09.30"
-        }
+        assert {a.period_end for a in built} == {"2026-08-31", "2026-09-30"}
 
     def test_genuine_round_duplication_still_merges(self, crawler):
         """주체·제목·종료일이 모두 같은 회차 중복은 여전히 1건으로 합친다."""
@@ -462,7 +468,7 @@ class TestSeisCardRegionCritique:
         assert deduped[0]["merged_count"] == 2
         announcement = crawler._to_announcement(deduped[0], "https://www.seis.or.kr")
         assert announcement.source_id == "8371"          # 최신 회차가 대표
-        assert announcement.period_end is None           # 관문이 정한다 (13차)
+        assert _finalize_periods("seis", announcement).period_end == "2026-12-31"
 
     def test_group_key_components(self, crawler):
         """중복 판별 키는 제목·주체·종료일 세 조각이다."""
@@ -833,24 +839,28 @@ class TestCycle11SeisWhitelist:
             "html.parser",
         )
 
-    def test_card_parser_gives_no_structural_label(self, crawler, soup):
-        """13차: 파서는 구조 라벨을 붙이지 않고, 실 카드는 기간을 못 만든다.
+    def test_card_parser_records_provenance_not_a_label(self, crawler, soup):
+        """파서는 **라벨을 지어내지 않고 출처를 기록**한다.
 
-        12차까지 카드 파서는 ``date_label="접수기간"`` 을 붙였다 - 그
-        구조 라벨이 무라벨 범위 14건을 전부 마감으로 만들었다
-        (9차 게이트 HIGH ①). 라벨은 **값 본문**에서만 온다.
+        12차까지 카드 파서는 ``date_label="접수기간"`` 이라는 자유 라벨을
+        붙였고, 그 라벨이 무라벨 범위를 전부 마감으로 만들었다 (9차 게이트
+        HIGH ①). 지금은 라벨 대신 **어느 셀렉터에서 읽었는지**를 남기고,
+        추출기가 그 자리만 인정한다.
         """
         items = crawler._parse_main_cards(soup)
         assert items and all(i["date_label"] == "" for i in items)
+        assert all(i["date_field"] == SEIS_CARD_DATE_FIELD for i in items)
 
         deduped = crawler._dedupe_items(items)
         announcements = [
-            crawler._to_announcement(i, "https://www.seis.or.kr") for i in deduped
+            _finalize_periods(
+                "seis", crawler._to_announcement(i, "https://www.seis.or.kr")
+            )
+            for i in deduped
         ]
-        assert len(announcements) == 14           # 병합 슬롯은 그대로 동작한다
-        assert all(a is not None for a in announcements)
-        assert sum(1 for a in announcements if a.period_end) == 0
-        # 날짜 자체는 잃지 않는다
+        assert len(announcements) == 14           # 병합은 그대로 동작한다
+        assert sum(1 for a in announcements if a.period_end) == 14
+        # 날짜 자체도 잃지 않는다
         assert all(json.loads(a.raw_data).get("posted") for a in announcements)
 
     def test_author_difference_keeps_two_items(self, crawler):

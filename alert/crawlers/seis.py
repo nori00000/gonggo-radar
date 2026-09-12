@@ -12,7 +12,7 @@ from .date_labels import (
     label_for,
 )
 from .dedupe_keys import ALWAYS_OPEN_TOKENS, group_key, normalize_title
-from .period_extractors import seis_period
+from .period_extractors import SEIS_CARD_DATE_FIELD, seis_period
 from ..models import RawAnnouncement
 
 try:
@@ -207,9 +207,16 @@ class SeisCrawler(BaseCrawler):
             # 주체(지역·기관·사업명)는 span.sub 만 본다.
             info_values = []
             round_label = ""
+            dday = ""
             for info in card.select("ul.info li"):
                 value = self._clean(info.get_text(strip=True))
-                if not value or self._DDAY_RE.match(value):
+                if not value:
+                    continue
+                if self._DDAY_RE.match(value):
+                    # D-day 는 **마감 카운트다운**이다. 기간의 구조적 방증
+                    # 으로 남긴다 - 추출 조건은 아니다(마감 당일 표기가
+                    # 달라질 수 있다).
+                    dday = dday or value
                     continue
                 if self._ROUND_RE.search(value):
                     round_label = round_label or value
@@ -222,11 +229,13 @@ class SeisCrawler(BaseCrawler):
                 "author": "",
                 "category": category,
                 "date": self._clean(date_elem.get_text(strip=True)) if date_elem else "",
-                # 13차: 구조 라벨을 **주지 않는다**. 이 자리에는 접수기간·
-                # 교육기간·무라벨 범위가 섞여 들어오므로, 값 자체가
-                # ``접수기간 …`` 이라고 말할 때만 기간이 된다
-                # (9차 게이트 HIGH ①: 무라벨 범위 14건이 모두 마감이 됐다).
+                # 13차: **텍스트 라벨을 지어내지 않는다**. 대신 이 값을 어느
+                # 자리에서 읽었는지(출처)를 기록한다 - 기간 추출기는
+                # ``li.swiper-slide p.date`` 에서 온 값만 접수기간으로 읽는다
+                # (근거는 ``period_extractors.SEIS_CARD_DATE_FIELD`` 주석).
                 "date_label": "",
+                "date_field": SEIS_CARD_DATE_FIELD if date_elem else "",
+                "dday": dday,
                 "sub": self._clean(sub.get_text(strip=True)) if sub else "",
                 "info": info_values,
                 "round": round_label,

@@ -235,7 +235,9 @@ class TestLawmakingCrawler:
         )
         assert (ann.period_start, ann.period_end) == (None, None)
         gated = _finalize_periods(ann.source, ann)
-        assert (gated.period_start, gated.period_end) == (None, "2026-10-19")
+        assert (gated.period_start, gated.period_end) == (
+            "2026-09-07", "2026-10-19"
+        )
         assert ann.category.startswith("입법예고")
 
     def test_normalize_date_accepts_spaced_dots(self, crawler):
@@ -377,8 +379,8 @@ class TestCycle11PolicyWhitelist:
         assert not any(a.period_start or a.period_end for a in built)
         assert json.loads(built[0].raw_data)["posted"] == "2026-09-07"
 
-    def test_lawmaking_deadline_comes_from_the_gate(self):
-        """(c) 의견제출 기간 셀은 **관문에서** 마감이 된다 - 시작일은 안 만든다."""
+    def test_lawmaking_period_comes_from_the_gate(self):
+        """(c) 의견제출 기간 셀은 **관문에서** 시작·종료가 된다."""
         config = make_config("lawmaking", "https://opinion.lawmaking.go.kr")
         with patch("alert.crawlers.base.get_config", return_value=config):
             crawler = LawmakingCrawler()
@@ -391,5 +393,6 @@ class TestCycle11PolicyWhitelist:
         assert (ann.period_start, ann.period_end) == (None, None)
 
         gated = _finalize_periods(ann.source, ann)
-        assert gated.period_start is None          # 시작일은 만들지 않는다
-        assert gated.period_end == "2026-10-19"
+        assert (gated.period_start, gated.period_end) == (
+            "2026-09-07", "2026-10-19"
+        )

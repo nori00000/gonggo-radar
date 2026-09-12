@@ -35,8 +35,22 @@ _MONTH_DAY = r"\d{1,2}\s*[-./월]\s*\d{1,2}\s*일?\s*\.?"
 # 월·일(그때 연도는 A 에서 온다)이다.
 _RANGE = re.compile(rf"({_FULL_DATE})\s*[~∼〜-]\s*({_FULL_DATE}|{_MONTH_DAY})")
 
-# SEIS 카드 ``p.date`` - 값이 **접수기간 라벨로 시작**할 때만 기간이다.
-# 구조 라벨(파서가 붙이는 ``date_label``)은 믿지 않는다: 같은 자리에
+# SEIS 메인 카드의 **접수기간 자리**. 파서가 이 셀렉터에서 실제로 읽은
+# 값에만 붙이는 출처 표시이며, 자유 텍스트 라벨과 달리 지어낼 수 없다.
+#
+# 이 자리를 접수기간으로 인정하는 근거(2026-09-13 라이브·픽스처 실측):
+#   - 사이트가 **클래스로 분기**한다: 공고 카드(인·지정/사업공고/재정지원)만
+#     ``p.date`` 를 채우고(22/22 전부 ``A ~ B`` 범위), 공지사항 카드 12건은
+#     빈 ``p.date-temp`` 를 쓴다.
+#   - 같은 카드 ``ul.info`` 의 **D-day 배지가 ``p.date`` 종료일까지의 남은
+#     날짜와 22/22 일치**한다(종료일 - 2026-09-13 = D-N). 사이트 자신이 그
+#     종료일을 마감으로 세고 있다.
+# 텍스트 라벨(``접수기간``)은 이 페이지 전체에 **0건**이므로 텍스트만으로는
+# 이 22건을 영원히 읽을 수 없다.
+SEIS_CARD_DATE_FIELD = "li.swiper-slide p.date"
+
+# 값이 **접수기간 라벨로 시작**하면 자리와 무관하게 인정한다(표·목록 경로).
+# 파서가 붙이는 자유 라벨(``date_label``)은 믿지 않는다: 같은 자리에
 # 교육기간·행사일정·무라벨 범위가 함께 들어온다.
 _SEIS_RECEPTION_LABEL = re.compile(r"^\s*접수\s*기간\s*[:：]?\s*(\S.*)$")
 
@@ -98,39 +112,47 @@ def _single_range(text: str) -> Period:
 
 
 def seis_period(raw: Dict[str, object]) -> Period:
-    """SEIS - 값이 ``접수기간 …`` 으로 시작하는 단일 범위만 기간이다.
+    """SEIS - 근거가 **두 가지 중 하나**일 때만 단일 범위를 기간으로 읽는다.
 
-    라벨 없는 범위는 접수 의미가 입증되지 않았으므로 기간이 아니다
-    (9차 게이트 HIGH ①: 실 카드의 무라벨 범위 14건이 모두 마감이 됐다).
+    1. **구조 근거**: 값을 ``li.swiper-slide p.date`` 에서 읽었다
+       (``date_field``). 위 상수의 실측 근거 참조 - 사이트가 이 자리를
+       클래스로 분기하고 D-day 로 카운트다운한다.
+    2. **텍스트 근거**: 값 자체가 ``접수기간 …`` 으로 시작한다.
+
+    둘 다 아니면 기간이 아니다 - 목록의 무라벨 범위, 교육기간, 제목 라벨은
+    전부 여기서 걸린다 (9차 게이트 HIGH ①·②).
 
     Args:
-        raw: 크롤러가 남긴 ``raw_data`` 딕셔너리. ``date`` 만 읽는다
+        raw: 크롤러가 남긴 ``raw_data``. ``date_field`` 와 ``date`` 만 읽는다
 
     Returns:
         ``(period_start, period_end)`` - 조건을 못 채우면 ``(None, None)``
     """
-    match = _SEIS_RECEPTION_LABEL.match(_normalize(raw.get("date")))
+    value = _normalize(raw.get("date"))
+    if raw.get("date_field") == SEIS_CARD_DATE_FIELD:
+        return _single_range(value)
+
+    match = _SEIS_RECEPTION_LABEL.match(value)
     if not match:
         return None, None
     return _single_range(match.group(1))
 
 
 def lawmaking_period(raw: Dict[str, object]) -> Period:
-    """국민참여입법센터 - 의견제출 기간 셀에 범위가 하나일 때 그 종료일.
+    """국민참여입법센터 - 의견제출 기간 셀에 범위가 **하나**일 때 그 범위.
 
-    셀에 ``/ 심사기간 …`` 이 붙어 범위가 둘이면 None 이다 (9차 게이트
-    HIGH: 심사 종료일이 의견접수 마감으로 합성됐다).
+    셀 전체가 의견제출 기간 필드이므로, 범위가 하나면 시작일·종료일이
+    **같은 근거**로 적혀 있다. 둘 이상이면(``/ 심사기간 …``) 어느 쪽이
+    의견접수인지 알 수 없어 None 이다 (9차 게이트 HIGH: 심사 종료일이
+    의견접수 마감으로 합성됐다).
 
     Args:
         raw: 크롤러가 남긴 ``raw_data`` 딕셔너리. ``period`` 만 읽는다
 
     Returns:
-        ``(None, period_end)`` - 조건을 못 채우면 ``(None, None)``
+        ``(period_start, period_end)`` - 조건을 못 채우면 ``(None, None)``
     """
-    _start, end = _single_range(_normalize(raw.get("period")))
-    if not end:
-        return None, None
-    return None, end
+    return _single_range(_normalize(raw.get("period")))
 
 
 # 기간을 만들 수 있는 소스 **전부**. 여기 없는 소스는 항상 None 이다.

@@ -16,7 +16,8 @@
 
 import ast
 import json
-from datetime import datetime
+import re
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -31,6 +32,7 @@ from alert.crawlers.kofpi import KofpiCrawler
 from alert.crawlers.lawmaking import LawmakingCrawler
 from alert.crawlers.period_extractors import (
     PERIOD_EXTRACTORS,
+    SEIS_CARD_DATE_FIELD,
     lawmaking_period,
     seis_period,
 )
@@ -320,9 +322,10 @@ class TestLawmakingExtractor:
     """lawmaking - 의견제출 기간 셀에 범위가 **하나**일 때 그 종료일."""
 
     @pytest.mark.parametrize("value,expected", [
-        # 정상: 실제 목록 표기
-        ("2026. 9. 7. ~2026. 10. 19.", (None, "2026-10-19")),
-        ("2026.09.01 ~ 2026.09.30", (None, "2026-09-30")),
+        # 정상: 실제 목록 표기 - 셀 전체가 의견제출 기간 필드이므로
+        # 시작일도 같은 근거로 적혀 있다
+        ("2026. 9. 7. ~2026. 10. 19.", ("2026-09-07", "2026-10-19")),
+        ("2026.09.01 ~ 2026.09.30", ("2026-09-01", "2026-09-30")),
         # Codex 재현: 심사기간이 붙어 범위가 둘
         ("2026.09.01 ~ 2026.09.30 / 심사기간 2026.10.01 ~ 2026.10.31",
          (None, None)),
@@ -391,33 +394,119 @@ class TestSeisTitleLabelReentry:
 class TestRealFixtures:
     """실 픽스처 - 커버리지가 어디서 사라지고 어디서 남는지 못박는다."""
 
-    def test_seis_main_cards_have_no_reception_label(self):
-        """실 카드의 ``p.date`` 에는 접수 라벨이 **없다** (커버리지 14 -> 0).
+    def test_seis_cards_carry_no_text_label_at_all(self):
+        """실 카드에는 ``접수기간`` 텍스트가 **한 건도 없다** (2026-09-13 실측).
 
-        라벨 없는 범위를 마감으로 쓰면 없는 접수기간을 말한다. 마감을
-        모른다고 말하는 쪽을 택했다 - 커버리지 손실은 의도한 대가다.
+        그래서 텍스트 근거만으로는 이 22건을 영원히 읽을 수 없다 - 구조
+        근거(``p.date`` 자리)가 필요한 이유다.
         """
+        html = (FIXTURES / "seis_main_cards.html").read_text(encoding="utf-8")
+        assert "접수" not in html and "기간" not in html
+
+        crawler = make(SeisCrawler)
+        items = crawler._parse_main_cards(BeautifulSoup(html, "html.parser"))
+        assert items and all(item["date_label"] == "" for item in items)
+
+    def test_seis_cards_are_read_through_the_structural_field(self):
+        """``p.date`` 자리에서 읽은 22건은 기간이 된다 (커버리지 복구)."""
         crawler = make(SeisCrawler)
         soup = BeautifulSoup(
             (FIXTURES / "seis_main_cards.html").read_text(encoding="utf-8"),
             "html.parser",
         )
         items = crawler._parse_main_cards(soup)
-        assert len(items) >= 14
-        assert not any("접수" in (item.get("date") or "") for item in items)
+        assert len(items) == 22
+        assert all(
+            item["date_field"] == SEIS_CARD_DATE_FIELD for item in items
+        )
 
         built = [
             _finalize_periods("seis", crawler._to_announcement(item, "https://www.seis.or.kr"))
             for item in items
         ]
-        offenders = [
-            (a.source_id, a.period_start, a.period_end)
-            for a in built if a and (a.period_start or a.period_end)
-        ]
-        assert offenders == []
+        assert all(a.period_start and a.period_end for a in built)
+        assert (built[0].period_start, built[0].period_end) == (
+            "2026-07-30", "2026-09-15"
+        )
 
-    def test_lawmaking_list_keeps_its_deadlines(self):
-        """lawmaking 은 셀이 진짜 기간 필드다 - 커버리지가 살아 있다."""
+    def test_notice_cards_have_no_date_field(self):
+        """공지사항 카드는 빈 ``p.date-temp`` 를 쓴다 - 기간이 없다.
+
+        사이트가 **클래스로 분기**한다는 실측 근거(12건). 이 카드들은
+        ``p.date`` 셀렉터에 걸리지 않으므로 출처 표시도 붙지 않는다.
+        """
+        html = (FIXTURES / "seis_main_cards.html").read_text(encoding="utf-8")
+        soup = BeautifulSoup(html, "html.parser")
+        notices = [
+            card for card in soup.select("li.swiper-slide")
+            if card.get("data-type") == "공지사항"
+        ]
+        assert len(notices) == 12
+        assert all(card.select_one("p.date") is None for card in notices)
+        assert all(
+            card.select_one("p.date-temp").get_text(strip=True) == ""
+            for card in notices
+        )
+
+    def test_dday_badge_counts_down_to_the_period_end(self):
+        """같은 카드의 D-day 가 ``p.date`` 종료일까지의 남은 날짜다.
+
+        사이트 **자신이** 그 종료일을 마감으로 세고 있다는 증거 - 구조
+        근거를 인정한 이유다. 픽스처 수집 기준일 2026-09-13, 22/22 일치
+        (라이브 페이지에서도 같은 날 22/22 일치를 실측했다).
+        """
+        captured = date(2026, 9, 13)
+        crawler = make(SeisCrawler)
+        soup = BeautifulSoup(
+            (FIXTURES / "seis_main_cards.html").read_text(encoding="utf-8"),
+            "html.parser",
+        )
+        checked = 0
+        for item in crawler._parse_main_cards(soup):
+            _start, end = seis_period(item)
+            days = int(re.sub(r"[^0-9]", "", item["dday"] or "") or -1)
+            assert end and days >= 0, item
+            assert date.fromisoformat(end) == captured + timedelta(days=days), item
+            checked += 1
+        assert checked == 22
+
+    def test_a_bare_range_without_the_structural_field_is_refused(self):
+        """출처 표시가 없으면 같은 문자열도 기간이 아니다."""
+        assert seis_period({"date": "2026.07.30 ~ 2026.09.15"}) == (None, None)
+        assert seis_period(
+            {"date": "2026.07.30 ~ 2026.09.15", "date_field": "p.date"}
+        ) == (None, None)
+
+    LIVE_CARD = (
+        '<li class="swiper-slide" data-type="인·지정">\n<div class="link">\n'
+        '<div class="txt-area">\n<span class="badge cate">인·지정 </span>\n'
+        '<span class="sub">서울특별시 </span>\n'
+        '<p class="tit"><a href="subPage.do?menuId=30100&amp;tabId=certPageView'
+        '&amp;dsgnPbofrSn=8313" title="공고 게시물 자세히보기 링크">'
+        '서울특별시 2026년도 2차 지정공모 </a></p>\n'
+        '<ul class="info" style="width:310px;">\n<li>서울특별시 </li>\n'
+        '<li style="width:100px;">D-2 </li>\n</ul>\n</div>\n'
+        '<p class="date">\n\t\t\t\t\t\t\t\t\t\t\t2026.07.30 ~ 2026.09.15</p>\n'
+        '</div>\n</li>'
+    )
+
+    def test_verbatim_live_card_fragment(self):
+        """라이브 원문 조각(2026-09-13 수집) 그대로 -> 07-30 / 09-15."""
+        crawler = make(SeisCrawler)
+        soup = BeautifulSoup("<ul>" + self.LIVE_CARD + "</ul>", "html.parser")
+        items = crawler._parse_main_cards(soup)
+        assert len(items) == 1
+        assert items[0]["date_field"] == SEIS_CARD_DATE_FIELD
+        assert items[0]["dday"] == "D-2"
+        announcement = _finalize_periods(
+            "seis", crawler._to_announcement(items[0], "https://www.seis.or.kr")
+        )
+        assert (announcement.period_start, announcement.period_end) == (
+            "2026-07-30", "2026-09-15"
+        )
+
+    def test_lawmaking_list_keeps_its_periods(self):
+        """lawmaking 은 셀이 진짜 기간 필드다 - 시작·종료가 함께 산다."""
         crawler = make(LawmakingCrawler)
         soup = BeautifulSoup(
             (FIXTURES / "lawmaking_list.html").read_text(encoding="utf-8"),
@@ -429,9 +518,11 @@ class TestRealFixtures:
             _finalize_periods("lawmaking", crawler._to_announcement(item, "https://opinion.lawmaking.go.kr"))
             for item in items
         ]
-        ends = [a.period_end for a in built if a]
-        assert all(end is not None for end in ends), ends
-        assert all(a.period_start is None for a in built if a)
+        assert all(a.period_end is not None for a in built if a)
+        assert all(a.period_start is not None for a in built if a)
+        assert (built[0].period_start, built[0].period_end) == (
+            "2026-09-07", "2026-10-19"
+        )
 
 
 class TestStaleRowsAreOverwritten:

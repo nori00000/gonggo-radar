@@ -335,9 +335,9 @@ class TestSeisListPathHasNoPeriod:
 class TestLawmakingCellIsTheOnlyTableSource:
     """lawmaking 셀만 표 기반 기간을 만든다 (셀 자체가 기간 필드)."""
 
-    def test_single_range_gives_the_deadline(self):
+    def test_single_range_gives_the_whole_period(self):
         assert lawmaking_period({"period": "2026. 9. 7. ~2026. 10. 19."}) == (
-            None, "2026-10-19"
+            "2026-09-07", "2026-10-19"
         )
 
     def test_two_ranges_give_nothing(self):
