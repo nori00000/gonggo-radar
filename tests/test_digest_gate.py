@@ -23,7 +23,7 @@ SAMPLE_MD = """<!-- lane: Claude opus executor -->
 [D-9] 사회적협동조합·사회적기업 공공조달 1:1 컨설팅 참여기업 모집 — 협동조합포털(기재부) · 대상: 사협·사회적기업 · 마감 9/22
   [원문](https://example.com/a)
 
-[새 소식] 2026년도 제2차 산림형 예비사회적기업 지정 계획 공고 — 산림청 · 대상: 사회적기업·산림사업자 · 마감 원문 확인
+[새 소식] 2026년도 제2차 산림형 예비사회적기업 지정 계획 공고 — 산림청 · 대상: 사회적기업·산림사업자 · 접수 9/7부터, 마감 원문 확인
   [원문](https://example.com/b)
 
 [상시] 산양삼 등 산촌자원 활용 시제품 개발 지원 참여자 모집 — 한국임업진흥원 · 대상: 산림사업자 · 마감 연중 상시 모집
@@ -73,6 +73,7 @@ def test_parse_digest_numbers_items_in_document_order():
     assert parsed["items"][3]["section"] == "알아두세요"
     assert parsed["items"][3]["label"] == ""
     assert parsed["items"][3]["deadline"] == "의견 10/19까지"
+    assert parsed["items"][1]["deadline"] == "접수 9/7부터, 마감 원문 확인"
     assert parsed["period"] == "9/7~9/13"
     assert parsed["has_marker"] is True
     assert parsed["holds"] == [
@@ -99,7 +100,7 @@ def test_render_preview_has_header_numbers_status_usage():
     # 판정 ⑦: 미리보기는 발송본 그대로 (선정 이유를 따로 붙이지 않는다)
     assert (
         "2. [새 소식] 2026년도 제2차 산림형 예비사회적기업 지정 계획 공고 — "
-        "산림청 · 대상: 사회적기업·산림사업자 · 마감 원문 확인"
+        "산림청 · 대상: 사회적기업·산림사업자 · 접수 9/7부터, 마감 원문 확인"
     ) in text
     assert "■ ✅ 신청하세요 (마감순)" in text
     assert "보류 1건 (핀 n으로 승격)" in text

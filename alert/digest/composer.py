@@ -227,6 +227,15 @@ TAG_ORDER = (
     TAG_ALL,
 )
 
+# 권역·광역 표기 (개정 v2.4 (b)). 센터명이 여러 시·도를 나열하면 권역명이 정답이다
+# (예: `[세종대전충청센터]` → 충청).
+REGION_BROAD_PATTERNS = (
+    ("수도권", "수도권"),
+    ("충청", "충청"),
+    ("영남", "영남"),
+    ("호남", "호남"),
+)
+
 # 지역 한정 시 붙일 도명. 긴 표기를 먼저 본다.
 REGION_PATTERNS = (
     ("서울특별시", "서울"),
@@ -247,6 +256,14 @@ REGION_PATTERNS = (
     ("경상북도", "경북"),
     ("경상남도", "경남"),
     ("제주특별자치도", "제주"),
+    ("서울", "서울"),
+    ("부산", "부산"),
+    ("대구", "대구"),
+    ("인천", "인천"),
+    ("광주", "광주"),
+    ("대전", "대전"),
+    ("울산", "울산"),
+    ("세종", "세종"),
     ("경기", "경기"),
     ("강원", "강원"),
     ("충북", "충북"),
@@ -275,7 +292,12 @@ _RAW_SKIP_KEYS = ("link", "url", "href")
 # 「」『』는 한국 공문에서 사업·법령 **이름을 인용**하는 부호이므로 내용은 남기고
 # 부호만 지운다(_SYMBOL_RE가 처리). 내용까지 지우면 제목의 알맹이가 사라져서
 # "…참여자 추가모집 공고"끼리 엉뚱하게 병합된다.
-_BRACKET_RE = re.compile(r"[(\[{（【<][^)\]}）】>]*[)\]}）】>]")
+# 한 단계 중첩까지 소비한다 — "('26.09.30.(수) 14:00, 대전)" 처럼 괄호 안에 괄호가
+# 들어간 공공기관 제목이 흔하고, 바깥 괄호만 지우면 " 14:00, 대전)"이 본문에 남아
+# 지역 태그가 엉뚱하게 붙는다.
+_BRACKET_RE = re.compile(
+    r"[(\[{（【<](?:[^()\[\]{}（）【】<>]|\([^()]*\))*[)\]}）】>]"
+)
 # 괄호 내용을 지우고 남은 알맹이가 이보다 짧으면 부호만 지우는 쪽으로 되돌린다.
 _MIN_DEDUP_KEY_CHARS = 8
 _DATE_TOKEN_RE = re.compile(
@@ -396,13 +418,48 @@ def strip_brackets(text: str) -> str:
     return " ".join(_BRACKET_RE.sub(" ", normalize_title(text)).split())
 
 
-def infer_region(title: str) -> Optional[str]:
-    """제목에서 지역 한정 도명을 추론. 센터명 접두사(`[세종대전충청센터]`)는 세지 않는다."""
-    text = strip_brackets(title)
+def _scan_regions(text: str) -> List[str]:
+    """텍스트에 등장하는 시·도명 (표시명 기준 중복 제거)."""
+    found: List[str] = []
     for pattern, display in REGION_PATTERNS:
+        if pattern in text and display not in found:
+            found.append(display)
+    return found
+
+
+def _scan_broad_region(text: str) -> Optional[str]:
+    for pattern, display in REGION_BROAD_PATTERNS:
         if pattern in text:
             return display
     return None
+
+
+def _region_from(text: str) -> Optional[str]:
+    """시·도가 하나면 그것, 여럿이거나 없으면 권역명, 그래도 없으면 None."""
+    singles = _scan_regions(text)
+    if len(singles) == 1:
+        return singles[0]
+    broad = _scan_broad_region(text)
+    if broad:
+        return broad
+    return None
+
+
+def infer_region(title: str) -> Optional[str]:
+    """제목에서 지역 한정 도·광역·권역명을 추론 (개정 v2.4 (b)).
+
+    ① 먼저 괄호 밖 본문을 본다 (`경기도 …`, `강원(춘천 권역) …`).
+    ② 본문에서 못 찾으면 `[세종대전충청센터]` 같은 접두 괄호까지 포함해서 본다.
+    여러 시·도가 섞여 있으면 권역명을 쓰고, 권역명도 없으면 붙이지 않는다(여러 지역 = 판정 불가).
+
+    주의: announcements 스키마에는 소스별 지역 필드가 없다(스키마 변경 금지). 그래서
+    판정 근거는 제목뿐이다 — 소스 지역 필드가 생기면 여기에 합친다.
+    """
+    body = strip_brackets(title)
+    region = _region_from(body)
+    if region:
+        return region
+    return _region_from(normalize_title(title))
 
 
 def infer_target_tags(text: str) -> Tuple[str, ...]:
@@ -702,24 +759,33 @@ def _build_item(row: Sequence, classification: Classification, today: date) -> D
     posted = posted_known or _parse_created_date(created_at)
     quotes = extract_quotes(summary, raw_data)
 
+    # 개정 v2.4 (a): 마감 표기 3단계. "마감 원문 확인" 단독 표기는 폐지.
+    quoted = quotes["quote_deadline"]
+    has_quote = quoted != QUOTE_FALLBACK
     if deadline is not None:
         days_left = (deadline - today).days
         label = f"D-{days_left}"
-        deadline_display = format_month_day(deadline)
+        deadline_short = format_month_day(deadline)
+        deadline_display = f"마감 {deadline_short}"
         sort_bucket = 0
     else:
         days_left = None
+        deadline_short = ""
         # 판정 ④: "새 소식"은 게시 7일 이내임을 **알 때만** 붙인다. 모르면 "상시"(보수).
         fresh = (
             posted_known is not None
             and (today - posted_known).days <= NEW_WINDOW_DAYS
         )
         label = LABEL_NEW if fresh else LABEL_STANDING
-        deadline_display = (
-            quotes["quote_deadline"]
-            if quotes["quote_deadline"] != QUOTE_FALLBACK
-            else QUOTE_FALLBACK
-        )
+        # 인용 span이 있으면 "원문 확인"/"미정" 자리를 **원문 문구 그대로** 채운다
+        # (판정 ⑦ — 창작이 아니라 인용이므로 정보를 버리지 않는다).
+        tail = quoted if has_quote else None
+        if posted_known is not None:
+            deadline_display = "접수 {}부터, 마감 {}".format(
+                format_month_day(posted_known), tail or "원문 확인"
+            )
+        else:
+            deadline_display = f"마감 {tail or '미정'}"
         sort_bucket = 1 if fresh else 2
 
     item = {
@@ -737,6 +803,7 @@ def _build_item(row: Sequence, classification: Classification, today: date) -> D
         "target": target_display(classification.tags, classification.region),
         "period_end": period_end or "",
         "deadline": deadline.isoformat() if deadline else "",
+        "deadline_short": deadline_short,
         "deadline_display": deadline_display,
         "days_left": days_left,
         "label": label,
@@ -988,12 +1055,10 @@ def item_line(item: Dict) -> str:
         parts.append(f"대상: {item['target']}")
 
     if item["verdict"] == VERDICT_NOTICE:
-        if item["deadline"]:
-            parts.append(f"의견 {item['deadline_display']}까지")
-        elif item["deadline_display"] != QUOTE_FALLBACK:
-            parts.append(f"의견 {item['deadline_display']}")
+        if item["deadline_short"]:
+            parts.append(f"의견 {item['deadline_short']}까지")
     else:
-        parts.append(f"마감 {item['deadline_display']}")
+        parts.append(item["deadline_display"])
 
     if item["similar_count"]:
         parts.append(f"유사 항목 {item['similar_count']}")
@@ -1043,14 +1108,14 @@ def render_markdown(data: Dict) -> str:
             lines.append(f"  [원문]({item['url']})")
             lines.append("")
 
-    lines.append(f"## {SECTION_HEADINGS[SECTION_COUNCIL]}")
-    lines.append("")
+    # 개정 v2.4 (c): 협의회에서·회원사 소식은 내용이 없으면 섹션 자체를 생략한다
+    # (빈 자리 표시 금지 — 발송본에 남은 플레이스홀더는 브리핑의 신뢰를 깎는다).
     if data.get("council_notes"):
+        lines.append(f"## {SECTION_HEADINGS[SECTION_COUNCIL]}")
+        lines.append("")
         for note in data["council_notes"]:
             lines.append(f"· {note}")
-    else:
-        lines.append("· (면담·건의·수렴 현황 — 이번 주 기록 없음)")
-    lines.append("")
+        lines.append("")
 
     # 판정 ⑩: 회원사 소식은 없으면 섹션을 생략한다.
     if data.get("member_news"):
@@ -1085,13 +1150,11 @@ def render_kakao(data: Dict, headline: Optional[str] = None) -> str:
             lines.append(f"  {item['url']}")
         lines.append("")
 
-    lines.append(SECTION_HEADINGS[SECTION_COUNCIL])
     if data.get("council_notes"):
+        lines.append(SECTION_HEADINGS[SECTION_COUNCIL])
         for note in data["council_notes"]:
             lines.append(f"· {note}")
-    else:
-        lines.append("· (면담·건의·수렴 현황 — 이번 주 기록 없음)")
-    lines.append("")
+        lines.append("")
 
     if data.get("member_news"):
         lines.append(SECTION_HEADINGS[SECTION_MEMBER])

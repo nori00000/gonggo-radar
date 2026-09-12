@@ -32,7 +32,9 @@ from alert.digest.composer import (
     jaccard,
     normalize_title,
     render_kakao,
+    render_markdown,
     source_display_name,
+    target_display,
     title_ngrams,
 )
 from alert.digest.checker import (
@@ -329,9 +331,10 @@ class TestComposer:
 
         assert f"## {APPLY_HEADING}" in markdown
         assert f"## {NOTICE_HEADING}" in markdown
-        assert f"## {SECTION_HEADINGS['협의회에서']}" in markdown
-        # 판정 ⑩: 회원사 소식은 없으면 섹션을 생략한다
+        # 개정 v2.4 (c): 내용 없는 협의회에서·회원사 소식은 섹션 자체를 생략
+        assert SECTION_HEADINGS["협의회에서"] not in markdown
         assert SECTION_HEADINGS["회원사 소식"] not in markdown
+        assert "이번 주 기록 없음" not in markdown
         # v2.1에서 소스 축 섹션은 폐기됐다
         assert "산림 정책 동향" not in markdown
         assert "사회연대경제 동향" not in markdown
@@ -555,8 +558,13 @@ class TestComposer:
         assert "[상시] 임업 경영 컨설팅 참여기업 모집" in markdown
         # 게시일을 모르는 항목에 "새 소식"을 붙이지 않는다 (fail-closed)
         assert "[상시] 사회적기업 사무공간 신규 입주기업 모집 공고" in markdown
-        # 인용할 마감 문구가 없으면 "원문 확인"
-        assert "마감 원문 확인" in markdown
+        # 개정 v2.4 (a) 2단계: 게시일만 알면 "접수 M/D부터, 마감 원문 확인"
+        assert "접수 3/24부터, 마감 원문 확인" in markdown
+        assert "접수 10/29부터, 마감 원문 확인" in markdown
+        # 3단계: 둘 다 모르면 "마감 미정"
+        assert "· 마감 미정" in markdown
+        # "마감 원문 확인" 단독 표기는 폐지됐다
+        assert "· 마감 원문 확인" not in markdown
 
     def test_compose_digest_expired_deadline_dropped(self, tmp_path):
         """판정 ④: 마감이 지난 신청 항목은 배제된다."""
@@ -1469,8 +1477,8 @@ class TestRulesV21:
         assert result.verdict == VERDICT_HOLD
         assert result.reason == "섹션 판정 불명"
 
-    def test_region_from_title_not_from_center_prefix(self):
-        """지역 태그는 센터명 접두사가 아니라 제목 본문에서만 (판정 ①)."""
+    def test_region_prefers_title_body(self):
+        """제목 본문의 시·도가 1순위 (판정 ① + 개정 v2.4 (b))."""
         gyeonggi = classify_item(
             "2026년 경기도 사회적기업 사회보험료 지원사업 참여기업 모집 공고",
             "",
@@ -1478,13 +1486,13 @@ class TestRulesV21:
         )
         assert gyeonggi.region == "경기"
 
-        center = classify_item(
-            "[세종대전충청센터] 2026년 하반기 전국 릴레이 사회적협동조합 "
-            "설립인가 교육생 모집",
+        gangwon = classify_item(
+            "[경기강원센터] 강원(춘천 권역) 사회적경제 성장사다리 프로그램 "
+            "참여기업 모집",
             "",
             "coop",
         )
-        assert center.region is None
+        assert gangwon.region == "강원"
 
     def test_infer_target_tags_separates_coop_kinds(self):
         assert infer_target_tags("사회적협동조합 설립인가 교육") == ("사협",)
@@ -1872,3 +1880,168 @@ class TestFixCycle2:
         assert f"| {HOLD_REASON_DIVERSITY} -->" in markdown
         assert f"| {HOLD_REASON_SECTION_CAP} -->" in markdown
         assert markdown.count(f"| {HOLD_REASON_SECTION_CAP} -->") == 2
+
+
+class TestFixCycle3:
+    """개정 v2.4 (콜드리드 r2 판정 a·b·c)."""
+
+    # ─── (a) 마감 표기 3단계 ────────────────────────────────────────────
+    def test_deadline_display_three_tiers(self, tmp_path):
+        db_path = tmp_path / "c3.db"
+        _create_announcements_table(db_path)
+
+        _insert_one(
+            db_path,
+            source="kofpi",
+            source_id="tier1",
+            title="산림분야 오픈이노베이션 참여기업 모집 공고",
+            url="https://example.com/tier1",
+            period_start="2026-03-20",
+            period_end="2026-09-30",
+        )
+        _insert_one(
+            db_path,
+            source="fowi",
+            source_id="tier2",
+            title="산림복지전문업 플랫폼 입점 지원사업 모집",
+            url="https://example.com/tier2",
+            period_start="2026-03-24",
+            period_end=None,
+        )
+        _insert_one(
+            db_path,
+            source="coop",
+            source_id="tier3",
+            title="사회적협동조합 공공조달 컨설팅 참여기업 모집",
+            url="https://example.com/tier3",
+            period_start=None,
+            period_end=None,
+        )
+
+        markdown = compose_digest(
+            db_path=str(db_path), week_str=W13, today=W13_TODAY
+        )
+
+        assert "· 마감 9/30" in markdown
+        assert "[D-188]" in markdown
+        assert "· 접수 3/24부터, 마감 원문 확인" in markdown
+        assert "· 마감 미정" in markdown
+        assert "· 마감 원문 확인" not in markdown
+
+    def test_deadline_quote_fills_the_placeholder(self, tmp_path):
+        """인용 span이 있으면 "원문 확인"/"미정" 자리를 원문 문구 그대로 채운다."""
+        db_path = tmp_path / "c3quote.db"
+        _create_announcements_table(db_path)
+        _insert_one(
+            db_path,
+            source="fowi",
+            source_id="quoted",
+            title="산림복지전문업 플랫폼 입점 지원사업 참가기업 모집 연장",
+            url="https://example.com/quoted",
+            period_start="2026-03-24",
+            period_end=None,
+            raw_data=(
+                '{"title": "산림복지전문업 플랫폼 입점 지원사업 '
+                '참가기업 모집 연장(~9.14.)"}'
+            ),
+        )
+
+        markdown = compose_digest(
+            db_path=str(db_path), week_str=W13, today=W13_TODAY
+        )
+        assert "· 접수 3/24부터, 마감 ~9.14." in markdown
+
+    def test_notice_keeps_opinion_deadline_form(self, tmp_path):
+        db_path = tmp_path / "c3notice.db"
+        _create_announcements_table(db_path)
+        _insert_one(
+            db_path,
+            source="lawmaking",
+            source_id="notice",
+            title="산림재난방지법 시행령 일부개정령안 입법예고",
+            url="https://example.com/notice",
+            period_start="2026-03-24",
+            period_end="2026-10-19",
+        )
+
+        markdown = compose_digest(
+            db_path=str(db_path), week_str=W13, today=W13_TODAY
+        )
+        assert "· 의견 10/19까지" in markdown
+
+    # ─── (b) 지역 태그 ──────────────────────────────────────────────────
+    def test_center_prefix_yields_broad_region(self):
+        """`[세종대전충청센터]`처럼 여러 시·도가 나열되면 권역명이 붙는다."""
+        result = classify_item(
+            "[세종대전충청센터] (예비)사회적기업 인·지정 설명회 안내", "", "socialenterprise"
+        )
+        assert result.region == "충청"
+        assert target_display(result.tags, result.region) == "사회적기업(충청)"
+
+    def test_broad_region_in_title_body_wins(self):
+        result = classify_item(
+            "[세종대전충청센터] 2026년 9월 충청권역 (예비)사회적기업 인 · 지정 "
+            "설명회 안내('26.09.30.(수) 14:00, 대전)",
+            "",
+            "socialenterprise",
+        )
+        assert result.region == "충청"
+
+    def test_multiple_regions_without_broad_name_is_unassigned(self):
+        """여러 시·도가 섞였고 권역명이 없으면 붙이지 않는다 (틀린 지역 주장 금지)."""
+        result = classify_item(
+            "[부산울산경남센터] 사회적협동조합 설립인가 및 경영공시 교육 참여기업 모집",
+            "",
+            "coop",
+        )
+        assert result.region is None
+
+    def test_region_appears_in_target_field(self, tmp_path):
+        db_path = tmp_path / "c3region.db"
+        _create_announcements_table(db_path)
+        _insert_one(
+            db_path,
+            source="seis",
+            source_id="region",
+            title="2026년 경기도 사회적기업 사회보험료 지원사업 참여기업 모집 공고",
+            url="https://example.com/region",
+            period_end="2026-12-31",
+        )
+        markdown = compose_digest(
+            db_path=str(db_path), week_str=W13, today=W13_TODAY
+        )
+        assert "대상: 사회적기업(경기)" in markdown
+
+    # ─── (c) 빈 섹션 생략 ───────────────────────────────────────────────
+    def test_empty_council_section_is_omitted(self, sample_announcements):
+        markdown = compose_digest(
+            db_path=sample_announcements, week_str=W13, today=W13_TODAY
+        )
+        kakao = render_kakao(
+            compose_digest_data(
+                sample_announcements, week_str=W13, today=W13_TODAY
+            )
+        )
+        for text in (markdown, kakao):
+            assert "협의회에서" not in text
+            assert "회원사 소식" not in text
+            assert "이번 주 기록 없음" not in text
+
+    def test_council_section_appears_when_filled(self, sample_announcements):
+        data = compose_digest_data(
+            sample_announcements, week_str=W13, today=W13_TODAY
+        )
+        data["council_notes"] = ["산림청 면담 1회 (9/10)"]
+        markdown = render_markdown(data)
+        kakao = render_kakao(data)
+        for text in (markdown, kakao):
+            assert "협의회에서" in text
+            assert "· 산림청 면담 1회 (9/10)" in text
+
+    # ─── (d) 마커 불변 ──────────────────────────────────────────────────
+    def test_headline_marker_unchanged(self, sample_announcements):
+        markdown = compose_digest(
+            db_path=sample_announcements, week_str=W13, today=W13_TODAY
+        )
+        assert markdown.count(MARKER) == 1
+        assert f"이번 주 한 줄: {MARKER}" in markdown

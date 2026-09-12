@@ -136,7 +136,7 @@ def parse_digest(markdown_text: str) -> Dict:
                 "title": matched.group("title").strip(),
                 "author": rest.split(" · ")[0].strip(),
                 "target": _segment(rest, ("대상:",)),
-                "deadline": _segment(rest, ("마감", "의견")),
+                "deadline": _segment(rest, ("마감", "의견", "접수")),
                 "url": "",
             }
             continue
