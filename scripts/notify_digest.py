@@ -178,13 +178,12 @@ def main():
     # 올라간 뒤에도 옛 카드가 남아 있으면 사람이 낡은 승인을 누를 수 있다.
     # (최종 방어는 카드 callback_data 의 본문 해시다 — 이건 UX 상의 정리다.)
     state_path = state_mod.state_path_for_markdown(markdown_path)
-    stale_card = None
+    lock_path = state_mod.lock_path_for_markdown(markdown_path)
     try:
-        state = state_mod.load_state(state_path, week)
-        stale_card = state.get("card_message_id")
+        stale_card = state_mod.load_state(state_path, week).get("card_message_id")
     except state_mod.StateError as exc:
         print(f"⚠️  상태 확인 실패(미리보기는 계속 전송): {exc}", file=sys.stderr)
-        state = None
+        stale_card = None
     if stale_card:
         ok, error = clear_card(token, chat_id, stale_card)
         if not ok:
@@ -202,18 +201,25 @@ def main():
         message_ids.append(message_id)
         print(f"✓ 전송 {index}/{len(chunks)} message_id={message_id}")
 
+    # 계약 W10 사이클2 #1: 상태 쓰기는 **잠금 하 read-modify-write** 다.
+    # 텔레그램 왕복 동안 다른 발송이 sent 를 썼을 수 있으므로, 여기서 다시 읽고
+    # message_id 만 더한다(record_preview 는 status 를 건드리지 않는다).
+    item_urls = preview_mod.item_urls(markdown_text)
     try:
-        if state is None:
-            state = state_mod.load_state(state_path, week)
-        state_mod.save_state(
-            state_path,
-            state_mod.record_preview(
-                state, message_ids, preview_mod.item_urls(markdown_text)
+        state_mod.update_state(
+            state_path, lock_path, week,
+            lambda current: state_mod.record_preview(
+                current, message_ids, item_urls
+            ),
+            on_reclaim=lambda reason: print(
+                f"⚠️  잔존 잠금 회수: {reason}", file=sys.stderr
             ),
         )
         print(f"✓ 상태 기록: {state_path}")
-    except (state_mod.StateError, OSError) as exc:
-        print(f"⚠️  상태 기록 실패(미리보기는 전송됨): {exc}", file=sys.stderr)
+    except (state_mod.StateError, state_mod.TransitionError,
+            state_mod.LockBusy, OSError) as exc:
+        print(f"⚠️  상태 기록 실패(미리보기는 전송됨): {redact(exc)}",
+              file=sys.stderr)
         return 1
 
     return 0

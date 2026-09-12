@@ -10,11 +10,10 @@
 import re
 from typing import Dict, List, Optional
 
+from alert.digest import prune
+
 MARKER = "<!-- 상민 확정 필요 -->"
 TELEGRAM_LIMIT = 4096
-
-# 항목 섹션 (회원사 동정·협의회 의견은 항목이 아니다)
-ITEM_SECTIONS = ("산림 정책 동향", "지원사업 공고", "사회연대경제 동향")
 
 _LINK_RE = re.compile(r"\[([^\]]+)\]\(([^)]+)\)")
 _ORIGIN_RE = re.compile(r"^\*\*원문:\*\*\s*(.+)$")
@@ -25,15 +24,12 @@ _TITLE_RE = re.compile(r"^#\s+(.+)$")
 
 
 def item_urls(markdown_text: str) -> List[str]:
-    """문서 순서대로 항목 URL만 뽑는다 (번호 → URL 좌표의 정본)."""
-    urls = []
-    for line in markdown_text.splitlines():
-        matched = _ORIGIN_RE.match(line.strip())
-        if not matched:
-            continue
-        link = _LINK_RE.search(matched.group(1))
-        urls.append(link.group(2).strip() if link else matched.group(1).strip())
-    return urls
+    """문서 순서대로 항목 URL만 뽑는다 (번호 → URL 좌표의 정본).
+
+    항목 섹션 안의 블록만 센다 (사이클2 #5·#6) — 해설의 참고 링크가 번호를
+    차지하면 `제외 N` 이 엉뚱한 항목을 지운다.
+    """
+    return [block["url"] for block in prune.item_blocks(markdown_text)]
 
 
 def parse_digest(markdown_text: str) -> Dict:
@@ -60,7 +56,7 @@ def parse_digest(markdown_text: str) -> Dict:
             name = line[3:].strip()
             in_commentary = name == "협의회 의견"
             current_item = None
-            if name in ITEM_SECTIONS:
+            if prune.section_key(name) is not None:
                 current_section = {"name": name, "items": []}
                 sections.append(current_section)
             else:

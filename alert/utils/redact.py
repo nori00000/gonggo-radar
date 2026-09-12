@@ -11,6 +11,9 @@ REDACTED = "bot<redacted>"
 
 # `bot<digits>:<token>` — 텔레그램 봇 토큰의 URL 형태. 토큰 본문은 base64url 문자.
 _BOT_TOKEN_RE = re.compile(r"bot\d+:[A-Za-z0-9_\-]+")
+# URL 밖에 맨몸으로 나온 토큰(사이클2 #8) — 봇 id 6자리 이상 + 시크릿 20자 이상.
+# 이 길이 제한은 "12:30:45" 같은 시각·버전 문자열을 가리지 않기 위한 것이다.
+_BARE_TOKEN_RE = re.compile(r"\b\d{6,}:[A-Za-z0-9_\-]{20,}")
 
 
 def redact(text, secrets=()):
@@ -25,6 +28,7 @@ def redact(text, secrets=()):
     """
     out = "" if text is None else str(text)
     out = _BOT_TOKEN_RE.sub(REDACTED, out)
+    out = _BARE_TOKEN_RE.sub("<redacted>", out)
     for secret in secrets or ():
         if secret and len(str(secret)) >= 8:
             out = out.replace(str(secret), "<redacted>")

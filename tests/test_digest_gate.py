@@ -232,17 +232,33 @@ def _write_digest(tmp_path, markdown_text=None, check=None):
 
 
 class _OkNotifier:
-    """SMTP 성공 스텁 (send_html 호출 전 상태를 관찰할 수 있다)."""
+    """SMTP 성공 스텁 (send_html_staged 호출 전 상태를 관찰할 수 있다)."""
 
     sender = "sender@example.com"
     password = "x"
     recipients = ["a@example.com", "b@example.com"]
     observer = None
+    bodies = None
 
-    def send_html(self, subject, body, recipients):
+    def send_html_staged(self, subject, body, recipients):
         if self.observer is not None:
             self.observer()
-        return True
+        if self.bodies is not None:
+            self.bodies.append(body)
+        return True, "done"
+
+
+def _sha8(md):
+    """그 파일 본문의 승인 지문 (계약 W10 사이클2 #2)."""
+    from pathlib import Path as _Path
+    return markdown_sha256(_Path(md).read_text(encoding="utf-8"))[:8]
+
+
+def _send(md, **kwargs):
+    """실발송 호출 — 현재 본문 지문을 승인 지문으로 넘긴다."""
+    kwargs.setdefault("approved_by", "1401666801")
+    kwargs.setdefault("approved_sha", _sha8(md))
+    return send_digest(md, dry_run=False, **kwargs)
 
 
 def test_send_digest_refuses_already_sent_week(tmp_path, monkeypatch):
@@ -259,7 +275,7 @@ def test_send_digest_refuses_already_sent_week(tmp_path, monkeypatch):
         raise AssertionError("이미 발송된 주차에서 EmailNotifier가 생성됐다")
 
     monkeypatch.setattr("scripts.send_digest.EmailNotifier", boom)
-    assert send_digest(md, dry_run=False, approved_by="1401666801") == 2
+    assert _send(md) == 2
 
 
 def test_send_digest_records_state_on_success(tmp_path, monkeypatch):
@@ -271,12 +287,14 @@ def test_send_digest_records_state_on_success(tmp_path, monkeypatch):
         password = "x"
         recipients = ["a@example.com", "b@example.com"]
 
-        def send_html(self, subject, body, recipients):
+        def send_html_staged(self, subject, body, recipients):
             assert recipients == self.recipients
-            return True
+            return True, "done"
 
     monkeypatch.setattr("scripts.send_digest.EmailNotifier", FakeNotifier)
-    assert send_digest(md, dry_run=False, approved_by="1401666801") == 0
+    sha = _sha8(md)
+    assert send_digest(md, dry_run=False, approved_by="1401666801",
+                       approved_sha=sha) == 0
 
     state = state_mod.load_state(
         state_mod.state_path_for_markdown(md), "2026-W37"
@@ -287,7 +305,8 @@ def test_send_digest_records_state_on_success(tmp_path, monkeypatch):
     assert state["sent_at"]
 
     # 멱등: 같은 주차 두 번째 발송은 거부된다
-    assert send_digest(md, dry_run=False, approved_by="1401666801") == 2
+    assert send_digest(md, dry_run=False, approved_by="1401666801",
+                       approved_sha=sha) == 2
 
 
 def test_send_digest_dry_run_does_not_touch_state(tmp_path):
@@ -304,7 +323,7 @@ def test_send_digest_still_refuses_unconfirmed_marker(tmp_path, monkeypatch):
         "scripts.send_digest.EmailNotifier",
         lambda: (_ for _ in ()).throw(AssertionError("마커 게이트가 뚫렸다")),
     )
-    assert send_digest(md, dry_run=False, approved_by="1") == 2
+    assert _send(md) == 2
 
 
 # ─── 재검증 (재조립 없이 check.json만 갱신) ─────────────────────────────
@@ -359,13 +378,13 @@ def test_send_digest_refuses_when_lock_exists(tmp_path, monkeypatch):
     lock = state_mod.lock_path_for_markdown(md)
     lock.write_text("99999\n", encoding="utf-8")
     _forbid_notifier(monkeypatch, "잠금이 있는데 발송을 시작했다")
-    assert send_digest(md, dry_run=False, approved_by="1") == 2
+    assert _send(md) == 2
 
 
 def test_send_digest_releases_lock_after_success(tmp_path, monkeypatch):
     md = _annotated_digest(tmp_path)
     monkeypatch.setattr("scripts.send_digest.EmailNotifier", _OkNotifier)
-    assert send_digest(md, dry_run=False, approved_by="1") == 0
+    assert _send(md) == 0
     assert not state_mod.lock_path_for_markdown(md).exists()
 
 
@@ -382,7 +401,7 @@ def test_send_digest_marks_sending_before_smtp(tmp_path, monkeypatch):
         ))
 
     monkeypatch.setattr("scripts.send_digest.EmailNotifier", Notifier)
-    assert send_digest(md, dry_run=False, approved_by="1") == 0
+    assert _send(md) == 0
     assert observed["state"]["status"] == "sending"
     assert observed["state"]["sending_at"]
     final = state_mod.load_state(state_mod.state_path_for_markdown(md), "2026-W37")
@@ -399,7 +418,7 @@ def test_send_digest_refuses_when_state_is_sending(tmp_path, monkeypatch):
         ),
     )
     _forbid_notifier(monkeypatch, "sending 상태에서 발송을 시작했다")
-    assert send_digest(md, dry_run=False, approved_by="1") == 2
+    assert _send(md) == 2
 
 
 def test_send_digest_state_save_failure_leaves_sending(tmp_path, monkeypatch):
@@ -417,7 +436,7 @@ def test_send_digest_state_save_failure_leaves_sending(tmp_path, monkeypatch):
     monkeypatch.setattr("scripts.send_digest.EmailNotifier", _OkNotifier)
     monkeypatch.setattr(state_mod, "save_state", flaky_save)
     monkeypatch.setattr("scripts.send_digest.STATE_SAVE_BACKOFF", 0)
-    assert send_digest(md, dry_run=False, approved_by="1") == 1
+    assert _send(md) == 1
     # 재시도했는가 (sending 1회 + sent 3회)
     assert calls["n"] == 1 + 3
 
@@ -427,21 +446,25 @@ def test_send_digest_state_save_failure_leaves_sending(tmp_path, monkeypatch):
     )
     assert state["status"] == "sending"
     _forbid_notifier(monkeypatch, "sending 잔존 상태에서 재발송했다")
-    assert send_digest(md, dry_run=False, approved_by="1") == 2
+    assert _send(md) == 2
 
 
 @pytest.mark.parametrize(
     "smtp_mode,expected_rc,expected_status",
     [
-        ("ok", 0, "sent"),
+        # 확정적 미발송(연결 전) → annotated 로 되돌려 재시도 허용 (사이클2 #4)
+        ("connect-error", 2, "annotated"),
+        ("starttls-error", 2, "annotated"),
+        ("login-error", 2, "annotated"),
+        # DATA 이후·불명 → 전달 여부 불확실 → sending 유지(수동 해제)
         ("smtp-error", 2, "sending"),
-        ("connect-error", 2, "sending"),
+        ("ok", 0, "sent"),
     ],
 )
 def test_send_digest_smtp_matrix(
     tmp_path, monkeypatch, smtp_mode, expected_rc, expected_status
 ):
-    """실제 EmailNotifier + smtplib 몽키패치 매트릭스."""
+    """실제 EmailNotifier + smtplib 몽키패치 매트릭스 (단계별 실패 분류)."""
     import smtplib
 
     from alert.notifiers import email_sender
@@ -456,30 +479,31 @@ def test_send_digest_smtp_matrix(
             if smtp_mode == "connect-error":
                 raise OSError("연결 거부")
 
-        def __enter__(self):
-            return self
-
-        def __exit__(self, *exc_info):
-            return False
-
         def starttls(self):
-            return None
+            if smtp_mode == "starttls-error":
+                raise smtplib.SMTPException("STARTTLS 실패")
 
         def login(self, sender, password):
-            return None
+            if smtp_mode == "login-error":
+                raise smtplib.SMTPAuthenticationError(535, b"auth failed")
 
         def send_message(self, msg):
             if smtp_mode == "smtp-error":
                 raise smtplib.SMTPException("550 거부")
+
+        def quit(self):
             return None
 
     monkeypatch.setattr(email_sender.smtplib, "SMTP", FakeSMTP)
-    assert send_digest(md, dry_run=False, approved_by="1") == expected_rc
+    assert _send(md) == expected_rc
     state = state_mod.load_state(
         state_mod.state_path_for_markdown(md), "2026-W37"
     )
     assert state["status"] == expected_status
     assert not state_mod.lock_path_for_markdown(md).exists()
+    if expected_status == "annotated":
+        # 되돌려졌으니 같은 본문으로 재시도가 가능하다
+        assert state["sending_at"] is None
 
 
 def test_acquire_lock_is_exclusive(tmp_path):
@@ -500,7 +524,7 @@ def test_send_digest_refuses_stale_check_hash(tmp_path, monkeypatch):
     md = _write_digest(tmp_path, annotated)
     md.write_text(annotated + "\n### 몰래 추가한 항목\n", encoding="utf-8")
     _forbid_notifier(monkeypatch, "해시 불일치인데 발송했다")
-    assert send_digest(md, dry_run=False, approved_by="1") == 2
+    assert _send(md) == 2
 
 
 def test_send_digest_refuses_check_without_hash(tmp_path, monkeypatch):
@@ -513,7 +537,7 @@ def test_send_digest_refuses_check_without_hash(tmp_path, monkeypatch):
         json.dumps(PASS_CHECK, ensure_ascii=False), encoding="utf-8"
     )
     _forbid_notifier(monkeypatch, "해시 없는 검증으로 발송했다")
-    assert send_digest(md, dry_run=False, approved_by="1") == 2
+    assert _send(md) == 2
 
 
 def _empty_db(tmp_path):
@@ -560,7 +584,7 @@ def test_recheck_failure_overwrites_check_as_fail(tmp_path, monkeypatch):
 
     # 그 뒤의 발송은 거부된다
     _forbid_notifier(monkeypatch, "재검증 실패 상태에서 발송했다")
-    assert send_digest(md, dry_run=False, approved_by="1") == 2
+    assert _send(md) == 2
 
 
 # ─── 크리틱 #2: 죽은 URL 본문 잔존 ──────────────────────────────────────
@@ -815,3 +839,446 @@ def test_digest_job_keeps_strict_mode():
     assert "set -euo pipefail" in Path("scripts/digest_job.sh").read_text(
         encoding="utf-8"
     )
+
+
+# ══ 사이클2: 상태 기계 단일화 (#1) ══════════════════════════════════════
+def test_transition_table_is_the_gate():
+    assert state_mod.can_transition("draft", "annotated")
+    assert state_mod.can_transition("annotated", "sending")
+    assert state_mod.can_transition("sending", "sent")
+    assert state_mod.can_transition("draft", "held")
+    assert state_mod.can_transition("annotated", "held")
+    assert state_mod.can_transition("held", "draft")        # 재검토
+    # sending 은 sent 로만 나아간다 — 되돌리기는 escape 두 경로뿐
+    assert not state_mod.can_transition("sending", "held")
+    assert not state_mod.can_transition("sending", "annotated")
+    assert not state_mod.can_transition("sending", "draft")
+    assert state_mod.can_transition("sending", "annotated", escape=True)
+    assert state_mod.can_transition("sending", "draft", escape=True)
+    # sent 는 불변
+    for target in ("draft", "annotated", "sending", "held"):
+        assert not state_mod.can_transition("sent", target)
+        assert not state_mod.can_transition("sent", target, escape=True)
+    # held 에서 바로 발송은 못 한다 (재검토를 거친다)
+    assert not state_mod.can_transition("held", "sending")
+
+
+def _sending_state():
+    return state_mod.mark_sending(
+        state_mod.default_state("2026-W37"), "2026-09-13T01:00:00"
+    )
+
+
+def test_mark_held_refuses_sending():
+    """미확정 발송을 보류로 풀 수 없다 (Codex 신규 #2)."""
+    with pytest.raises(state_mod.TransitionError):
+        state_mod.mark_held(_sending_state())
+
+
+def test_mark_annotated_refuses_sending_and_sent():
+    for status in ("sending", "sent"):
+        state = dict(state_mod.default_state("2026-W37"), status=status)
+        with pytest.raises(state_mod.TransitionError):
+            state_mod.mark_annotated(state, "새 의견")
+
+
+def test_add_excluded_urls_refuses_sending_and_sent():
+    for status in ("sending", "sent"):
+        state = dict(state_mod.default_state("2026-W37"), status=status)
+        with pytest.raises(state_mod.TransitionError):
+            state_mod.add_excluded_urls(state, ["https://example.com/a"])
+
+
+def test_record_preview_never_touches_status():
+    """미리보기 기록은 어떤 상태에서도 status 를 바꾸지 않는다 (Codex 신규 #1)."""
+    for status in STATUS_SAMPLES:
+        state = dict(state_mod.default_state("2026-W37"), status=status)
+        updated = state_mod.record_preview(state, [11], ["u1"])
+        assert updated["status"] == status
+        assert updated["preview_message_ids"] == [11]
+
+
+STATUS_SAMPLES = ("draft", "annotated", "sending", "sent", "held")
+
+
+def test_apply_state_rejects_forbidden_transition(tmp_path):
+    path = tmp_path / "2026-W37.state.json"
+    sending = _sending_state()
+    state_mod.save_state(path, sending)
+    with pytest.raises(state_mod.TransitionError):
+        state_mod.apply_state(
+            path, sending, dict(sending, status="held")
+        )
+    assert state_mod.load_state(path, "2026-W37")["status"] == "sending"
+
+
+def test_release_sending_needs_escape(tmp_path):
+    """`/digest 해제` 만 sending 을 푼다 — 일반 저장 경로로는 안 된다."""
+    path = tmp_path / "2026-W37.state.json"
+    sending = dict(_sending_state(), commentary="확정 의견")
+    state_mod.save_state(path, sending)
+    released = state_mod.release_sending(sending)
+    assert released["status"] == "annotated" and released["sending_at"] is None
+    # 해설 기록이 없어도 annotated 로 푼다 (마커 게이트를 통과한 본문이므로)
+    assert state_mod.release_sending(_sending_state())["status"] == "annotated"
+    with pytest.raises(state_mod.TransitionError):
+        state_mod.apply_state(path, sending, released)          # escape 없음
+    state_mod.apply_state(path, sending, released, escape=True)  # 사람의 해제
+    assert state_mod.load_state(path, "2026-W37")["status"] == "annotated"
+
+    with pytest.raises(state_mod.TransitionError):
+        state_mod.release_sending(state_mod.default_state("2026-W37"))
+
+
+def test_update_state_rereads_under_lock(tmp_path):
+    """잠금을 쥔 뒤 다시 읽으므로, 그 사이의 남의 쓰기를 덮어쓰지 않는다."""
+    path = tmp_path / "2026-W37.state.json"
+    lock = tmp_path / "2026-W37.lock"
+    state_mod.save_state(path, state_mod.default_state("2026-W37"))
+    stale = state_mod.load_state(path, "2026-W37")       # 오래된 스냅샷(draft)
+    state_mod.save_state(
+        path, state_mod.mark_sent(stale, 1, 2, "2026-09-13T01:00:00")
+    )
+    seen = {}
+
+    def mutate(current):
+        seen["status"] = current["status"]
+        return state_mod.record_preview(current, [99], ["u"])
+
+    result = state_mod.update_state(path, lock, "2026-W37", mutate)
+    assert seen["status"] == "sent"          # 스냅샷(draft)이 아니라 디스크 값
+    assert result["status"] == "sent"
+    assert result["preview_message_ids"] == [99]
+
+
+def test_notify_preview_does_not_overwrite_sent(tmp_path, monkeypatch):
+    """notify 도중 다른 발송이 sent 를 써도 최종 상태는 sent 다 (Codex 신규 #1)."""
+    from scripts import notify_digest
+
+    md = tmp_path / "2026-W37.md"
+    md.write_text(SAMPLE_MD, encoding="utf-8")
+    state_path = state_mod.state_path_for_markdown(md)
+    state_mod.save_state(state_path, state_mod.default_state("2026-W37"))
+
+    monkeypatch.setattr(
+        notify_digest, "resolve_target", lambda topic_key="council": (-100, 2011)
+    )
+    monkeypatch.setattr(notify_digest, "resolve_token", lambda: "123:FAKE")
+
+    def send_chunk(token, chat_id, thread_id, text):
+        # 텔레그램 왕복 도중 다른 프로세스가 발송을 끝냈다
+        current = state_mod.load_state(state_path, "2026-W37")
+        if current["status"] != "sent":
+            state_mod.save_state(
+                state_path,
+                state_mod.mark_sent(current, 42, 3, "2026-09-13T01:00:00"),
+            )
+        return True, 2014, ""
+
+    monkeypatch.setattr(notify_digest, "send_chunk", send_chunk)
+    monkeypatch.setattr("sys.argv", ["notify_digest.py", str(md)])
+    assert notify_digest.main() == 0
+
+    state = state_mod.load_state(state_path, "2026-W37")
+    assert state["status"] == "sent"                    # 덮어쓰이지 않았다
+    assert state["preview_message_ids"] == [2014]       # 기록은 됐다
+    assert state["recipients_count"] == 3
+
+
+def test_apply_commentary_refuses_sending_week(tmp_path, monkeypatch):
+    from scripts.apply_commentary import main as commentary_main
+
+    md = tmp_path / "2026-W37.md"
+    md.write_text(SAMPLE_MD, encoding="utf-8")
+    state_mod.save_state(
+        state_mod.state_path("2026-W37", tmp_path), _sending_state()
+    )
+    monkeypatch.setattr(
+        "sys.argv",
+        ["apply_commentary.py", "2026-W37", "의견", "--out-dir", str(tmp_path)],
+    )
+    assert commentary_main() == 1
+    assert state_mod.load_state(
+        state_mod.state_path("2026-W37", tmp_path), "2026-W37"
+    )["status"] == "sending"
+
+
+# ══ 사이클2: TOCTOU (#2) ════════════════════════════════════════════════
+def test_send_digest_requires_approved_sha(tmp_path, monkeypatch):
+    md = _annotated_digest(tmp_path)
+    _forbid_notifier(monkeypatch, "승인 지문 없이 발송했다")
+    assert send_digest(md, dry_run=False, approved_by="1") == 2
+
+
+def test_send_digest_refuses_wrong_approved_sha(tmp_path, monkeypatch):
+    md = _annotated_digest(tmp_path)
+    _forbid_notifier(monkeypatch, "다른 지문으로 발송했다")
+    assert send_digest(
+        md, dry_run=False, approved_by="1", approved_sha="deadbeef"
+    ) == 2
+
+
+def test_send_digest_sends_the_text_it_gated(tmp_path, monkeypatch):
+    """게이트 통과 직후 본문을 갈아치워도, 발송되는 건 게이트가 본 본문이다."""
+    md = _annotated_digest(tmp_path)
+    from scripts import send_digest as send_mod
+
+    real_gate = send_mod.check_gate
+    captured = []
+
+    def gate_then_swap(markdown_text, check_json_path):
+        result = real_gate(markdown_text, check_json_path)
+        md.write_text(
+            markdown_text
+            + "\n### 몰래 끼운 항목\n\n**원문:** [x](https://evil.example/x)\n",
+            encoding="utf-8",
+        )
+        return result
+
+    class Notifier(_OkNotifier):
+        bodies = captured
+
+    monkeypatch.setattr("scripts.send_digest.check_gate", gate_then_swap)
+    monkeypatch.setattr("scripts.send_digest.EmailNotifier", Notifier)
+    assert _send(md) == 0
+    assert captured and "evil.example" not in captured[0]
+    assert "몰래 끼운" not in captured[0]
+
+
+# ══ 사이클2: 잠금 회수 (#3) ═════════════════════════════════════════════
+def test_acquire_lock_records_pid_and_timestamp(tmp_path):
+    import os
+
+    path = tmp_path / "2026-W37.lock"
+    fd = state_mod.acquire_lock(path)
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    assert payload["pid"] == os.getpid()
+    assert payload["started_at"] > 0
+    state_mod.release_lock(path, fd)
+
+
+def test_acquire_lock_reclaims_dead_pid(tmp_path):
+    """크래시로 남은 잠금은 회수하고 진행한다 (Codex 신규 #3)."""
+    path = tmp_path / "2026-W37.lock"
+    path.write_text(
+        json.dumps({"pid": 999999, "started_at": 9e9}), encoding="utf-8"
+    )
+    reclaimed = []
+    fd = state_mod.acquire_lock(path, on_reclaim=reclaimed.append)
+    assert reclaimed and "보유 프로세스 없음" in reclaimed[0]
+    state_mod.release_lock(path, fd)
+
+
+def test_acquire_lock_reclaims_timed_out_lock(tmp_path):
+    import os
+
+    path = tmp_path / "2026-W37.lock"
+    path.write_text(
+        json.dumps({"pid": os.getpid(), "started_at": 0}), encoding="utf-8"
+    )
+    reclaimed = []
+    fd = state_mod.acquire_lock(path, on_reclaim=reclaimed.append)
+    assert reclaimed and "보유 시간 초과" in reclaimed[0]
+    state_mod.release_lock(path, fd)
+
+
+def test_acquire_lock_reclaims_corrupt_lock(tmp_path):
+    path = tmp_path / "2026-W37.lock"
+    path.write_text("not json", encoding="utf-8")
+    reclaimed = []
+    fd = state_mod.acquire_lock(path, on_reclaim=reclaimed.append)
+    assert reclaimed and "pid 없음" in reclaimed[0]
+    state_mod.release_lock(path, fd)
+
+
+def test_acquire_lock_refuses_live_lock(tmp_path):
+    import os
+    import time as _time
+
+    path = tmp_path / "2026-W37.lock"
+    path.write_text(
+        json.dumps({"pid": os.getpid(), "started_at": _time.time()}),
+        encoding="utf-8",
+    )
+    with pytest.raises(state_mod.LockBusy):
+        state_mod.acquire_lock(path)
+
+
+def test_send_digest_reclaims_stale_lock(tmp_path, monkeypatch):
+    md = _annotated_digest(tmp_path)
+    state_mod.lock_path_for_markdown(md).write_text(
+        json.dumps({"pid": 999999, "started_at": 9e9}), encoding="utf-8"
+    )
+    monkeypatch.setattr("scripts.send_digest.EmailNotifier", _OkNotifier)
+    assert _send(md) == 0
+    assert state_mod.load_state(
+        state_mod.state_path_for_markdown(md), "2026-W37"
+    )["status"] == "sent"
+
+
+# ══ 사이클2: prune 범위·항목 수·중복 (#5 #6 #7) ═════════════════════════
+COMMENTARY_WITH_BLOCK = SAMPLE_MD.replace(
+    preview_mod.MARKER,
+    "### 검토 의견\n\n**원문:** [자료](https://dead.invalid/opinion)\n\n"
+    "우리 협의회는 이 사업의 자격 요건 완화를 건의했습니다.",
+)
+
+
+def test_prune_keeps_prose_section_blocks(tmp_path, monkeypatch):
+    """협의회 의견 안의 `###` 블록은 링크만 떼고 문장을 남긴다 (Codex 신규 #5)."""
+    text, removed, stripped = prune_mod.strip_dead_urls(
+        COMMENTARY_WITH_BLOCK, ["https://dead.invalid/opinion"]
+    )
+    assert removed == []
+    assert stripped == ["https://dead.invalid/opinion"]
+    assert "### 검토 의견" in text
+    assert "자격 요건 완화를 건의했습니다" in text
+    assert "https://dead.invalid/opinion" not in text
+    assert prune_mod.item_block_count(text) == 3     # 공고 3건 그대로
+
+
+def test_section_key_only_matches_item_sections():
+    """항목 섹션은 composer.SECTION_LIMITS 의 키가 정본 (계약 v1.2 현재 이름)."""
+    assert prune_mod.section_key("산림 정책 동향")
+    assert prune_mod.section_key("지원사업 공고")
+    assert prune_mod.section_key("사회연대경제 동향")
+    for prose in ("협의회 의견", "협의회에서", "회원사 소식", "회원사 동정",
+                  "이번 주 한 줄", ""):
+        assert prune_mod.section_key(prose) is None
+
+
+def test_section_key_follows_composer_rename(monkeypatch):
+    """계약 v2 로 섹션 이름이 바뀌어도 composer 를 따라간다 (이모지·부제 포함)."""
+    from alert.digest import composer
+
+    monkeypatch.setattr(
+        composer, "SECTION_LIMITS", {"신청하세요": 5, "알아두세요": 3}
+    )
+    assert prune_mod.section_key("✅ 신청하세요 (마감순)") == "신청하세요"
+    assert prune_mod.section_key("👀 알아두세요") == "알아두세요"
+    for prose in ("🤝 협의회에서", "🏢 회원사 소식", "이번 주 한 줄"):
+        assert prune_mod.section_key(prose) is None
+
+
+def test_fallback_item_keys_cover_both_contracts():
+    """composer 를 못 읽어도 v1.2·v2 항목 섹션 이름을 모두 알아본다."""
+    assert prune_mod.FALLBACK_ITEM_SECTION_KEYS == (
+        "신청하세요", "알아두세요", "산림", "지원사업", "사회연대경제",
+    )
+    monkeypatched = prune_mod.FALLBACK_ITEM_SECTION_KEYS
+    assert any("신청하세요" in key for key in monkeypatched)
+
+
+def test_item_blocks_counts_blocks_not_links():
+    """해설의 참고 링크는 항목이 아니다 (Codex 신규 #6)."""
+    assert prune_mod.item_block_count(SAMPLE_MD) == 3
+    assert prune_mod.item_block_count(COMMENTARY_WITH_BLOCK) == 3
+    assert len(preview_mod.item_urls(COMMENTARY_WITH_BLOCK)) == 3
+
+
+def test_checker_fails_when_no_item_blocks(tmp_path, monkeypatch):
+    """공고가 0건이면 해설 링크가 살아 있어도 pass=false (Codex 신규 #6)."""
+    only_commentary = SAMPLE_MD
+    for url in ("https://example.com/a", "https://example.com/b",
+                "https://example.com/c"):
+        only_commentary = only_commentary.replace(url, "https://dead.invalid/x")
+    only_commentary = only_commentary.replace(
+        preview_mod.MARKER, "참고 [자료](https://alive.example/ok)"
+    )
+    md = tmp_path / "2026-W37.md"
+    monkeypatch.setattr(
+        "alert.digest.checker.check_url_alive",
+        lambda url, timeout=8: "dead.invalid" not in url,
+    )
+    monkeypatch.setattr(
+        "sys.argv",
+        ["recheck_digest.py", str(md), "--db", str(_empty_db(tmp_path))],
+    )
+    md.write_text(only_commentary, encoding="utf-8")
+    assert recheck_main() == 1
+    check = json.loads((tmp_path / "2026-W37.check.json").read_text(encoding="utf-8"))
+    assert check["pass"] is False
+    assert check["item_blocks"] == 0
+    assert check["reason"] == "항목 0건"
+
+
+def test_dedupe_titles_drops_later_duplicate():
+    """링크를 떼어내 제목이 겹치면 뒤 블록을 지운다 (Codex 신규 #7)."""
+    body = SAMPLE_MD.replace(
+        "### 예비사회적기업 모집 공고", "### 동향 [자료](https://dead.invalid/t)"
+    ).replace("### 스마트팜 의견 조사", "### 동향 자료")
+    pruned, _, stripped = prune_mod.strip_dead_urls(body, ["https://dead.invalid/t"])
+    assert stripped == ["https://dead.invalid/t"]
+    assert pruned.count("### 동향 자료") == 2
+    deduped, removed = prune_mod.dedupe_titles(pruned)
+    assert [item["title"] for item in removed] == ["동향 자료"]
+    assert deduped.count("### 동향 자료") == 1
+    assert prune_mod.item_block_count(deduped) == 2
+
+
+def test_recheck_dedupes_after_link_strip(tmp_path, monkeypatch):
+    body = SAMPLE_MD.replace(
+        "### 예비사회적기업 모집 공고", "### 동향 [자료](https://dead.invalid/t)"
+    ).replace("### 스마트팜 의견 조사", "### 동향 자료")
+    annotated, _ = apply_commentary(body, "확정 의견")
+    md = tmp_path / "2026-W37.md"
+    md.write_text(annotated, encoding="utf-8")
+    monkeypatch.setattr(
+        "alert.digest.checker.check_url_alive",
+        lambda url, timeout=8: "dead.invalid" not in url,
+    )
+    monkeypatch.setattr(
+        "sys.argv",
+        ["recheck_digest.py", str(md), "--db", str(_empty_db(tmp_path))],
+    )
+    assert recheck_main() == 0
+    final = md.read_text(encoding="utf-8")
+    assert final.count("### 동향 자료") == 1
+    check = json.loads((tmp_path / "2026-W37.check.json").read_text(encoding="utf-8"))
+    assert check["pass"] is True
+    assert check["item_blocks"] == 2
+    assert "동향 자료" in [item["title"] for item in check["dropped"]]
+
+
+def test_cap_violation_fails_the_gate(tmp_path, monkeypatch):
+    """섹션 상한을 넘은 본문은 pass=false (상한을 다시 적용하지는 않는다)."""
+    extra = "".join(
+        f"\n### 추가 공고 {n}\n\n**기관:** 기관\n**마감:** 미정\n"
+        f"**원문:** [https://example.com/x{n}](https://example.com/x{n})\n"
+        for n in range(1, 6)
+    )
+    body = SAMPLE_MD.replace(
+        "\n## 사회연대경제 동향", extra + "\n## 사회연대경제 동향"
+    )
+    violations = prune_mod.cap_violations(body)
+    assert violations and violations[0][0] == "지원사업 공고"
+    md = tmp_path / "2026-W37.md"
+    md.write_text(body, encoding="utf-8")
+    monkeypatch.setattr(
+        "alert.digest.checker.check_url_alive", lambda url, timeout=8: True
+    )
+    result = check_digest(db_path=str(_empty_db(tmp_path)), markdown_path=md)
+    assert result["pass"] is False
+    assert "섹션 상한 초과" in result["reason"]
+
+
+def test_section_caps_come_from_composer():
+    from alert.digest import composer
+
+    assert prune_mod.section_caps() == {
+        str(key): int(value) for key, value in composer.SECTION_LIMITS.items()
+    }
+    assert set(prune_mod.item_section_keys()) == set(composer.SECTION_LIMITS)
+
+
+# ══ 사이클2: redact bare 토큰 (#8) ══════════════════════════════════════
+def test_redact_hides_bare_token_without_secrets():
+    bare = "1401666801:AAHt9Xk2mQpLzR7vNbC3dEfGhIjKlMnOpQr"
+    cleaned = redact(f"login failed for {bare}")
+    assert bare not in cleaned
+    assert "<redacted>" in cleaned
+
+
+def test_redact_keeps_ordinary_colon_numbers():
+    for text in ("12:30:45", "exit 2 — 2026-W37", "port 443:8080"):
+        assert redact(text) == text

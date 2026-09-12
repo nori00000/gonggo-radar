@@ -4,11 +4,23 @@ import os
 import smtplib
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
-from typing import List
+from typing import List, Tuple
 
 from alert.config import get_config
 from alert.models import AnalyzedAnnouncement
 from alert.utils.logger import setup_logger
+
+# SMTP 진행 단계 (계약 W10 사이클2 #4 — 실패 분류의 좌표)
+SMTP_STAGE_CONFIG = "config"        # 자격증명·수신자 미설정 (전송 시도 없음)
+SMTP_STAGE_CONNECT = "connect"      # 연결·DNS 실패 (확정적 미발송)
+SMTP_STAGE_STARTTLS = "starttls"    # TLS 협상 실패 (확정적 미발송)
+SMTP_STAGE_LOGIN = "login"          # 인증 실패 (확정적 미발송)
+SMTP_STAGE_DATA = "data"            # DATA 전송 중·이후 실패 (전달 여부 불확실)
+SMTP_STAGE_DONE = "done"
+
+# 여기서 실패했으면 메일은 확정적으로 나가지 않았다 → 재시도를 허용해도 안전하다.
+UNSENT_STAGES = (SMTP_STAGE_CONFIG, SMTP_STAGE_CONNECT, SMTP_STAGE_STARTTLS,
+                 SMTP_STAGE_LOGIN)
 
 
 class EmailNotifier:
@@ -152,7 +164,8 @@ class EmailNotifier:
         msg.attach(html_part)
 
         # SMTP 전송 (공용 경로)
-        if not self._send_via_smtp(msg):
+        delivered, _stage = self._send_via_smtp(msg)
+        if not delivered:
             return False
 
         self.logger.info(
@@ -161,37 +174,68 @@ class EmailNotifier:
         )
         return True
 
-    def _send_via_smtp(self, msg: MIMEMultipart) -> bool:
-        """구성된 메시지를 SMTP로 전송 (connect/starttls/login/send).
+    def _send_via_smtp(self, msg: MIMEMultipart) -> Tuple[bool, str]:
+        """구성된 메시지를 SMTP로 전송 (connect/starttls/login/data).
 
         Args:
             msg: 전송할 MIME 메시지
 
         Returns:
-            전송 성공 여부
+            (전송 성공 여부, 실패한 단계). 성공이면 ("done").
+
+            단계를 돌려주는 이유(계약 W10 사이클2 #4): 발송 게이트가 "확정적으로
+            안 나갔다"(connect/starttls/login)와 "전달 여부 불확실"(data 이후)을
+            구별해야 한다. 앞쪽은 재시도를 허용하고, 뒤쪽은 사람 확인을 요구한다.
         """
+        stage = SMTP_STAGE_CONNECT
         try:
-            with smtplib.SMTP(
+            server = smtplib.SMTP(
                 self.email_config.smtp_server,
                 self.email_config.smtp_port,
                 timeout=30
-            ) as server:
-                if self.email_config.use_tls:
-                    server.starttls()
-
-                server.login(self.sender, self.password)
-                server.send_message(msg)
-
-            return True
-
+            )
         except smtplib.SMTPException as exc:
-            self.logger.error(f"SMTP 오류로 이메일 전송 실패: {exc}")
-            return False
+            self.logger.error(f"SMTP 연결 실패: {exc}")
+            return False, stage
         except Exception as exc:
-            self.logger.error(f"이메일 전송 중 예외 발생: {exc}")
-            return False
+            self.logger.error(f"SMTP 연결 중 예외 발생: {exc}")
+            return False, stage
+
+        delivered = False
+        try:
+            if self.email_config.use_tls:
+                stage = SMTP_STAGE_STARTTLS
+                server.starttls()
+
+            stage = SMTP_STAGE_LOGIN
+            server.login(self.sender, self.password)
+
+            stage = SMTP_STAGE_DATA
+            server.send_message(msg)
+            delivered = True
+        except smtplib.SMTPException as exc:
+            self.logger.error(f"SMTP 오류로 이메일 전송 실패({stage}): {exc}")
+            return False, stage
+        except Exception as exc:
+            self.logger.error(f"이메일 전송 중 예외 발생({stage}): {exc}")
+            return False, stage
+        finally:
+            # 종료 실패는 전달 여부를 바꾸지 않는다 — 조용히 닫는다.
+            try:
+                server.quit()
+            except Exception:   # noqa: BLE001
+                pass
+
+        return delivered, SMTP_STAGE_DONE
 
     def send_html(self, subject: str, html_body: str, recipients: List[str]) -> bool:
+        """send_html_staged 의 bool 전용 래퍼 (기존 호출부 호환)."""
+        delivered, _stage = self.send_html_staged(subject, html_body, recipients)
+        return delivered
+
+    def send_html_staged(
+        self, subject: str, html_body: str, recipients: List[str]
+    ) -> Tuple[bool, str]:
         """임의의 HTML 본문을 지정 수신자에게 전송 (기존 SMTP 경로 재사용).
 
         Args:
@@ -200,15 +244,15 @@ class EmailNotifier:
             recipients: 수신자 이메일 목록
 
         Returns:
-            전송 성공 여부
+            (전송 성공 여부, 실패 단계) — 단계는 SMTP_STAGE_* 중 하나.
         """
         if not self.sender or not self.password:
             self.logger.error("이메일 인증 정보가 설정되지 않았습니다.")
-            return False
+            return False, SMTP_STAGE_CONFIG
 
         if not recipients:
             self.logger.error("수신자가 설정되지 않았습니다.")
-            return False
+            return False, SMTP_STAGE_CONFIG
 
         msg = MIMEMultipart("alternative")
         msg["From"] = self.sender
@@ -216,11 +260,12 @@ class EmailNotifier:
         msg["Subject"] = subject
         msg.attach(MIMEText(html_body, "html", "utf-8"))
 
-        if not self._send_via_smtp(msg):
-            return False
+        delivered, stage = self._send_via_smtp(msg)
+        if not delivered:
+            return False, stage
 
         self.logger.info(f"HTML 메일 전송 성공: 수신자 {len(recipients)}명")
-        return True
+        return True, stage
 
     def send_test(self) -> bool:
         """테스트 이메일 전송으로 설정 확인.

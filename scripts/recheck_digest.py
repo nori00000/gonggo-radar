@@ -60,8 +60,13 @@ def recheck(markdown_path: Path, db_path: str, check_path: Path):
         if pruned == text:
             # 제거 대상을 본문에서 찾지 못했다 → 더 돌려도 같다. 아래에서 pass=false.
             break
+        # 사이클2 #7: 링크를 떼어내면 제목이 겹칠 수 있다 → 중복 재검사.
+        pruned, duplicates = prune.dedupe_titles(pruned)
         markdown_path.write_text(pruned, encoding="utf-8")
         dropped.extend(removed)
+        dropped.extend(duplicates)
+        for item in duplicates:
+            print(f"  중복 제목 제거: {item['title']}")
         # 해설·본문에서 링크만 떼어낸 죽은 URL도 check.json 에 남긴다 —
         # 미리보기 헤더의 "죽은 URL 제외 N건" 이 실제 제거 건수와 맞아야 한다.
         dropped.extend({"title": "본문 링크", "url": url} for url in unlinked)
@@ -86,6 +91,7 @@ def write_failure(check_path: Path, markdown_path: Path, reason: str) -> None:
         "dropped": [],
         "pass": False,
         "network_checked": False,
+        "item_blocks": 0,
         "reason": f"재검증 실패: {reason}",
         "md_sha256": md_sha,
     })

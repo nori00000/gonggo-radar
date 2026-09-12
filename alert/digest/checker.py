@@ -8,6 +8,8 @@ from pathlib import Path
 from typing import Dict, List, Optional
 import requests
 
+from alert.digest import prune
+
 
 def markdown_sha256(markdown_text: str) -> str:
     """검증한 본문의 지문 (계약 W10 크리틱 #3).
@@ -153,6 +155,7 @@ def check_digest(
             "dropped": [],
             "pass": False,
             "network_checked": False,
+            "item_blocks": 0,
             "reason": "마크다운 파일 없음",
             "md_sha256": "",
         }
@@ -175,6 +178,7 @@ def check_digest(
             "dropped": [],
             "pass": False,
             "network_checked": False,
+            "item_blocks": 0,
             "reason": "항목 없음",
             "md_sha256": markdown_sha256(markdown_text),
         }
@@ -235,19 +239,38 @@ def check_digest(
     # 계약 W10 크리틱 #2: items 는 **본문에 실린 URL 전부**다. 그 안에 죽은 URL이
     # 하나라도 남아 있으면 통과시키지 않는다 — 죽은 링크를 메일로 보내는 것이
     # "살아 있는 항목도 있으니 pass" 보다 나쁘다. 제거는 호출자(재조립·prune)가 한다.
+    #
+    # 사이클2 #6·#7: 항목 수는 **링크 수가 아니라 항목 블록 수**다(해설의 참고 링크가
+    # 항목으로 세어지면 "공고 0건인데 pass" 가 난다). 섹션 상한 초과도 fail 이다.
+    item_blocks = prune.item_block_count(markdown_text)
+    cap_violations = prune.cap_violations(markdown_text)
+
     if not network_checked:
         reason = "네트워크 미검사"
     elif alive_count == 0:
         reason = "생존 항목 없음"
     elif len(dropped) > 0:
         reason = f"본문에 죽은 URL {len(dropped)}건 잔존"
+    elif item_blocks == 0:
+        reason = "항목 0건"
+    elif cap_violations:
+        reason = "섹션 상한 초과: " + ", ".join(
+            f"{name} {count}>{cap}" for name, count, cap in cap_violations
+        )
     else:
         reason = ""
 
     result = {
         "items": items,
         "dropped": dropped,
-        "pass": network_checked and alive_count > 0 and len(dropped) == 0,
+        "item_blocks": item_blocks,
+        "pass": (
+            network_checked
+            and alive_count > 0
+            and len(dropped) == 0
+            and item_blocks > 0
+            and not cap_violations
+        ),
         # 실제로 네트워크 검사한 URL이 0건이면 False
         "network_checked": network_checked,
         "reason": reason,

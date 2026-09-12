@@ -73,14 +73,21 @@ def main():
     markdown_path.write_text(updated, encoding="utf-8")
     print(f"✓ 협의회 의견 적용: {markdown_path}")
 
+    # 계약 W10 사이클2 #1: 상태 쓰기는 잠금 하 read-modify-write.
+    # 발송 중(sending)·발송 완료(sent) 주차의 해설 변경은 mark_annotated 가 거부한다.
     state_path = state_mod.state_path(args.week, args.out_dir)
+    lock_path = state_mod.lock_path(args.week, args.out_dir)
     try:
-        state = state_mod.load_state(state_path, args.week)
-        state_mod.save_state(
-            state_path, state_mod.mark_annotated(state, commentary)
+        state_mod.update_state(
+            state_path, lock_path, args.week,
+            lambda current: state_mod.mark_annotated(current, commentary),
+            on_reclaim=lambda reason: print(
+                f"⚠️  잔존 잠금 회수: {reason}", file=sys.stderr
+            ),
         )
         print(f"✓ 상태 기록: {state_path} (status=annotated)")
-    except (state_mod.StateError, OSError) as exc:
+    except (state_mod.StateError, state_mod.TransitionError,
+            state_mod.LockBusy, OSError) as exc:
         print(f"⚠️  상태 기록 실패(본문은 적용됨): {exc}", file=sys.stderr)
         return 1
 

@@ -889,7 +889,8 @@ class TestSendDigest:
 
         monkeypatch.setattr("alert.notifiers.email_sender.smtplib.SMTP", FakeSMTP)
 
-        rc = send_digest(md_path, to_email="third@example.com", dry_run=False)
+        rc = send_digest(md_path, to_email="third@example.com", dry_run=False,
+                         approved_sha=markdown_sha256(body)[:8])
 
         assert rc == 0
         assert sent["to"] == "third@example.com"
