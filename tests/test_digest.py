@@ -50,8 +50,9 @@ from alert.digest.composer import (
     render_kakao_chunks,
     render_kakao,
     render_markdown,
+    bracket_regions,
+    dedup_key,
     infer_region,
-    is_non_region_tag,
     prefix_bracket,
     prefix_brackets,
     sanitize_title,
@@ -2161,9 +2162,9 @@ class TestFixCycle4:
         assert sanitize_title("<img src=x onerror=1> 공고") == (
             "＜img src=x onerror=1＞ 공고"
         )
-        # 사이클 8 #2: 선두 대괄호는 전각 짝으로 중화된다 (라벨 흉내·링크 문법 차단).
-        # 괄호 **내용**과 꼬리 표기는 그대로 남는다.
-        assert sanitize_title("[모집] 산림 공고(~9.30)") == "［모집］ 산림 공고(~9.30)"
+        # 사이클 9 #6: 선두 대괄호는 **원문 그대로** 둔다 — 링크 판정은 괄호 내용이
+        # URL 일 때만이고, 라벨 흉내는 items.json 제목 대조가 잡는다.
+        assert sanitize_title("[모집] 산림 공고(~9.30)") == "[모집] 산림 공고(~9.30)"
 
     def test_sanitize_title_neutralizes_leading_structure(self):
         """DB 제목이 문서 구조를 바꾸지 못한다 (사이클 8 #2 / Codex 4차 HIGH #3)."""
@@ -2173,7 +2174,8 @@ class TestFixCycle4:
         assert sanitize_title("> 인용 제목") == "＞ 인용 제목"
         assert sanitize_title("+ 더하기 제목") == "＋ 더하기 제목"
         assert sanitize_title("1. 산림 제도 개정") == "1． 산림 제도 개정"
-        assert sanitize_title("[D-9] 위조 라벨 제목") == "［D-9］ 위조 라벨 제목"
+        # 선두 대괄호는 중화하지 않는다 (사이클 9 #6) — 라벨 흉내는 정본 대조가 잡는다
+        assert sanitize_title("[D-9] 위조 라벨 제목") == "[D-9] 위조 라벨 제목"
         # 항목 줄 구분자와 겹치는 em dash 는 en dash 로 (제목/꼬리 경계 보호)
         assert sanitize_title("산림 — 제도 개정") == "산림 – 제도 개정"
         # 선두가 아닌 기호는 손대지 않는다
@@ -2599,9 +2601,9 @@ class TestFixCycle4:
         """지역 미확정(None)끼리도 접두 문자열이 다르면 별개 공고다 (사이클 8 #3).
 
         Codex 4차 HIGH #1 재현 입력: `[모집공고][경기]`/`[모집공고][강원]` 은
-        접두 태그가 `NON_REGION_PREFIX_TAGS` 에 없어 지역 탐색이 멈추고 region 이
-        양쪽 None 이 됐다 — 병합 키가 같아져 유효 공고가 sections·holds 양쪽에서
-        사라졌다(게시 1 · merged_ids=[2]).
+        접두 태그를 몰라 지역 탐색이 멈추고 region 이 양쪽 None 이 됐다 —
+        병합 키가 같아져 유효 공고가 sections·holds 양쪽에서 사라졌다
+        (게시 1 · merged_ids=[2]).
         """
         db_path = tmp_path / f"c8_merge_{abs(hash(prefix))}.db"
         _create_announcements_table(db_path)
@@ -2623,6 +2625,54 @@ class TestFixCycle4:
             f"{prefix}[경기]", f"{prefix}[강원]"
         }
 
+    @pytest.mark.parametrize("shape", [
+        "사회적기업 사업개발비 지원사업 모집 [{}]",
+        "[모집공고][{}] 사회적기업 사업개발비 지원사업 모집",
+        "사회적기업 사업개발비 지원사업 모집({} 권역)",
+    ])
+    def test_region_in_any_bracket_prevents_merge(self, tmp_path, shape):
+        """선두·후미·중간 어느 괄호에 있어도 지역을 찾는다 (사이클 9 #2).
+
+        Codex 5차 HIGH #3 재현 입력: 지역 괄호를 **제목 뒤**로 옮기면 region 이
+        양쪽 None 이 되고 접두 서명도 빈 문자열이라 병합 키가 같아졌다
+        (게시 1 · 보류 0 — 살아 있는 공고가 양쪽에서 사라짐).
+        """
+        db_path = tmp_path / f"c9_region_{abs(hash(shape))}.db"
+        _create_announcements_table(db_path)
+        for index, region in enumerate(["경기", "강원"]):
+            _insert_one(
+                db_path, source="seis", source_id=f"t_{index}",
+                title=shape.format(region),
+                url=f"https://example.com/t-{index}",
+                period_start="2026-09-08", period_end="2026-09-30",
+                created_at=W37_CREATED_AT,
+            )
+        data = compose_digest_data(
+            str(db_path), week_str=W37, today=W37_TODAY
+        )
+        published = data["sections"][VERDICT_APPLY]
+        assert len(published) == 2, [item["title"] for item in published]
+        assert {item["region"] for item in published} == {"경기", "강원"}
+        assert data["merged_ids"] == []
+
+    def test_region_found_in_trailing_and_middle_brackets(self):
+        assert infer_region("지원사업 모집 [경기]") == "경기"
+        assert infer_region("지원사업 모집 [강원]") == "강원"
+        assert infer_region("지원사업 모집(충청 권역)") == "충청"
+        assert bracket_regions("[모집공고][경기] 지원") == ("경기",)
+        assert bracket_regions("지원사업 모집 [강원]") == ("강원",)
+        assert bracket_regions("지원사업 모집(~9.30)") == ()
+        # 행사 장소는 여전히 자격 지역이 아니다
+        assert infer_region("전국 지원사업 모집(설명회 장소: 서울)") is None
+
+    def test_dedup_key_keeps_bracket_contents(self):
+        """병합 정규화가 괄호 내용을 지우지 않는다 (사이클 9 #2)."""
+        assert "경기" in dedup_key("지원사업 모집 [경기]")
+        assert "강원" in dedup_key("지원사업 모집 [강원]")
+        assert dedup_key("지원사업 모집 [경기]") != dedup_key("지원사업 모집 [강원]")
+        # 날짜·기호만 든 괄호는 여전히 사라진다 (표기 차이는 같은 공고다)
+        assert dedup_key("산림 공고(~9.30)") == dedup_key("산림 공고")
+
     def test_prefix_signature_is_part_of_the_merge_key(self):
         assert prefix_signature("[모집공고][경기] 지원사업") == "[모집공고][경기]"
         assert prefix_signature("[2026년] 지원사업") == "[2026년]"
@@ -2636,10 +2686,10 @@ class TestFixCycle4:
         assert infer_region("[모집][경기] 지원사업 모집") == "경기"
         assert infer_region("[공고][강원] 지원사업 모집") == "강원"
         assert infer_region("[경기][모집] 지원사업 모집") == "경기"
-        assert is_non_region_tag("모집") and is_non_region_tag("공고")
-        assert not is_non_region_tag("경기")
-        # 알 수 없는 접두사(기관명)에서는 멈춘다 — 본문 탐색으로 넘어간다
+        # 사이클 9 #2: 접두 그룹을 전부 훑으므로 비지역 태그 목록이 필요 없다 —
+        # 지역이 없는 접두사(기관명)는 그냥 지역을 못 주고 지나간다.
         assert infer_region("[고용노동부 공고] 사회적기업 인증 공고") is None
+        assert infer_region("[국립김해숲체원] 숲체험교육사업 모집공고") is None
         # 행사 장소는 여전히 자격 지역이 아니다
         assert infer_region(
             "[세종대전충청센터] 설명회 안내(설명회 장소: 서울)"
@@ -2905,8 +2955,8 @@ class TestFixCycle5:
     @pytest.mark.parametrize(
         "title",
         [
-            ("[모집](~9.30) 산림 지원사업", "［모집］(~9.30) 산림 지원사업"),
-            ("[모집](산림사업자) 지원사업", "［모집］(산림사업자) 지원사업"),
+            ("[모집](~9.30) 산림 지원사업", "[모집](~9.30) 산림 지원사업"),
+            ("[모집](산림사업자) 지원사업", "[모집](산림사업자) 지원사업"),
             ("「2026년 산림 공고」(~9.30)", "「2026년 산림 공고」(~9.30)"),
         ],
     )
@@ -2940,7 +2990,7 @@ class TestFixCycle5:
         markdown = compose_digest(
             db_path=str(db_path), week_str=W13, today=W13_TODAY
         )
-        assert "［모집］(~9.30) 산림 지원사업 참여기업" in markdown
+        assert "[모집](~9.30) 산림 지원사업 참여기업" in markdown
 
     @pytest.mark.parametrize(
         "title",

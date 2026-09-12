@@ -105,24 +105,31 @@ def strip_dead_urls(
     return text, removed, stripped
 
 
-def dedupe_urls(
+def dedupe_duplicate_blocks(
     markdown_text: str, item_sections: Optional[Sequence[str]] = None
 ) -> Tuple[str, List[Dict]]:
-    """같은 URL을 가리키는 뒤쪽 항목 블록을 삭제 (사이클 6 #3).
+    """**같은 (id, URL) 블록이 두 번 실린 것**만 접는다 (사이클 9 #1).
 
-    제목이 같아도 URL 이 다르면 **남긴다** — 소스 간 비병합 계약(같은 사안을
-    forest_service·forest_press 가 각자 게시)을 재검토가 뒤집지 않는다.
+    사이클 6~8 판은 "같은 URL" 이면 뒤 블록을 지웠다. 그것이 자동 교정이 되어,
+    md 의 URL 하나를 잘못 고친 본문에서 **살아 있는 다른 공고**를 중복으로 지우고
+    통과시켰다(Codex 5차 HIGH #2). 이제 접는 대상은 문자 그대로의 블록 복제
+    (같은 id · 같은 URL)뿐이고, 정본(items.json)은 **건드리지 않는다** — 정본에는
+    그 id 가 한 번만 있으므로 복제를 접으면 개수가 저절로 맞는다 (MEDIUM #5).
+
+    id·URL 이 다른 불일치는 고치지 않는다. checker 가 `pass=false` 로 멈추고,
+    해소는 재조립뿐이다.
     """
     seen = set()
     removed: List[Dict] = []
     kept: List[Dict] = []
     for block in blocks_mod.parse_blocks(markdown_text, item_sections):
         if block["kind"] == "item":
-            if block["url"] in seen:
+            key = (str(block.get("item_id")), block["url"])
+            if key in seen:
                 removed.append({"title": block["title"], "url": block["url"],
                                 "item_id": block.get("item_id")})
                 continue
-            seen.add(block["url"])
+            seen.add(key)
         kept.append(block)
 
     if not removed:

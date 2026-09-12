@@ -722,7 +722,10 @@ def _bind(markdown_path):
             "id": item_id,
             "url": block["url"],
             "title": block["fields"]["title"],
-            "section": block["section"],
+            # 정본의 section 은 **섹션 키**다 (md 의 헤딩이 아니라) — 사이클 9 #4
+            "section": composer_mod.HEADING_TO_SECTION.get(
+                block["section"], block["section"]
+            ),
             "deadline_label": block["fields"]["label"],
         })
         conn.execute(
@@ -1742,59 +1745,110 @@ def _duplicate_url_body() -> str:
     return SAMPLE_MD.replace("https://example.com/c", "https://example.com/b")
 
 
-def test_dedupe_urls_keeps_same_title_from_different_sources():
-    """제목이 같아도 URL 이 다르면 남긴다 (사이클 6 #3 / Codex 신규 #5).
+def test_dedupe_keeps_same_title_from_different_sources():
+    """제목이 같아도 URL 이 다르면 남긴다 (사이클 6 #3 / Codex 3차 #5).
 
     병합 판정은 compose 단계의 몫이다 — forest_service·forest_press 가 같은 사안을
     각자 게시하는 비병합 계약을 재검토가 뒤집으면 안 된다.
     """
     body = _duplicate_title_body()
     assert body.count(DUP_PLAIN) == 2
-    deduped, removed = prune_mod.dedupe_urls(body)
+    deduped, removed = prune_mod.dedupe_duplicate_blocks(body)
     assert removed == []
     assert deduped == body
     assert blocks_mod.item_block_count(deduped) == 4
 
 
-def test_dedupe_urls_drops_later_same_url_block():
-    """같은 URL 을 가리키는 뒤쪽 블록만 지운다 (사이클 6 #3)."""
-    body = _duplicate_url_body()
+def test_dedupe_keeps_different_ids_with_the_same_url():
+    """같은 URL 이라도 **id 가 다르면** 지우지 않는다 (사이클 9 #1).
+
+    Codex 5차 HIGH #2 재현 입력: md 의 한 항목 URL 만 다른 항목의 URL 로 고쳐 놓으면,
+    예전 재검토는 그것을 "중복" 으로 보고 **살아 있는 공고**를 지우며 통과했다.
+    이제 재검토는 고치지 않고 멈춘다 — 지우는 것은 문자 그대로의 블록 복제뿐이다.
+    """
+    body = _duplicate_url_body()        # c 의 URL 을 b 의 URL 로 바꾼 본문
     assert blocks_mod.item_block_count(body) == 4
-    deduped, removed = prune_mod.dedupe_urls(body)
-    assert [item["url"] for item in removed] == ["https://example.com/b"]
-    assert blocks_mod.item_block_count(deduped) == 3
-    assert blocks_mod.item_urls(deduped) == [
-        "https://example.com/a", "https://example.com/b", "https://example.com/d",
-    ]
+    deduped, removed = prune_mod.dedupe_duplicate_blocks(body)
+    assert removed == []
+    assert deduped == body
+
+
+def test_dedupe_drops_only_literal_block_duplication():
+    """같은 id·같은 URL 블록이 두 번 실린 것만 접는다 (사이클 9 #1)."""
+    lines = SAMPLE_MD.split("\n")
+    start = lines.index("<!-- item id=11 -->")
+    duplicated = "\n".join(
+        lines[:start] + lines[start:start + 3] + lines[start:]
+    )
+    assert blocks_mod.item_block_count(duplicated) == 5
+    deduped, removed = prune_mod.dedupe_duplicate_blocks(duplicated)
+    assert [item["item_id"] for item in removed] == ["11"]
+    assert blocks_mod.item_block_count(deduped) == 4
 
 
 def test_prune_has_no_title_dedupe():
-    """제목 기반 중복 제거는 폐지됐다 (사이클 6 #3)."""
+    """제목 기반 중복 제거는 폐지됐다 (사이클 6 #3). URL 기반도 폐지 (사이클 9 #1)."""
     assert not hasattr(prune_mod, "dedupe_titles")
+    assert not hasattr(prune_mod, "dedupe_urls")
 
 
-def test_recheck_dedupes_same_url_after_link_strip(tmp_path, monkeypatch):
-    body = _duplicate_url_body()
-    annotated, _ = apply_headline(body, f"확정 의견 [자료]({DEAD}) 참고")
+def test_recheck_stops_instead_of_deleting_a_mismatch(tmp_path, monkeypatch):
+    """md 와 정본이 어긋나면 재검토는 **고치지 않고 멈춘다** (사이클 9 #1).
+
+    Codex 5차 HIGH #2 재현 입력: 정상 A/U1·B/U2 에서 md 의 B URL 만 U1 로 바꾸면,
+    예전 재검토는 B 를 "중복" 으로 지우고 정본에서도 빼서 1건·pass 로 만들었다 —
+    살아 있는 B/U2 가 sections·holds 양쪽에서 사라졌다. 이제 멈추고 재조립을 요구한다.
+    """
     md = tmp_path / "2026-W37.md"
-    md.write_text(annotated, encoding="utf-8")
+    md.write_text(SAMPLE_MD, encoding="utf-8")
+    db = _bind(md)                      # 정본은 정상 본문 기준 (a·b·c·d)
+    tampered = SAMPLE_MD.replace(
+        "  [원문](https://example.com/c)", "  [원문](https://example.com/b)"
+    )
+    md.write_text(tampered, encoding="utf-8")
+    composer_mod.refresh_manifest_binding(md)
+
     monkeypatch.setattr(
         "alert.digest.checker.check_url_alive",
         lambda url, timeout=8: "dead.invalid" not in url,
     )
-    monkeypatch.setattr(
-        "sys.argv",
-        ["recheck_digest.py", str(md), "--db", str(_bind(md))],
-    )
-    assert recheck_main() == 0
+    monkeypatch.setattr("sys.argv", ["recheck_digest.py", str(md), "--db", str(db)])
+    assert recheck_main() == 1
+
     final = md.read_text(encoding="utf-8")
-    assert DEAD not in final
-    assert "확정 의견 자료 참고" in final       # 산문은 문장을 보존한다
-    assert final.count("[원문](https://example.com/b)") == 1
+    # 본문은 그대로다 — 재검토가 아무것도 지우지 않았다
+    assert final == tampered
+    assert blocks_mod.item_block_count(final) == 4
+    manifest = composer_mod.load_items_manifest(md)
+    assert len(manifest["items"]) == 4          # 정본도 그대로
+    check = json.loads((tmp_path / "2026-W37.check.json").read_text(encoding="utf-8"))
+    assert check["pass"] is False
+    assert "재조립 필요" in check["reason"]
+
+
+def test_recheck_folds_literal_block_duplication(tmp_path, monkeypatch):
+    """같은 id·URL 블록 복제는 접고 정본은 그대로 둔다 (사이클 9 #1 / MEDIUM #5)."""
+    md = tmp_path / "2026-W37.md"
+    md.write_text(SAMPLE_MD, encoding="utf-8")
+    db = _bind(md)
+    lines = SAMPLE_MD.split("\n")
+    start = lines.index("<!-- item id=11 -->")
+    duplicated = "\n".join(lines[:start] + lines[start:start + 3] + lines[start:])
+    md.write_text(duplicated, encoding="utf-8")
+    composer_mod.refresh_manifest_binding(md)
+
+    monkeypatch.setattr(
+        "alert.digest.checker.check_url_alive", lambda url, timeout=8: True
+    )
+    monkeypatch.setattr("sys.argv", ["recheck_digest.py", str(md), "--db", str(db)])
+    assert recheck_main() == 0
+
+    assert blocks_mod.item_block_count(md.read_text(encoding="utf-8")) == 4
+    manifest = composer_mod.load_items_manifest(md)
+    assert len(manifest["items"]) == 4          # 정본은 건드리지 않았다
     check = json.loads((tmp_path / "2026-W37.check.json").read_text(encoding="utf-8"))
     assert check["pass"] is True
-    assert check["item_blocks"] == 3
-    assert "https://example.com/b" in [item["url"] for item in check["dropped"]]
+    assert check["manifest_problems"] == []
 
 
 def test_cap_violation_fails_the_gate(tmp_path, monkeypatch):
@@ -2547,3 +2601,204 @@ def test_apply_headline_is_idempotent_for_multiline_input():
     assert changed is False and twice == once
     assert once.count("둘째줄") == 1
     assert "이번 주 한 줄: 첫줄 둘째줄" in once
+
+
+# ══ 사이클 9: 위협 모델 · 정본 스키마 · 카톡 조각 한도 ══════════════════
+def test_threat_model_is_documented_next_to_the_gate():
+    """게이트의 전제는 코드에 적혀 있어야 한다 (사이클 9).
+
+    "무엇을 막고 무엇을 막지 않는가"가 문서에 없으면, 다음 크리틱이 범위 밖 공격을
+    결함으로 보고하고 그것을 막으려다 게이트가 쓸모없이 엄격해진다.
+    """
+    from alert.digest import checker as checker_mod
+
+    doc = checker_mod.__doc__ or ""
+    assert "THREAT_MODEL" in doc
+    assert "신뢰 경계 안" in doc
+    assert "동시" in doc and "목적" in doc        # 두 파일 동시 위조는 범위 밖
+    for purpose in ("조용히 사라지지", "날조", "제외", "승인"):
+        assert purpose in doc, purpose
+
+
+def test_manifest_schema_requires_every_field(tmp_path, monkeypatch):
+    """필수 필드가 없는 정본은 통과하지 못한다 (사이클 9 #4)."""
+    monkeypatch.setattr(
+        "alert.digest.checker.check_url_alive", lambda url, timeout=8: True
+    )
+    md = tmp_path / "2026-W37.md"
+    md.write_text(SAMPLE_MD, encoding="utf-8")
+    db = _bind(md)
+    good = composer_mod.load_items_manifest(md)
+
+    for field in ("id", "url", "title", "section"):
+        broken = json.loads(json.dumps(good))
+        broken["items"][0].pop(field)
+        composer_mod.write_items_manifest(md, broken)
+        result = check_digest(db_path=str(db), markdown_path=md, output_path=None)
+        assert result["pass"] is False, field
+        joined = " ".join(result["manifest_problems"])
+        assert "필수 필드 누락" in joined or "정본에 없는 항목" in joined, (
+            field, result["manifest_problems"]
+        )
+
+    # week 누락
+    broken = json.loads(json.dumps(good))
+    broken.pop("week")
+    composer_mod.write_items_manifest(md, broken)
+    result = check_digest(db_path=str(db), markdown_path=md, output_path=None)
+    assert "정본에 week 이 없음" in result["manifest_problems"]
+
+    # 해시 누락 (예전 정본)
+    broken = json.loads(json.dumps(good))
+    broken.pop("markdown_sha256")
+    composer_mod.write_items_manifest(md, broken)
+    result = check_digest(db_path=str(db), markdown_path=md, output_path=None)
+    assert result["pass"] is False
+    assert "markdown_sha256 이 없음" in " ".join(result["manifest_problems"])
+
+
+def test_manifest_rejects_duplicate_ids(tmp_path, monkeypatch):
+    """같은 id 를 두 번 넣은 정본은 통과하지 못한다 (사이클 9 #4)."""
+    monkeypatch.setattr(
+        "alert.digest.checker.check_url_alive", lambda url, timeout=8: True
+    )
+    md = tmp_path / "2026-W37.md"
+    md.write_text(SAMPLE_MD, encoding="utf-8")
+    db = _bind(md)
+    manifest = composer_mod.load_items_manifest(md)
+    manifest["items"].append(json.loads(json.dumps(manifest["items"][0])))
+    composer_mod.write_items_manifest(md, manifest)
+    result = check_digest(db_path=str(db), markdown_path=md, output_path=None)
+    assert result["pass"] is False
+    assert "정본에 중복된 항목 id=" in " ".join(result["manifest_problems"])
+
+
+def test_manifest_section_must_match_the_body(tmp_path, monkeypatch):
+    """정본의 section 이 본문의 실제 섹션과 달라도 통과하지 못한다 (사이클 9 #4)."""
+    monkeypatch.setattr(
+        "alert.digest.checker.check_url_alive", lambda url, timeout=8: True
+    )
+    md = tmp_path / "2026-W37.md"
+    md.write_text(SAMPLE_MD, encoding="utf-8")
+    db = _bind(md)
+    manifest = composer_mod.load_items_manifest(md)
+    manifest["items"][0]["section"] = "알아두세요"      # 실제로는 신청하세요
+    composer_mod.write_items_manifest(md, manifest)
+    result = check_digest(db_path=str(db), markdown_path=md, output_path=None)
+    assert result["pass"] is False
+    assert "섹션 불일치" in " ".join(result["manifest_problems"])
+
+
+def test_manifest_title_must_match_the_db_title(tmp_path, monkeypatch):
+    """md·정본 제목을 함께 위조해도 DB 제목이 근거로 남는다 (사이클 9 #3).
+
+    Codex 5차 HIGH #1 재현 입력: DB 제목은 `산림 제도 개정` 인데 md·items.json 을
+    `자료를 참고해 주세요` 로 바꾸고 해시까지 맞추면 예전에는 통과했다.
+    """
+    monkeypatch.setattr(
+        "alert.digest.checker.check_url_alive", lambda url, timeout=8: True
+    )
+    md = tmp_path / "2026-W37.md"
+    md.write_text(SAMPLE_MD, encoding="utf-8")
+    db = _bind(md)
+    # DB 제목만 다르게 (우리가 만들지 않은 값)
+    conn = sqlite3.connect(db)
+    conn.execute(
+        "UPDATE announcements SET title = ? WHERE id = 11", ("산림 제도 개정",)
+    )
+    conn.commit()
+    conn.close()
+    result = check_digest(db_path=str(db), markdown_path=md, output_path=None)
+    assert result["pass"] is False
+    assert "DB 제목 불일치" in " ".join(result["manifest_problems"])
+
+
+LONG_URL = "https://example.com/" + "z" * 4120
+
+
+def test_long_prose_url_is_replaced_in_every_renderer(tmp_path):
+    """산문·회원사 소식·해설의 긴 URL 은 **모든 렌더러**에서 같은 치환을 받는다 (#5)."""
+    from scripts.send_digest import markdown_to_html
+
+    body = SAMPLE_MD.replace(
+        "· (면담·건의·수렴 현황 — 이번 주 기록 없음)",
+        f"· 참고 [자료]({LONG_URL}) 입니다",
+    )
+    kakao = composer_mod.kakao_file_text_from_markdown(body)
+    preview_body = preview_mod.render_preview("2026-W37", body, PASS_CHECK)
+    html = markdown_to_html(body)
+
+    for name, rendered in (("kakao", kakao), ("preview", preview_body),
+                           ("html", html)):
+        assert LONG_URL not in rendered, name
+        assert composer_mod.URL_TOO_LONG_NOTICE in rendered, name
+    # URL 은 절대 분절하지 않는다 — 조각을 이어도 잘린 주소가 나오지 않는다
+    assert "example.com/zzz" not in kakao
+    assert all(
+        len(chunk) <= composer_mod.KAKAO_CHUNK_LIMIT
+        for chunk in kakao.split(f"\n{KAKAO_CHUNK_SEPARATOR}\n")
+    )
+    assert all(
+        len(chunk) <= preview_mod.TELEGRAM_LIMIT
+        for chunk in preview_mod.chunk_text(preview_body)
+    )
+
+
+def test_multiline_member_news_with_long_url_stays_within_limit(tmp_path):
+    """`첫줄\n둘째줄\n<4,139자 URL>` 도 조각 한도를 넘기지 않는다 (Codex 5차 #6)."""
+    body = SAMPLE_MD.replace(
+        "· (면담·건의·수렴 현황 — 이번 주 기록 없음)",
+        f"· 첫줄\n· 둘째줄\n· {LONG_URL}",
+    )
+    kakao = composer_mod.kakao_file_text_from_markdown(body)
+    chunks = kakao.split(f"\n{KAKAO_CHUNK_SEPARATOR}\n")
+    assert all(len(chunk) <= composer_mod.KAKAO_CHUNK_LIMIT for chunk in chunks), [
+        len(chunk) for chunk in chunks
+    ]
+    assert LONG_URL not in kakao
+    # 분절이 아니라 **치환**으로 처리됐다 (URL 은 절대 자르지 않는다)
+    assert composer_mod.URL_TOO_LONG_NOTICE in kakao
+    assert "example.com/zzz" not in kakao
+    assert composer_mod.markdown_kakao_problems(body) == []
+
+
+def test_split_url_fails_the_gate(tmp_path, monkeypatch):
+    """치환을 우회해 URL 이 분절되면 pass=false (사이클 9 #5).
+
+    조각 길이만 보면 "URL 을 잘라서 한도를 맞춘" 출력이 통과한다 — Codex 5차가
+    측정한 것이 정확히 그 상태였다(4,092자 산문 URL 분절 · pass). 그래서 생성 후
+    확인은 조각 길이와 **URL 온전성**을 함께 본다.
+    """
+    monkeypatch.setattr(
+        "alert.digest.checker.check_url_alive", lambda url, timeout=8: True
+    )
+    # 치환을 무력화해 분절이 실제로 일어나게 한다
+    monkeypatch.setattr(
+        "alert.digest.composer.fit_prose_urls",
+        lambda text, limit=composer_mod.KAKAO_CHUNK_LIMIT: (text, []),
+    )
+    body = SAMPLE_MD.replace(
+        "· (면담·건의·수렴 현황 — 이번 주 기록 없음)",
+        f"· 참고 [자료]({LONG_URL}) 입니다",
+    )
+    md = tmp_path / "2026-W37.md"
+    md.write_text(body, encoding="utf-8")
+    db = _bind(md)
+    result = check_digest(db_path=str(db), markdown_path=md, output_path=None)
+    assert result["kakao_problems"], result["kakao_problems"]
+    assert any("분절" in problem for problem in result["kakao_problems"])
+    assert result["pass"] is False
+    assert "카톡 조각 초과" in result["reason"]
+
+
+def test_normal_body_has_no_kakao_problems(tmp_path, monkeypatch):
+    """정상 본문에서는 조각 길이·URL 온전성 둘 다 문제 없다 (기준선)."""
+    monkeypatch.setattr(
+        "alert.digest.checker.check_url_alive", lambda url, timeout=8: True
+    )
+    md = tmp_path / "2026-W37.md"
+    md.write_text(SAMPLE_MD, encoding="utf-8")
+    db = _bind(md)
+    result = check_digest(db_path=str(db), markdown_path=md, output_path=None)
+    assert result["kakao_problems"] == []
+    assert result["pass"] is True

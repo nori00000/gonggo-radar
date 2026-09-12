@@ -1,4 +1,23 @@
-"""다이제스트 항목 검증: URL 생존성 및 마감일 파싱."""
+"""다이제스트 항목 검증: URL 생존성·정본 대조·마감일 파싱.
+
+THREAT_MODEL (사이클 9에서 확정 — 이 파일의 모든 게이트가 이 전제를 공유한다)
+====================================================================
+**신뢰 경계 안**: 로컬 파일시스템(`digests/*.md`, `*.items.json`, `*.state.json`,
+`*.check.json`). 이 파일들은 소유자와 우리 스크립트만 쓴다. 두 파일을 **동시에**
+위조하는 공격자를 막는 것은 이 게이트의 목적이 **아니다** — 그 능력이 있으면
+DB 도 고칠 수 있고, 어떤 파일 대조로도 막지 못한다.
+
+**게이트의 목적** (네 가지, 전부 "조용한 실패"를 막는 것):
+  ① 살아 있는 공고가 조용히 사라지지 않게 한다 (오병합·자동 삭제 방지)
+  ② 죽은/날조 정보가 나가지 않게 한다 (URL 생존·DB 대조·구조 위조 차단)
+  ③ 사람이 제외한 항목이 실제로 빠지게 한다 (상태 파일 반영)
+  ④ 승인된 본문과 발송 본문이 같게 한다 (바이트 해시·미리보기 지문)
+
+그래서 실패의 기본값은 **멈춤**이다. 특히 md 와 정본(items.json)이 어긋나면
+검증은 고쳐주지 않고 `pass=false` 로 멈춘다 — 자동 교정은 ①을 위반한다
+(Codex 5차 HIGH #2: 재검토가 불일치 항목을 지워 통과시키면서 살아 있는 공고가
+sections·holds 양쪽에서 사라졌다). 해소는 재조립뿐이다.
+"""
 
 import hashlib
 import json
@@ -10,10 +29,13 @@ import requests
 from alert.digest import blocks as blocks_mod
 from alert.digest import sections as sections_mod
 from alert.digest.composer import (
+    HEADING_TO_SECTION,
     ITEMS_JSON_SUFFIX,
     fit_prose_urls,
     load_items_manifest,
+    markdown_kakao_problems,
     parse_deadline,
+    sanitize_title,
 )
 
 
@@ -55,15 +77,21 @@ def manifest_problems(
     if manifest is None:
         return [f"항목 정본 파일 없음 (<주차>{ITEMS_JSON_SUFFIX}) — 재조립 필요"]
 
-    problems: List[str] = []
+    problems: List[str] = _schema_problems(manifest)
     recorded_hash = manifest.get("markdown_sha256")
-    if recorded_hash and recorded_hash != markdown_sha256(markdown_bytes):
+    if not recorded_hash:
+        problems.append("정본에 markdown_sha256 이 없음 — 재조립 필요")
+    elif recorded_hash != markdown_sha256(markdown_bytes):
         problems.append("항목 정본 파일이 이 본문의 것이 아님 — 재검토 필요")
 
     entries = {}
     for entry in manifest.get("items") or []:
         if isinstance(entry, dict) and entry.get("id") is not None:
-            entries[str(entry["id"])] = entry
+            key = str(entry["id"])
+            if key in entries:
+                problems.append(f"정본에 중복된 항목 id={key}")
+                continue
+            entries[key] = entry
 
     blocks = blocks_mod.item_blocks(markdown_text, item_sections)
     if len(blocks) != len(entries):
@@ -87,10 +115,19 @@ def manifest_problems(
                 f"id={item_id} URL 불일치: 본문 {block['url']} ≠ 정본 {entry.get('url')}"
             )
         expected_title = entry.get("title")
-        if expected_title and block["fields"]["title"] != expected_title:
+        if block["fields"]["title"] != expected_title:
             problems.append(
                 f"id={item_id} 제목 불일치: 본문 {block['fields']['title']!r} "
                 f"≠ 정본 {expected_title!r}"
+            )
+        # 사이클 9 #4: 정본의 section 이 본문의 실제 섹션과 같아야 한다.
+        block_section = HEADING_TO_SECTION.get(
+            block["section"], block["section"]
+        )
+        if entry.get("section") != block_section:
+            problems.append(
+                f"id={item_id} 섹션 불일치: 본문 {block_section!r} "
+                f"≠ 정본 {entry.get('section')!r}"
             )
 
     missing = sorted(set(entries) - seen)
@@ -101,8 +138,43 @@ def manifest_problems(
     return problems
 
 
+REQUIRED_ENTRY_FIELDS = ("id", "url", "title", "section")
+
+
+def _schema_problems(manifest: Dict) -> List[str]:
+    """항목 정본 파일의 필수 필드·형식 검증 (사이클 9 #4).
+
+    해시가 없는 옛 정본, 제목 필드를 뺀 정본, 같은 id 를 두 번 넣은 정본이
+    각각 통과했다 — 스키마가 느슨하면 대조가 조용히 건너뛰어진다.
+    """
+    problems: List[str] = []
+    if not str(manifest.get("week") or "").strip():
+        problems.append("정본에 week 이 없음")
+    items = manifest.get("items")
+    if not isinstance(items, list):
+        return problems + ["정본의 items 가 목록이 아님"]
+    for index, entry in enumerate(items):
+        if not isinstance(entry, dict):
+            problems.append(f"정본 items[{index}] 가 객체가 아님")
+            continue
+        missing = [
+            field for field in REQUIRED_ENTRY_FIELDS
+            if entry.get(field) in (None, "")
+        ]
+        if missing:
+            problems.append(
+                f"정본 items[{index}] 필수 필드 누락: {', '.join(missing)}"
+            )
+    return problems
+
+
 def _db_problems(entries: Dict[str, Dict], db_path: str) -> List[str]:
-    """정본의 (id, url) 이 DB 와 맞는지 (사이클 8 #1의 마지막 고리)."""
+    """정본의 (id, url, 제목) 이 DB 와 맞는지 (사이클 8 #1 + 사이클 9 #3).
+
+    제목까지 대조하는 이유: id·URL 만 보면 md 와 정본의 제목을 **함께** 고쳐 놓은
+    본문이 통과했다(Codex 5차 HIGH #1). DB 제목은 우리가 만들지 않은 값이므로
+    `sanitize_title(DB 제목) == 정본 제목` 이 제목의 독립 근거가 된다.
+    """
     if not entries:
         return []
     problems: List[str] = []
@@ -111,14 +183,21 @@ def _db_problems(entries: Dict[str, Dict], db_path: str) -> List[str]:
         try:
             for item_id, entry in entries.items():
                 row = conn.execute(
-                    "SELECT url FROM announcements WHERE id = ? LIMIT 1",
+                    "SELECT url, title FROM announcements WHERE id = ? LIMIT 1",
                     (item_id,),
                 ).fetchone()
                 if row is None:
                     problems.append(f"DB에 없는 항목 id={item_id}")
-                elif row[0] != entry.get("url"):
+                    continue
+                if row[0] != entry.get("url"):
                     problems.append(
                         f"id={item_id} DB URL 불일치: {row[0]} ≠ {entry.get('url')}"
+                    )
+                expected = sanitize_title(row[1] or "")
+                if expected != entry.get("title"):
+                    problems.append(
+                        f"id={item_id} DB 제목 불일치: {expected!r} "
+                        f"≠ 정본 {entry.get('title')!r}"
                     )
         finally:
             conn.close()
@@ -401,6 +480,9 @@ def check_digest(
     # 사이클 8 #4: 해설의 한도 초과 URL 은 카톡·미리보기에서 안내 문구로 바뀐다.
     # 조용히 바뀌면 사람이 모르므로 경고로 남긴다(pass 는 바꾸지 않는다).
     _, long_prose_urls = fit_prose_urls(markdown_text)
+    # 사이클 9 #5: 치환 규칙이 완전한지 **생성 후** 확인한다 — 한도를 넘긴 조각과
+    # 분절·유실된 URL 을 둘 다 본다(조각 길이만 보면 "URL 을 잘라 맞춘" 출력이 통과).
+    kakao_problems = markdown_kakao_problems(markdown_text)
 
     if not network_checked:
         reason = "네트워크 미검사"
@@ -409,7 +491,9 @@ def check_digest(
     elif len(dropped) > 0:
         reason = f"본문에 죽은 URL {len(dropped)}건 잔존"
     elif problems:
-        reason = "항목 정본 대조 실패: " + "; ".join(problems[:3])
+        reason = "항목 정본 대조 실패(재조립 필요): " + "; ".join(problems[:3])
+    elif kakao_problems:
+        reason = "카톡 조각 초과: " + "; ".join(kakao_problems[:3])
     elif prose_lines:
         reason = "항목 섹션에 산문 {}건: {}".format(
             len(prose_lines), prose_lines[0][:40]
@@ -438,6 +522,7 @@ def check_digest(
         "manifest_problems": problems,
         "link_audit": links,
         "long_prose_urls": long_prose_urls,
+        "kakao_problems": kakao_problems,
         "pass": (
             network_checked
             and alive_count > 0
@@ -446,6 +531,7 @@ def check_digest(
             and not cap_violations
             and not prose_lines
             and not problems
+            and not kakao_problems
             and not link_mismatch
         ),
         # 실제로 네트워크 검사한 URL이 0건이면 False

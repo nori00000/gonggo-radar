@@ -18,6 +18,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from alert.notifiers.email_sender import UNSENT_STAGES, EmailNotifier
 from alert.digest import blocks as blocks_mod
+from alert.digest.composer import fit_prose_urls
 from alert.digest import state as state_mod
 from alert.digest.checker import markdown_sha256
 
@@ -47,6 +48,10 @@ def markdown_to_html(markdown_text: str) -> str:
     """
     # HTML 기본 구조
     html_body = "<html><head><meta charset='UTF-8'></head><body>"
+
+    # 사이클 9 #5: 긴 URL 치환은 **모든 렌더러가 같은 함수**를 쓴다 — 채널마다
+    # 다른 본문이 나가면 "메일에는 있는데 카톡에는 없는 링크" 가 생긴다.
+    markdown_text, _ = fit_prose_urls(markdown_text)
 
     # 마크다운 변환
     lines = markdown_text.split("\n")

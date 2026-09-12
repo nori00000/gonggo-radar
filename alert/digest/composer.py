@@ -458,8 +458,14 @@ _LEADING_FULLWIDTH = {
     "#": "＃", "*": "＊", "-": "－", "+": "＋", ">": "＞", "|": "｜",
     "~": "～", "=": "＝", "·": "・", "•": "・",
 }
-_LEADING_BRACKET_RE = re.compile(r"^\[([^\[\]]*)\]")
 _LEADING_ORDERED_RE = re.compile(r"^(\d+)\.")
+# 제목의 모든 괄호 그룹 (선두·중간·후미) — 병합 서명과 지역 탐색이 함께 쓴다.
+_ANY_BRACKET_GROUP_RE = re.compile(
+    r"[(\[（【［]([^()\[\]（）【】［］]*)[)\]）】］]"
+)
+_TRAILING_BRACKET_RE = re.compile(
+    r"[(\[（【［]([^()\[\]（）【】［］]*)[)\]）】］]\s*$"
+)
 # 항목 줄의 구분자와 겹치는 em dash — 제목 안에 있으면 제목/꼬리 경계가 흔들린다.
 _EM_DASH = "—"
 _EN_DASH = "–"
@@ -468,10 +474,13 @@ _EN_DASH = "–"
 def neutralize_title_structure(text: str) -> str:
     """제목 선두의 마크다운 구문을 중화한다 (사이클 8 #2).
 
-    ①선두 대괄호 짝 → 전각 `［…］` (`[D-9]` 라벨 흉내·링크 문법 차단)
-    ②선두 기호 런(`#`·`*`·`-`·`>` …) → 전각
-    ③선두 번호 목록 `1.` → `1．`
-    ④제목 안의 em dash → en dash (항목 줄 구분자 ` — ` 와 겹치지 않게)
+    ①선두 기호 런(`#`·`*`·`-`·`>` …) → 전각
+    ②선두 번호 목록 `1.` → `1．`
+    ③제목 안의 em dash → en dash (항목 줄 구분자 ` — ` 와 겹치지 않게)
+
+    선두 대괄호(`[모집]`)는 **중화하지 않는다** (사이클 9 #6). 링크 판정은 괄호 내용이
+    URL 일 때만이고, 항목 줄 판정은 라벨 목록과 정확히 일치할 때만이므로 무해하다 —
+    `[D-9]` 흉내는 items.json 제목 대조가 잡는다(사이클 8 #1).
     """
     if not text:
         return text
@@ -480,9 +489,6 @@ def neutralize_title_structure(text: str) -> str:
         index += 1
     if index:
         text = "".join(_LEADING_FULLWIDTH[c] for c in text[:index]) + text[index:]
-    matched = _LEADING_BRACKET_RE.match(text)
-    if matched:
-        text = "［" + matched.group(1) + "］" + text[matched.end():]
     matched = _LEADING_ORDERED_RE.match(text)
     if matched:
         text = matched.group(1) + "．" + text[matched.end():]
@@ -495,7 +501,7 @@ def sanitize_title(title: str) -> str:
     - `[텍스트](http…)` → `텍스트` (URL은 버린다 — 링크는 "원문" 필드의 몫)
     - `<https://…>` → `https://…` (꺾쇠 제거)
     - 남은 `<`·`>`는 전각으로 바꿔 태그가 만들어지지 못하게 한다
-    - 괄호 내용이 URL이 아니면 내용은 유지한다 (`(~9.30)` 보존)
+    - 괄호 내용이 URL이 아니면 표기를 그대로 둔다 (`[모집]`·`(~9.30)` 보존)
     - **선두 마크다운 구문은 전각으로 중화한다** (사이클 8 #2 — 구조 변형 차단)
     """
     text = normalize_title(title)
@@ -513,13 +519,15 @@ def _strip_tokens(text: str) -> str:
 
 
 def dedup_key(title: str) -> str:
-    """중복 판정용 강한 정규화 (판정 ⑥: 괄호·기호·날짜·「」 제거)."""
-    text = normalize_title(title)
-    stripped = _strip_tokens(_BRACKET_RE.sub(" ", text))
-    if len(stripped.replace(" ", "")) >= _MIN_DEDUP_KEY_CHARS:
-        return stripped
-    # 제목이 사실상 괄호 안에만 있는 경우 — 부호만 지운다
-    return _strip_tokens(text)
+    """중복 판정용 정규화 — **괄호 내용은 남긴다** (사이클 9 #2).
+
+    예전에는 괄호 그룹의 내용까지 지웠다(`_BRACKET_RE`). 그 결과
+    `… 지원사업 모집 [경기]` 와 `… 지원사업 모집 [강원]` 의 정규화 결과가 같아져,
+    지역이 다른 유효 공고가 하나로 병합되며 한 건이 sections·holds 양쪽에서
+    사라졌다(Codex 5차 HIGH #3). 지역·회차·센터명은 괄호 안에 들어오는 일이 많으므로
+    괄호 내용은 판정의 **근거**다. 지우는 것은 부호·날짜 토큰·공백뿐이다.
+    """
+    return _strip_tokens(normalize_title(title))
 
 
 def title_ngrams(title: str, n: int = NGRAM_SIZE) -> frozenset:
@@ -613,18 +621,6 @@ def _region_from(text: str) -> Optional[str]:
     return None
 
 
-# 선두 괄호에 붙는 **비지역** 태그 (정확 일치, 공백 정규화 후).
-# 이 태그는 건너뛰고 다음 괄호 그룹에서 지역을 계속 찾는다 — `[모집][경기]` 처럼
-# 지역이 두 번째 괄호에 있으면 첫 괄호만 보던 예전 코드가 지역을 잃었고,
-# 지역이 None 으로 같아져 경기/강원 공고가 하나로 병합됐다 (Codex 3차 HIGH #1).
-NON_REGION_PREFIX_TAGS = frozenset({
-    "모집", "재모집", "추가모집", "공고", "재공고", "정정", "정정공고", "변경",
-    "취소", "안내", "공지", "재공지", "알림", "교육", "공모", "공모전", "공모결과",
-    "결과", "발표", "접수", "연장", "마감", "신규", "새소식", "채용", "입찰",
-    "세미나", "설명회", "행사", "이벤트", "긴급", "필독", "중요", "필수",
-})
-
-
 def prefix_brackets(title: str) -> List[str]:
     """제목 맨 앞에 연달아 붙은 괄호 그룹의 내용 (등장 순서)."""
     groups: List[str] = []
@@ -645,19 +641,36 @@ def prefix_bracket(title: str) -> str:
 
 
 def prefix_signature(title: str) -> str:
-    """제목 선두 괄호 그룹 **전체 문자열** (병합 키의 일부 — 사이클 8 #3).
+    """제목 **선두** 괄호 그룹의 전체 문자열 (지역 탐색 진단용)."""
+    return "".join(f"[{group}]" for group in prefix_brackets(title))
 
-    지역 추론이 실패해 `region` 이 양쪽 None 이 되면, 예전 병합 키는 두 공고를
-    같은 것으로 봤다 — `[모집공고][경기]`/`[모집공고][강원]` 이 하나로 합쳐지며
-    유효 공고가 sections·holds 양쪽에서 사라졌다. 접두 문자열이 다르면 다른 공고다.
+
+def bracket_regions(title: str) -> Tuple[str, ...]:
+    """제목의 **모든** 괄호 그룹에서 찾은 지역 (선두·중간·후미, 등장 순서).
+
+    선두만 보면 후미 괄호(`… 모집 [경기]`)를 놓친다 — 지역이 양쪽 None 이 되어
+    병합 키가 같아졌다(Codex 5차 HIGH #3). 진단·테스트용이며, 판정 정본은
+    infer_region 이다(이 함수와 같은 그룹 집합을 본다).
     """
-    groups = prefix_brackets(title)
-    return "".join(f"[{group}]" for group in groups)
+    found = []
+    for group in _ANY_BRACKET_GROUP_RE.findall(normalize_title(title)):
+        region = _region_from(_drop_venue_context(group))
+        if region and region not in found:
+            found.append(region)
+    return tuple(found)
 
 
-def is_non_region_tag(text: str) -> bool:
-    """인식된 비지역 태그인가 (지역 탐색이 건너뛸 수 있는 것)."""
-    return " ".join((text or "").split()) in NON_REGION_PREFIX_TAGS
+def trailing_brackets(title: str) -> List[str]:
+    """제목 **후미**에 붙은 괄호 그룹의 내용 (뒤에서부터 순서대로)."""
+    groups: List[str] = []
+    rest = normalize_title(title).rstrip()
+    while True:
+        matched = _TRAILING_BRACKET_RE.search(rest)
+        if not matched or matched.end() != len(rest):
+            break
+        groups.append(matched.group(1).strip())
+        rest = rest[: matched.start()].rstrip()
+    return groups
 
 
 def _drop_venue_context(text: str) -> str:
@@ -678,17 +691,21 @@ def infer_region(title: str) -> Optional[str]:
     주의: announcements 스키마에는 소스별 지역 필드가 없다(스키마 변경 금지). 그래서
     판정 근거는 제목뿐이다 — 소스 지역 필드가 생기면 여기에 합친다.
     """
+    # 사이클 9 #2: 접두 괄호 그룹을 **전부** 훑는다. 예전에는 알 수 없는 태그
+    # (`[모집공고]`)에서 멈춰서 그 뒤의 `[경기]` 를 놓쳤다 — 지역이 None 이 되어
+    # 경기/강원 공고가 하나로 병합됐다(Codex 5차 HIGH #3·HIGH #1 잔여).
     for group in prefix_brackets(title):
         region = _region_from(group)
         if region:
-            # 접두 괄호에서 확정하고 끝낸다 — 2차 탐색을 하면 행사 장소
+            # 괄호에서 확정하고 끝낸다 — 괄호 밖 2차 탐색을 하면 행사 장소
             # (`(설명회 장소: 서울)`)가 섞여 자격 지역이 사라진다.
             return region
-        if is_non_region_tag(group):
-            # 인식된 비지역 태그(`[모집]`·`[공고]`)는 건너뛰고 다음 괄호를 본다
-            continue
-        # 알 수 없는 접두사(기관명 등)에서는 더 파고들지 않는다 (fail-closed)
-        break
+
+    # **후미** 괄호도 본다 (`… 지원사업 모집 [경기]`·`…(충청 권역)`).
+    for group in trailing_brackets(title):
+        region = _region_from(_drop_venue_context(group))
+        if region:
+            return region
 
     body = _drop_venue_context(strip_brackets(title))
     return _region_from(body)
@@ -1145,6 +1162,9 @@ def _mergeable(left: Dict, right: Dict) -> bool:
     if (left["region"] or "") != (right["region"] or ""):
         return False
     # 사이클 8 #3: 지역 미확정(None)끼리도 접두 괄호가 다르면 별개 공고다.
+    # 후미 지역 괄호(`… 모집 [경기]`)는 사이클 9 #2 에서 infer_region 이 잡으므로
+    # 위 region 검사로 이미 갈라진다 — 모든 괄호 내용을 키에 넣으면
+    # `…안내` / `…안내(참여기업)` 같은 **정상 중복**이 병합되지 않는다.
     if left.get("prefix_signature", "") != right.get("prefix_signature", ""):
         return False
     if _is_new_round(left) or _is_new_round(right):
@@ -1737,32 +1757,95 @@ def kakao_item_fits(item: Dict, limit: int = KAKAO_CHUNK_LIMIT) -> bool:
 
 
 def fit_prose_urls(text: str, limit: int = KAKAO_CHUNK_LIMIT) -> Tuple[str, List[str]]:
-    """산문·해설의 한도 초과 URL 을 안내 문구로 치환 (사이클 8 #4 / #9).
+    """한도를 넘기는 URL 을 안내 문구로 치환 (사이클 9 #5 — 모든 렌더러가 이 함수만 쓴다).
 
-    항목은 compose 가 보류로 내리지만 해설 URL 은 사람이 써넣는다 — 그것 하나로
-    카톡·미리보기 조각이 한도를 넘었다. (치환한 URL 목록, check.json 경고용)
+    판정 기준은 URL 길이가 아니라 **그 줄이 한도를 넘는가**다. 예전에는
+    `len(url) + 4 > limit` 로만 봐서 `[자료이름](4,092자 URL)` 처럼 링크 문구가 붙은
+    줄이 한도를 넘겨도 치환되지 않았고, 조각 분할이 URL 을 잘라 링크가 죽었다
+    (Codex 5차 MEDIUM #4·#6).
+
+    **URL 은 절대 분절하지 않는다** — 줄이 한도를 넘으면 긴 링크부터 안내 문구로
+    바꾸고, 그래도 남으면 그 줄은 순수 텍스트이므로 조각 분할에 맡긴다.
+    (치환한 URL 목록은 check.json 경고로 남는다.)
     """
     from alert.digest import blocks as blocks_mod
 
     replaced: List[str] = []
     lines = []
     for line in (text or "").split("\n"):
-        links = [
-            link for link in blocks_mod.find_links(line)
-            if len(link.url) + 4 > limit
-        ]
-        for link in reversed(links):
-            if link.url not in replaced:
-                replaced.append(link.url)
-            line = line[:link.start] + URL_TOO_LONG_NOTICE + line[link.end:]
-        bare = line.strip()
-        if len(bare) > limit and (bare.startswith("http://")
-                                  or bare.startswith("https://")):
-            if bare not in replaced:
-                replaced.append(bare)
-            line = line[:len(line) - len(line.lstrip())] + URL_TOO_LONG_NOTICE
+        # ① 마크다운 링크부터 (긴 것 먼저) — 줄이 한도 안에 들어오면 멈춘다
+        if len(line) > limit:
+            for link in sorted(
+                blocks_mod.find_links(line), key=lambda link: -len(link.url)
+            ):
+                if len(line) <= limit:
+                    break
+                if link.url not in replaced:
+                    replaced.append(link.url)
+                line = line.replace(
+                    line[link.start:link.end], URL_TOO_LONG_NOTICE, 1
+                )
+        # ② 맨몸 URL 토큰 (`· https://…`) — 글머리·들여쓰기는 보존한다
+        if len(line) > limit:
+            tokens = line.split(" ")
+            order = sorted(
+                (index for index, token in enumerate(tokens)
+                 if _is_url_line(token)),
+                key=lambda index: -len(tokens[index]),
+            )
+            for index in order:
+                if len(" ".join(tokens)) <= limit:
+                    break
+                token = tokens[index]
+                if token not in replaced:
+                    replaced.append(token)
+                tokens[index] = URL_TOO_LONG_NOTICE
+            line = " ".join(tokens)
         lines.append(line)
     return "\n".join(lines), replaced
+
+
+def markdown_kakao_problems(markdown_text: str) -> List[str]:
+    """카톡 렌더의 **생성 후 확인** (사이클 9 #5). 비어 있어야 정상이다.
+
+    두 가지를 본다:
+      ① 한도를 넘긴 조각 — 분할이 링크를 자르게 되는 상태
+      ② **URL 분절/유실** — 본문의 링크가 어느 조각에도 온전히 실리지 않았고
+         안내 문구로 치환된 것도 아닌 상태
+
+    ②가 핵심이다. 조각 길이만 보면 "URL 을 잘라서 한도를 맞춘" 출력이 통과한다 —
+    Codex 5차가 측정한 것이 정확히 그 상태였다(4,092자 산문 URL 분절 · pass).
+    치환 규칙이 완전하다면 둘 다 비어 있다. 비어 있지 않으면 게이트가 막는다:
+    조용히 잘린 링크를 보내는 것보다 발송을 멈추는 편이 낫다.
+    """
+    from alert.digest import blocks as blocks_mod
+
+    chunks = _pack_blocks(
+        kakao_blocks_from_markdown(markdown_text), KAKAO_CHUNK_LIMIT
+    )
+    problems = [
+        f"조각 #{index} {len(chunk)}자 (한도 {KAKAO_CHUNK_LIMIT})"
+        for index, chunk in enumerate(chunks)
+        if len(chunk) > KAKAO_CHUNK_LIMIT
+    ]
+    joined = "\n".join(chunks)
+    _, replaced = fit_prose_urls(markdown_text)
+    replaced_urls = set(replaced)
+
+    # 마크다운 링크 + 맨몸 URL 줄 (`· https://…`) 을 모두 본다
+    candidates = list(blocks_mod.body_link_urls(markdown_text))
+    for line in (markdown_text or "").split("\n"):
+        stripped = line.strip()
+        if stripped.startswith("· "):
+            stripped = stripped[2:].strip()
+        if _is_url_line(stripped):
+            candidates.append(stripped)
+
+    for url in dict.fromkeys(candidates):
+        if url in replaced_urls or url in joined:
+            continue
+        problems.append(f"URL 분절/유실: {url[:48]}…")
+    return problems
 
 
 def _is_item_block(block: str) -> bool:
@@ -1863,7 +1946,8 @@ def kakao_blocks(data: Dict, headline: Optional[str] = None) -> List[str]:
         blocks.append(SECTION_HEADINGS[SECTION_MEMBER])
         for company, contents in sorted(data["member_news"].items()):
             for content in contents:
-                blocks.append(f"· {company}: {content}")
+                # 사이클 9 #5: 회원사 소식의 긴 URL 도 같은 치환을 지난다
+                blocks.append(fit_prose_urls(f"· {company}: {content}")[0])
         blocks.append("")
 
     return blocks

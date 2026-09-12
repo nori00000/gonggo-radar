@@ -66,18 +66,26 @@ def recheck(markdown_path: Path, db_path: str, check_path: Path):
         # 사이클3 #7: 섹션 판정은 방금 쓴 check.json 의 목록과 정확 일치로 한다.
         item_sections, _ = sections_mod.resolve(result, text)
 
-        # 사이클 7 (Codex 3차 MEDIUM #4): 같은 URL 중복 제거는 **죽은 링크와 무관하게
-        # 항상** 돈다. 예전에는 prune 라운드 안에만 있어서, 무관한 dead 산문 링크가
-        # 있을 때만 중복이 접히고 없으면 같은 URL 2건이 그대로 pass 했다.
-        deduped, duplicates = prune.dedupe_urls(text, item_sections)
+        # 사이클 7 (#4) + 사이클 9 (#1): **블록 복제**(같은 id·같은 URL 이 두 번
+        # 실린 것)만 접는다. 이것이 허용되는 유일한 자동 교정이다 — 같은 항목이
+        # 두 번 실린 것은 증명 가능하게 안전하다. 정본은 건드리지 않는다
+        # (정본에는 그 id 가 한 번만 있으므로 복제를 접으면 개수가 저절로 맞는다).
+        # 불일치 판정보다 **먼저** 돈다 — 복제 때문에 생긴 "개수 불일치" 로
+        # 멈춰버리면 복제를 영원히 접을 수 없다.
+        deduped, duplicates = prune.dedupe_duplicate_blocks(text, item_sections)
         if duplicates:
             markdown_path.write_text(deduped, encoding="utf-8")
-            _drop_from_manifest(markdown_path, duplicates)
-            dropped.extend(duplicates)
+            refresh_manifest_binding(markdown_path)
             for item in duplicates:
-                print(f"  중복 URL 제거: {item['title']} ({item['url']})")
+                print(f"  블록 복제 제거: {item['title']} (id={item['item_id']})")
             text = deduped
             continue
+
+        # 사이클 9 #1: **그 밖의 자동 교정은 금지.** md 와 정본이 어긋나면 고치지
+        # 않고 멈춘다 — 불일치를 삭제로 없애면 살아 있는 공고가 조용히 사라진다
+        # (THREAT_MODEL ①). 해소는 재조립(`weekly_digest.py`)뿐이다.
+        if result.get("manifest_problems"):
+            break
 
         dead = dead_urls(result)
         if not dead or attempt == MAX_PRUNE_ROUNDS - 1:
