@@ -217,6 +217,7 @@ SOURCE_DIVERSITY_LIMIT = 2
 # 보류 사유 (개정 v2.3 G2: 다양성 때문에 밀린 것과 상한 때문에 밀린 것을 구분한다)
 HOLD_REASON_DIVERSITY = f"소스 다양성 상한(같은 소스 {SOURCE_DIVERSITY_LIMIT}건)"
 HOLD_REASON_SECTION_CAP = "상한 초과"
+HOLD_REASON_URL_TOO_LONG = "URL 길이 초과"
 
 # ─── 대상 태그 (판정 ①) ──────────────────────────────────────────────────
 TAG_SOCIAL_COOP = "사협"          # 사회적협동조합
@@ -305,6 +306,14 @@ ITEM_LINE_RE = re.compile(
     r"^(?:\[(?P<label>" + ITEM_LABEL_PATTERN + r")\]\s+)?"
     r"(?P<title>\S.*?)\s+—\s+(?P<rest>\S.*)$"
 )
+
+# 항목 블록의 **구조 마커** (Codex 3차 HIGH #2). 항목 줄 바로 앞에 놓인다.
+# 정규식만으로 항목을 판정하면 양방향 오류가 난다 — 산문이 항목으로 세어지고
+# (`자료를 참고해 주세요 — 자세한 내용은 …` + 원문 줄 → 공고 0건인데 pass),
+# `*산림 제도 개정 — 산림청` 같은 위조 항목이 상한을 우회한다.
+# 이 마커는 composer 만 쓴다 — 발송 HTML·카톡 렌더는 주석 줄을 버리므로 실리지 않는다.
+ITEM_MARKER_TEMPLATE = "<!-- item id={} -->"
+ITEM_MARKER_RE = re.compile(r"^<!--\s*item\s+id=(\S+)\s*-->$")
 
 # 항목이 하나도 없는 항목 섹션에 남기는 표시 (블록 파서·prune 이 같은 문자열을 쓴다)
 EMPTY_SECTION_LINE = "*(항목 없음)*"
@@ -562,10 +571,40 @@ def _region_from(text: str) -> Optional[str]:
     return None
 
 
+# 선두 괄호에 붙는 **비지역** 태그 (정확 일치, 공백 정규화 후).
+# 이 태그는 건너뛰고 다음 괄호 그룹에서 지역을 계속 찾는다 — `[모집][경기]` 처럼
+# 지역이 두 번째 괄호에 있으면 첫 괄호만 보던 예전 코드가 지역을 잃었고,
+# 지역이 None 으로 같아져 경기/강원 공고가 하나로 병합됐다 (Codex 3차 HIGH #1).
+NON_REGION_PREFIX_TAGS = frozenset({
+    "모집", "재모집", "추가모집", "공고", "재공고", "정정", "정정공고", "변경",
+    "취소", "안내", "공지", "재공지", "알림", "교육", "공모", "공모전", "공모결과",
+    "결과", "발표", "접수", "연장", "마감", "신규", "새소식", "채용", "입찰",
+    "세미나", "설명회", "행사", "이벤트", "긴급", "필독", "중요", "필수",
+})
+
+
+def prefix_brackets(title: str) -> List[str]:
+    """제목 맨 앞에 연달아 붙은 괄호 그룹의 내용 (등장 순서)."""
+    groups: List[str] = []
+    rest = normalize_title(title)
+    while True:
+        matched = _PREFIX_BRACKET_RE.match(rest)
+        if not matched:
+            break
+        groups.append(matched.group(1).strip())
+        rest = rest[matched.end():]
+    return groups
+
+
 def prefix_bracket(title: str) -> str:
     """제목 맨 앞 괄호의 내용 (없으면 빈 문자열)."""
-    matched = _PREFIX_BRACKET_RE.match(normalize_title(title))
-    return matched.group(1).strip() if matched else ""
+    groups = prefix_brackets(title)
+    return groups[0] if groups else ""
+
+
+def is_non_region_tag(text: str) -> bool:
+    """인식된 비지역 태그인가 (지역 탐색이 건너뛸 수 있는 것)."""
+    return " ".join((text or "").split()) in NON_REGION_PREFIX_TAGS
 
 
 def _drop_venue_context(text: str) -> str:
@@ -576,19 +615,27 @@ def _drop_venue_context(text: str) -> str:
 def infer_region(title: str) -> Optional[str]:
     """제목에서 **신청 자격 지역**을 추론 (개정 v2.4 (b) + v2.6 (2)(4)).
 
-    ① 접두 괄호(`[경기]`·`［경기센터］`)에 지역이 있으면 **거기서 확정하고 끝낸다**.
-       2차 탐색을 하면 행사 장소(`(설명회 장소: 서울)`)가 섞여 자격 지역이 사라진다.
+    ① 접두 괄호 그룹을 **순서대로 전부** 훑는다 (`[모집][경기]`). 지역을 만나면
+       거기서 확정하고 끝낸다 — 2차 탐색을 하면 행사 장소(`(설명회 장소: 서울)`)가
+       섞여 자격 지역이 사라진다. 인식된 비지역 태그(`[모집]`)는 건너뛰고,
+       알 수 없는 접두사(기관명)에서는 멈춘다.
     ② 접두 괄호에 지역이 없으면 괄호 밖 본문을 본다(장소 문맥 제거 후).
     여러 시·도가 섞여 있으면 권역명을 쓰고, 권역명도 없으면 붙이지 않는다.
 
     주의: announcements 스키마에는 소스별 지역 필드가 없다(스키마 변경 금지). 그래서
     판정 근거는 제목뿐이다 — 소스 지역 필드가 생기면 여기에 합친다.
     """
-    prefix = prefix_bracket(title)
-    if prefix:
-        region = _region_from(prefix)
+    for group in prefix_brackets(title):
+        region = _region_from(group)
         if region:
+            # 접두 괄호에서 확정하고 끝낸다 — 2차 탐색을 하면 행사 장소
+            # (`(설명회 장소: 서울)`)가 섞여 자격 지역이 사라진다.
             return region
+        if is_non_region_tag(group):
+            # 인식된 비지역 태그(`[모집]`·`[공고]`)는 건너뛰고 다음 괄호를 본다
+            continue
+        # 알 수 없는 접두사(기관명 등)에서는 더 파고들지 않는다 (fail-closed)
+        break
 
     body = _drop_venue_context(strip_brackets(title))
     return _region_from(body)
@@ -1297,8 +1344,20 @@ def compose_digest_data(
             continue
         kept.append(item)
 
+    # 사이클 7 (#9): 카톡 한 조각에 들어갈 수 없는 URL 은 발송본에서 내린다.
+    # 오버사이즈 조각을 만드는 대신 보류로 남겨 사람이 판단하게 한다.
+    fitting: List[Dict] = []
+    url_too_long: List[Dict] = []
+    for item in kept:
+        (fitting if kakao_item_fits(item["url"]) else url_too_long).append(item)
+    kept = fitting
+
     sections: Dict[str, List[Dict]] = {VERDICT_APPLY: [], VERDICT_NOTICE: []}
     holds: List[Dict] = []
+    for item in url_too_long:
+        item["verdict"] = VERDICT_HOLD
+        item["reason"] = HOLD_REASON_URL_TOO_LONG
+        holds.append(item)
     apply_candidates: List[Dict] = []
     notice_candidates: List[Dict] = []
     for item in kept:
@@ -1409,6 +1468,11 @@ def item_line(item: Dict) -> str:
     return f"{head} — " + " · ".join(parts)
 
 
+def item_marker(item: Dict) -> str:
+    """항목 블록의 구조 마커 (`<!-- item id=123 -->`)."""
+    return ITEM_MARKER_TEMPLATE.format(item["id"])
+
+
 def hold_comment(item: Dict) -> str:
     """보류 한 줄 (개정 v2.5 #13).
 
@@ -1459,6 +1523,7 @@ def render_markdown(data: Dict) -> str:
             lines.append("")
             continue
         for item in items:
+            lines.append(item_marker(item))
             lines.append(item_line(item))
             lines.append(f"  [원문]({item['url']})")
             lines.append("")
@@ -1522,6 +1587,18 @@ def _is_url_line(line: str) -> bool:
     return stripped.startswith("http://") or stripped.startswith("https://")
 
 
+def kakao_item_fits(url: str, limit: int = KAKAO_CHUNK_LIMIT) -> bool:
+    """이 URL 을 가진 항목이 카톡 한 조각 안에 들어갈 수 있는가 (#9).
+
+    제목은 줄일 수 있지만 URL 은 줄일 수 없다 — URL 줄 하나가 한도를 넘으면
+    어떤 제목으로도 조각이 한도 안에 들어가지 않는다. 그런 항목은 오버사이즈
+    조각을 만드는 대신 compose 단계에서 **보류**로 내린다.
+    """
+    url_line = f"  {(url or '').strip()}"
+    # `제목 한 글자 + 개행 + URL 줄` 도 안 들어가면 불가능하다
+    return len(url_line) + 2 <= limit
+
+
 def _is_item_block(block: str) -> bool:
     """카톡 항목 블록인가 (제목 줄 + URL 줄, 딱 두 줄)."""
     lines = block.split("\n")
@@ -1542,6 +1619,18 @@ def _shrink_item_block(block: str, limit: int) -> str:
     return f"{head}\n{url_line}"
 
 
+URL_TOO_LONG_NOTICE = "(URL 길이 초과 — 원문 확인)"
+
+
+def _url_too_long_block(block: str, limit: int) -> str:
+    """한도를 넘는 URL 줄을 표기로 대체 (오버사이즈 조각 금지 — 사이클 7 #9)."""
+    head = block.split("\n")[0]
+    room = limit - len(URL_TOO_LONG_NOTICE) - 3
+    if len(head) > room:
+        head = head[: max(1, room - 1)] + "…"
+    return f"{head}\n  {URL_TOO_LONG_NOTICE}"
+
+
 def _pack_blocks(blocks: Sequence[str], limit: int) -> List[str]:
     """블록(항목·머리글·메모)을 쪼개지 않고 한도 이하로 묶는다 (개정 v2.6 (5))."""
     chunks: List[str] = []
@@ -1559,10 +1648,10 @@ def _pack_blocks(blocks: Sequence[str], limit: int) -> List[str]:
         if len(block) > limit:
             flush()
             if _is_item_block(block):
-                # 제목을 줄여도 URL 자체가 한도를 넘는다 (사이클 6 #5).
-                # 링크 보존이 우선이므로 이 조각만 한도를 넘긴 채 통째로 보낸다 —
-                # 쪼개면 URL 줄이 다음 메시지 맨 앞으로 밀려 링크가 죽는다.
-                chunks.append(block)
+                # 사이클 7 (#9): 오버사이즈 조각은 **절대 만들지 않는다.**
+                # 정상 경로에서는 compose 가 이런 항목을 보류로 내리므로 여기에
+                # 오지 않는다. 손으로 고친 본문에서 오면 URL 을 표기로 대체한다.
+                chunks.append(_url_too_long_block(block, limit))
             else:
                 chunks.extend(chunk_plaintext(block, limit))
             continue

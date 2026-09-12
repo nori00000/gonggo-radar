@@ -24,7 +24,9 @@ from alert.digest.composer import (
     ITEM_SECTIONS,
     KAKAO_CHUNK_LIMIT,
     MARKER,
+    URL_TOO_LONG_NOTICE,
     chunk_plaintext,
+    kakao_item_fits,
 )
 
 __all__ = [
@@ -93,7 +95,7 @@ def parse_digest(markdown_text: str, item_sections=None) -> Dict:
             continue
 
         if block["kind"] == "section":
-            if not block["is_item"]:
+            if not block["in_item_section"]:
                 continue
             heading = block["name"]
             current = {
@@ -222,8 +224,15 @@ def render_preview(
             continue
         if block["kind"] == "item":
             lines.append(f"{numbers[index]}. {block['title']}")
-            lines.append(f"   {block['url']}")
-            lines.extend("" for _ in block["lines"][2:])
+            # 사이클 7 (#9): 한 조각에 들어갈 수 없는 URL 은 표기로 대체한다 —
+            # 미리보기도 오버사이즈 조각을 만들지 않는다(발송 경로와 같은 규칙).
+            lines.append(
+                f"   {block['url']}" if kakao_item_fits(block["url"])
+                else f"   {URL_TOO_LONG_NOTICE}"
+            )
+            lines.extend(
+                "" for line in block["lines"] if not line.strip()
+            )
             continue
         for raw in block["lines"]:
             line = raw.strip()

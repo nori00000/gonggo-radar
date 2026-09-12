@@ -22,7 +22,10 @@ from alert.digest.composer import (
     KAKAO_HEADLINE_PLACEHOLDER,
     KAKAO_HEADLINE_PREFIX,
     SECTION_LIMITS,
+    HOLD_REASON_URL_TOO_LONG,
+    KAKAO_CHUNK_LIMIT,
     SOURCE_DIVERSITY_LIMIT,
+    URL_TOO_LONG_NOTICE,
     VERDICT_APPLY,
     VERDICT_EXCLUDE,
     VERDICT_HOLD,
@@ -46,7 +49,10 @@ from alert.digest.composer import (
     render_kakao_chunks,
     render_kakao,
     render_markdown,
+    infer_region,
+    is_non_region_tag,
     prefix_bracket,
+    prefix_brackets,
     sanitize_title,
     source_display_name,
     target_display,
@@ -2160,11 +2166,24 @@ class TestFixCycle4:
     def test_extract_item_urls_only_reads_origin_links(self):
         markdown = (
             "## ✅ 신청하세요 (마감순)\n\n"
+            "<!-- item id=1 -->\n"
             "산림 지원사업 [신청](https://example.com/dead) 모집 — 기관\n"
             "  [원문](https://example.com/live)\n"
         )
         assert extract_item_urls(markdown) == ["https://example.com/live"]
         assert "https://example.com/dead" in body_links(markdown)
+
+    def test_item_needs_the_structural_marker(self):
+        """사이클 7: 마커가 없으면 모양이 맞아도 항목이 아니다 (Codex 3차 #2)."""
+        markdown = (
+            "## ✅ 신청하세요 (마감순)\n\n"
+            "산림 지원사업 참여기업 모집 — 기관 · 마감 9/22\n"
+            "  [원문](https://example.com/live)\n"
+        )
+        assert extract_item_urls(markdown) == []
+        assert blocks_mod.item_block_count(markdown) == 0
+        # 그 줄은 "항목 섹션의 산문"으로 잡힌다
+        assert blocks_mod.prose_lines_in_item_sections(markdown)
 
     def test_residual_dropped_url_in_body_fails_closed(
         self, tmp_path, monkeypatch
@@ -2364,7 +2383,7 @@ class TestFixCycle4:
     # ─── #7 미리보기 = 발송본 ───────────────────────────────────────────
     def test_preview_shows_every_send_section(self, tmp_path):
         from alert.digest import preview as preview_mod
-        from scripts.apply_commentary import apply_commentary
+        from scripts.apply_commentary import apply_headline
 
         csv_path = tmp_path / "forms.csv"
         csv_path.write_text(
@@ -2391,8 +2410,8 @@ class TestFixCycle4:
         )
         data["council_notes"] = ["산림청 면담 완료"]
         markdown = render_markdown(data)
-        annotated, replaced = apply_commentary(
-            markdown, "첫 줄 해설\n두 번째 줄 해설"
+        annotated, replaced = apply_headline(
+            markdown, "첫 줄 해설 · 두 번째 줄 해설"
         )
         assert replaced is True
 
@@ -2530,6 +2549,52 @@ class TestFixCycle4:
         assert {item["region"] for item in published} == {"경기", "강원"}
         assert data["merged_ids"] == []
 
+    def test_region_prefix_after_a_tag_prevents_merge(self, tmp_path):
+        """`[모집][경기]` — 선두 괄호 그룹을 **전부** 훑어 지역을 찾는다.
+
+        Codex 3차 HIGH #1 재현 입력: 첫 괄호만 보던 예전 코드는 지역을 둘 다
+        None 으로 두고, 같은 소스·같은 마감의 경기/강원 공고를 하나로 병합했다
+        (게시 1 · 보류 0 · merged_ids=[2]).
+        """
+        db_path = tmp_path / "c7_region.db"
+        _create_announcements_table(db_path)
+        for index, region in enumerate(["경기", "강원"]):
+            _insert_one(
+                db_path,
+                source="seis",
+                source_id=f"rt_{index}",
+                title=f"[모집][{region}] 사회적기업 사업개발비 지원사업 모집",
+                url=f"https://example.com/rt-{index}",
+                period_start="2026-09-08",
+                period_end="2026-09-30",
+                created_at=W37_CREATED_AT,
+            )
+
+        data = compose_digest_data(
+            str(db_path), week_str=W37, today=W37_TODAY
+        )
+        published = data["sections"][VERDICT_APPLY]
+        assert len(published) == 2
+        assert {item["region"] for item in published} == {"경기", "강원"}
+        assert data["merged_ids"] == []
+
+    def test_prefix_brackets_and_region_scan_rules(self):
+        """선두 괄호 순회 규칙 (사이클 7 #1)."""
+        assert prefix_brackets("[모집][경기] 지원사업 모집") == ["모집", "경기"]
+        assert prefix_brackets("지원사업 모집") == []
+        # 인식된 비지역 태그는 건너뛴다
+        assert infer_region("[모집][경기] 지원사업 모집") == "경기"
+        assert infer_region("[공고][강원] 지원사업 모집") == "강원"
+        assert infer_region("[경기][모집] 지원사업 모집") == "경기"
+        assert is_non_region_tag("모집") and is_non_region_tag("공고")
+        assert not is_non_region_tag("경기")
+        # 알 수 없는 접두사(기관명)에서는 멈춘다 — 본문 탐색으로 넘어간다
+        assert infer_region("[고용노동부 공고] 사회적기업 인증 공고") is None
+        # 행사 장소는 여전히 자격 지역이 아니다
+        assert infer_region(
+            "[세종대전충청센터] 설명회 안내(설명회 장소: 서울)"
+        ) == "충청"
+
     # ─── #12 카톡 분할·동기화 ───────────────────────────────────────────
     def test_kakao_chunks_respect_limit(self, tmp_path):
         db_path = tmp_path / "c4_12.db"
@@ -2582,7 +2647,8 @@ class TestFixCycle4:
         )
 
         rc = apply_mod.main(
-            [W13, "이번 주는 산림형 예비사회적기업 지정 공고", "--out-dir", str(out_dir)]
+            [W13, "--headline", "이번 주는 산림형 예비사회적기업 지정 공고",
+             "--out-dir", str(out_dir)]
         )
         assert rc in (0, 1)
         kakao_text = kakao_path.read_text(encoding="utf-8")
@@ -2595,9 +2661,11 @@ class TestFixCycle4:
             "# 📋 협의회 주간 정책브리핑 2026-W37 (9/7~9/13)\n\n"
             "이번 주 한 줄: 확정 문구\n\n"
             "## ✅ 신청하세요 (마감순)\n\n"
+            "<!-- item id=1 -->\n"
             "[D-9] 산림 공고 — 산림청 · 대상: 산림사업자 · 마감 9/22\n"
             "  [원문](https://example.com/a)\n\n"
             "## 👀 알아두세요\n\n"
+            "<!-- item id=2 -->\n"
             "입법예고 — 국민참여입법센터 · 대상: 산림사업자 · 의견 10/19까지\n"
             "  [원문](https://example.com/d)\n"
         )
@@ -2621,6 +2689,7 @@ class TestFixCycle4:
             "# 📋 협의회 주간 정책브리핑 2026-W37 (9/7~9/13)\n\n"
             f"이번 주 한 줄: {MARKER}\n\n"
             "## ✅ 신청하세요 (마감순)\n\n"
+            "<!-- item id=7 -->\n"
             "[D-9] 산림 공고 — 산림청 · 대상: 산림사업자 · 마감 9/22\n"
             "  [원문](https://example.com/a)\n\n"
             "<!-- 보류: 1. 보류 항목 | 이유 | id=1 -->\n"
@@ -2896,7 +2965,12 @@ class TestFixCycle5:
         assert len(holder) == 1
         assert holder[0].rstrip().endswith("https://example.com/huge-item")
 
-    def test_kakao_keeps_oversized_url_intact(self, tmp_path):
+    def test_oversized_url_item_is_held_at_compose(self, tmp_path):
+        """사이클 7 (#9): 카톡 한 조각에 못 들어가는 URL 은 보류로 내린다.
+
+        예전에는 그 조각만 한도를 넘긴 채(4,207자) 보냈다 — 오버사이즈 조각은
+        이제 어느 경로에서도 만들지 않는다.
+        """
         db_path = tmp_path / "c5_5b.db"
         _create_announcements_table(db_path)
         long_url = "https://example.com/" + "a" * 4120
@@ -2911,16 +2985,37 @@ class TestFixCycle5:
         data = compose_digest_data(
             str(db_path), week_str=W13, today=W13_TODAY
         )
+
+        published = data["sections"][VERDICT_APPLY] + data["sections"][VERDICT_NOTICE]
+        assert [item["url"] for item in published] == []
+        held = [item for item in data["holds"] if item["url"] == long_url]
+        assert len(held) == 1
+        assert held[0]["reason"] == HOLD_REASON_URL_TOO_LONG
+
         chunks = render_kakao_chunks(data)
-        assert any(long_url in chunk for chunk in chunks)
-        # 사이클 6 #5: 제목을 줄여도 URL 이 한도를 넘으면 그 조각만 한도를 넘긴다.
-        # 쪼개서 URL 줄을 다음 메시지 맨 앞으로 밀지 않는다.
-        holder = [chunk for chunk in chunks if long_url in chunk]
-        assert len(holder) == 1
-        assert not holder[0].lstrip().startswith("http")
-        assert "산림 지원사업" in holder[0]
-        for chunk in chunks:
-            assert not chunk.lstrip().startswith("https://")
+        assert all(len(chunk) <= KAKAO_CHUNK_LIMIT for chunk in chunks)
+        assert all(long_url not in chunk for chunk in chunks)
+        # 발송본 마크다운에도 실리지 않고 보류 주석으로만 남는다
+        markdown = render_markdown(data)
+        assert long_url not in markdown
+        assert HOLD_REASON_URL_TOO_LONG in markdown
+
+    def test_oversized_url_never_makes_an_oversize_chunk(self):
+        """손으로 고친 본문에서 와도 오버사이즈 조각은 만들지 않는다 (#9)."""
+        long_url = "https://example.com/" + "a" * 4120
+        md = (
+            "# 📋 협의회 주간 정책브리핑 2026-W37 (9/7~9/13)\n\n"
+            "이번 주 한 줄: 확정 문구\n\n"
+            "## ✅ 신청하세요 (마감순)\n\n"
+            "<!-- item id=1 -->\n"
+            "[D-9] 산림 공고 — 산림청 · 대상: 산림사업자 · 마감 9/22\n"
+            f"  [원문]({long_url})\n"
+        )
+        text = kakao_file_text_from_markdown(md)
+        chunks = text.split(f"\n{KAKAO_CHUNK_SEPARATOR}\n")
+        assert all(len(chunk) <= KAKAO_CHUNK_LIMIT for chunk in chunks)
+        assert long_url not in text
+        assert URL_TOO_LONG_NOTICE in text
 
     def test_kakao_blocks_keep_item_with_its_url(self, tmp_path):
         db_path = tmp_path / "c5_5c.db"

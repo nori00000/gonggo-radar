@@ -275,12 +275,31 @@ def check_digest(
     item_blocks = blocks_mod.item_block_count(markdown_text, item_sections)
     cap_violations = blocks_mod.cap_violations(markdown_text, item_sections)
 
+    # 사이클 7 (Codex 3차 HIGH #2): 항목 섹션에는 composer 가 만든 항목 블록만
+    # 실려야 한다. 마커 없는 줄은 사람이 끼워 넣은 것이고, 그 줄이 항목 모양이면
+    # 발송 HTML 에는 링크가 실리면서 항목 수·상한 게이트는 통과해버린다.
+    prose_lines = blocks_mod.prose_lines_in_item_sections(
+        markdown_text, item_sections
+    )
+    # 발송 HTML 의 링크 수 == 항목 수 + 해설·산문 섹션 링크 수
+    links = blocks_mod.link_audit(markdown_text, item_sections)
+    link_mismatch = links["total"] != links["items"] + links["commentary"]
+
     if not network_checked:
         reason = "네트워크 미검사"
     elif alive_count == 0:
         reason = "생존 항목 없음"
     elif len(dropped) > 0:
         reason = f"본문에 죽은 URL {len(dropped)}건 잔존"
+    elif prose_lines:
+        reason = "항목 섹션에 산문 {}건: {}".format(
+            len(prose_lines), prose_lines[0][:40]
+        )
+    elif link_mismatch:
+        reason = (
+            "링크 수 불일치: 본문 {total}개 ≠ 항목 {items} + 해설 {commentary}"
+            .format(**links)
+        )
     elif item_blocks == 0:
         reason = "항목 0건"
     elif cap_violations:
@@ -296,12 +315,16 @@ def check_digest(
         "item_blocks": item_blocks,
         "item_sections": list(item_sections),
         "commentary_sections": list(commentary_sections),
+        "prose_in_item_sections": prose_lines,
+        "link_audit": links,
         "pass": (
             network_checked
             and alive_count > 0
             and len(dropped) == 0
             and item_blocks > 0
             and not cap_violations
+            and not prose_lines
+            and not link_mismatch
         ),
         # 실제로 네트워크 검사한 URL이 0건이면 False
         "network_checked": network_checked,

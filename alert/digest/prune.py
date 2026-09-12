@@ -67,7 +67,7 @@ def _render(
 def _mark_empty_sections(kept: List[Dict]) -> None:
     """항목이 전부 빠진 항목 섹션에 composer 와 같은 빈 표시를 남긴다."""
     for index, block in enumerate(kept):
-        if block["kind"] != "section" or not block["is_item"]:
+        if block["kind"] != "section" or not block["in_item_section"]:
             continue
         following = kept[index + 1:]
         end = next(

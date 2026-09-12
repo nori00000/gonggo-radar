@@ -13,15 +13,25 @@
   공고 섹션으로 오분류돼 사람이 쓴 해설이 항목으로 세어지고 삭제된다).
 - **그 섹션 안에서 무엇이 항목인가** = 이 모듈.
 
-항목 블록의 정의 (두 조건을 **모두** 만족해야 항목이다):
+항목 블록의 정의 (세 조건을 **모두** 만족해야 항목이다 — 사이클 7):
 
-1. 항목 줄이 composer 가 만드는 형식이다 (`composer.ITEM_LINE_RE` 가 정본)
+1. **직전 줄이 구조 마커 `<!-- item id=<announcement id> -->`** 다.
+   composer 만 이 마커를 쓴다(`composer.ITEM_MARKER_RE` 가 정본). 발송 HTML·카톡
+   렌더는 주석 줄을 버리므로 사람 눈에는 보이지 않는다.
+2. 항목 줄이 composer 가 만드는 형식이다 (`composer.ITEM_LINE_RE`, 보조 조건)
    - 신청하세요: `[라벨] 제목 — 기관 · 대상: … · 마감 …` (라벨 = D-n / 새 소식 / 상시 / 마감 미정)
    - 알아두세요: `제목 — 기관 · 대상: … · 의견 …까지`
-2. **바로 다음 줄이 `  [원문](URL)`** 이다.
+3. 그 다음 줄이 `  [원문](URL)` 이다 (보조 조건).
 
-산문 줄 + 링크 줄은 항목이 아니다. 구형 형식 v1.2(`### 제목` + `**원문:** [x](url)`)는
-더 이상 생성되지 않으므로 지원하지 않는다 — 지원하는 척하면 두 형식의 계수가 또 갈라진다.
+**마커를 요구하는 이유** (Codex 3차 HIGH #2): 정규식만으로는 양방향으로 틀린다.
+`자료를 참고해 주세요 — 자세한 내용은 원문에 있습니다.` + 원문 줄은 공고가 아닌데
+항목으로 세어져 "공고 0건인데 pass" 가 났고, 반대로 `*산림 제도 개정 — 산림청` 같은
+위조 항목은 항목으로 세어지지 않으면서 발송 HTML 에는 링크가 실려 상한을 우회했다.
+구조 마커는 **누가 이 줄을 만들었는지**를 묻기 때문에 양쪽을 동시에 닫는다.
+
+항목 섹션 안에서 마커 없는 비어 있지 않은 줄(산문·떠돌이 링크·항목 흉내)은
+`prose_lines_in_item_sections()` 가 잡아내고 checker 가 pass=false 로 떨어뜨린다.
+구형 형식 v1.2(`### 제목` + `**원문:** [x](url)`)는 지원하지 않는다.
 
 블록 경계 (사이클 6 #2): 항목 블록은 **제목 줄 + 원문 줄(+ 뒤따르는 빈 줄)** 뿐이다.
 다음 항목 줄·헤딩·주석은 각자 새 블록을 연다. 그래서 죽은 항목을 지워도 이어지는
@@ -39,11 +49,16 @@ _SCHEME_RE = re.compile(r"^(?:https?://|www\.)", re.IGNORECASE)
 # 항목의 원문 링크 줄은 링크 하나로만 이루어진다.
 ORIGIN_LINK_TEXT = "원문"
 
+# composer 를 못 읽을 때의 항목 마커 폴백 (정본은 composer.ITEM_MARKER_RE)
+_FALLBACK_ITEM_MARKER_RE = re.compile(r"^<!--\s*item\s+id=(\S+)\s*-->$")
+
 # 항목 줄이 될 수 없는 줄머리: 헤딩(#), 주석(<!--), 강조·빈 표시(*), 산문 글머리
 _NOT_ITEM_PREFIXES = ("#", "<!--", "*", "·", "-", ">", "|")
 
 EMPTY_SECTION_LINE = "*(항목 없음)*"
 
+# 항목 섹션 안에서 마커 없이도 허용되는 줄 (composer 가 쓰는 빈 섹션 표시)
+_ALLOWED_BARE_LINES = (EMPTY_SECTION_LINE,)
 
 class Link(NamedTuple):
     """본문에서 찾은 마크다운 링크 하나."""
@@ -161,6 +176,16 @@ def body_link_urls(markdown_text: str) -> List[str]:
 
 
 # ─── 항목 줄 판정 ────────────────────────────────────────────────────────
+def item_marker_id(line: str) -> Optional[str]:
+    """항목 구조 마커 줄에서 공고 id. 마커가 아니면 None."""
+    composer = _composer()
+    pattern = getattr(composer, "ITEM_MARKER_RE", None) if composer else None
+    if pattern is None:
+        pattern = _FALLBACK_ITEM_MARKER_RE
+    matched = pattern.match(line.strip())
+    return matched.group(1) if matched else None
+
+
 def parse_item_line(line: str) -> Optional[Dict]:
     """항목 줄을 라벨·제목·기관·대상·마감으로 분해. 항목 줄이 아니면 None."""
     stripped = line.strip()
@@ -202,17 +227,18 @@ def _is_comment(line: str) -> bool:
 # 블록 종류:
 #   head    — 첫 섹션 앞의 줄 (제목·이번 주 한 줄)
 #   section — `## ` 헤딩
-#   item    — 항목 (제목 줄 + 원문 줄)
+#   item    — 항목 (마커 줄 + 제목 줄 + 원문 줄)
 #   comment — HTML 주석 줄 (보류 목록·레인 표기). **절대 항목과 묶이지 않는다**
 #   prose   — 그 밖의 줄 (협의회에서·회원사 소식·해설)
+# 모든 블록은 `in_item_section` 을 갖는다 — 그 블록을 감싼 `## ` 헤딩이 항목 섹션인가.
 def parse_blocks(
     markdown_text: str, item_sections: Optional[Sequence[str]] = None
 ) -> List[Dict]:
     """본문을 블록으로 쪼갠다. 블록들의 lines 를 이으면 원문과 **정확히 같다**.
 
-    각 블록: {kind, lines, section, is_item, name?(section),
-              title?/url?/fields?(item)}
-    `is_item` = 그 블록이 속한 섹션이 **항목 섹션 목록과 정확히 일치**하는가.
+    각 블록: {kind, lines, section, in_item_section, name?(section),
+              title?/url?/fields?/item_id?(item)}
+    `in_item_section` = 그 블록을 감싼 헤딩이 **항목 섹션 목록과 정확히 일치**하는가.
     """
     known = item_section_headings(markdown_text, item_sections)
     lines = (markdown_text or "").split("\n")
@@ -240,31 +266,36 @@ def parse_blocks(
             in_item_section = section_name in known        # 정확 일치
             index = push({"kind": "section", "name": section_name,
                           "section": section_name,
-                          "is_item": in_item_section,
+                          "in_item_section": in_item_section,
                           "lines": [line]}, index + 1)
             continue
 
         if _is_comment(line):
+            # 항목 구조 마커 + 뒤따르는 두 줄이 항목 모양이면 **한 블록**이다.
+            # 마커를 블록에 포함해야 항목을 지울 때 마커가 고아로 남지 않는다
+            # (고아 마커는 다음 산문을 항목으로 둔갑시킨다).
+            item_id = item_marker_id(line)
+            if item_id is not None and in_item_section and index + 2 < total:
+                fields = parse_item_line(lines[index + 1])
+                url = origin_url(lines[index + 2]) if fields else None
+                if fields and url:
+                    index = push({"kind": "item", "title": fields["raw"],
+                                  "section": section_name,
+                                  "in_item_section": True,
+                                  "url": url, "fields": fields,
+                                  "item_id": item_id,
+                                  "lines": [line, lines[index + 1],
+                                            lines[index + 2]]}, index + 3)
+                    continue
             index = push({"kind": "comment", "section": section_name,
-                          "is_item": False, "lines": [line]}, index + 1)
+                          "in_item_section": in_item_section,
+                          "lines": [line]}, index + 1)
             continue
-
-        if in_item_section and not stripped.startswith("#"):
-            fields = parse_item_line(line)
-            url = (
-                origin_url(lines[index + 1]) if fields and index + 1 < total
-                else None
-            )
-            if fields and url:
-                index = push({"kind": "item", "title": fields["raw"],
-                              "section": section_name, "is_item": True,
-                              "url": url, "fields": fields,
-                              "lines": [line, lines[index + 1]]}, index + 2)
-                continue
 
         kind = "head" if not section_name else "prose"
         index = push({"kind": kind, "section": section_name,
-                      "is_item": False, "lines": [line]}, index + 1)
+                      "in_item_section": in_item_section,
+                      "lines": [line]}, index + 1)
 
     return blocks
 
@@ -279,7 +310,8 @@ def item_blocks(
     """
     return [
         {"title": block["title"], "url": block["url"],
-         "section": block["section"], "fields": block["fields"]}
+         "section": block["section"], "fields": block["fields"],
+         "item_id": block["item_id"]}
         for block in parse_blocks(markdown_text, item_sections)
         if block["kind"] == "item"
     ]
@@ -307,7 +339,7 @@ def section_block_counts(
     """항목 섹션 헤딩 → 그 섹션의 항목 블록 수."""
     counts: Dict[str, int] = {}
     for block in parse_blocks(markdown_text, item_sections):
-        if block["kind"] == "section" and block["is_item"]:
+        if block["kind"] == "section" and block["in_item_section"]:
             counts.setdefault(block["name"], 0)
         elif block["kind"] == "item":
             counts[block["section"]] = counts.get(block["section"], 0) + 1
@@ -329,3 +361,65 @@ def cap_violations(
         for name, count in counts.items()
         if name in caps and count > caps[name]
     ]
+
+
+def prose_lines_in_item_sections(
+    markdown_text: str, item_sections: Optional[Sequence[str]] = None
+) -> List[str]:
+    """항목 섹션 안에서 **마커 없이** 실린 비어 있지 않은 줄 (사이클 7).
+
+    산문·떠돌이 링크·항목 흉내(`*산림 제도 개정 — 산림청`)가 여기에 걸린다.
+    checker 가 이 목록이 비어 있지 않으면 pass=false 로 떨어뜨린다 — 항목 섹션은
+    composer 가 만든 항목 블록만 실어야 하고, 그 밖의 줄은 사람이 끼워 넣은 것이다.
+    허용은 `*(항목 없음)*` 한 줄뿐이다.
+    """
+    offending: List[str] = []
+    for block in parse_blocks(markdown_text, item_sections):
+        if block["kind"] in ("item", "section"):
+            continue
+        if not block.get("in_item_section"):
+            continue
+        for line in block["lines"]:
+            stripped = line.strip()
+            if not stripped or stripped in _ALLOWED_BARE_LINES:
+                continue
+            if _is_comment(stripped):
+                # 주석은 발송본에 실리지 않는다 (보류 목록·고아 마커)
+                continue
+            offending.append(stripped)
+    return offending
+
+
+def link_audit(
+    markdown_text: str, item_sections: Optional[Sequence[str]] = None
+) -> Dict:
+    """본문 링크 수의 내역 (사이클 7 — HTML 링크 수 == 항목 수 + 해설 링크 수).
+
+    Returns:
+        {"total": 본문 전체 링크 수, "items": 항목 블록 링크 수,
+         "commentary": 항목 섹션 **밖**(머리말·산문 섹션) 링크 수,
+         "stray": 항목 섹션 안의 마커 없는 링크 수}
+
+    `total != items + commentary` 이면 발송 HTML 에 항목도 해설도 아닌 링크가
+    실린다는 뜻이다 — 위조 항목이 상한을 우회하는 경로다.
+    """
+    total = 0
+    items = 0
+    commentary = 0
+    stray = 0
+    for block in parse_blocks(markdown_text, item_sections):
+        if block["kind"] == "comment":
+            continue                    # 주석은 발송본에 실리지 않는다
+        counted = sum(
+            len(find_links(line)) for line in block["lines"]
+            if not _is_comment(line)
+        )
+        total += counted
+        if block["kind"] == "item":
+            items += counted
+        elif block.get("in_item_section"):
+            stray += counted
+        else:
+            commentary += counted
+    return {"total": total, "items": items,
+            "commentary": commentary, "stray": stray}

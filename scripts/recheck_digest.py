@@ -53,27 +53,32 @@ def recheck(markdown_path: Path, db_path: str, check_path: Path):
             output_path=None,
             skip_network=False,
         )
+        text = markdown_path.read_text(encoding="utf-8")
+        # 사이클3 #7: 섹션 판정은 방금 쓴 check.json 의 목록과 정확 일치로 한다.
+        item_sections, _ = sections_mod.resolve(result, text)
+
+        # 사이클 7 (Codex 3차 MEDIUM #4): 같은 URL 중복 제거는 **죽은 링크와 무관하게
+        # 항상** 돈다. 예전에는 prune 라운드 안에만 있어서, 무관한 dead 산문 링크가
+        # 있을 때만 중복이 접히고 없으면 같은 URL 2건이 그대로 pass 했다.
+        deduped, duplicates = prune.dedupe_urls(text, item_sections)
+        if duplicates:
+            markdown_path.write_text(deduped, encoding="utf-8")
+            dropped.extend(duplicates)
+            for item in duplicates:
+                print(f"  중복 URL 제거: {item['title']} ({item['url']})")
+            text = deduped
+            continue
+
         dead = dead_urls(result)
         if not dead or attempt == MAX_PRUNE_ROUNDS - 1:
             break
 
-        text = markdown_path.read_text(encoding="utf-8")
-        # 사이클3 #7: 섹션 판정은 방금 쓴 check.json 의 목록과 정확 일치로 한다.
-        item_sections, _ = sections_mod.resolve(result, text)
         pruned, removed, unlinked = prune.strip_dead_urls(text, dead, item_sections)
         if pruned == text:
             # 제거 대상을 본문에서 찾지 못했다 → 더 돌려도 같다. 아래에서 pass=false.
             break
-        # 사이클 6 #3: 같은 URL 을 가리키는 블록만 접는다. 제목이 같아도 URL 이
-        # 다르면 남긴다 — 소스 간 비병합 계약(같은 사안을 forest_service·
-        # forest_press 가 각자 게시)을 재검토가 뒤집으면 안 된다.
-        # 섹션 판정은 방금 쓴 check.json 의 목록과 정확 일치다 (사이클3 #7).
-        pruned, duplicates = prune.dedupe_urls(pruned, item_sections)
         markdown_path.write_text(pruned, encoding="utf-8")
         dropped.extend(removed)
-        dropped.extend(duplicates)
-        for item in duplicates:
-            print(f"  중복 URL 제거: {item['title']} ({item['url']})")
         # 해설·본문에서 링크만 떼어낸 죽은 URL도 check.json 에 남긴다 —
         # 미리보기 헤더의 "죽은 URL 제외 N건" 이 실제 제거 건수와 맞아야 한다.
         dropped.extend({"title": "본문 링크", "url": url} for url in unlinked)
