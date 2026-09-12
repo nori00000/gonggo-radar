@@ -19,6 +19,7 @@ import requests
 
 from alert.digest import preview as preview_mod
 from alert.digest import state as state_mod
+from alert.utils.redact import redact
 
 TOPIC_GROUP_FILE = os.path.expanduser(
     os.environ.get("TOPIC_GROUP_FILE") or "~/.config/homelab/topic-group.json"
@@ -68,28 +69,54 @@ def resolve_token():
     return token
 
 
-def send_chunk(token, chat_id, thread_id, text):
-    """sendMessage 1건. 반환: (ok, message_id, 오류요지)."""
-    url = f"https://api.telegram.org/bot{token}/sendMessage"
-    payload = {
-        "chat_id": chat_id,
-        "message_thread_id": thread_id,
-        "text": text,
-        "disable_web_page_preview": True,
-    }
+def _api(token, method):
+    return f"https://api.telegram.org/bot{token}/{method}"
+
+
+def _post(token, method, payload):
+    """Telegram POST 1건. 반환: (ok, result, 오류요지).
+
+    오류요지에서 토큰을 가린다 (계약 W10 크리틱 #4) — requests 의 연결 오류
+    문자열에는 `/bot<TOKEN>/sendMessage` URL 이 그대로 들어 있다.
+    """
     try:
-        response = requests.post(url, data=payload, timeout=API_TIMEOUT)
+        response = requests.post(_api(token, method), data=payload,
+                                 timeout=API_TIMEOUT)
     except requests.exceptions.RequestException as exc:
-        return False, None, f"네트워크 오류: {exc}"
+        return False, None, redact(f"네트워크 오류: {exc}", secrets=(token,))
     try:
         body = response.json()
     except ValueError:
         return False, None, f"응답 파싱 실패 (HTTP {response.status_code})"
     if not body.get("ok"):
-        return False, None, "API 실패: {}".format(
-            str(body.get("description"))[:200]
+        return False, None, redact(
+            "API 실패: {}".format(str(body.get("description"))[:200]),
+            secrets=(token,),
         )
-    return True, (body.get("result") or {}).get("message_id"), ""
+    return True, body.get("result") or {}, ""
+
+
+def send_chunk(token, chat_id, thread_id, text):
+    """sendMessage 1건. 반환: (ok, message_id, 오류요지)."""
+    ok, result, error = _post(token, "sendMessage", {
+        "chat_id": chat_id,
+        "message_thread_id": thread_id,
+        "text": text,
+        "disable_web_page_preview": True,
+    })
+    if not ok:
+        return False, None, error
+    return True, result.get("message_id"), ""
+
+
+def clear_card(token, chat_id, message_id):
+    """이전 승인 카드의 버튼 제거 (계약 W10 크리틱 #6). 실패는 경고만."""
+    ok, _, error = _post(token, "editMessageReplyMarkup", {
+        "chat_id": chat_id,
+        "message_id": message_id,
+        "reply_markup": json.dumps({"inline_keyboard": []}),
+    })
+    return ok, error
 
 
 def load_check(markdown_path):
@@ -144,8 +171,24 @@ def main():
         chat_id, thread_id = resolve_target(args.topic_key)
         token = resolve_token()
     except (RuntimeError, OSError, json.JSONDecodeError) as exc:
-        print(f"✗ 전송 대상 확인 실패: {exc}", file=sys.stderr)
+        print(f"✗ 전송 대상 확인 실패: {redact(exc)}", file=sys.stderr)
         return 2
+
+    # 이전 승인 카드의 버튼을 먼저 지운다 (계약 W10 크리틱 #6) — 새 미리보기가
+    # 올라간 뒤에도 옛 카드가 남아 있으면 사람이 낡은 승인을 누를 수 있다.
+    # (최종 방어는 카드 callback_data 의 본문 해시다 — 이건 UX 상의 정리다.)
+    state_path = state_mod.state_path_for_markdown(markdown_path)
+    stale_card = None
+    try:
+        state = state_mod.load_state(state_path, week)
+        stale_card = state.get("card_message_id")
+    except state_mod.StateError as exc:
+        print(f"⚠️  상태 확인 실패(미리보기는 계속 전송): {exc}", file=sys.stderr)
+        state = None
+    if stale_card:
+        ok, error = clear_card(token, chat_id, stale_card)
+        if not ok:
+            print(f"⚠️  이전 승인 카드 버튼 제거 실패: {error}", file=sys.stderr)
 
     message_ids = []
     for index, chunk in enumerate(chunks, start=1):
@@ -159,11 +202,14 @@ def main():
         message_ids.append(message_id)
         print(f"✓ 전송 {index}/{len(chunks)} message_id={message_id}")
 
-    state_path = state_mod.state_path_for_markdown(markdown_path)
     try:
-        state = state_mod.load_state(state_path, week)
+        if state is None:
+            state = state_mod.load_state(state_path, week)
         state_mod.save_state(
-            state_path, state_mod.record_preview(state, message_ids)
+            state_path,
+            state_mod.record_preview(
+                state, message_ids, preview_mod.item_urls(markdown_text)
+            ),
         )
         print(f"✓ 상태 기록: {state_path}")
     except (state_mod.StateError, OSError) as exc:

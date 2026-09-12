@@ -6,6 +6,7 @@ import html as html_module
 import json
 import re
 import sys
+import time
 from datetime import datetime
 from pathlib import Path
 from typing import Tuple
@@ -16,6 +17,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from alert.notifiers.email_sender import EmailNotifier
 from alert.digest import state as state_mod
+from alert.digest.checker import markdown_sha256
+
+# 상태 기록(status=sent) 저장 재시도 — 여기서 실패하면 "발송했는데 기록이 없는" 창이 열린다.
+STATE_SAVE_ATTEMPTS = 3
+STATE_SAVE_BACKOFF = 0.5
 
 # [텍스트](URL) — URL 안의 괄호 한 단계까지 균형 있게 소비 (javascript:alert(1) 대응)
 LINK_PATTERN = r"\[([^\]]+)\]\(([^()\s]*(?:\([^()]*\)[^()\s]*)*)\)"
@@ -175,6 +181,14 @@ def check_fail_closed(markdown_path: Path, check_json_path: Path) -> Tuple[bool,
     if not check_result.get("network_checked", False):
         return False, "네트워크 검증이 실행되지 않음"
 
+    # 계약 W10 크리틱 #3: 검증이 **지금 이 본문**을 본 것인지 확인한다.
+    # 해시가 없으면(구버전 check.json) 과거 검증일 수 있으므로 거부한다.
+    recorded = check_result.get("md_sha256")
+    if not recorded:
+        return False, "검증에 본문 해시가 없음 — 재검증 필요"
+    if recorded != markdown_sha256(markdown_text):
+        return False, "검증 이후 본문이 바뀜 — 재검증 필요"
+
     return True, ""
 
 
@@ -226,10 +240,48 @@ def send_digest(
         print(f"[DRY-RUN] 본문 길이: {len(markdown_text)} bytes (마크다운), {len(html_text)} bytes (HTML)")
         return 0
 
-    # 계약 W10: status=sent 는 불변이다 — 같은 주차 재발송을 거부한다.
-    # 상태 파일이 손상돼 판정할 수 없으면 발송하지 않는다(fail-closed).
+    # 계약 W10 크리틱 #1: 발송 순서는 잠금 → sending → SMTP → sent 다.
+    #   · 잠금(O_EXCL)으로 같은 주차 동시 실행을 거부한다.
+    #   · SMTP 직전에 status=sending 을 남긴다. 이 표시가 남아 있으면(저장 실패·크래시)
+    #     이후 발송은 사람 확인 전까지 거부된다 — 자동 재발송을 하지 않는다.
     week = state_mod.week_from_markdown(markdown_path)
     state_path = state_mod.state_path_for_markdown(markdown_path)
+    lock_path = state_mod.lock_path_for_markdown(markdown_path)
+
+    try:
+        lock_fd = state_mod.acquire_lock(lock_path)
+    except state_mod.LockBusy as exc:
+        print(f"✗ 발송 거부: {exc} (같은 주차 발송이 진행 중)", file=sys.stderr)
+        return 2
+    except OSError as exc:
+        print(f"✗ 발송 거부: 잠금 생성 실패 — {exc}", file=sys.stderr)
+        return 2
+
+    try:
+        return _send_locked(
+            markdown_path=markdown_path,
+            markdown_text=markdown_text,
+            subject=subject,
+            to_email=to_email,
+            approved_by=approved_by,
+            week=week,
+            state_path=state_path,
+        )
+    finally:
+        state_mod.release_lock(lock_path, lock_fd)
+
+
+def _send_locked(
+    markdown_path: Path,
+    markdown_text: str,
+    subject: str,
+    to_email,
+    approved_by,
+    week: str,
+    state_path: Path,
+) -> int:
+    """잠금을 쥔 상태의 발송 본체 (계약 W10 크리틱 #1)."""
+    # 상태 파일이 손상돼 판정할 수 없으면 발송하지 않는다(fail-closed).
     try:
         state = state_mod.load_state(state_path, week)
     except state_mod.StateError as exc:
@@ -238,54 +290,95 @@ def send_digest(
     allowed, reason = state_mod.can_send(state)
     if not allowed:
         print(f"✗ 발송 거부: {reason}", file=sys.stderr)
+        if reason == state_mod.SENDING_REASON:
+            print(
+                f"  이전 발송의 결과가 확정되지 않았습니다. 메일함을 확인한 뒤 "
+                f"{state_path} 의 status 를 직접 정리하세요(자동 재발송 안 함).",
+                file=sys.stderr,
+            )
         return 2
 
-    # 실제 발송 - EmailNotifier 재사용
+    # SMTP 앞의 모든 준비는 sending 표시 **전**에 끝낸다 — 설정 실수로 sending 이
+    # 남아 사람 개입을 요구하는 일을 막는다.
     try:
         notifier = EmailNotifier()
-
-        if not notifier.sender or not notifier.password:
-            print("✗ 이메일 인증 정보가 설정되지 않았습니다", file=sys.stderr)
-            return 2
-
-        # --to 옵션이 지정되면 그것을 사용, 아니면 config의 모든 수신자
-        recipients = [to_email] if to_email else notifier.recipients
-
-        if not recipients:
-            print("✗ 수신자가 설정되지 않았습니다", file=sys.stderr)
-            return 2
-
-        # HTML 본문
-        html_body = markdown_to_html(markdown_text)
-
-        # 기존 EmailNotifier의 SMTP 경로 재사용
-        if not notifier.send_html(subject, html_body, recipients):
-            print("✗ 발송 실패: SMTP 전송에 실패했습니다", file=sys.stderr)
-            return 2
-
-        print(f"✓ 발송 성공: {len(recipients)}명")
-
-        try:
-            state_mod.save_state(
-                state_path,
-                state_mod.mark_sent(
-                    state,
-                    approved_by,
-                    len(recipients),
-                    datetime.now().isoformat(timespec="seconds"),
-                ),
-            )
-            print(f"✓ 상태 기록: {state_path} (status=sent)")
-        except OSError as exc:
-            # 발송은 이미 끝났다 — 상태 기록 실패는 크게 알리고 비정상 종료한다.
-            print(f"⚠️  상태 기록 실패(발송은 완료됨): {exc}", file=sys.stderr)
-            return 1
-
-        return 0
-
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001 — 설정·의존성 오류는 발송 전 거부
         print(f"✗ 초기화 실패: {exc}", file=sys.stderr)
         return 2
+
+    if not notifier.sender or not notifier.password:
+        print("✗ 이메일 인증 정보가 설정되지 않았습니다", file=sys.stderr)
+        return 2
+
+    # --to 옵션이 지정되면 그것을 사용, 아니면 config의 모든 수신자
+    recipients = [to_email] if to_email else notifier.recipients
+
+    if not recipients:
+        print("✗ 수신자가 설정되지 않았습니다", file=sys.stderr)
+        return 2
+
+    try:
+        html_body = markdown_to_html(markdown_text)
+    except Exception as exc:  # noqa: BLE001 — 렌더 실패는 발송 전 거부
+        print(f"✗ 본문 변환 실패: {exc}", file=sys.stderr)
+        return 2
+
+    now_iso = datetime.now().isoformat(timespec="seconds")
+    try:
+        state_mod.save_state(state_path, state_mod.mark_sending(state, now_iso))
+    except OSError as exc:
+        # sending 을 못 남기면 발송하지 않는다 — 기록 없는 발송이 중복 발송의 씨앗이다.
+        print(f"✗ 발송 거부: 발송 표시 기록 실패 — {exc}", file=sys.stderr)
+        return 2
+
+    try:
+        delivered = notifier.send_html(subject, html_body, recipients)
+    except Exception as exc:  # noqa: BLE001 — 전송 중 예외는 결과 미확정이다
+        print(f"✗ 발송 실패(결과 미확정): {exc}", file=sys.stderr)
+        print(
+            f"  status=sending 이 남았습니다 — 메일함 확인 후 {state_path} 를 "
+            f"직접 정리하세요(자동 재발송 안 함).",
+            file=sys.stderr,
+        )
+        return 2
+
+    if not delivered:
+        print("✗ 발송 실패: SMTP 전송에 실패했습니다", file=sys.stderr)
+        print(
+            f"  status=sending 이 남았습니다 — 메일함 확인 후 {state_path} 를 "
+            f"직접 정리하세요(자동 재발송 안 함).",
+            file=sys.stderr,
+        )
+        return 2
+
+    print(f"✓ 발송 성공: {len(recipients)}명")
+
+    sent_state = state_mod.mark_sent(state, approved_by, len(recipients), now_iso)
+    last_error = None
+    for attempt in range(1, STATE_SAVE_ATTEMPTS + 1):
+        try:
+            state_mod.save_state(state_path, sent_state)
+            print(f"✓ 상태 기록: {state_path} (status=sent)")
+            return 0
+        except OSError as exc:
+            last_error = exc
+            print(
+                f"⚠️  상태 기록 실패 {attempt}/{STATE_SAVE_ATTEMPTS}: {exc}",
+                file=sys.stderr,
+            )
+            if attempt < STATE_SAVE_ATTEMPTS:
+                time.sleep(STATE_SAVE_BACKOFF * attempt)
+
+    # 발송은 이미 끝났다 — status=sending 이 남으므로 이후 발송은 거부된다.
+    print(
+        f"⚠️  상태 기록 실패(발송은 완료됨): {last_error}", file=sys.stderr
+    )
+    print(
+        f"  status=sending 이 남았습니다 — {state_path} 를 직접 sent 로 "
+        f"정리하세요(자동 재발송 안 함).",
+        file=sys.stderr,
+    )
+    return 1
 
 
 def main():

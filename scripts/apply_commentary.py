@@ -17,6 +17,24 @@ from alert.digest.preview import MARKER
 
 NOOP_MESSAGE = "⚠️  마커 없음 — 변경하지 않았습니다 (이미 해설이 채워졌습니다)"
 
+# 계약 W10 크리틱 #7: 해설에 HTML 주석 구분자가 들어오면 거부한다.
+# 발송 렌더러(send_digest.markdown_to_html)는 `<!--` 로 시작하는 줄을 버리므로,
+# 주석을 품은 해설은 승인 마커까지 삼키면서 메일에서 조용히 사라진다.
+COMMENT_TOKENS = ("<!--", "-->")
+COMMENT_REJECT = (
+    "✗ 해설에 HTML 주석 구분자(<!-- 또는 -->)를 쓸 수 없습니다 — "
+    "발송 렌더러가 해당 줄을 버려 해설이 조용히 사라집니다"
+)
+
+
+def commentary_error(commentary: str) -> str:
+    """해설로 받아들일 수 없는 이유. 문제없으면 빈 문자열."""
+    if not (commentary or "").strip():
+        return "✗ 본문이 비었습니다"
+    if any(token in commentary for token in COMMENT_TOKENS):
+        return COMMENT_REJECT
+    return ""
+
 
 def apply_commentary(markdown_text: str, commentary: str):
     """(새 본문, 치환했는가). 마커가 없으면 원문을 그대로 돌려준다."""
@@ -35,8 +53,9 @@ def main():
     args = parser.parse_args()
 
     commentary = args.text.strip()
-    if not commentary:
-        print("✗ 본문이 비었습니다", file=sys.stderr)
+    error = commentary_error(commentary)
+    if error:
+        print(error, file=sys.stderr)
         return 2
 
     markdown_path = Path(args.out_dir) / f"{args.week}.md"
