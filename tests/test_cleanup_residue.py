@@ -644,3 +644,113 @@ class TestGate4RegionAndSameUrl:
 
         doomed, _reasons, _canonical = cleanup.find_duplicates(conn, "socialenterprise")
         assert doomed == []
+
+
+class TestGate6RoundAndAllSources:
+    """6차 게이트: 회차 키와 전 소스 마감 교정."""
+
+    def test_different_rounds_without_deadlines_are_not_deleted(self, db):
+        """같은 제목·서울센터·다른 URL·1차/2차·마감 없음 → 삭제 0 (게이트 #2)."""
+        conn, _ = db
+        first = insert(conn, source_id="100", title="상주기업 모집 공고",
+                       url=SEIS_URL.format(sid="100"),
+                       created_at="2026-09-10T00:00:00",
+                       raw_data={"sub": "서울센터", "info": ["교육"], "round": "1차"})
+        second = insert(conn, source_id="101", title="상주기업 모집 공고",
+                        url=SEIS_URL.format(sid="101"),
+                        created_at="2026-09-10T00:00:00",
+                        raw_data={"sub": "서울센터", "info": ["교육"], "round": "2차"})
+
+        doomed, _reasons, _canonical = cleanup.find_duplicates(conn, "seis")
+        assert doomed == []
+        survivors = {r["id"] for r in conn.execute("SELECT id FROM announcements")}
+        assert survivors == {first, second}
+
+    def test_same_round_without_deadlines_still_merges(self, db):
+        conn, _ = db
+        insert(conn, source_id="200", title="상주기업 모집 공고",
+               url=SEIS_URL.format(sid="200"), created_at="2026-09-10T00:00:00",
+               raw_data={"sub": "서울센터", "round": "2차"})
+        older = insert(conn, source_id="201", title="상주기업 모집 공고",
+                       url=SEIS_URL.format(sid="201"),
+                       created_at="2026-09-10T00:00:00",
+                       raw_data={"sub": "서울센터", "round": "2차"})
+
+        doomed, _reasons, _canonical = cleanup.find_duplicates(conn, "seis")
+        assert len(doomed) == 1
+        assert doomed[0]["id"] in {200, older} or doomed[0]["source_id"] in {"200", "201"}
+
+    def test_round_from_the_title_also_separates(self, db):
+        """회차가 제목에만 있어도 구분한다."""
+        conn, _ = db
+        insert(conn, source_id="300", title="상주기업 1차 모집 공고",
+               url=SEIS_URL.format(sid="300"), created_at="2026-09-10T00:00:00",
+               raw_data={"sub": "서울센터"})
+        insert(conn, source_id="301", title="상주기업 2차 모집 공고",
+               url=SEIS_URL.format(sid="301"), created_at="2026-09-10T00:00:00",
+               raw_data={"sub": "서울센터"})
+
+        doomed, _reasons, _canonical = cleanup.find_duplicates(conn, "seis")
+        assert doomed == []
+
+    def test_known_equal_deadline_ignores_the_round(self, db):
+        """마감이 같고 알려져 있으면 회차가 달라도 병합한다 (원래 수리 보존)."""
+        conn, _ = db
+        insert(conn, source_id="8371", title="사회보험료 지원사업 모집",
+               url=SEIS_URL.format(sid="8371"), period_end="2026-12-31",
+               period_start="2026-09-01",
+               raw_data={"sub": "사회보험료 지원 사업", "info": ["경기도"],
+                         "round": "9차"})
+        older = insert(conn, source_id="8370", title="사회보험료 지원사업 모집",
+                       url=SEIS_URL.format(sid="8370"), period_end="2026-12-31",
+                       period_start="2026-08-01",
+                       raw_data={"sub": "사회보험료 지원 사업", "info": ["경기도"],
+                                 "round": "8차"})
+
+        doomed, _reasons, _canonical = cleanup.find_duplicates(conn, "seis")
+        assert [row["id"] for row in doomed] == [older]
+
+    def test_fake_deadlines_are_found_in_every_source(self, db):
+        """socialenterprise 만 보던 것을 전 소스로 넓혔다 (게이트 #1)."""
+        conn, _ = db
+        seis_row = insert(conn, source="seis", source_id="900", title="공고",
+                          url=SEIS_URL.format(sid="900"),
+                          period_start="2026-09-11", period_end="2026-09-11",
+                          created_at="2026-09-11T09:00:00",
+                          raw_data={"date": "2026.09.11"})
+        coop_row = insert(conn, source="coop", source_id="901", title="공고",
+                          url="https://www.coop.go.kr/x?brd_no=901",
+                          period_start="2026-09-08", period_end="2026-09-08",
+                          created_at="2026-09-08T09:00:00",
+                          raw_data={"date": "2026.09.08"})
+
+        changes, reasons = cleanup.find_fake_deadlines(conn)
+        changed_ids = {row["id"] for row, _new_end in changes}
+        assert {seis_row, coop_row} <= changed_ids
+        assert all(new_end is None for _row, new_end in changes)
+        joined = " ".join(reasons)
+        assert "seis" in joined and "coop" in joined
+
+    def test_real_deadlines_in_other_sources_are_kept(self, db):
+        """게시일과 다른 마감은 어느 소스에서도 건드리지 않는다."""
+        conn, _ = db
+        insert(conn, source="seis", source_id="910", title="공고",
+               url=SEIS_URL.format(sid="910"),
+               period_start="2026-09-01", period_end="2026-09-30",
+               created_at="2026-09-01T09:00:00",
+               raw_data={"date": "2026.09.01 ~ 2026.09.30"})
+
+        changes, _reasons = cleanup.find_fake_deadlines(conn)
+        assert changes == []
+
+    def test_posted_field_is_recognised_as_a_posting_date(self, db):
+        """새 파서가 남기는 raw_data.posted 도 게시일 후보다."""
+        conn, _ = db
+        row_id = insert(conn, source="seis", source_id="920", title="공고",
+                        url=SEIS_URL.format(sid="920"),
+                        period_start="2026-09-11", period_end="2026-09-11",
+                        created_at="2026-09-13T09:00:00",
+                        raw_data={"posted": "2026-09-11"})
+
+        changes, _reasons = cleanup.find_fake_deadlines(conn)
+        assert [(row["id"], new_end) for row, new_end in changes] == [(row_id, None)]

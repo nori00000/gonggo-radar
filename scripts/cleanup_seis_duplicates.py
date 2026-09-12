@@ -22,7 +22,7 @@
 
 그 밖에 정리하는 것:
 
-- **socialenterprise 가짜 마감**: 게시일이 ``period_end`` 에 들어간 행.
+- **가짜 마감 (전 소스)**: 게시일이 ``period_end`` 에 들어간 행.
   단, 원문이 **당일 접수**(``date`` 가 범위 표기)라고 말하는 행은 남긴다
   (크리틱 #9).
 - **coop 가짜 접수 시작일**: 게시일이 ``period_start`` 에 들어간 행.
@@ -114,18 +114,21 @@ def row_region(row: sqlite3.Row) -> str:
     return extract_region(region_candidates(row))
 
 
-def row_key(row: sqlite3.Row) -> Tuple[str, str, str]:
+def row_key(row: sqlite3.Row) -> Tuple[str, Tuple[str, ...], str, str]:
     """행의 중복 판별 키 - 크롤러와 같은 ``group_key`` 를 쓴다.
 
     접수 종료일이 없으면 **적재 월**로 갈라 회차가 다른 공고가 합쳐지지
     않게 한다 (Codex 재검토 #4).
     """
     created = str(row["created_at"] or "")
+    payload = load_raw(row["raw_data"])
+    rounds = [str(payload.get("round") or "")] + region_candidates(row)
     return group_key(
         row["title"],
         region_candidates(row),
         row["period_end"] or None,
         ingested_month=created[:7],
+        round_candidates=rounds,
     )
 
 
@@ -249,11 +252,11 @@ def find_duplicates(
 
     # ---------- 규칙 B (seis 전용) 또는 규칙 C ----------
     if source == RULE_B_SOURCE:
-        groups: Dict[Tuple[str, str, str], List[sqlite3.Row]] = {}
+        groups: Dict[Tuple[str, Tuple[str, ...], str, str], List[sqlite3.Row]] = {}
         for row in survivors:
             groups.setdefault(row_key(row), []).append(row)
 
-        for (_title, region, deadline), group in groups.items():
+        for (_title, region, deadline, round_key), group in groups.items():
             if len(group) < 2:
                 continue
             locked = [r for r in group if r["id"] in canonical]
@@ -500,7 +503,7 @@ def deadline_evidence(payload: dict) -> Optional[str]:
 def find_fake_deadlines(
     conn: sqlite3.Connection, skip_ids: Optional[Set[int]] = None
 ) -> Tuple[List[Tuple[sqlite3.Row, Optional[str]]], List[str]]:
-    """socialenterprise 의 마감을 근거와 대조해 고친다.
+    """**모든 소스**의 마감을 근거와 대조해 고친다 (6차 게이트 #1).
 
     판정 (최종 게이트 #8) - 저장된 마감이 **게시일과 같을 때만** 손댄다:
 
@@ -517,12 +520,13 @@ def find_fake_deadlines(
     Returns:
         ``([(행, 새 마감 또는 None)], 근거 문장)``
     """
+    # **전 소스**를 본다 (6차 게이트 #1). socialenterprise 만 보던 동안
+    # SEIS의 게시일=마감 행이 그대로 남았다.
     rows = conn.execute(
-        "SELECT id, source_id, title, period_start, period_end, raw_data,"
+        "SELECT id, source, source_id, title, period_start, period_end, raw_data,"
         "       date(created_at) AS created_date"
         " FROM announcements"
-        " WHERE source = 'socialenterprise'"
-        "   AND period_end IS NOT NULL AND period_end != ''"
+        " WHERE period_end IS NOT NULL AND period_end != ''"
     ).fetchall()
 
     skip_ids = skip_ids or set()
@@ -541,7 +545,8 @@ def find_fake_deadlines(
         if evidence:
             changes.append((row, evidence))
             reasons.append(
-                f"  [교체] id={row['id']} period_end={row['period_end']} "
+                f"  [교체] {row['source']} id={row['id']} "
+                f"period_end={row['period_end']} "
                 f"(게시일) -> {evidence} (raw 근거)"
             )
             continue
@@ -549,7 +554,8 @@ def find_fake_deadlines(
         quote = str(payload.get("quote_deadline") or "")
         note = f"인용에 날짜 없음({quote[:24]})" if quote else "목록 날짜가 단일 게시일"
         reasons.append(
-            f"  [게시일] id={row['id']} period_end={row['period_end']} "
+            f"  [게시일] {row['source']} id={row['id']} "
+            f"period_end={row['period_end']} "
             f"== 게시일, {note} -> NULL"
         )
     return changes, reasons
@@ -697,7 +703,7 @@ def main() -> int:
     replaced = [c for c in deadline_changes if c[1]]
     nulled = [c for c in deadline_changes if not c[1]]
     print(
-        f"\n[c] socialenterprise 마감 교정: 교체 {len(replaced)} 행 / "
+        f"\n[c] 마감 교정 (전 소스): 교체 {len(replaced)} 행 / "
         f"NULL {len(nulled)} 행"
     )
     for line in deadline_reasons:

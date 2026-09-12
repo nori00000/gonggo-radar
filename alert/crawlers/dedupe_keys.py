@@ -34,6 +34,10 @@ _REGION_RE = re.compile("|".join(re.escape(token) for token in REGION_TOKENS))
 
 _TITLE_NOISE = re.compile(r"[\s·.,()\[\]{}「」『』\-~/]+")
 
+# 회차 표기 (6차 게이트 #2). 마감을 모르는 공고에서는 회차가 유일한
+# 구분자다 - 같은 제목·같은 센터의 1차와 2차는 별개 공고다.
+_ROUND_TOKENS = re.compile(r"(\d+)\s*차|상시|수시|추가|연장")
+
 # "전국" 와일드카드는 **철회했다** (5차 게이트 #3 REGRESSED).
 # 지역 하나를 넘기려던 완화가 주체 서명 전체를 무효화해, 대표가
 # ``sub=서울센터, info=[전국]`` 이면 ``sub=부산센터, info=[부산]`` 인
@@ -89,6 +93,26 @@ def subject_signature(candidates: Iterable[str]) -> Tuple[str, ...]:
     return tuple(sorted(cleaned))
 
 
+def extract_round(candidates: Iterable[str]) -> str:
+    """제목·주체·분류에서 회차 표기를 모아 하나의 키로 만든다.
+
+    ``2차``, ``상시``, ``추가``, ``연장`` 같은 말이 회차를 가른다. 여러 개가
+    보이면 모두 담는다(정렬해 순서 무관).
+
+    Args:
+        candidates: 제목·``sub``·``info`` 등 문자열들
+
+    Returns:
+        ``"2차"`` / ``"상시"`` / ``"1차|추가"`` 형태. 없으면 빈 문자열
+    """
+    found = set()
+    for value in candidates:
+        for match in _ROUND_TOKENS.finditer(value or ""):
+            number = match.group(1)
+            found.add(f"{int(number)}차" if number else match.group(0).strip())
+    return "|".join(sorted(found))
+
+
 def deadline_key(period_end: Optional[str], ingested_month: str = "") -> str:
     """마감 키 - 종료일이 없으면 적재 월로 갈라 회차를 구분한다.
 
@@ -111,28 +135,41 @@ def group_key(
     region_candidates: Sequence[str],
     period_end: Optional[str],
     ingested_month: str = "",
-) -> Tuple[str, Tuple[str, ...], str]:
+    round_candidates: Optional[Sequence[str]] = None,
+) -> Tuple[str, Tuple[str, ...], str, str]:
     """중복 판별 키를 만든다.
+
+    회차는 **마감을 모를 때만** 키에 들어간다 (6차 게이트 #2):
+
+    - 마감이 같고 알려져 있으면 회차별로 다시 걸린 **같은 공고**다
+      (SEIS 메인이 사회보험료 지원사업을 1~9차로 9번 나열하는 경우).
+    - 마감이 없으면 회차가 유일한 구분자다 - 같은 제목·같은 센터의
+      1차와 2차를 합치면 별개 공고가 사라진다.
 
     Args:
         title: 공고 제목
         region_candidates: 주체·지역 후보 문자열들 (sub, info…)
         period_end: 접수 종료일 (ISO) 또는 None
         ingested_month: ``YYYY-MM`` 적재 월 (종료일 없을 때 회차 구분용)
+        round_candidates: 회차 후보 문자열들 (제목·sub·info…)
 
     Returns:
-        ``(정규화 제목, 주체 서명, 마감 키)``
+        ``(정규화 제목, 주체 서명, 마감 키, 회차 키)``
     """
+    round_key = ""
+    if not period_end:
+        round_key = extract_round(list(round_candidates or ()) + [title])
     return (
         normalize_title(title),
         subject_signature(region_candidates),
         deadline_key(period_end, ingested_month),
+        round_key,
     )
 
 
 def keys_compatible(
-    first: Tuple[str, Tuple[str, ...], str],
-    second: Tuple[str, Tuple[str, ...], str],
+    first: Tuple[str, Tuple[str, ...], str, str],
+    second: Tuple[str, Tuple[str, ...], str, str],
     ignore_deadline: bool = False,
 ) -> bool:
     """두 키가 **같은 공고**를 가리킬 수 있는지 본다.
@@ -156,6 +193,11 @@ def keys_compatible(
     if first[0] != second[0]:
         return False
     if bool(first[1]) and bool(second[1]) and first[1] != second[1]:
+        return False
+    # 회차가 둘 다 있고 다르면 별개 공고다 (6차 게이트 #2)
+    first_round = first[3] if len(first) > 3 else ""
+    second_round = second[3] if len(second) > 3 else ""
+    if first_round and second_round and first_round != second_round:
         return False
     if first[2] == second[2]:
         return True

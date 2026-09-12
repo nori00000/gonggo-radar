@@ -467,3 +467,197 @@ class TestSeisCardRegionCritique:
             {**base, "date": ""}
         )
 
+
+class TestGate6PostedDateLabels:
+    """6차 게이트 #1: 목록의 게시일이 마감으로 저장되던 결함.
+
+    상세 수집이 꺼진 상태에서도 재현됐다 - 목록 파서 자체의 결함이다.
+    """
+
+    TABLE = (
+        "<table class=board_list><thead><tr>"
+        "<th>번호</th><th>제목</th><th>{label}</th></tr></thead><tbody><tr>"
+        "<td>1</td><td class=title>"
+        '<a href="subPage.do?menuId=30200&tabId=pbancMainView&fncPbofrSn=99">'
+        "사회적기업 모집 공고</a></td>"
+        "<td>{value}</td></tr></tbody></table>"
+    )
+
+    @pytest.fixture
+    def crawler(self):
+        config = MagicMock()
+        config.crawler.timeout = 10
+        config.crawler.retry_count = 1
+        config.crawler.retry_delay = 0
+        config.crawler.user_agent = "test-agent"
+        source = MagicMock()
+        source.enabled = True
+        source.base_url = "https://www.seis.or.kr"
+        source.fetch_detail = False
+        config.crawler.sources = {"seis": source}
+        with patch("alert.crawlers.base.get_config", return_value=config):
+            yield SeisCrawler()
+
+    def announce(self, crawler, label, value):
+        html = self.TABLE.format(label=label, value=value)
+        items = crawler._parse_table_board(BeautifulSoup(html, "html.parser"))
+        assert items, "행을 파싱하지 못했다"
+        return items[0], crawler._to_announcement(items[0], "https://www.seis.or.kr")
+
+    @pytest.mark.parametrize("label", ["게시일", "작성일", "등록일", "공고일"])
+    def test_posting_labels_never_become_a_period(self, crawler, label):
+        """게시일/작성일/등록일은 기간 필드에 들어가지 않는다."""
+        item, announcement = self.announce(crawler, label, "2026.09.11")
+        assert item["date_label"] == label
+        assert announcement.period_start is None
+        assert announcement.period_end is None
+        assert json.loads(announcement.raw_data)["posted"] == "2026-09-11"
+
+    def test_unlabelled_single_date_is_treated_as_posted(self, crawler):
+        """라벨을 모르는 단일 날짜도 게시일로 본다 - 마감을 지어내지 않는다."""
+        _item, announcement = self.announce(crawler, "구분", "2026.09.11")
+        assert (announcement.period_start, announcement.period_end) == (None, None)
+        assert json.loads(announcement.raw_data)["posted"] == "2026-09-11"
+
+    def test_reception_range_is_a_real_period(self, crawler):
+        _item, announcement = self.announce(
+            crawler, "접수기간", "2026.09.01 ~ 2026.09.30"
+        )
+        assert announcement.period_start == "2026-09-01"
+        assert announcement.period_end == "2026-09-30"
+        assert "posted" not in json.loads(announcement.raw_data)
+
+    def test_deadline_label_gives_only_an_end(self, crawler):
+        """"접수마감 2026.09.30" 은 마감일 하나다 - 시작일을 만들지 않는다."""
+        _item, announcement = self.announce(crawler, "접수마감", "2026.09.30")
+        assert announcement.period_start is None
+        assert announcement.period_end == "2026-09-30"
+
+    def test_range_without_a_label_is_still_a_period(self, crawler):
+        """범위 표기가 있으면 라벨이 없어도 접수기간이다."""
+        _item, announcement = self.announce(
+            crawler, "구분", "2026.09.01 ~ 2026.09.30"
+        )
+        assert (announcement.period_start, announcement.period_end) == (
+            "2026-09-01", "2026-09-30"
+        )
+
+    def test_classify_date_directly(self, crawler):
+        assert crawler._classify_date("2026.09.11", "게시일") == (
+            None, None, "2026-09-11"
+        )
+        assert crawler._classify_date("2026.09.01 ~ 2026.09.30", "접수기간") == (
+            "2026-09-01", "2026-09-30", None
+        )
+        assert crawler._classify_date("", "게시일") == (None, None, None)
+
+
+class TestGate6RoundInKey:
+    """6차 게이트 #2: 마감 없는 별도 회차가 병합되던 결함."""
+
+    CARD = """
+    <li class="swiper-slide" data-type="사업공고">
+      <span class="badge cate">사업공고</span>
+      <span class="sub">서울센터</span>
+      <p class="tit"><a href="subPage.do?menuId=30400&tabId=view&itgrdAplyPbancSn={sid}">
+         성장지원센터 상주기업 모집 공고</a></p>
+      <ul class="info"><li>교육</li><li>{rnd}</li><li>D-10</li></ul>
+      <p class="date">{period}</p>
+    </li>
+    """
+
+    @pytest.fixture
+    def crawler(self):
+        config = MagicMock()
+        config.crawler.timeout = 10
+        config.crawler.retry_count = 1
+        config.crawler.retry_delay = 0
+        config.crawler.user_agent = "test-agent"
+        source = MagicMock()
+        source.enabled = True
+        source.base_url = "https://www.seis.or.kr"
+        source.fetch_detail = False
+        config.crawler.sources = {"seis": source}
+        with patch("alert.crawlers.base.get_config", return_value=config):
+            yield SeisCrawler()
+
+    def build(self, crawler, cards):
+        soup = BeautifulSoup("<ul>" + "".join(cards) + "</ul>", "html.parser")
+        items = crawler._parse_main_cards(soup)
+        return items, crawler._dedupe_items(items)
+
+    def test_different_rounds_without_dates_stay_separate(self, crawler):
+        """마감이 없으면 회차가 유일한 구분자다 - 1차와 2차는 별개 공고다."""
+        items, deduped = self.build(crawler, [
+            self.CARD.format(sid="100", rnd="1차", period=""),
+            self.CARD.format(sid="101", rnd="2차", period=""),
+        ])
+        assert len(items) == 2
+        assert len(deduped) == 2
+
+    @pytest.mark.parametrize("first,second", [
+        ("1차", "2차"), ("상시", "1차"), ("1차", "추가"), ("2차", "연장"),
+    ])
+    def test_round_tokens_separate(self, crawler, first, second):
+        _items, deduped = self.build(crawler, [
+            self.CARD.format(sid="200", rnd=first, period=""),
+            self.CARD.format(sid="201", rnd=second, period=""),
+        ])
+        assert len(deduped) == 2
+
+    def test_same_round_without_dates_merges(self, crawler):
+        _items, deduped = self.build(crawler, [
+            self.CARD.format(sid="300", rnd="2차", period=""),
+            self.CARD.format(sid="301", rnd="2차", period=""),
+        ])
+        assert len(deduped) == 1
+        assert deduped[0]["merged_count"] == 2
+
+    def test_no_round_anywhere_merges(self, crawler):
+        """양쪽 다 회차 표기가 없으면 같은 공고로 본다."""
+        _items, deduped = self.build(crawler, [
+            self.CARD.format(sid="400", rnd="교육", period=""),
+            self.CARD.format(sid="401", rnd="교육", period=""),
+        ])
+        assert len(deduped) == 1
+
+    def test_known_equal_deadline_still_merges_rounds(self, crawler):
+        """마감이 같고 알려져 있으면 회차별 재게시는 여전히 1건이다.
+
+        원래 수리(계약 v2.1 판정 6-①)를 되돌리지 않는다 - SEIS 메인은
+        같은 공고를 1~9차로 나열하면서 같은 마감을 쓴다.
+        """
+        _items, deduped = self.build(crawler, [
+            self.CARD.format(sid="8371", rnd="9차", period="2026.09.01 ~ 2026.12.31"),
+            self.CARD.format(sid="8370", rnd="8차", period="2026.08.01 ~ 2026.12.31"),
+        ])
+        assert len(deduped) == 1
+        assert deduped[0]["merged_count"] == 2
+
+    def test_live_fixture_still_collapses_to_fourteen(self, crawler):
+        """실측 fixture 회귀: 22 카드 -> 14 건, 9건 병합 유지."""
+        soup = BeautifulSoup(
+            (FIXTURES / "seis_main_cards.html").read_text(encoding="utf-8"),
+            "html.parser",
+        )
+        items = crawler._parse_main_cards(soup)
+        deduped = crawler._dedupe_items(items)
+        assert (len(items), len(deduped)) == (22, 14)
+        merged = [i for i in deduped if i.get("merged_count")]
+        assert len(merged) == 1 and merged[0]["merged_count"] == 9
+
+    def test_extract_round_tokens(self):
+        from alert.crawlers.dedupe_keys import extract_round
+
+        assert extract_round(["2026년도 (9차)"]) == "9차"
+        assert extract_round(["상시 모집"]) == "상시"
+        assert extract_round(["추가 모집", "1차"]) == "1차|추가"
+        assert extract_round(["교육", "시설/공간"]) == ""
+
+    def test_round_only_enters_the_key_when_the_deadline_is_unknown(self):
+        from alert.crawlers.dedupe_keys import group_key
+
+        known = group_key("공고", ["서울"], "2026-12-31", round_candidates=["9차"])
+        unknown = group_key("공고", ["서울"], None, "2026-09", round_candidates=["9차"])
+        assert known[3] == ""          # 마감을 알면 회차는 키에서 빠진다
+        assert unknown[3] == "9차"
