@@ -671,7 +671,7 @@ class TestComposer:
 
     @pytest.mark.parametrize("group", [
         "설명회 장소 서울", "설명회 장소: 서울", "서울 개최", "개최 장소 대전",
-        "서울에서", "서울 회장", "서울 행사장",
+        "서울에서 개최", "서울에서 진행", "서울 회장", "서울 행사장",
     ])
     def test_venue_group_without_colon_is_not_a_region(self, group):
         """콜론이 없어도 장소 문맥이면 자격 지역이 아니다 (사이클 11 #5)."""
@@ -696,6 +696,11 @@ class TestComposer:
         # `장` 이 자격 조건에 든 괄호는 장소가 아니다
         assert infer_region("[경기 사업장 보유 기업] 사회적기업 지원사업 모집") == "경기"
         assert infer_region("[강원 교육장 운영 기업] 지원사업 모집") == "강원"
+        # 사이클 13 #4: `에서` 는 **장소 동사가 따를 때만** 장소 신호다
+        assert infer_region("[경기에서 사업하는 기업] 사회적기업 지원사업 모집") == "경기"
+        assert infer_region("[강원에서 창업한 기업] 지원사업 모집") == "강원"
+        assert infer_region("[서울에서 개최] 지원사업 모집") is None
+        assert infer_region("[서울에서 진행되는 설명회] 지원사업 모집") is None
 
     def test_merge_title_key_is_conservative(self):
         """병합 키는 공백·구두점만 지운다 (괄호·날짜·회차 전부 보존 — #1)."""

@@ -700,6 +700,15 @@ def test_send_digest_refuses_check_without_hash(tmp_path, monkeypatch):
     assert _send(md) == 2
 
 
+_BIND_SOURCE = "kofpi"
+
+
+def _classify_for_bind(title):
+    """(대상 태그, 지역) — checker 가 DB 에서 재계산하는 것과 같은 입력·같은 함수."""
+    classification = composer_mod.classify_item(title, "", _BIND_SOURCE)
+    return classification.tags, classification.region
+
+
 def _bind(markdown_path):
     """md 의 항목 블록에서 **항목 정본 파일과 DB** 를 만든다 (사이클 8 #1 픽스처).
 
@@ -714,7 +723,7 @@ def _bind(markdown_path):
     conn.execute(
         "CREATE TABLE IF NOT EXISTS announcements "
         "(id INTEGER PRIMARY KEY, url TEXT, period_start TEXT,"
-        " period_end TEXT, title TEXT)"
+        " period_end TEXT, title TEXT, summary TEXT, source TEXT)"
     )
     entries = []
     block_lines = {
@@ -739,18 +748,25 @@ def _bind(markdown_path):
             "origin_line": lines[2],
             "period_start": "2026-09-08",
             "period_end": "2026-12-31",
+            # 사이클 13 #2: 표시 근거 — DB 행에서 재계산한 값과 같아야 한다
+            "org": composer_mod.source_display_name(_BIND_SOURCE),
+            "target": composer_mod.target_display(
+                *_classify_for_bind(block["fields"]["title"])
+            ),
+            "region": _classify_for_bind(block["fields"]["title"])[1] or "",
         })
         conn.execute(
             "INSERT OR REPLACE INTO announcements"
-            " (id, url, period_start, period_end, title)"
-            " VALUES (?, ?, ?, ?, ?)",
+            " (id, url, period_start, period_end, title, summary, source)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?)",
             (item_id, block["url"], "2026-09-08", "2026-12-31",
-             block["fields"]["title"]),
+             block["fields"]["title"], "", _BIND_SOURCE),
         )
     conn.commit()
     conn.close()
     composer_mod.write_items_manifest(markdown_path, {
         "week": "2026-W37",
+        "schema_version": composer_mod.ITEMS_SCHEMA_VERSION,
         "markdown_sha256": markdown_sha256(markdown_path.read_bytes()),
         "items": entries,
     })
@@ -2380,6 +2396,9 @@ def _forged_entry():
         "origin_line": "  [원문](https://example.com/live)",
         "period_start": "2026-09-08",
         "period_end": "2026-12-31",
+        "org": "한국임업진흥원",
+        "target": "",
+        "region": "",
     }
 
 
@@ -2387,6 +2406,7 @@ def _write_manifest(markdown_path, entries, week="2026-W37", sha=None):
     """손으로 만든 정본 파일 (결속 실패 경로를 재현하기 위한 픽스처)."""
     composer_mod.write_items_manifest(markdown_path, {
         "week": week,
+        "schema_version": composer_mod.ITEMS_SCHEMA_VERSION,
         "markdown_sha256": (
             sha if sha is not None
             else markdown_sha256(Path(markdown_path).read_bytes())
@@ -2402,13 +2422,13 @@ def _db_with(tmp_path, rows):
     conn.execute(
         "CREATE TABLE IF NOT EXISTS announcements "
         "(id INTEGER PRIMARY KEY, url TEXT, period_start TEXT,"
-        " period_end TEXT, title TEXT)"
+        " period_end TEXT, title TEXT, summary TEXT, source TEXT)"
     )
     for item_id, url in rows:
         conn.execute(
             "INSERT OR REPLACE INTO announcements"
-            " (id, url, period_start, period_end, title)"
-            " VALUES (?, ?, '2026-09-08', '2026-12-31', '')",
+            " (id, url, period_start, period_end, title, summary, source)"
+            " VALUES (?, ?, '2026-09-08', '2026-12-31', '', '', 'kofpi')",
             (item_id, url),
         )
     conn.commit()
@@ -3026,7 +3046,8 @@ def test_leading_venue_bracket_is_not_a_region():
         "[설명회 장소: 서울] 사회적기업 지원사업 모집",
         "사회적기업 지원사업 모집 [설명회 장소: 서울]",
         "[개최 장소: 대전] 사회적기업 지원사업 모집",
-        "[서울에서] 사회적기업 지원사업 모집",
+        # 사이클 13 #4: `에서` 단독은 장소가 아니다 — 장소 동사가 따라야 한다
+        "[서울에서 개최] 사회적기업 지원사업 모집",
     ):
         assert infer_region(title) is None, title
     # 자격 지역은 여전히 잡는다
@@ -3384,3 +3405,177 @@ def test_split_url_still_fails_with_token_rule(tmp_path, monkeypatch):
     assert result["kakao_problems"], result["kakao_problems"]
     assert any("분절" in problem for problem in result["kakao_problems"])
     assert result["pass"] is False
+
+
+# ══ 사이클 13: 정본 스키마 버전 · DB 재계산 · 출현별 URL · 미리보기 ══════
+def test_previous_schema_version_manifest_fails(tmp_path, monkeypatch):
+    """렌더 규칙이 바뀌기 전 버전의 정본은 재조립을 요구한다 (사이클 13 #1).
+
+    Codex 9차 HIGH #1 재현: `fe7f365` 에서 조립한 정본(필수 필드는 모두 있음)을
+    최신 코드로 재검토하면 통과했다 — 그 사이 마감 근거 규칙이 바뀌었는데도.
+    필드의 **존재**가 아니라 **규칙 버전**이 정본의 유효기간을 정한다.
+    """
+    _alive(monkeypatch)
+    md = tmp_path / "2026-W37.md"
+    md.write_text(SAMPLE_MD, encoding="utf-8")
+    db = _bind(md)
+    manifest = composer_mod.load_items_manifest(md)
+    assert manifest["schema_version"] == composer_mod.ITEMS_SCHEMA_VERSION
+
+    manifest["schema_version"] = composer_mod.ITEMS_SCHEMA_VERSION - 1
+    composer_mod.write_items_manifest(md, manifest)
+    result = check_digest(db_path=str(db), markdown_path=md, output_path=None)
+    assert result["pass"] is False
+    assert "정본 구버전 — 재조립 필요" in " ".join(result["manifest_problems"])
+
+
+def test_manifest_without_schema_version_fails(tmp_path, monkeypatch):
+    """버전 키가 아예 없는 예전 정본도 구버전이다 (사이클 13 #1)."""
+    _alive(monkeypatch)
+    md = tmp_path / "2026-W37.md"
+    md.write_text(SAMPLE_MD, encoding="utf-8")
+    db = _bind(md)
+    manifest = composer_mod.load_items_manifest(md)
+    manifest.pop("schema_version")
+    composer_mod.write_items_manifest(md, manifest)
+    result = check_digest(db_path=str(db), markdown_path=md, output_path=None)
+    assert result["pass"] is False
+    assert "정본 구버전 — 재조립 필요" in " ".join(result["manifest_problems"])
+
+
+def test_db_summary_change_requires_recompose(tmp_path, monkeypatch):
+    """대상 태그의 근거가 바뀌면 정본은 무효다 (사이클 13 #2).
+
+    Codex 9차 MEDIUM #4 재현: summary 만 고쳐 새 조립의 대상이 달라졌는데도
+    재검토는 예전 대상을 그대로 pass 했다. 항목 줄 렌더 동일성 검사의 입력은
+    정본이 아니라 **DB 에서 재계산한 값**이어야 한다.
+    """
+    _alive(monkeypatch)
+    md = tmp_path / "2026-W37.md"
+    md.write_text(SAMPLE_MD, encoding="utf-8")
+    db = _bind(md)
+    assert check_digest(
+        db_path=str(db), markdown_path=md, output_path=None
+    )["pass"] is True
+
+    conn = sqlite3.connect(db)
+    conn.execute(
+        "UPDATE announcements SET summary = ? WHERE id = 11", ("협동조합 대상",)
+    )
+    conn.commit()
+    conn.close()
+    result = check_digest(db_path=str(db), markdown_path=md, output_path=None)
+    assert result["pass"] is False
+    joined = " ".join(result["manifest_problems"])
+    assert "DB 대상 변경" in joined and "재조립 필요" in joined
+    assert "협동조합" in joined
+
+
+def test_manifest_region_must_match_the_db_recomputation(tmp_path, monkeypatch):
+    """정본이 적어 둔 지역도 DB 재계산과 같아야 한다 (사이클 13 #2)."""
+    _alive(monkeypatch)
+    md = tmp_path / "2026-W37.md"
+    md.write_text(SAMPLE_MD, encoding="utf-8")
+    db = _bind(md)
+    manifest = composer_mod.load_items_manifest(md)
+    manifest["items"][0]["region"] = "경기"        # DB 제목에는 지역이 없다
+    composer_mod.write_items_manifest(md, manifest)
+    result = check_digest(db_path=str(db), markdown_path=md, output_path=None)
+    assert result["pass"] is False
+    assert "DB 지역 변경" in " ".join(result["manifest_problems"])
+
+
+OCCUR_URL = "https://example.com/occur/" + "o" * 4100
+
+
+def _replace_only_the_first(text, limit=None):
+    """첫 출현만 치환하는 가짜 치환기 — 집합 비교의 맹점을 그대로 만든다."""
+    index = text.find(OCCUR_URL)
+    if index < 0:
+        return text, []
+    replaced = (
+        text[:index]
+        + composer_mod.URL_TOO_LONG_NOTICE
+        + text[index + len(OCCUR_URL):]
+    )
+    return replaced, [OCCUR_URL]
+
+
+def test_url_occurrences_are_counted_not_deduped(tmp_path, monkeypatch):
+    """같은 URL 이 두 번 나오면 두 번 다 확인한다 (사이클 13 #3).
+
+    Codex 9차 MEDIUM #2 재현: 첫 출현이 치환 로그를 만족시키면 두 번째 출현이
+    조각 경계에서 잘려도 집합 비교가 통과했다(온전한 출현 2→1). 이제 출현 수를
+    센다 — `치환된 수 + 온전히 남은 수 == 원본 출현 수` 여야 한다.
+    """
+    _alive(monkeypatch)
+    monkeypatch.setattr(
+        "alert.digest.composer.fit_prose_urls", _replace_only_the_first
+    )
+    body = SAMPLE_MD.replace(
+        "· (면담·건의·수렴 현황 — 이번 주 기록 없음)",
+        f"· 첫 출현 {OCCUR_URL} 입니다\n· 둘째 출현 {OCCUR_URL} 입니다",
+    )
+    problems = composer_mod.markdown_kakao_problems(body)
+    assert any("URL 출현 불일치(2→1)" in problem for problem in problems), problems
+
+    md = tmp_path / "2026-W37.md"
+    md.write_text(body, encoding="utf-8")
+    db = _bind(md)
+    result = check_digest(db_path=str(db), markdown_path=md, output_path=None)
+    assert result["pass"] is False
+    assert any(
+        "출현 불일치" in problem for problem in result["kakao_problems"]
+    ), result["kakao_problems"]
+
+
+DOT_URL = "https://example.com/dot/" + "d" * 4200
+
+
+def test_trailing_dot_bare_url_substitution_passes(tmp_path, monkeypatch):
+    """끝 구두점이 붙은 4,200자 베어 URL 의 정상 치환은 pass 다 (사이클 13 #3).
+
+    Codex 9차 MEDIUM #2 후단 재현: `<URL>.` 의 마침표까지 URL 로 세면 치환 로그와
+    원본 토큰이 어긋나 **정상 치환이 유실로 오판**됐다.
+    """
+    _alive(monkeypatch)
+    body = SAMPLE_MD.replace(
+        "· (면담·건의·수렴 현황 — 이번 주 기록 없음)",
+        f"· 자세한 내용은 {DOT_URL}. 참고하세요",
+    )
+    assert composer_mod.markdown_kakao_problems(body) == []
+    kakao = composer_mod.kakao_file_text_from_markdown(body)
+    assert DOT_URL not in kakao
+    assert composer_mod.URL_TOO_LONG_NOTICE in kakao
+
+    md = tmp_path / "2026-W37.md"
+    md.write_text(body, encoding="utf-8")
+    db = _bind(md)
+    result = check_digest(db_path=str(db), markdown_path=md, output_path=None)
+    assert result["kakao_problems"] == []
+    assert result["pass"] is True, result["reason"]
+
+
+def test_preview_keeps_prose_headings(tmp_path):
+    """해설·회원사 소식의 `# `·`## ` 줄은 미리보기에도 남는다 (사이클 13 #5).
+
+    Codex 9차 MEDIUM #5 재현: 협의회 섹션에 `# 이번 지원은 경기 소재 기업만…` 을
+    넣으면 카톡에는 실리는데 미리보기에는 없었다 — 승인한 화면과 발송물이 다르다.
+    생략 대상은 **문서 제목 하나**뿐이다.
+    """
+    text = "이번 지원은 경기 소재 기업만 신청 가능합니다"
+    sub = "참고 자료"
+    body = SAMPLE_MD.replace(
+        "· (면담·건의·수렴 현황 — 이번 주 기록 없음)",
+        f"# {text}\n## {sub}\n· 면담 2건",
+    )
+    rendered = preview_mod.render_preview("2026-W37", body, PASS_CHECK)
+    kakao = composer_mod.kakao_file_text_from_markdown(body)
+
+    # 카톡과 같은 텍스트 — 둘 다 `#` 표기만 걷어낸다
+    assert text in kakao
+    assert text in rendered
+    assert rendered.count(text) == 1
+    assert f"■ {sub}" in rendered              # 섹션 제목 표기는 종전대로
+    # 문서 제목 **하나만** 생략된다 (미리보기 자체 머리글 뒤에는 없다)
+    assert "협의회 주간 정책브리핑 2026-W37 (9/7~9/13)" not in rendered.split("\n", 1)[1]

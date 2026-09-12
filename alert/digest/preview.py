@@ -212,6 +212,7 @@ def render_preview(
     # 항목 번호는 블록 파서가 정한 순서로만 붙인다 (문자열 일치 추측 금지 —
     # 제목이 우연히 같은 두 항목이 있으면 추측이 엉뚱한 번호를 붙인다).
     document = blocks_mod.parse_blocks(markdown_text, item_sections)
+    skipped_title = False
     numbers: Dict[int, int] = {}
     for index, block in enumerate(document):
         if block["kind"] == "item":
@@ -240,8 +241,15 @@ def render_preview(
             line = raw.strip()
             if _HOLD_RE.match(line) or _LANE_RE.match(line):
                 continue
+            # 사이클 13 #5: 생략하는 `# ` 는 **문서 제목 하나**뿐이다. 해설·회원사
+            # 소식에 사람이 쓴 `# ` 줄은 카톡에는 실리고 미리보기에서만 사라져,
+            # 편집자가 보지 못한 문장이 메일로 나갔다(승인 게이트가 거짓이 된다).
+            if block["kind"] == "head" and line.startswith("# ") and not skipped_title:
+                skipped_title = True
+                continue
             if line.startswith("# "):
-                # 제목은 미리보기 머리에 이미 있다
+                # 카톡과 같은 텍스트로 — 카톡 렌더도 `#` 표기만 걷어낸다
+                lines.append(line[2:].strip())
                 continue
             if line.startswith("## "):
                 lines.append(f"■ {line[3:].strip()}")

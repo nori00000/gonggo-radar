@@ -264,14 +264,22 @@ def _mask_link_targets(line: str) -> str:
     return masked
 
 
-def body_urls(markdown_text: str) -> List[str]:
-    """본문에 실린 **모든** URL — 마크다운 링크 + 맨몸 URL (중복 제거, 문서 순서).
+def body_urls(markdown_text: str, unique: bool = True) -> List[str]:
+    """본문에 실린 **모든** URL — 마크다운 링크 + 맨몸 URL (문서 순서).
 
     죽은 링크 검사·조각 온전성 검사가 공유하는 정본 목록이다.
+    `unique=False` 면 **출현마다** 담는다 (사이클 13 #3: 같은 URL 이 여러 번 나올 때
+    일부 출현만 잘린 것을 수로 잡아내기 위해).
     """
+    found = [
+        url for url in body_link_urls(markdown_text) + bare_urls(markdown_text)
+        if url
+    ]
+    if not unique:
+        return found
     seen = []
-    for url in body_link_urls(markdown_text) + bare_urls(markdown_text):
-        if url and url not in seen:
+    for url in found:
+        if url not in seen:
             seen.append(url)
     return seen
 

@@ -31,11 +31,14 @@ from alert.digest import sections as sections_mod
 from alert.digest.composer import (
     HEADING_TO_SECTION,
     ITEMS_JSON_SUFFIX,
+    ITEMS_SCHEMA_VERSION,
+    classify_item,
     fit_prose_urls,
     load_items_manifest,
     markdown_kakao_problems,
     parse_deadline,
     sanitize_title,
+    target_display,
 )
 
 
@@ -77,7 +80,15 @@ def manifest_problems(
     if manifest is None:
         return [f"항목 정본 파일 없음 (<주차>{ITEMS_JSON_SUFFIX}) — 재조립 필요"]
 
-    problems: List[str] = _schema_problems(manifest)
+    problems: List[str] = []
+    # 사이클 13 #1: 렌더 규칙 버전이 다르면 **필드가 다 있어도** 옛 규칙으로 렌더된
+    # 본문이다 — 근거가 정본 밖에 있던 시절의 산출물을 통과시키지 않는다.
+    if manifest.get("schema_version") != ITEMS_SCHEMA_VERSION:
+        problems.append(
+            "정본 구버전 — 재조립 필요 (schema_version "
+            f"{manifest.get('schema_version')!r} ≠ {ITEMS_SCHEMA_VERSION})"
+        )
+    problems.extend(_schema_problems(manifest))
     recorded_hash = manifest.get("markdown_sha256")
     if not recorded_hash:
         problems.append("정본에 markdown_sha256 이 없음 — 재조립 필요")
@@ -165,14 +176,18 @@ def manifest_problems(
 REQUIRED_ENTRY_FIELDS = (
     "id", "url", "title", "section",
     "line", "origin_line", "period_start", "period_end", "deadline_label",
+    "org", "target", "region",
 )
 LEGACY_MANIFEST_FIELDS = (
     "line", "origin_line", "period_start", "period_end", "deadline_label",
+    "org", "target", "region",
 )
 # 값이 비어 있어도 되는 필드 — **키의 존재**만 요구한다.
 # `deadline_label` 은 알아두세요 항목에서 빈 문자열이 정상이고(라벨을 렌더하지
 # 않는다), DB 기간은 NULL 인 소스가 실제로 있다(seis·coop: period_start NULL).
-OPTIONAL_VALUE_FIELDS = ("period_start", "period_end", "deadline_label")
+OPTIONAL_VALUE_FIELDS = (
+    "period_start", "period_end", "deadline_label", "target", "region",
+)
 
 
 def _schema_problems(manifest: Dict) -> List[str]:
@@ -210,6 +225,33 @@ def _schema_problems(manifest: Dict) -> List[str]:
     return problems
 
 
+def _classification_problems(item_id: str, entry: Dict, row) -> List[str]:
+    """대상 태그·지역을 DB 행에서 재계산해 정본과 대조 (사이클 13 #2).
+
+    정본에 적힌 값을 그대로 믿으면, DB 의 summary 를 고쳐 대상이 바뀌어도 재검토가
+    통과한다(Codex 9차 MEDIUM #4). 근거는 언제나 DB 이고 정본은 그 사본일 뿐이다.
+    """
+    problems: List[str] = []
+    try:
+        classification = classify_item(row[1] or "", row[4] or "", row[5] or "")
+    except Exception as exc:      # noqa: BLE001 — 분류 실패는 fail-closed
+        return [f"id={item_id} 분류 재계산 실패: {exc}"]
+
+    expected_region = classification.region or ""
+    if (entry.get("region") or "") != expected_region:
+        problems.append(
+            f"id={item_id} DB 지역 변경: {expected_region!r} "
+            f"≠ 정본 {entry.get('region')!r} — 재조립 필요"
+        )
+    expected_target = target_display(classification.tags, classification.region)
+    if (entry.get("target") or "") != expected_target:
+        problems.append(
+            f"id={item_id} DB 대상 변경: {expected_target!r} "
+            f"≠ 정본 {entry.get('target')!r} — 재조립 필요"
+        )
+    return problems
+
+
 def _db_problems(entries: Dict[str, Dict], db_path: str) -> List[str]:
     """정본의 (id, url, 제목) 이 DB 와 맞는지 (사이클 8 #1 + 사이클 9 #3).
 
@@ -225,8 +267,8 @@ def _db_problems(entries: Dict[str, Dict], db_path: str) -> List[str]:
         try:
             for item_id, entry in entries.items():
                 row = conn.execute(
-                    "SELECT url, title, period_start, period_end"
-                    " FROM announcements WHERE id = ? LIMIT 1",
+                    "SELECT url, title, period_start, period_end,"
+                    " summary, source FROM announcements WHERE id = ? LIMIT 1",
                     (item_id,),
                 ).fetchone()
                 if row is None:
@@ -246,6 +288,9 @@ def _db_problems(entries: Dict[str, Dict], db_path: str) -> List[str]:
                 # 렌더된 마감 표기가 더 이상 근거와 맞지 않으므로 재조립을 요구한다.
                 # period_start 도 본다: 게시일이 바뀌면 유효 마감(마감 경과 판정)이
                 # 달라지는데, period_end 만 보면 그것을 놓친다.
+                # 사이클 13 #2: 표시 근거를 **DB 에서 다시 계산**해 대조한다 —
+                # summary 만 고쳐 대상 태그를 바꾸던 경로가 여기서 막힌다.
+                problems.extend(_classification_problems(item_id, entry, row))
                 for column, field, label in (
                     (2, "period_start", "게시일"),
                     (3, "period_end", "마감"),

@@ -364,8 +364,14 @@ _PREFIX_BRACKET_RE = re.compile(
     r"^\s*[(\[（【［]([^()\[\]（）【】［］]*)[)\]）】］]"
 )
 # 행사 장소 문맥 — 자격 지역이 아니다 (개정 v2.6 (2)).
+# 사이클 13 #4: `에서` 는 **장소 동사가 따를 때만** 장소 신호다.
+# `[경기에서 사업하는 기업]` 은 자격 조건이지 행사 장소가 아니다 —
+# 토큰 존재만으로 괄호를 버리면 자격 지역이 사라진다(대상이 넓어져 오배포).
+_VENUE_VERBS = r"개최|진행|열린|열립|열리|실시"
 _VENUE_CONTEXT_RE = re.compile(
-    r"(?:개최\s*)?장소\s*[:：][^)\]]*|[가-힣]{2,5}에서|개최지\s*[:：][^)\]]*"
+    r"(?:개최\s*)?장소\s*[:：][^)\]]*"
+    r"|[가-힣]{2,5}에서\s*[^)\]]{0,10}?(?:" + _VENUE_VERBS + r")"
+    r"|개최지\s*[:：][^)\]]*"
 )
 # 콜론 없는 장소 문맥 (사이클 11 #5). `[설명회 장소 서울]`·`[서울 개최]` 처럼
 # 구분 기호가 없어도 행사 장소는 자격 지역이 아니다. **괄호 그룹 안에서만** 본다.
@@ -373,7 +379,9 @@ _VENUE_CONTEXT_RE = re.compile(
 # 사이클 12 #6: 단독 `장` 을 뺐다. `[경기 사업장 보유 기업]` 처럼 **자격 조건**에
 # 들어간 `장` 을 장소 신호로 읽어 지역 제한이 사라졌다 — 자격 지역을 잃는 것은
 # 행사 장소를 지역으로 오인하는 것보다 나쁘다(대상이 넓어져 오배포가 된다).
-_VENUE_TOKEN_RE = re.compile(r"장소|개최|에서|회장|행사장")
+_VENUE_TOKEN_RE = re.compile(
+    r"장소|개최|회장|행사장|에서\s*[^)\]]{0,10}?(?:" + _VENUE_VERBS + r")"
+)
 # 괄호 내용을 지우고 남은 알맹이가 이보다 짧으면 부호만 지우는 쪽으로 되돌린다.
 _MIN_DEDUP_KEY_CHARS = 8
 _DATE_TOKEN_RE = re.compile(
@@ -576,14 +584,22 @@ def strip_brackets(text: str) -> str:
 
 
 _REGION_SUFFIXES = ("센터", "권역", "광역", "특별", "지역", "도", "시", "권")
+# 처소격 조사 — `경기에서 사업하는 기업`의 `경기`는 지역이다 (사이클 13 #4).
+# `에`는 뒤가 음절로 이어지면(`에너지`) 낱말의 일부이므로 경계로 치지 않는다.
+_REGION_PARTICLES = ("에서", "에는", "에도", "에만")
+
+
+def _is_hangul_syllable(char: str) -> bool:
+    return bool(char) and "가" <= char <= "힣"
 
 
 def _region_boundary_ok(text: str, pattern: str, pos: int) -> bool:
-    """지역 토큰 경계 규칙 (개정 v2.6 (4)).
+    """지역 토큰 경계 규칙 (개정 v2.6 (4) + 사이클 13 #4).
 
     `경기침체`·`대구목재`처럼 다른 낱말에 묻힌 토큰은 지역으로 인정하지 않는다.
     허용: 문자열 끝 / 공백 / 구두점 / {센터·도·시·권·권역·지역·광역·특별} /
-    바로 다음에 또 다른 지역·권역 토큰(센터명 연쇄: `세종대전충청센터`).
+    처소격 조사(`에서`·`에`) / 바로 다음에 또 다른 지역·권역 토큰
+    (센터명 연쇄: `세종대전충청센터`).
     """
     rest = text[pos + len(pattern):]
     if not rest:
@@ -594,6 +610,10 @@ def _region_boundary_ok(text: str, pattern: str, pos: int) -> bool:
     if not (head.isalnum() or "가" <= head <= "힣"):
         return True
     if any(rest.startswith(suffix) for suffix in _REGION_SUFFIXES):
+        return True
+    if any(rest.startswith(particle) for particle in _REGION_PARTICLES):
+        return True
+    if rest.startswith("에") and not _is_hangul_syllable(rest[1:2]):
         return True
     if any(rest.startswith(other) for other, _ in REGION_PATTERNS):
         return True
@@ -1575,6 +1595,20 @@ def item_line(item: Dict) -> str:
 
 ITEMS_JSON_SUFFIX = ".items.json"
 
+# 항목 정본의 **렌더 규칙 버전** (사이클 13 #1).
+#
+# 규칙: 항목 줄·원문 줄의 렌더 방식이나 정본이 담는 근거가 바뀌면 **반드시 +1** 한다.
+# checker 는 이 상수와 다른 정본을 `정본 구버전 — 재조립 필요` 로 막는다.
+# 필드가 다 있어도 **옛 규칙으로 렌더된** 본문은 통과시키면 안 되기 때문이다 —
+# 사이클 12 이전 정본은 summary·raw_data 에서 유도한 마감을 담고 있었고, 그 근거는
+# 정본 밖에 있어 DB 대조로 잡을 수 없다(Codex 9차 HIGH #1).
+#
+#   1 = 사이클 13 현재 규칙
+#       · 마감 표기는 DB period_end 에서만 (사이클 12 #3)
+#       · 항목 줄·원문 줄을 정본에 그대로 담고 문자열 동일성 검사 (사이클 10 #2)
+#       · 대상·지역·기관을 DB 에서 재계산해 대조 (사이클 13 #2)
+ITEMS_SCHEMA_VERSION = 1
+
 
 def items_json_path(markdown_path) -> Path:
     """발송본 마크다운 경로 → 항목 정본 파일 경로."""
@@ -1594,6 +1628,7 @@ def items_manifest(data: Dict, markdown_bytes: bytes = b"") -> Dict:
     """
     return {
         "week": data["week"],
+        "schema_version": ITEMS_SCHEMA_VERSION,
         "markdown_sha256": hashlib.sha256(markdown_bytes).hexdigest(),
         "items": [
             {
@@ -1612,6 +1647,12 @@ def items_manifest(data: Dict, markdown_bytes: bytes = b"") -> Dict:
                 # 달라지는데, period_end 만 보면 그것을 놓친다 (사이클 11 #2).
                 "period_start": item.get("period_start") or "",
                 "period_end": item.get("period_end") or "",
+                # 사이클 13 #2: 표시 근거도 담는다. checker 가 DB 행(제목·summary·
+                # source)에서 **재계산한 값**과 대조하므로, DB 가 바뀌면 정본이 낡았음이
+                # 드러난다 — summary 만 고쳐 대상 태그를 바꾸던 경로가 닫힌다.
+                "org": item.get("org") or "",
+                "target": item.get("target") or "",
+                "region": item.get("region") or "",
             }
             for section in ITEM_SECTIONS
             for item in (data["sections"].get(section) or [])
@@ -1822,13 +1863,14 @@ def fit_prose_urls(text: str, limit: int = KAKAO_CHUNK_LIMIT) -> Tuple[str, List
         # ① 마크다운 링크부터 (긴 것 먼저). **매번 다시 스캔**한다 — 한 번 치환하면
         # 나머지 링크의 좌표가 밀려서, 옛 좌표로 자른 두 번째 링크는 실제로 남는데
         # "치환 완료" 로 기록됐다(사이클 10 #4).
+        # 기록은 **출현마다** 남긴다 (사이클 13 #3: 같은 URL 이 여러 번 나오면
+        # 그중 몇 번을 치환했는지가 판정에 필요하다).
         while len(line) > limit:
             links = blocks_mod.find_links(line)
             if not links:
                 break
             link = max(links, key=lambda found: len(found.url))
-            if link.url not in replaced:
-                replaced.append(link.url)
+            replaced.append(link.url)
             line = line[:link.start] + URL_TOO_LONG_NOTICE + line[link.end:]
 
         # ② 맨몸 URL 토큰 (`· https://…`) — 글머리·들여쓰기는 보존한다
@@ -1841,8 +1883,11 @@ def fit_prose_urls(text: str, limit: int = KAKAO_CHUNK_LIMIT) -> Tuple[str, List
             if not candidates:
                 break
             index = max(candidates, key=lambda i: len(tokens[i]))
-            if tokens[index] not in replaced:
-                replaced.append(tokens[index])
+            # 사이클 13 #3: 기록은 **본문 URL 추출기와 같은 형태**로 남긴다.
+            # 토큰에는 끝 구두점(`…/x.`)이 붙어 있을 수 있는데, 그대로 기록하면
+            # 출현 대조에서 원본 URL 과 다른 문자열이 되어 정상 치환이 유실로 잡힌다.
+            canonical = blocks_mod.bare_urls(tokens[index])
+            replaced.append(canonical[0] if canonical else tokens[index])
             tokens[index] = URL_TOO_LONG_NOTICE
             line = " ".join(tokens)
         lines.append(line)
@@ -1873,22 +1918,25 @@ def markdown_kakao_problems(markdown_text: str) -> List[str]:
         if len(chunk) > KAKAO_CHUNK_LIMIT
     ]
     joined = "\n".join(chunks)
-    # 사이클 12 #5: 판정을 **토큰 경계**로 한다 — 부분 문자열 비교를 쓰지 않는다.
+    # 사이클 12 #5 + 13 #3: 판정은 **토큰 경계 + 출현 수**다 (부분 문자열 비교 금지).
     #   ① 결과물의 URL 토큰이 원본에 없으면 그것이 **분절 조각**이다
-    #      (같은 URL 의 일부 출현만 잘린 경우도 이 규칙이 잡는다)
-    #   ② 원본 URL 은 온전히 실렸거나 치환됐어야 한다
-    # 접두를 공유하는 정상 URL 이 조각으로 오판되던 문제(앞 60자 비교)도 사라진다.
+    #   ② 각 URL 의 `결과물 출현 수 + 치환 수` 가 원본 출현 수와 같아야 한다
+    # 집합 비교만 하면 같은 URL 의 **일부 출현**이 잘려도 다른 출현이 그것을 가린다
+    # (Codex 9차 MEDIUM #2). 치환 기록은 출현마다 남으므로 수를 맞출 수 있다.
     _, replaced = fit_prose_urls(markdown_text)
-    replaced_urls = set(replaced)
-    source_urls = set(blocks_mod.body_urls(markdown_text))
-    rendered_urls = set(blocks_mod.body_urls(joined))
+    replaced_counts = Counter(replaced)
+    source_counts = Counter(blocks_mod.body_urls(markdown_text, unique=False))
+    rendered_counts = Counter(blocks_mod.body_urls(joined, unique=False))
 
-    for token in sorted(rendered_urls - source_urls):
+    for token in sorted(set(rendered_counts) - set(source_counts)):
         problems.append(f"URL 분절: {token[:48]}…")
-    for url in sorted(source_urls):
-        if url in rendered_urls or url in replaced_urls:
+    for url in sorted(source_counts):
+        accounted = rendered_counts[url] + replaced_counts[url]
+        if accounted == source_counts[url]:
             continue
-        problems.append(f"URL 유실: {url[:48]}…")
+        problems.append(
+            f"URL 출현 불일치({source_counts[url]}→{accounted}): {url[:40]}…"
+        )
     return problems
 
 
