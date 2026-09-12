@@ -11,7 +11,7 @@
 - **상한**: 지원사업 공고 ≤5건, 산림 정책 동향 ≤3건, 사회연대경제 동향 ≤3건 (섹션별 상한, 전역 상한 없음). 제목 정규화 기준 중복 제거 후 상한 적용.
 - **주간 창**: `--week`의 월~일 양끝 포함(`week_start <= DATE(created_at) <= week_end`).
 - **fail-closed 정의**: check.json 부재·손상·`pass=false`·항목 0건·`network_checked=false`·마크다운 SHA-256 부재 또는 불일치 중 하나라도 해당하면 발송 거부 exit 2. `--skip-check` 옵션 금지. `--dry-run`과 `--send` 동시 지정 시 dry-run 우선(발송 안 함).
-- **check.json 필드**: `{"items":[...], "pass":bool, "network_checked":bool, "reason":str, "markdown_sha256":str}`. `markdown_sha256`은 검사한 UTF-8 마크다운 원문 SHA-256이며, 발송 시 현재 원문과 다르면 거부한다.
+- **check.json 필드**: `{"items":[...], "pass":bool, "network_checked":bool, "reason":str, "markdown_sha256":str}`. `markdown_sha256`은 검사한 Markdown 원본 바이트 SHA-256이며, 발송 시 현재 바이트와 다르면 거부한다.
 - **렌더**: 마감일 없으면 `**마감:** 미정`, 요약 없으면 `*(요약 없음)*` 명시. 요약은 최대 3줄. 제목은 공백 정규화(개행·탭 제거). HTML 변환 시 모든 텍스트 `html.escape`, href는 http/https만 허용.
 - **폼 CSV**: `utf-8-sig`. `유형=동정`만 회원사 동정 섹션에. `유형=의견` 행은 `digests/YYYY-Www.opinions.md`에 별도 저장(상민 해설 입력용, 브리핑 본문에 넣지 않음). 로드 실패는 stderr + check.json `reason`에 기록.
 - **발송**: `alert/notifiers/email_sender.py`의 기존 SMTP 경로를 반드시 재사용, 수신자 전체에 발송. 

@@ -9,9 +9,9 @@ from typing import Dict, List, Optional
 import requests
 
 
-def markdown_sha256(markdown_text: str) -> str:
-    """Return the SHA-256 digest that binds a check result to its source text."""
-    return hashlib.sha256(markdown_text.encode("utf-8")).hexdigest()
+def markdown_sha256(markdown_bytes: bytes) -> str:
+    """Return the SHA-256 digest that binds a check result to source bytes."""
+    return hashlib.sha256(markdown_bytes).hexdigest()
 
 
 def parse_period_end(period_end_str: Optional[str]) -> bool:
@@ -146,10 +146,10 @@ def check_digest(
         write_check_result(output_path, result)
         return result
 
-    # 마크다운에서 URL 추출
-    with open(markdown_path, "r", encoding="utf-8") as f:
-        markdown_text = f.read()
-    content_hash = markdown_sha256(markdown_text)
+    # Markdown text and its binding hash must derive from the same source bytes.
+    markdown_bytes = markdown_path.read_bytes()
+    markdown_text = markdown_bytes.decode("utf-8")
+    content_hash = markdown_sha256(markdown_bytes)
 
     # [텍스트](URL) 형식에서 URL 추출
     url_pattern = r'\[([^\]]+)\]\(([^)]+)\)'

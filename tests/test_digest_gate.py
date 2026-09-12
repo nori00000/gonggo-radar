@@ -221,7 +221,7 @@ def _write_digest(tmp_path, markdown_text=None, check=None):
     result = dict(check or PASS_CHECK)
     result.setdefault(
         "markdown_sha256",
-        hashlib.sha256(md.read_text(encoding="utf-8").encode("utf-8")).hexdigest(),
+        hashlib.sha256(md.read_bytes()).hexdigest(),
     )
     (tmp_path / "2026-W37.check.json").write_text(
         json.dumps(result, ensure_ascii=False), encoding="utf-8"
@@ -240,6 +240,14 @@ def test_send_gate_rejects_markdown_changed_after_check(tmp_path):
     annotated, _ = apply_commentary(SAMPLE_MD, "확정 의견")
     md = _write_digest(tmp_path, annotated)
     md.write_text(annotated + "\n사후 변경", encoding="utf-8")
+
+    assert send_digest(md, dry_run=True) == 2
+
+
+def test_send_gate_rejects_line_ending_change_after_check(tmp_path):
+    annotated, _ = apply_commentary(SAMPLE_MD, "확정 의견")
+    md = _write_digest(tmp_path, annotated)
+    md.write_bytes(annotated.replace("\n", "\r\n").encode("utf-8"))
 
     assert send_digest(md, dry_run=True) == 2
 
@@ -345,9 +353,7 @@ def test_recheck_digest_preserves_commentary(tmp_path, monkeypatch):
         (tmp_path / "2026-W37.check.json").read_text(encoding="utf-8")
     )
     assert check["pass"] is True
-    assert check["markdown_sha256"] == hashlib.sha256(
-        annotated.encode("utf-8")
-    ).hexdigest()
+    assert check["markdown_sha256"] == hashlib.sha256(md.read_bytes()).hexdigest()
     assert len(check["items"]) == 3
     assert md.read_text(encoding="utf-8") == annotated
     assert preview_mod.MARKER not in md.read_text(encoding="utf-8")
