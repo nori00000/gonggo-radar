@@ -7,6 +7,7 @@ from typing import List, Optional
 from .base import BaseCrawler
 from .date_labels import (
     classify_date,
+    posted_date,
     extract_date_and_label,
     header_labels,
     label_for,
@@ -609,6 +610,45 @@ class SeisCrawler(BaseCrawler):
             self.logger.warning(f"Failed to parse period '{period_str}': {e}")
             return None, None
 
+    # ── 허용목록 (a): 접수기간 필드 ────────────────────────────────
+    # 카드의 ``p.date`` 와 표의 접수 헤더가 **사이트 구조상** 접수기간
+    # 필드다. 그래서 seis 만 목록 단계에서 기간을 만들 수 있다.
+    PERIOD_EXTRACTOR = "_period_from_reception_field"
+
+    # 값 자체가 "접수기간 …" 으로 시작하면 그 라벨만 허용한다
+    _RECEPTION_PREFIX = re.compile(r"^\s*접수\s*기간\s*[:：]?\s*")
+    _FIRST_DIGIT = re.compile(r"\d")
+
+    def _period_from_reception_field(self, item: dict):
+        """접수기간 필드에서만 기간을 만든다. 그 밖은 ``(None, None)``.
+
+        두 겹으로 막는다:
+        1. **값의 앞머리** - 날짜 앞에 한글이 남아 있으면(``교육기간``,
+           ``행사일정`` …) 접수기간이 아니다. 카드 파서가 붙이는
+           ``date_label="접수기간"`` 은 구조 라벨이라 셀 **본문**의 라벨을
+           보지 못하므로, 본문을 따로 검사한다.
+        2. **라벨** - 공용 허용목록(``classify_date``)을 통과해야 한다.
+           표 헤더가 ``구분`` 이면 범위여도 기간이 아니다.
+        """
+        value = (item.get("date") or "").strip()
+        if not value:
+            return None, None
+
+        body = self._RECEPTION_PREFIX.sub("", value)
+        labelled_in_text = body != value
+
+        digit = self._FIRST_DIGIT.search(body)
+        if not digit:
+            return None, None
+        if re.search(r"[가-힣]", body[:digit.start()]):
+            return None, None          # 날짜 앞의 다른 라벨 = 접수기간 아님
+
+        label = "접수기간" if labelled_in_text else (
+            item.get("date_label") or ""
+        ).strip()
+        start, end, _posted = self._classify_date(body, label)
+        return start, end
+
     def _to_announcement(self, item: dict, base_url: str) -> Optional[RawAnnouncement]:
         """파싱된 공고 데이터를 RawAnnouncement로 변환한다."""
         try:
@@ -625,8 +665,10 @@ class SeisCrawler(BaseCrawler):
             author = item.get("author", "").strip()
             category = item.get("category", "").strip()
 
-            period_start, period_end, posted = self._classify_date(
-                item.get("date", ""), item.get("date_label", "")
+            period_start, period_end = self.resolve_period(item)
+            # 기간이 안 나온 날짜는 잃지 않고 게시일로 남긴다
+            posted = None if (period_start or period_end) else posted_date(
+                item.get("date", "")
             )
 
             payload = dict(item)

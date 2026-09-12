@@ -29,6 +29,13 @@ from .detail_quotes import (
 class BaseCrawler(abc.ABC):
     """All crawlers inherit from this."""
 
+    # 12차 choke point: 접수기간은 **이 이름의 메서드를 선언한 크롤러만**
+    # 만들 수 있다. 선언이 없으면 ``safe_fetch`` 가 기간을 무조건 None 으로
+    # 되돌린다 - 하위 클래스의 파서가 무엇을 계산했든 소용없다. 환각
+    # 마감은 열 번의 게이트에서 늘 "라벨을 잘못 읽었다" 로 들어왔으므로
+    # 읽기를 고치는 대신 **쓸 수 있는 소스를 선언으로 제한**한다.
+    PERIOD_EXTRACTOR: Optional[str] = None
+
     def __init__(self, source_name: str):
         self.source_name = source_name
         self.config = get_config()
@@ -353,6 +360,53 @@ class BaseCrawler(abc.ABC):
 
         announcement.raw_data = json.dumps(payload, ensure_ascii=False)
 
+    def declares_period_extractor(self) -> bool:
+        """이 크롤러가 기간 추출기를 선언했는가."""
+        name = type(self).PERIOD_EXTRACTOR
+        return bool(name) and callable(getattr(self, name, None))
+
+    def resolve_period(self, item: dict) -> Tuple[Optional[str], Optional[str]]:
+        """허용목록 소스만 기간을 만든다. 그 밖은 항상 ``(None, None)``.
+
+        하위 클래스의 ``_to_announcement`` 는 기간을 직접 계산하지 않고
+        이 메서드만 부른다.
+        """
+        if not self.declares_period_extractor():
+            return None, None
+        try:
+            result = getattr(self, type(self).PERIOD_EXTRACTOR)(item)
+        except Exception as exc:                       # noqa: BLE001
+            self.logger.error(f"기간 추출 실패: {exc}")
+            return None, None
+        if not result:
+            return None, None
+        start, end = result
+        return start or None, end or None
+
+    def _enforce_period_whitelist(
+        self, results: List[RawAnnouncement]
+    ) -> List[RawAnnouncement]:
+        """choke point - 선언 없는 소스가 만든 기간을 지운다.
+
+        ``_to_announcement`` 를 고쳐도 새 크롤러가 다시 기간을 채울 수 있다.
+        마지막 관문을 베이스에 두면 **선언하지 않은 소스는 구조적으로**
+        기간을 저장할 수 없다.
+        """
+        if self.declares_period_extractor():
+            return results
+        stripped = 0
+        for announcement in results:
+            if announcement.period_start or announcement.period_end:
+                announcement.period_start = None
+                announcement.period_end = None
+                stripped += 1
+        if stripped:
+            self.logger.warning(
+                f"{self.source_name}: PERIOD_EXTRACTOR 미선언 - "
+                f"기간 {stripped} 건을 지웠다"
+            )
+        return results
+
     def safe_fetch(self) -> List[RawAnnouncement]:
         """Wrapper that catches exceptions and logs them.
 
@@ -373,7 +427,7 @@ class BaseCrawler(abc.ABC):
             self.logger.info(
                 f"{self.source_name}: fetched {len(results)} announcements"
             )
-            return results
+            return self._enforce_period_whitelist(results)
         except Exception as e:
             self.logger.error(
                 f"{self.source_name} crawl failed: {e}",

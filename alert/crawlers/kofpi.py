@@ -196,44 +196,58 @@ class KofpiCrawler(BaseCrawler):
 
         return None
 
-    def _extract_deadline(self, title: str, posted: Optional[str]) -> Optional[str]:
-        """제목의 "(~9.30)" 형태 마감일을 ISO 날짜로 변환한다.
+    # ── 허용목록 (b): 제목 끝의 ``(~M.D)`` ────────────────────────
+    PERIOD_EXTRACTOR = "_period_from_title"
 
-        연도가 표기되지 않으므로 게시일의 연도를 기준으로 추정하며,
-        마감 월이 게시 월보다 빠르면 다음 해로 넘어간 것으로 본다.
+    # **제목 끝**에 붙은 괄호 마감 표기만 읽는다. 문장 중간의
+    # "(~9.30 접수 후 발표)" 같은 표기는 마감이 아니다.
+    _TITLE_DEADLINE_RE = re.compile(
+        r"\(\s*~\s*(?:(\d{4})\s*[.\-/]\s*)?"
+        r"(\d{1,2})\s*[.\-/]\s*(\d{1,2})\s*\.?\s*\)\s*$"
+    )
+
+    def _period_from_title(self, item: dict):
+        """제목 끝의 마감 표기만 마감으로 쓴다. 시작일은 만들지 않는다."""
+        posted = self._normalize_date(item.get("date", ""))
+        return None, self._extract_deadline(item.get("title", ""), posted)
+
+    def _extract_deadline(self, title: str, posted: Optional[str]) -> Optional[str]:
+        """**제목 끝**의 ``(~M.D)`` / ``(~YYYY.M.D)`` 만 마감으로 읽는다.
+
+        12차에서 두 가지를 좁혔다:
+        - **끝 고정**: 괄호가 제목 끝에 있어야 한다. "(~9.30 접수 후 발표)"
+          처럼 괄호 안에 다른 말이 붙으면 마감 표기가 아니다.
+        - **연도 추측 금지**: 연도가 없으면 게시 연도로 읽고, 그 결과가
+          게시일보다 **과거면 버린다**. 예전에는 "월이 더 작으면 다음 해"
+          로 추측해 존재하지 않는 마감을 만들었다.
 
         Args:
             title: 공고 제목
             posted: 게시일 (ISO 형식) 또는 None
 
         Returns:
-            ISO 형식 마감일, 추출 실패 시 None
+            ISO 형식 마감일, 읽을 수 없으면 None
         """
         if not title:
             return None
 
-        # 연도가 명시된 경우 우선 사용
-        full = re.search(r"~\s*(\d{4})[-./\s]\s*(\d{1,2})[-./\s]\s*(\d{1,2})", title)
-        if full:
-            year, month, day = full.groups()
-            return self._safe_date(int(year), int(month), int(day))
-
-        short = re.search(r"~\s*(\d{1,2})[-./]\s?(\d{1,2})", title)
-        if not short:
+        match = self._TITLE_DEADLINE_RE.search(title)
+        if not match:
             return None
 
-        month, day = int(short.group(1)), int(short.group(2))
-        if not (1 <= month <= 12 and 1 <= day <= 31):
-            return None
+        year_text, month, day = match.groups()
+        month, day = int(month), int(day)
 
-        if posted:
-            posted_year = int(posted[:4])
-            posted_month = int(posted[5:7])
-            year = posted_year + 1 if month < posted_month else posted_year
-        else:
-            return None
+        if year_text:
+            return self._safe_date(int(year_text), month, day)
 
-        return self._safe_date(year, month, day)
+        if not posted:
+            return None                      # 기준 연도가 없으면 추측 금지
+
+        deadline = self._safe_date(int(posted[:4]), month, day)
+        if not deadline or deadline < posted:
+            return None                      # 게시일보다 과거면 버린다
+        return deadline
 
     @staticmethod
     def _safe_date(year: int, month: int, day: int) -> Optional[str]:
@@ -258,7 +272,7 @@ class KofpiCrawler(BaseCrawler):
             # 목록 날짜는 게시일이므로 기간 필드에 넣지 않는다 - 예전에는
             # period_start 로 들어가 존재하지 않는 접수 시작일을 말했다.
             posted = self._normalize_date(item.get("date", ""))
-            deadline = self._extract_deadline(title, posted)
+            _start, deadline = self.resolve_period(item)
 
             payload = dict(item)
             if posted:

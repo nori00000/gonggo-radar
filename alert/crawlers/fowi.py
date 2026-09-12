@@ -5,7 +5,7 @@ import re
 from typing import List, Optional
 from .base import BaseCrawler
 from .date_labels import (
-    classify_date,
+    posted_date,
     extract_date_and_label,
     header_labels,
     label_for,
@@ -512,11 +512,11 @@ class FowiCrawler(BaseCrawler):
             author = item.get("author", "").strip()
             category = item.get("category", "").strip()
 
-            # 목록의 날짜는 라벨로 가린다 - 게시일을 기간으로 쓰지 않는다
-            # (6차 게이트 #1, 공용 규칙 alert/crawlers/date_labels.py)
-            period_start, period_end, posted = classify_date(
-                item.get("date", ""), item.get("date_label", "")
-            )
+            # 12차 choke point: 이 소스는 PERIOD_EXTRACTOR 를 선언하지
+            # 않는다 = 기간을 만들 수 없다. 목록 날짜는 게시일로만 남고
+            # 라벨 분류(classify_date)는 기간 경로에서 빠졌다.
+            period_start, period_end = self.resolve_period(item)
+            posted = posted_date(item.get("date", ""))
 
             payload = dict(item)
             if posted:

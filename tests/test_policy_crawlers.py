@@ -96,10 +96,25 @@ class TestKofpiCrawler:
         assert ann.period_end == "2026-09-30"
         assert json.loads(ann.raw_data)["posted"] == "2026-09-07"
 
-    def test_deadline_rolls_over_to_next_year(self, crawler):
-        """게시월보다 마감월이 빠르면 다음 해로 본다."""
-        assert crawler._extract_deadline("공모 안내(~2.15)", "2026-12-01") == "2027-02-15"
+    def test_deadline_never_guesses_the_next_year(self, crawler):
+        """12차: 연도를 추측하지 않는다 - 게시일보다 과거면 버린다.
+
+        예전에는 "마감월이 게시월보다 작으면 다음 해" 로 추측해 존재하지
+        않는 마감을 만들었다. 연도를 알아야 마감을 말한다.
+        """
+        assert crawler._extract_deadline("공모 안내(~2.15)", "2026-12-01") is None
         assert crawler._extract_deadline("공모 안내(~12.15)", "2026-12-01") == "2026-12-15"
+        # 연도가 제목에 있으면 그대로 쓴다
+        assert (
+            crawler._extract_deadline("공모 안내(~2027.2.15)", "2026-12-01")
+            == "2027-02-15"
+        )
+
+    def test_deadline_must_end_the_title(self, crawler):
+        """괄호 안에 다른 말이 붙으면 마감 표기가 아니다."""
+        assert crawler._extract_deadline("공모(~9.30 접수 후 발표)", "2026-09-07") is None
+        assert crawler._extract_deadline("공모(~9.30) 안내", "2026-09-07") is None
+        assert crawler._extract_deadline("공모(~9.30)", "2026-09-07") == "2026-09-30"
 
     def test_deadline_absent_returns_none(self, crawler):
         """마감 표기가 없으면 None."""

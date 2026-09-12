@@ -4,7 +4,7 @@ import json
 import re
 from typing import List, Optional
 from .base import BaseCrawler
-from .date_labels import classify_date
+from .date_labels import classify_date, posted_date
 from ..models import RawAnnouncement
 
 try:
@@ -189,6 +189,16 @@ class LawmakingCrawler(BaseCrawler):
         single = self._normalize_date(period_str)
         return single, single
 
+    # ── 허용목록 (c): 의견제출 기간 필드 ──────────────────────────
+    PERIOD_EXTRACTOR = "_period_from_opinion_field"
+
+    def _period_from_opinion_field(self, item: dict):
+        """목록의 의견제출 기간 셀만 기간이 된다."""
+        start, end, _posted = classify_date(
+            item.get("period", ""), "입법의견 접수기간"
+        )
+        return start, end
+
     def _to_announcement(self, item: dict, base_url: str) -> Optional[RawAnnouncement]:
         """파싱된 입법예고 데이터를 RawAnnouncement로 변환한다."""
         try:
@@ -201,10 +211,10 @@ class LawmakingCrawler(BaseCrawler):
             if not source_id:
                 source_id = hashlib.md5(title.encode("utf-8")).hexdigest()[:16]
 
-            # 허용목록 (c): ``입법의견 접수기간`` 셀만 기간이 된다.
-            # 공용 허용목록을 통과시켜 다른 소스와 같은 규칙을 쓴다.
-            period_start, period_end, posted = classify_date(
-                item.get("period", ""), "입법의견 접수기간"
+            # 허용목록 (c): 기간은 PERIOD_EXTRACTOR 만 만든다.
+            period_start, period_end = self.resolve_period(item)
+            posted = None if (period_start or period_end) else posted_date(
+                item.get("period", "")
             )
 
             category_parts = [

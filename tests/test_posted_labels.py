@@ -132,14 +132,18 @@ class TestForestPressInheritsTheFix:
             "date_label": "게시일",
         }
         with patch(
-            "alert.crawlers.forest_service.classify_date",
-            return_value=(None, None, "2026-09-12"),
-        ) as classifier:
+            "alert.crawlers.forest_service.posted_date",
+            return_value="2026-09-12",
+        ) as reader:
             announcement = crawler._to_announcement(
                 item, "https://www.forest.go.kr"
             )
-        classifier.assert_called_once_with("2026.09.12", "게시일")
+        reader.assert_called_once_with("2026.09.12")
+        # 12차 choke point: 이 소스는 PERIOD_EXTRACTOR 를 선언하지 않으므로
+        # 어떤 HTML 이 와도 기간을 만들 수 없다
+        assert crawler.declares_period_extractor() is False
         assert (announcement.period_start, announcement.period_end) == (None, None)
+        assert json.loads(announcement.raw_data)["posted"] == "2026-09-12"
         assert json.loads(announcement.raw_data)["posted"] == "2026-09-12"
 
 

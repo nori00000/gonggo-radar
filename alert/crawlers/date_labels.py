@@ -135,6 +135,18 @@ def _leading_label(label: str, allowed: Sequence[str]) -> bool:
     return any(text.startswith(token) for token in allowed)
 
 
+def posted_date(text: str) -> Optional[str]:
+    """라벨과 무관하게 값의 첫 날짜를 **게시일로** 돌려준다.
+
+    허용목록 밖 소스(대부분)는 기간을 만들 수 없으므로 날짜를 분류할
+    필요가 없다 - 잃지 않게 게시일로만 남긴다.
+    """
+    value = (text or "").strip()
+    if not value:
+        return None
+    return normalize_date(strip_notes(value))
+
+
 def classify_date(
     text: str, label: str = ""
 ) -> Tuple[Optional[str], Optional[str], Optional[str]]:
