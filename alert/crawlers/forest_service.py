@@ -33,8 +33,11 @@ class ForestServiceCrawler(BaseCrawler):
         "/kfsweb/cop/bbs/selectBoardList.do?bbsId=BBSMSTR_1031&mn=NKFS_04_01_01",  # 산림청 알립니다
     ]
 
-    def __init__(self):
-        super().__init__(source_name="forest_service")
+    DEFAULT_AUTHOR = "산림청"
+    DEFAULT_CATEGORY = ""
+
+    def __init__(self, source_name: str = "forest_service"):
+        super().__init__(source_name=source_name)
         if BeautifulSoup is None:
             self.logger.error(
                 "BeautifulSoup4 is not installed. "
@@ -471,13 +474,13 @@ class ForestServiceCrawler(BaseCrawler):
             raw_data = json.dumps(item, ensure_ascii=False)
 
             return RawAnnouncement(
-                source="forest_service",
+                source=self.source_name,
                 source_id=source_id,
                 title=title,
                 url=link,
                 summary="",
-                author=author or "산림청",
-                category=category,
+                author=author or self.DEFAULT_AUTHOR,
+                category=category or self.DEFAULT_CATEGORY,
                 target="",
                 period_start=period_start,
                 period_end=period_end,

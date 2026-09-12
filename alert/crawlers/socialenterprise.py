@@ -376,13 +376,21 @@ class SocialenterpriseCrawler(BaseCrawler):
         return items
 
     def _extract_post_id(self, link: str) -> str:
-        """URL에서 공고 ID를 추출한다."""
+        """URL에서 게시글 고유 ID를 추출한다.
+
+        주의: 상세 URL은 ``?bsIdx=10002&bIdx=39062&...`` 형태로,
+        ``bsIdx``는 게시판 구분자(모든 글이 동일)이고 ``bIdx``가 글 번호다.
+        게시판 구분자를 ID로 잡으면 UNIQUE(source, source_id) 충돌로
+        한 배치에서 한 건만 저장되므로, ``bIdx``를 먼저 확인하고
+        범용 ``idx``/``no`` 패턴은 단어 경계를 요구한다.
+        """
         if not link:
             return ""
 
         id_params = [
+            r"\bbIdx=(\d+)",
             r"nttId=(\d+)", r"announcementId=(\d+)", r"notifyId=(\d+)",
-            r"seq=(\d+)", r"idx=(\d+)", r"no=(\d+)",
+            r"\bseq=(\d+)", r"\bidx=(\d+)", r"\bno=(\d+)",
             r"articleId=(\d+)", r"artclId=(\d+)",
         ]
         for pattern in id_params:

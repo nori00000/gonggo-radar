@@ -63,6 +63,10 @@ def _import_crawlers() -> Dict[str, Any]:
         ("ggeea", "alert.crawlers.ggeea", "GgeeaCrawler"),
         ("mois_sse", "alert.crawlers.mois_sse", "MoisSseCrawler"),
         ("goyang_startup", "alert.crawlers.goyang_startup", "GoyangStartupCrawler"),
+        ("kofpi", "alert.crawlers.kofpi", "KofpiCrawler"),
+        ("forest_press", "alert.crawlers.forest_press", "ForestPressCrawler"),
+        ("lawmaking", "alert.crawlers.lawmaking", "LawmakingCrawler"),
+        ("coop", "alert.crawlers.coop", "CoopCrawler"),
     ]
 
     for name, module_path, class_name in crawler_modules:
