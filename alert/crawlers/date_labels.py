@@ -23,11 +23,31 @@ from typing import List, Optional, Sequence, Tuple
 
 # 게시 시각을 말하는 라벨 - 절대 기간이 아니다
 POSTED_LABELS = re.compile(r"게시일|작성일|등록일|등록날짜|작성날짜|공고일|게시날짜|작성자")
-# 접수 일정을 말하는 라벨
-PERIOD_LABELS = re.compile(r"접수|신청|모집|마감|공모|기간|일정|기한")
-# **종료일만** 주는 라벨 (7차 게이트 #3): "신청기한 2026.09.30" 처럼
-# 단일 날짜 하나가 마감인 표현들.
-DEADLINE_ONLY_LABELS = re.compile(r"마감|기한|종료|까지")
+# ---------------------------------------------------------------------------
+# 허용목록 (whitelist) - 이 목록에 **라벨 선두**로 걸릴 때만 기간이 생긴다.
+#
+# 여덟 차례 게이트에서 "라벨을 읽어 추론" 하는 방식이 계속 없는 마감을
+# 만들어 냈다(v2final7 재현: 교육기간 범위가 접수기간으로 승격, 접수시작
+# 단일 날짜가 시작=마감, 제목의 "모집" 이 라벨로 유입). 그래서 추론을 버리고
+# 허용목록만 남겼다. 커버리지 손실은 받아들인다 - 없는 마감을 말하는 것보다
+# 마감을 모른다고 말하는 것이 낫다.
+# ---------------------------------------------------------------------------
+# 접수 **기간**을 말하는 라벨 - 값이 범위일 때만 (시작, 종료)
+RECEPTION_RANGE_LABELS = (
+    "접수기간", "접수 기간", "신청기간", "신청 기간", "모집기간", "모집 기간",
+    "공모기간", "공모 기간", "접수일정", "신청일정",
+    "의견제출기간", "의견 제출 기간", "입법의견 접수기간", "의견접수기간",
+)
+# 접수 **마감**을 말하는 라벨 - 단일 날짜면 종료일만
+RECEPTION_END_LABELS = (
+    "접수마감", "신청마감", "모집마감", "공모마감",
+    "접수기한", "신청기한", "제출기한", "마감일시", "마감기한", "마감일",
+)
+# 기간을 만들 수 없는 라벨 - 회귀로 고정해 둔다
+NEVER_PERIOD_LABELS = (
+    "교육기간", "행사일정", "행사기간", "운영기간", "사업기간", "협약기간",
+    "접수시작", "신청시작", "모집시작", "발표", "선정", "심사기간",
+)
 
 # 범위 구분: ~ 계열, 공백으로 감싼 하이픈, "부터…까지"
 _RANGE_MARK = re.compile(r"[~∼〜]|\s[-–—]\s|부터")
@@ -104,14 +124,29 @@ def parse_period(text: str) -> Tuple[Optional[str], Optional[str]]:
     return single, single
 
 
+def _leading_label(label: str, allowed: Sequence[str]) -> bool:
+    """라벨이 허용목록 항목으로 **시작**하는지 본다.
+
+    선두를 요구하는 이유: 포함 검사만 하면 ``교육기간 접수 안내`` 나
+    제목이 앞에 붙은 ``참여기업 모집 공고 접수기간`` 도 라벨로 인정된다.
+    그건 제목이지 라벨이 아니다.
+    """
+    text = (label or "").strip().lstrip("[(【<「·-–— ")
+    return any(text.startswith(token) for token in allowed)
+
+
 def classify_date(
     text: str, label: str = ""
 ) -> Tuple[Optional[str], Optional[str], Optional[str]]:
-    """목록의 날짜가 **접수기간**인지 **게시일**인지 가른다.
+    """목록의 날짜를 **허용목록으로만** 분류한다.
+
+    기간은 접수 라벨이 **라벨 선두**에 있을 때만 만든다. 그 밖의 날짜는
+    모두 게시일로 돌린다 - 라벨이 없거나, 모르는 라벨이거나, 범위만
+    있어도 마감을 만들지 않는다.
 
     Args:
         text: 목록에서 읽은 날짜 문자열
-        label: 그 날짜의 컬럼 라벨 (표 헤더·클래스명·앞말)
+        label: 그 날짜의 라벨 (같은 요소 텍스트의 날짜 앞부분)
 
     Returns:
         ``(period_start, period_end, posted)``
@@ -120,23 +155,26 @@ def classify_date(
     if not value:
         return None, None, None
 
-    label = (label or "").strip()
-    if label and POSTED_LABELS.search(label):
-        return None, None, normalize_date(value)
+    cleaned = strip_notes(value)
 
-    if _RANGE_MARK.search(value):
-        start, end = parse_period(value)
-        return start, end, None
+    if _leading_label(label, RECEPTION_RANGE_LABELS):
+        if _RANGE_MARK.search(cleaned):
+            start, end = parse_period(cleaned)
+            if start and end:
+                return start, end, None
+        # 접수기간 라벨인데 범위가 아니면 기간을 만들지 않는다
+        return None, None, normalize_date(cleaned)
 
-    if label and PERIOD_LABELS.search(label):
-        start, end = parse_period(value)
-        if DEADLINE_ONLY_LABELS.search(label) and start == end:
-            # "접수마감/신청기한 2026.09.30" 은 마감일 하나다 (시작일 아님)
-            return None, end, None
-        return start, end, None
+    if _leading_label(label, RECEPTION_END_LABELS):
+        start, end = parse_period(cleaned)
+        if end and start == end:
+            return None, end, None      # 단일 날짜 = 마감일 하나
+        if start and end:
+            return start, end, None     # 마감 라벨에 범위가 오면 범위대로
+        return None, None, normalize_date(cleaned)
 
-    # 라벨이 없거나 모르는 단일 날짜는 게시일로 본다
-    return None, None, normalize_date(value)
+    # 허용목록 밖 = 기간을 만들지 않는다 (게시일로만 남긴다)
+    return None, None, normalize_date(cleaned)
 
 
 def header_labels(table) -> List[str]:

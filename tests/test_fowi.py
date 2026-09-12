@@ -130,8 +130,10 @@ class TestFowiCrawler:
             assert announcement.url == "https://fowi.or.kr/user/board/boardView.do?nttId=12345"
             assert announcement.author == "한국산림복지진흥원"
             assert announcement.category == "지원사업"
-            assert announcement.period_start == "2026-04-01"
-            assert announcement.period_end == "2026-05-01"
+            # 11차(허용목록): 목록의 무라벨 범위는 기간이 아니다 - 게시일로만 남는다
+            assert announcement.period_start is None
+            assert announcement.period_end is None
+            assert json.loads(announcement.raw_data)["posted"] == "2026-04-01"
 
     def test_to_announcement_missing_title(self, mock_fowi_config):
         """_to_announcement() should return None for item without title."""

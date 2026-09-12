@@ -179,9 +179,13 @@ class TestSharedRuleContract:
         assert classify_date("2026.09.11", "구분") == (None, None, "2026-09-11")
         assert classify_date("2026.09.11", "") == (None, None, "2026-09-11")
 
-    def test_range_without_a_label_is_a_period(self):
+    def test_range_without_a_label_is_not_a_period(self):
+        """11차(허용목록): 라벨 없는 범위는 접수기간이 되지 않는다.
+
+        7차 게이트 #1 재현 - 무라벨/무관 범위가 마감으로 저장된 결함.
+        """
         assert classify_date("2026.09.01~2026.09.30", "") == (
-            "2026-09-01", "2026-09-30", None
+            None, None, "2026-09-01"
         )
 
     def test_empty_input(self):
@@ -350,3 +354,71 @@ class TestGate8ConservativeLabels:
         assert strip_notes("2026.09.01(화)").strip() == "2026.09.01"
         # 숫자가 든 괄호는 남긴다 (회차 등)
         assert "(9차)" in strip_notes("2026년도 (9차)")
+
+
+class TestCycle11WhitelistOnly:
+    """11차: 기간은 **허용목록 세 자리**에서만 나온다.
+
+    (a) SEIS 메인 카드 ``p.date`` = 구조적 접수기간 필드
+    (b) KOFPI 제목 ``(~M.D)`` = 마감 하나
+    (c) 국민참여입법센터 목록의 의견제출 기간 필드
+
+    그 밖의 소스·필드는 기간을 만들지 않는다. 아래는 게이트 크리틱
+    재현 3건(교육기간 / 링크 제목 / 접수시작·행사일정)이다.
+    """
+
+    @staticmethod
+    def extract(html):
+        from alert.crawlers.date_labels import extract_date_and_label
+
+        item = BeautifulSoup(html, "html.parser").find("li")
+        return extract_date_and_label(item)
+
+    def test_training_period_never_becomes_a_period(self):
+        """재현 1: ``교육기간 2026.10.01 ~ 2026.10.31`` → 기간 NULL.
+
+        교육 일정은 접수 일정이 아니다. 범위 표기가 있어도 승격하지 않는다.
+        """
+        assert classify_date("2026.10.01 ~ 2026.10.31", "교육기간") == (
+            None, None, "2026-10-01"
+        )
+
+    def test_link_title_never_becomes_a_label(self):
+        """재현 2: 링크 제목이 라벨로 새어 기간이 되던 자리 → 게시일."""
+        value, label = self.extract(
+            '<li><a href="/view.do?nttId=1">모집기간 연장 공고</a>'
+            "<span>2026.09.01 ~ 2026.09.30</span></li>"
+        )
+        assert label == ""
+        assert classify_date(value, label) == (None, None, "2026-09-01")
+
+    @pytest.mark.parametrize("label,value", [
+        ("접수시작", "2026.09.15"),
+        ("신청시작", "2026.09.15"),
+        ("모집시작", "2026.09.15"),
+        ("행사일정", "2026.10.15"),
+        ("행사기간", "2026.10.01 ~ 2026.10.31"),
+        ("운영기간", "2026.10.01 ~ 2026.10.31"),
+        ("사업기간", "2026.10.01 ~ 2026.10.31"),
+        ("심사기간", "2026.10.01 ~ 2026.10.31"),
+    ])
+    def test_never_period_labels(self, label, value):
+        """재현 3: 시작·행사·운영 라벨은 접수기간이 아니다 → 기간 NULL."""
+        start, end, posted = classify_date(value, label)
+        assert (start, end) == (None, None)
+        assert posted is not None
+
+    @pytest.mark.parametrize("label", [
+        "접수기간", "신청기간", "모집기간", "공모기간", "의견제출기간",
+    ])
+    def test_whitelisted_range_labels_still_work(self, label):
+        """허용목록 라벨 + 범위 = 진짜 접수기간 (허용목록이 죽지 않았다)."""
+        assert classify_date("2026.09.01 ~ 2026.09.30", label) == (
+            "2026-09-01", "2026-09-30", None
+        )
+
+    def test_label_must_lead(self):
+        """라벨은 **선두**여야 한다 - 문장 중간의 "접수기간" 은 안 된다."""
+        assert classify_date(
+            "2026.10.01 ~ 2026.10.31", "교육 접수기간 안내"
+        ) == (None, None, "2026-10-01")

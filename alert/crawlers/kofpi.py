@@ -254,10 +254,16 @@ class KofpiCrawler(BaseCrawler):
                 title.encode("utf-8")
             ).hexdigest()[:16]
 
+            # 허용목록 (b): 마감은 **제목의 ``(~M.D)`` 표기**에서만 온다.
+            # 목록 날짜는 게시일이므로 기간 필드에 넣지 않는다 - 예전에는
+            # period_start 로 들어가 존재하지 않는 접수 시작일을 말했다.
             posted = self._normalize_date(item.get("date", ""))
             deadline = self._extract_deadline(title, posted)
 
-            raw_data = json.dumps(item, ensure_ascii=False)
+            payload = dict(item)
+            if posted:
+                payload["posted"] = posted
+            raw_data = json.dumps(payload, ensure_ascii=False)
 
             return RawAnnouncement(
                 source=self.source_name,
@@ -268,7 +274,7 @@ class KofpiCrawler(BaseCrawler):
                 author="한국임업진흥원",
                 category=item.get("category", "").strip(),
                 target="",
-                period_start=posted,
+                period_start=None,
                 period_end=deadline,
                 raw_data=raw_data,
             )

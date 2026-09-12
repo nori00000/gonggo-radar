@@ -91,8 +91,10 @@ class TestKofpiCrawler:
         assert ann.source_id == "12658"
         assert ann.url == "https://www.kofpi.or.kr/notice/notice_01view.do?bb_seq=12658"
         assert ann.author == "한국임업진흥원"
-        assert ann.period_start == "2026-09-07"
+        # 11차(허용목록 b): 제목의 (~M.D) 만 마감이고 게시일은 기간이 아니다
+        assert ann.period_start is None
         assert ann.period_end == "2026-09-30"
+        assert json.loads(ann.raw_data)["posted"] == "2026-09-07"
 
     def test_deadline_rolls_over_to_next_year(self, crawler):
         """게시월보다 마감월이 빠르면 다음 해로 본다."""
@@ -339,3 +341,44 @@ class TestForestSocialEconomyDomain:
         ]
         for text, expected in cases:
             assert dc.classify_text(text)[0] == expected
+
+
+class TestCycle11PolicyWhitelist:
+    """11차 허용목록 (b) KOFPI 제목 마감 · (c) 입법예고 의견제출 기간."""
+
+    def test_whitelist_b_kofpi_title_gives_only_a_deadline(self):
+        """(b) 제목의 ``(~9.30)`` 은 마감 하나다 - 게시일은 기간이 아니다."""
+        config = make_config("kofpi", "https://www.kofpi.or.kr")
+        with patch("alert.crawlers.base.get_config", return_value=config):
+            crawler = KofpiCrawler()
+
+        items = crawler.parse_list(
+            load_fixture("kofpi_notice.html"), "/notice/notice_01view.do", "공지"
+        )
+        ann = crawler._to_announcement(items[0], "https://www.kofpi.or.kr")
+
+        assert ann.period_start is None
+        assert ann.period_end == "2026-09-30"
+        assert json.loads(ann.raw_data)["posted"] == "2026-09-07"
+
+        # 제목에 마감 표기가 없는 항목은 기간이 아예 없다
+        plain = [
+            crawler._to_announcement(i, "https://www.kofpi.or.kr") for i in items[1:]
+        ]
+        for ann2 in plain:
+            if ann2 is None or "~" in ann2.title:
+                continue
+            assert (ann2.period_start, ann2.period_end) == (None, None)
+
+    def test_whitelist_c_lawmaking_opinion_period(self):
+        """(c) 입법예고 목록의 의견제출 기간은 진짜 접수기간이다."""
+        config = make_config("lawmaking", "https://opinion.lawmaking.go.kr")
+        with patch("alert.crawlers.base.get_config", return_value=config):
+            crawler = LawmakingCrawler()
+
+        items = crawler.parse_list(load_fixture("lawmaking_list.html"))
+        ann = crawler._to_announcement(items[0], "https://opinion.lawmaking.go.kr")
+
+        assert ann.period_start == "2026-09-07"
+        assert ann.period_end == "2026-10-19"
+        assert "posted" not in json.loads(ann.raw_data)

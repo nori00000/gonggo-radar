@@ -4,6 +4,7 @@ import json
 import re
 from typing import List, Optional
 from .base import BaseCrawler
+from .date_labels import classify_date
 from ..models import RawAnnouncement
 
 try:
@@ -200,7 +201,11 @@ class LawmakingCrawler(BaseCrawler):
             if not source_id:
                 source_id = hashlib.md5(title.encode("utf-8")).hexdigest()[:16]
 
-            period_start, period_end = self._parse_period(item.get("period", ""))
+            # 허용목록 (c): ``입법의견 접수기간`` 셀만 기간이 된다.
+            # 공용 허용목록을 통과시켜 다른 소스와 같은 규칙을 쓴다.
+            period_start, period_end, posted = classify_date(
+                item.get("period", ""), "입법의견 접수기간"
+            )
 
             category_parts = [
                 p for p in ["입법예고", item.get("law_type", ""), item.get("field", "")]
@@ -208,7 +213,10 @@ class LawmakingCrawler(BaseCrawler):
             ]
             category = "/".join(dict.fromkeys(category_parts))
 
-            raw_data = json.dumps(item, ensure_ascii=False)
+            payload = dict(item)
+            if posted:
+                payload["posted"] = posted
+            raw_data = json.dumps(payload, ensure_ascii=False)
 
             return RawAnnouncement(
                 source=self.source_name,

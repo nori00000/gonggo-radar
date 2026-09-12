@@ -128,8 +128,10 @@ class TestSeisCrawler:
             assert result.url == "https://www.seis.or.kr/front/board/boardView.do?nttId=12345"
             assert result.author == "한국사회적기업진흥원"
             assert result.category == "지원사업"
-            assert result.period_start == "2026-04-01"
-            assert result.period_end == "2026-04-30"
+            # 11차(허용목록): 목록의 무라벨 범위는 기간이 아니다 - 게시일로만 남는다
+            assert result.period_start is None
+            assert result.period_end is None
+            assert json.loads(result.raw_data)["posted"] == "2026-04-01"
 
     def test_to_announcement_missing_title(self, mock_seis_config):
         """_to_announcement() should return None if title is missing."""
@@ -454,7 +456,13 @@ class TestSeisCardRegionCritique:
 
     def test_group_key_components(self, crawler):
         """중복 판별 키는 제목·주체·종료일 세 조각이다."""
-        base = {"title": "같은 제목", "sub": "서울센터", "date": "2026.09.01 ~ 2026.09.30"}
+        # 11차(허용목록): 접수기간 라벨이 있어야 마감이 키에 들어간다
+        base = {
+            "title": "같은 제목",
+            "sub": "서울센터",
+            "date": "2026.09.01 ~ 2026.09.30",
+            "date_label": "접수기간",
+        }
         assert crawler._group_key(base) == crawler._group_key(dict(base))
         assert crawler._group_key(base) != crawler._group_key(
             {**base, "sub": "부산센터"}
@@ -533,14 +541,13 @@ class TestGate6PostedDateLabels:
         assert announcement.period_start is None
         assert announcement.period_end == "2026-09-30"
 
-    def test_range_without_a_label_is_still_a_period(self, crawler):
-        """범위 표기가 있으면 라벨이 없어도 접수기간이다."""
+    def test_range_without_a_label_is_not_a_period(self, crawler):
+        """11차(허용목록): 범위여도 접수 라벨이 없으면 게시일로만 남는다."""
         _item, announcement = self.announce(
             crawler, "구분", "2026.09.01 ~ 2026.09.30"
         )
-        assert (announcement.period_start, announcement.period_end) == (
-            "2026-09-01", "2026-09-30"
-        )
+        assert (announcement.period_start, announcement.period_end) == (None, None)
+        assert json.loads(announcement.raw_data)["posted"] == "2026-09-01"
 
     def test_classify_date_directly(self, crawler):
         assert crawler._classify_date("2026.09.11", "게시일") == (
@@ -774,3 +781,73 @@ class TestGate7RoundTokenBoundaries:
         from alert.crawlers.dedupe_keys import extract_round
 
         assert extract_round([text]) == expected
+
+
+class TestCycle11SeisWhitelist:
+    """11차 허용목록 (a): SEIS 메인 카드의 ``p.date`` 만 접수기간이다.
+
+    카드의 날짜 자리는 사이트 구조상 접수기간 필드이므로 파서가
+    ``date_label="접수기간"`` 을 붙인다. 그래서 이 소스만 목록 단계에서
+    기간을 만들 수 있다.
+    """
+
+    @pytest.fixture
+    def crawler(self):
+        config = MagicMock()
+        config.crawler.timeout = 10
+        config.crawler.retry_count = 1
+        config.crawler.retry_delay = 0
+        config.crawler.user_agent = "test-agent"
+        source = MagicMock()
+        source.enabled = True
+        source.base_url = "https://www.seis.or.kr"
+        source.fetch_detail = False
+        config.crawler.sources = {"seis": source}
+        with patch("alert.crawlers.base.get_config", return_value=config):
+            yield SeisCrawler()
+
+    @pytest.fixture
+    def soup(self):
+        return BeautifulSoup(
+            (FIXTURES / "seis_main_cards.html").read_text(encoding="utf-8"),
+            "html.parser",
+        )
+
+    def test_card_date_is_labelled_as_a_reception_period(self, crawler, soup):
+        """카드 파서가 접수기간 라벨을 붙이고, 전 카드가 기간을 갖는다."""
+        items = crawler._parse_main_cards(soup)
+        assert items and all(i["date_label"] == "접수기간" for i in items)
+
+        deduped = crawler._dedupe_items(items)
+        announcements = [
+            crawler._to_announcement(i, "https://www.seis.or.kr") for i in deduped
+        ]
+        assert len(announcements) == 14
+        assert all(a is not None for a in announcements)
+        # 허용목록 (a): 14/14 접수기간 유지
+        assert sum(1 for a in announcements if a.period_end) == 14
+        # 게시일이 마감으로 새지 않는다
+        assert not any(
+            a.period_end and a.period_end == json.loads(a.raw_data).get("posted")
+            for a in announcements
+        )
+
+    def test_author_difference_keeps_two_items(self, crawler):
+        """재현 4: 제목·기간이 같아도 주체가 다르면 병합하지 않는다."""
+        base = {
+            "title": "2026년 사회적기업 지원사업 참여기업 모집 공고",
+            "date": "2026.09.01 ~ 2026.12.31",
+            "date_label": "접수기간",
+            "info": ["경기도"],
+        }
+        deduped = crawler._dedupe_items([
+            {**base, "sub": "사회보험료 지원 사업", "link": "subPage.do?fncPbofrSn=1"},
+            {**base, "sub": "일자리창출 지원 사업", "link": "subPage.do?fncPbofrSn=2"},
+        ])
+        assert len(deduped) == 2
+
+        same = crawler._dedupe_items([
+            {**base, "sub": "사회보험료 지원 사업", "link": "subPage.do?fncPbofrSn=1"},
+            {**base, "sub": "사회보험료 지원 사업", "link": "subPage.do?fncPbofrSn=2"},
+        ])
+        assert len(same) == 1

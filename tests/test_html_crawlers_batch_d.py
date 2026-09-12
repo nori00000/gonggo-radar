@@ -1,6 +1,7 @@
 """Tests for HTML crawlers Batch D: KosmesCrawler, IpetCrawler, ApfsCrawler."""
 
 import hashlib
+import json
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -209,8 +210,10 @@ class TestIpetCrawler:
             assert announcement.url == "https://www.ipet.re.kr/boardView.do?nttId=99999"
             assert announcement.author == "농림식품기술기획평가원"  # default author
             assert announcement.category == "R&D"
-            assert announcement.period_start == "2026-07-01"
-            assert announcement.period_end == "2026-07-31"
+            # 11차(허용목록): 목록의 무라벨 범위는 기간이 아니다 - 게시일로만 남는다
+            assert announcement.period_start is None
+            assert announcement.period_end is None
+            assert json.loads(announcement.raw_data)["posted"] == "2026-07-01"
             assert announcement.source_id == "99999"
 
 

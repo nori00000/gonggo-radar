@@ -221,6 +221,10 @@ class SeisCrawler(BaseCrawler):
                 "author": "",
                 "category": category,
                 "date": self._clean(date_elem.get_text(strip=True)) if date_elem else "",
+                # 허용목록 (a): SEIS 메인 카드의 ``p.date`` 는 **구조적으로**
+                # 접수기간 필드다(D-day 배지 옆의 기간 표시). 라벨 텍스트가
+                # 없으므로 구조로 라벨을 준다 - 범위일 때만 기간이 된다.
+                "date_label": "접수기간",
                 "sub": self._clean(sub.get_text(strip=True)) if sub else "",
                 "info": info_values,
                 "round": round_label,
@@ -261,7 +265,10 @@ class SeisCrawler(BaseCrawler):
         _, period_end, _posted = self._classify_date(
             item.get("date", ""), item.get("date_label", "")
         )
-        candidates = [item.get("sub", "") or ""]
+        # 기관(author/sub)이 다르면 절대 병합하지 않는다 (v2final7 #4):
+        # table.board_list 의 같은 제목·같은 게시일 두 행이 td.author=서울센터/
+        # 부산센터인데 병합되어 부산만 남았다.
+        candidates = [item.get("sub", "") or "", item.get("author", "") or ""]
         candidates.extend(item.get("info", []) or [])
         # 회차 후보: 카드의 round 필드 + 주체 + 분류 (제목은 group_key가 본다)
         rounds = [item.get("round", "") or ""] + candidates
