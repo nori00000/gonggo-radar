@@ -18,9 +18,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from alert.notifiers.email_sender import UNSENT_STAGES, EmailNotifier
 from alert.digest import prune
-from alert.digest import sections as sections_mod
 from alert.digest import state as state_mod
 from alert.digest.checker import markdown_sha256
+from alert.utils.redact import redact
 
 # 상태 기록(status=sent) 저장 재시도 — 여기서 실패하면 "발송했는데 기록이 없는" 창이 열린다.
 STATE_SAVE_ATTEMPTS = 3
@@ -28,6 +28,20 @@ STATE_SAVE_BACKOFF = 0.5
 
 # 승인 세대 id 형식 (사이클4 #2). 접두 비교를 폐지했으므로 지문 대신 세대 id 를 받는다.
 APPROVAL_ID_RE = re.compile(r"^[0-9a-f]{%d}$" % state_mod.APPROVAL_ID_LEN)
+
+
+def _err(message) -> None:
+    """발송기의 **모든** stderr 출력 (사이클5 #4).
+
+    check.json 의 reason 이나 예외 문자열에 토큰이 섞여 launchd 로그·봇 카드 편집으로
+    새지 않도록 한 곳에서 redact 한다.
+    """
+    print(redact(message), file=sys.stderr)
+
+
+def _out(message) -> None:
+    """발송기의 stdout 출력 (봇이 수신자 수를 파싱한다)."""
+    print(redact(message))
 
 # [텍스트](URL) — URL 안의 괄호 한 단계까지 균형 있게 소비 (javascript:alert(1) 대응)
 LINK_PATTERN = r"\[([^\]]+)\]\(([^()\s]*(?:\([^()]*\)[^()\s]*)*)\)"
@@ -241,28 +255,36 @@ def send_digest(
     markdown_path = Path(markdown_path)
 
     if not markdown_path.exists():
-        print(f"✗ 파일 없음: {markdown_path}", file=sys.stderr)
+        _err(f"✗ 파일 없음: {markdown_path}")
         return 2
 
     check_json_path = markdown_path.with_suffix(".check.json")
+
+    # 사이클5 #3: 검증 파괴 표식이 있으면 무조건 거부 (드라이런도).
+    # 제거는 `/digest 재검토` 가 재조립+재검증에 성공했을 때만.
+    broken = state_mod.tombstone_reason(
+        state_mod.tombstone_path_for_markdown(markdown_path))
+    if broken:
+        _err(f"✗ 발송 거부: {state_mod.TOMBSTONE_REASON} [{broken}]")
+        return 2
 
     if dry_run:
         # 드라이런도 게이트가 본 바이트를 그대로 렌더한다 (해시 기준 일치)
         try:
             markdown_bytes = markdown_path.read_bytes()
         except OSError as exc:
-            print(f"✗ 마크다운 읽기 실패: {exc}", file=sys.stderr)
+            _err(f"✗ 마크다운 읽기 실패: {exc}")
             return 2
         passed, msg = _check_fail_closed_bytes(markdown_bytes, check_json_path)
         if not passed:
-            print(f"✗ 발송 거부: {msg}", file=sys.stderr)
+            _err(f"✗ 발송 거부: {msg}")
             return 2
         markdown_text = markdown_bytes.decode("utf-8")
         html_text = markdown_to_html(markdown_text)
         recipients = to_email if to_email else "[config에서 설정]"
-        print(f"[DRY-RUN] 발송 대상: {recipients}")
-        print(f"[DRY-RUN] 제목: {_subject(markdown_text)}")
-        print(
+        _out(f"[DRY-RUN] 발송 대상: {recipients}")
+        _out(f"[DRY-RUN] 제목: {_subject(markdown_text)}")
+        _out(
             f"[DRY-RUN] 본문 길이: {len(markdown_text)} bytes (마크다운), "
             f"{len(html_text)} bytes (HTML)"
         )
@@ -272,10 +294,9 @@ def send_digest(
     approval = (approval_id or "").strip().lower()
     if not APPROVAL_ID_RE.match(approval):
         problem = "없습니다" if not approval else f"형식이 아닙니다: {approval!r}"
-        print(
+        _err(
             f"✗ 발송 거부: --approval-id 가 {problem} "
-            f"({state_mod.APPROVAL_ID_LEN}자 16진수)",
-            file=sys.stderr,
+            f"({state_mod.APPROVAL_ID_LEN}자 16진수)"
         )
         return 2
 
@@ -286,10 +307,10 @@ def send_digest(
     try:
         lock_handle = state_mod.acquire_lock(lock_path)
     except state_mod.LockBusy as exc:
-        print(f"✗ 발송 거부: {exc}", file=sys.stderr)
+        _err(f"✗ 발송 거부: {exc}")
         return 2
     except OSError as exc:
-        print(f"✗ 발송 거부: 잠금 생성 실패 — {exc}", file=sys.stderr)
+        _err(f"✗ 발송 거부: 잠금 생성 실패 — {exc}")
         return 2
 
     try:
@@ -329,63 +350,69 @@ def _send_locked(
     try:
         markdown_bytes = markdown_path.read_bytes()
     except OSError as exc:
-        print(f"✗ 발송 거부: 마크다운 읽기 실패 — {exc}", file=sys.stderr)
+        _err(f"✗ 발송 거부: 마크다운 읽기 실패 — {exc}")
         return 2
 
     try:
         markdown_text = markdown_bytes.decode("utf-8")
     except UnicodeDecodeError as exc:
-        print(f"✗ 발송 거부: 마크다운 디코드 실패 — {exc}", file=sys.stderr)
+        _err(f"✗ 발송 거부: 마크다운 디코드 실패 — {exc}")
         return 2
 
     current_sha = markdown_sha256(markdown_bytes)
 
     passed, msg = _check_fail_closed_bytes(markdown_bytes, check_json_path)
     if not passed:
-        print(f"✗ 발송 거부: {msg}", file=sys.stderr)
+        _err(f"✗ 발송 거부: {msg}")
         return 2
 
     # 상태 파일이 손상돼 판정할 수 없으면 발송하지 않는다(fail-closed).
     try:
         state = state_mod.load_state(state_path, week)
     except state_mod.StateError as exc:
-        print(f"✗ 발송 거부: {exc}", file=sys.stderr)
+        _err(f"✗ 발송 거부: {exc}")
         return 2
 
     allowed, reason = state_mod.can_send(state)
     if not allowed:
-        print(f"✗ 발송 거부: {reason}", file=sys.stderr)
+        _err(f"✗ 발송 거부: {reason}")
         if reason == state_mod.SENDING_REASON:
-            print(
+            _err(
                 "  이전 발송의 결과가 확정되지 않았습니다. 메일함을 확인한 뒤 "
-                f"`/digest 해제 {week}` 로 풀어주세요(자동 재발송 안 함).",
-                file=sys.stderr,
+                f"`/digest 해제 {week}` 로 풀어주세요(자동 재발송 안 함)."
             )
         return 2
 
-    # 사이클4 #2: 승인 세대 검증 — id 일치 **그리고** 전체 SHA 3중 일치.
-    #   state.approval.id == --approval-id
-    #   state.approval.sha == 현재 원시 바이트 전체 SHA == check.json.markdown_sha256
-    # (뒤쪽 항등식의 check.json 쪽은 _check_fail_closed_bytes 가 이미 확인했다)
-    ok, reason = state_mod.check_approval(state, approval_id, current_sha)
+    # 사이클4 #2 · 사이클5 #2: 승인 세대 검증 — id + 본문 전체 SHA + **검증 파일 SHA**.
+    #   state.approval.id       == --approval-id
+    #   state.approval.sha      == 현재 원시 바이트 전체 SHA (== check.markdown_sha256)
+    #   state.approval.check_sha == 현재 check.json **바이트** SHA
+    # 본문 ↔ check.json 항등식은 _check_fail_closed_bytes 가 이미 확인했다. 여기서
+    # 검증 파일 바이트까지 묶는 이유: 본문 SHA 가 같아도 렌더에 쓴 분류가 바뀌면
+    # (v2 분류로 0건 → 수정 후 pass) 사람이 본 화면과 발송물이 달라진다(Codex 재현).
+    try:
+        check_bytes = check_json_path.read_bytes()
+    except OSError as exc:
+        _err(f"✗ 발송 거부: 검증 파일 읽기 실패 — {exc}")
+        return 2
+    current_check_sha = markdown_sha256(check_bytes)
+    ok, reason = state_mod.check_approval(
+        state, approval_id, current_sha, current_check_sha
+    )
     if not ok:
-        print(f"✗ 발송 거부: {reason}", file=sys.stderr)
+        _err(f"✗ 발송 거부: {reason}")
         return 2
 
-    # 사이클4 #3: 제외한 항목이 본문에 남아 있으면 재조립이 반영되지 않은 것이다.
-    try:
-        check_result = json.loads(check_json_path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        check_result = {}
-    item_sections, _ = sections_mod.resolve(check_result, markdown_text)
+    # 사이클4 #3 · 사이클5 #1: 제외한 URL 이 **본문 어디에라도** 남아 있으면 거부.
+    # 항목의 `**원문:**` 만 보면 제외 URL 을 해설 참고 링크나 항목의 두 번째 링크로
+    # 옮겨 검사를 통과시킬 수 있었다(Codex 재현).
     leftover = state_mod.excluded_still_present(
-        state, [block["url"] for block in prune.item_blocks(markdown_text, item_sections)]
+        state, prune.body_links(markdown_text)
     )
     if leftover:
-        print(
+        _err(
             f"✗ 발송 거부: {state_mod.EXCLUDED_NOT_APPLIED_REASON} "
-            f"({len(leftover)}건, 예: {leftover[0]})",
-            file=sys.stderr,
+            f"({len(leftover)}건, 예: {leftover[0]})"
         )
         return 2
 
@@ -394,24 +421,24 @@ def _send_locked(
     try:
         notifier = EmailNotifier()
     except Exception as exc:  # noqa: BLE001 — 설정·의존성 오류는 발송 전 거부
-        print(f"✗ 초기화 실패: {exc}", file=sys.stderr)
+        _err(f"✗ 초기화 실패: {exc}")
         return 2
 
     if not notifier.sender or not notifier.password:
-        print("✗ 이메일 인증 정보가 설정되지 않았습니다", file=sys.stderr)
+        _err("✗ 이메일 인증 정보가 설정되지 않았습니다")
         return 2
 
     # --to 옵션이 지정되면 그것을 사용, 아니면 config의 모든 수신자
     recipients = [to_email] if to_email else notifier.recipients
 
     if not recipients:
-        print("✗ 수신자가 설정되지 않았습니다", file=sys.stderr)
+        _err("✗ 수신자가 설정되지 않았습니다")
         return 2
 
     try:
         html_body = markdown_to_html(markdown_text)
     except Exception as exc:  # noqa: BLE001 — 렌더 실패는 발송 전 거부
-        print(f"✗ 본문 변환 실패: {exc}", file=sys.stderr)
+        _err(f"✗ 본문 변환 실패: {exc}")
         return 2
 
     now_iso = datetime.now().isoformat(timespec="seconds")
@@ -421,7 +448,7 @@ def _send_locked(
         )
     except (OSError, state_mod.TransitionError) as exc:
         # sending 을 못 남기면 발송하지 않는다 — 기록 없는 발송이 중복 발송의 씨앗이다.
-        print(f"✗ 발송 거부: 발송 표시 기록 실패 — {exc}", file=sys.stderr)
+        _err(f"✗ 발송 거부: 발송 표시 기록 실패 — {exc}")
         return 2
 
     try:
@@ -429,13 +456,12 @@ def _send_locked(
             _subject(markdown_text), html_body, recipients
         )
     except Exception as exc:  # noqa: BLE001 — 전송 중 예외는 결과 미확정이다
-        print(f"✗ 발송 실패(결과 미확정): {exc}", file=sys.stderr)
+        _err(f"✗ 발송 실패(결과 미확정): {exc}")
         _keep_sending_notice(state_path, week)
         return 2
 
     if not delivered:
-        print(f"✗ 발송 실패: SMTP 전송에 실패했습니다 (단계: {stage})",
-              file=sys.stderr)
+        _err(f"✗ 발송 실패: SMTP 전송에 실패했습니다 (단계: {stage})")
         if stage in UNSENT_STAGES:
             # 확정적 미발송 — 재시도를 허용한다 (사이클2 #4)
             _revert_sending(state_path, state, stage)
@@ -443,26 +469,23 @@ def _send_locked(
             _keep_sending_notice(state_path, week)
         return 2
 
-    print(f"✓ 발송 성공: {len(recipients)}명")
+    _out(f"✓ 발송 성공: {len(recipients)}명")
 
     sent_state = state_mod.mark_sent(state, approved_by, len(recipients), now_iso)
     last_error = None
     for attempt in range(1, STATE_SAVE_ATTEMPTS + 1):
         try:
             state_mod.apply_state(state_path, state, sent_state)
-            print(f"✓ 상태 기록: {state_path} (status=sent)")
+            _out(f"✓ 상태 기록: {state_path} (status=sent)")
             return 0
         except (OSError, state_mod.TransitionError) as exc:
             last_error = exc
-            print(
-                f"⚠️  상태 기록 실패 {attempt}/{STATE_SAVE_ATTEMPTS}: {exc}",
-                file=sys.stderr,
-            )
+            _err(f"⚠️  상태 기록 실패 {attempt}/{STATE_SAVE_ATTEMPTS}: {exc}")
             if attempt < STATE_SAVE_ATTEMPTS:
                 time.sleep(STATE_SAVE_BACKOFF * attempt)
 
     # 발송은 이미 끝났다 — status=sending 이 남으므로 이후 발송은 거부된다.
-    print(f"⚠️  상태 기록 실패(발송은 완료됨): {last_error}", file=sys.stderr)
+    _err(f"⚠️  상태 기록 실패(발송은 완료됨): {last_error}")
     _keep_sending_notice(state_path, week)
     return 1
 
@@ -474,22 +497,20 @@ def _revert_sending(state_path: Path, state, stage: str) -> None:
             state_path, state, state_mod.revert_sending(state), escape=True
         )
     except (OSError, state_mod.TransitionError) as exc:
-        print(f"⚠️  발송 표시 되돌리기 실패: {exc}", file=sys.stderr)
+        _err(f"⚠️  발송 표시 되돌리기 실패: {exc}")
         return
-    print(
+    _err(
         f"  전송 전 단계({stage}) 실패 — 발송되지 않았습니다. "
-        f"status={reverted['status']} 로 되돌렸습니다(재시도 가능).",
-        file=sys.stderr,
-    )
+        f"status={reverted['status']} 로 되돌렸습니다(재시도 가능)."
+        )
 
 
 def _keep_sending_notice(state_path: Path, week: str) -> None:
     """전달 여부가 불확실한 실패 — sending 을 남기고 사람을 부른다."""
-    print(
+    _err(
         f"  전달 여부가 확인되지 않았습니다 — status=sending 유지. 메일함 확인 후 "
-        f"`/digest 해제 {week}` 로 풀어주세요(자동 재발송 안 함). 상태: {state_path}",
-        file=sys.stderr,
-    )
+        f"`/digest 해제 {week}` 로 풀어주세요(자동 재발송 안 함). 상태: {state_path}"
+        )
 
 
 def main():
@@ -522,7 +543,7 @@ def main():
     parser.add_argument(
         "--approval-id",
         help=f"승인 카드의 세대 id(16진수 {state_mod.APPROVAL_ID_LEN}자). --send 에 필수",
-    )
+        )
 
     args = parser.parse_args()
 
@@ -535,7 +556,7 @@ def main():
         dry_run=dry_run,
         approved_by=args.approved_by,
         approval_id=args.approval_id,
-    )
+        )
 
 
 if __name__ == "__main__":

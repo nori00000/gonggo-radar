@@ -123,24 +123,43 @@ def clear_card(token, chat_id, message_id):
 
 
 def load_check(markdown_path):
-    """같은 주차의 check.json. 부재·손상은 빈 dict."""
+    """같은 주차의 check.json → (바이트, dict). 부재·손상은 (None, {}).
+
+    바이트를 함께 돌려주는 이유: 승인 세대가 **검증 파일 바이트 SHA** 로도 결속된다
+    (사이클5 #2).
+    """
     check_path = Path(markdown_path).with_suffix(".check.json")
     if not check_path.exists():
-        return {}
+        return None, {}
     try:
-        with open(check_path, "r", encoding="utf-8") as fh:
-            return json.load(fh)
-    except (OSError, json.JSONDecodeError):
-        return {}
+        raw = check_path.read_bytes()
+    except OSError:
+        return None, {}
+    try:
+        return raw, json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return raw, {}
 
 
 def _blocking_reason(markdown_path, week, check, current_sha, markdown_text):
     """미리보기를 "검증 필요" 안내로 대체해야 하는 이유. 없으면 None (사이클4 #3·#4·#6)."""
+    broken = state_mod.tombstone_reason(
+        state_mod.tombstone_path_for_markdown(markdown_path))
+    if broken:
+        return "{} [{}]".format(state_mod.TOMBSTONE_REASON, broken)
     recorded = (check or {}).get("markdown_sha256")
     if not recorded:
         return "검증 파일이 이 본문을 본 기록이 없습니다"
     if recorded != current_sha:
         return "검증 파일이 다른 본문의 것입니다 (재검증 필요)"
+    # 사이클5 #2: pass=false·항목 0건이면 승인 세대를 발급하지 않는다.
+    if not (check or {}).get("pass"):
+        return "검증 미통과 — {}".format(
+            (check or {}).get("reason") or "사유 미기록")
+    if len((check or {}).get("items") or []) < 1:
+        return "검증에 항목이 0건"
+    if int((check or {}).get("item_blocks") or 0) < 1:
+        return "항목 0건 (공고 블록 없음)"
     try:
         state = state_mod.load_state(
             state_mod.state_path_for_markdown(markdown_path), week)
@@ -150,11 +169,9 @@ def _blocking_reason(markdown_path, week, check, current_sha, markdown_text):
         return state_mod.VERIFICATION_BROKEN_REASON
     if state.get("rebuild_failed"):
         return state_mod.REBUILD_FAILED_REASON
-    item_sections, _ = sections_mod.resolve(check, markdown_text)
+    # 사이클5 #1: 제외 검사는 본문 **전체** URL 기준이다.
     leftover = state_mod.excluded_still_present(
-        state,
-        [block["url"] for block in prune.item_blocks(markdown_text, item_sections)],
-    )
+        state, prune.body_links(markdown_text))
     if leftover:
         return "{} ({}건)".format(
             state_mod.EXCLUDED_NOT_APPLIED_REASON, len(leftover))
@@ -184,20 +201,23 @@ def main():
         return 2
 
     week = state_mod.week_from_markdown(markdown_path)
+    state_path = state_mod.state_path_for_markdown(markdown_path)
+    lock_path = state_mod.lock_path_for_markdown(markdown_path)
+
     # 승인 지문(approval.sha)은 발송 게이트와 같은 **원시 바이트** 해시다.
     # 렌더에 쓰는 텍스트도 같은 읽기에서 나와야 지문과 화면이 어긋나지 않는다.
     try:
         markdown_bytes = markdown_path.read_bytes()
         markdown_text = markdown_bytes.decode("utf-8")
     except (OSError, UnicodeDecodeError) as exc:
-        print(f"✗ 마크다운 읽기 실패: {exc}", file=sys.stderr)
+        print(f"✗ 마크다운 읽기 실패: {redact(exc)}", file=sys.stderr)
         return 2
-    check = load_check(markdown_path)
+    check_bytes, check = load_check(markdown_path)
     current_sha = markdown_sha256(markdown_bytes)
+    current_check_sha = markdown_sha256(check_bytes) if check_bytes else None
 
-    # 사이클4 #6: 렌더 **전에** check.json 이 이 바이트를 본 것인지 확인한다.
-    # 불일치면 항목 미리보기를 만들지 않는다 — 항목 0건 화면이 승인 대상이 되던
-    # 경로(다른 계약의 check 로 렌더)가 닫힌다. 섹션 목록도 그 check.json 의 것을 쓴다.
+    # 사이클4 #6 · 사이클5 #2: 렌더 **전에** 이 본문·이 검증으로 승인해도 되는지 본다.
+    # 차단이면 항목 미리보기를 만들지 않고 승인 세대도 발급하지 않는다.
     blocked = _blocking_reason(markdown_path, week, check, current_sha,
                                markdown_text)
     if blocked:
@@ -206,12 +226,14 @@ def main():
         chunks = [body]
         item_urls = []
         approval_sha = None
+        approval_check_sha = None
     else:
         item_sections, _ = sections_mod.resolve(check, markdown_text)
         body = preview_mod.render_preview(week, markdown_text, check)
         chunks = preview_mod.chunk_text(body)
         item_urls = preview_mod.item_urls(markdown_text, item_sections)
         approval_sha = current_sha
+        approval_check_sha = current_check_sha
 
     if args.dry_run:
         print(f"[DRY-RUN] {week} 미리보기 {len(chunks)}개 메시지")
@@ -227,56 +249,65 @@ def main():
         print(f"✗ 전송 대상 확인 실패: {redact(exc)}", file=sys.stderr)
         return 2
 
-    # 이전 승인 카드의 버튼을 먼저 지운다 (계약 W10 크리틱 #6) — 새 미리보기가
-    # 올라간 뒤에도 옛 카드가 남아 있으면 사람이 낡은 승인을 누를 수 있다.
-    # (최종 방어는 카드 callback_data 의 본문 해시다 — 이건 UX 상의 정리다.)
-    state_path = state_mod.state_path_for_markdown(markdown_path)
-    lock_path = state_mod.lock_path_for_markdown(markdown_path)
+    # 사이클5 #5: 발송이 진행 중이면(발송기가 flock 보유) 미리보기를 보내지 않는다.
+    # 같은 잠금을 쥐고 전송·상태 기록까지 끝내므로 "미리보기는 갔는데 기록은 LockBusy"
+    # 가 생기지 않는다.
     try:
-        stale_card = state_mod.card_message_id(
-            state_mod.load_state(state_path, week))
-    except state_mod.StateError as exc:
-        print(f"⚠️  상태 확인 실패(미리보기는 계속 전송): {exc}", file=sys.stderr)
-        stale_card = None
-    if stale_card:
-        ok, error = clear_card(token, chat_id, stale_card)
-        if not ok:
-            print(f"⚠️  이전 승인 카드 버튼 제거 실패: {error}", file=sys.stderr)
-
-    message_ids = []
-    for index, chunk in enumerate(chunks, start=1):
-        ok, message_id, error = send_chunk(token, chat_id, thread_id, chunk)
-        if not ok:
-            print(
-                f"✗ 전송 실패 ({index}/{len(chunks)}): {error}",
-                file=sys.stderr,
-            )
-            return 2
-        message_ids.append(message_id)
-        print(f"✓ 전송 {index}/{len(chunks)} message_id={message_id}")
-
-    # 계약 W10 사이클2 #1: 상태 쓰기는 **잠금 하 read-modify-write** 다.
-    # 텔레그램 왕복 동안 다른 발송이 sent 를 썼을 수 있으므로, 여기서 다시 읽고
-    # message_id 만 더한다(record_preview 는 status 를 건드리지 않는다).
-    #
-    # 사이클4 #2: 사람이 **본** 본문의 지문으로 **새 승인 세대**를 발급한다.
-    # 차단 상태(검증 불일치·제외 미반영 등)면 승인 세대를 발급하지 않는다 —
-    # approval=None 이므로 어떤 카드도 발송 게이트를 통과하지 못한다.
-    try:
-        new_state = state_mod.update_state(
-            state_path, lock_path, week,
-            lambda current: state_mod.record_preview(
-                current, message_ids, item_urls, approval_sha
-            ),
+        handle = state_mod.acquire_lock(lock_path)
+    except state_mod.LockBusy:
+        ok, _mid, error = send_chunk(
+            token, chat_id, thread_id,
+            "⏳ 발송 진행 중 — 미리보기를 보내지 않았습니다. 끝난 뒤 `/digest 재검토`.",
         )
-        approval = state_mod.approval_of(new_state)
-        print("✓ 상태 기록: {} (approval={})".format(
-            state_path, approval.get("id") or "없음(검증 필요)"))
-    except (state_mod.StateError, state_mod.TransitionError,
-            state_mod.LockBusy, OSError) as exc:
-        print(f"⚠️  상태 기록 실패(미리보기는 전송됨): {redact(exc)}",
-              file=sys.stderr)
-        return 1
+        if not ok:
+            print(f"✗ 발송 진행 중 안내 전송 실패: {error}", file=sys.stderr)
+        print("✗ 미리보기 생략: 발송 진행 중(잠금 보유)", file=sys.stderr)
+        return 3
+
+    try:
+        # 이전 승인 카드의 버튼을 먼저 지운다 (계약 W10 크리틱 #6).
+        try:
+            stale_card = state_mod.card_message_id(
+                state_mod.load_state(state_path, week))
+        except state_mod.StateError as exc:
+            print(f"⚠️  상태 확인 실패(미리보기는 계속 전송): {redact(exc)}",
+                  file=sys.stderr)
+            stale_card = None
+        if stale_card:
+            ok, error = clear_card(token, chat_id, stale_card)
+            if not ok:
+                print(f"⚠️  이전 승인 카드 버튼 제거 실패: {error}", file=sys.stderr)
+
+        message_ids = []
+        for index, chunk in enumerate(chunks, start=1):
+            # 사이클5 #4: 미리보기 본문도 단일 발신 경로에서 redact 를 지난다.
+            ok, message_id, error = send_chunk(
+                token, chat_id, thread_id, redact(chunk))
+            if not ok:
+                print(f"✗ 전송 실패 ({index}/{len(chunks)}): {error}",
+                      file=sys.stderr)
+                return 2
+            message_ids.append(message_id)
+            print(f"✓ 전송 {index}/{len(chunks)} message_id={message_id}")
+
+        # 사이클4 #2: 사람이 **본** 본문·검증으로 새 승인 세대를 발급한다.
+        # 잠금을 이미 쥐고 있으므로 apply_state 로 쓴다(update_state 는 재획득 시도).
+        try:
+            current = state_mod.load_state(state_path, week)
+            new_state = state_mod.apply_state(
+                state_path, current,
+                state_mod.record_preview(current, message_ids, item_urls,
+                                         approval_sha, approval_check_sha),
+            )
+            approval = state_mod.approval_of(new_state)
+            print("✓ 상태 기록: {} (approval={})".format(
+                state_path, approval.get("id") or "없음(검증 필요)"))
+        except (state_mod.StateError, state_mod.TransitionError, OSError) as exc:
+            print(f"⚠️  상태 기록 실패(미리보기는 전송됨): {redact(exc)}",
+                  file=sys.stderr)
+            return 1
+    finally:
+        state_mod.release_lock(handle)
 
     return 0
 

@@ -94,6 +94,29 @@ def item_blocks(
     ]
 
 
+def body_links(markdown_text: str) -> List[str]:
+    """본문에 실린 **모든** URL (항목·해설·산문·머리말, 문서 순서·중복 제거).
+
+    제외(excluded_urls) 검사의 기준이다 (사이클5 #1): 제외한 URL 을 해설의 참고
+    링크나 항목의 두 번째 링크로 옮기면 `**원문:**` 목록에서 빠져 검사를 통과했다.
+    마크다운 링크 전부 + `**원문:**` 의 링크 아닌 원시값까지 센다.
+    """
+    found: List[str] = []
+
+    def _add(url):
+        url = (url or "").strip()
+        if url and url not in found:
+            found.append(url)
+
+    for line in (markdown_text or "").split("\n"):
+        for match in _LINK_RE.finditer(line):
+            _add(match.group(2))
+        origin = _ORIGIN_RE.match(line.strip())
+        if origin and not _LINK_RE.search(origin.group(1)):
+            _add(origin.group(1))
+    return found
+
+
 def item_block_count(
     markdown_text: str, item_sections: Optional[Sequence[str]] = None
 ) -> int:

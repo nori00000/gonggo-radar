@@ -365,11 +365,20 @@ def test_send_digest_dry_run_does_not_touch_state(tmp_path):
     assert not state_mod.state_path_for_markdown(md).exists()
 
 
-def test_send_digest_still_refuses_unconfirmed_marker(tmp_path, monkeypatch):
-    """기존 게이트(마커) 불변 — 상태 파일이 생겨도 마커가 남으면 거부."""
-    md = _write_digest(tmp_path)
+def test_send_digest_still_refuses_unconfirmed_marker(
+    tmp_path, monkeypatch, capsys
+):
+    """마커 게이트 불변 — **승인 세대까지 갖춘 상태**에서 마커만으로 거부된다.
+
+    사이클5 #8: 이전 테스트는 승인 세대를 심지 않아 "승인 세대 없음" 으로 거부됐고,
+    마커 검사를 지워도 통과했다. 이제 다른 조건을 전부 충족시켜 마커가 유일한
+    거부 사유가 되게 한다.
+    """
+    md = _write_digest(tmp_path)            # 마커가 남은 본문
+    _seed_preview(md)                       # 승인 세대·검증 결속까지 정상
     _forbid_notifier(monkeypatch, "마커 게이트가 뚫렸다")
     assert _send(md) == 2
+    assert "미확정 마커" in capsys.readouterr().err
 
 
 # ─── 재검증 (재조립 없이 check.json만 갱신) ─────────────────────────────
@@ -407,8 +416,16 @@ def test_recheck_digest_preserves_commentary(tmp_path, monkeypatch):
 
 
 # ─── 크리틱 #1: 중복 발송 (잠금 · sending 상태) ─────────────────────────
-def _seed_preview(md, sha=None):
-    """미리보기를 보낸 것으로 기록 — 새 승인 세대를 발급한다 (사이클4 #2)."""
+def _check_sha(md):
+    """그 주차 check.json 의 **바이트** SHA (사이클5 #2 검증 결속)."""
+    from pathlib import Path as _Path
+
+    check = _Path(md).with_suffix(".check.json")
+    return markdown_sha256(check.read_bytes()) if check.exists() else None
+
+
+def _seed_preview(md, sha=None, check_sha=None):
+    """미리보기를 보낸 것으로 기록 — 새 승인 세대를 발급한다 (사이클4 #2 · 5 #2)."""
     from pathlib import Path as _Path
 
     md = _Path(md)
@@ -418,6 +435,7 @@ def _seed_preview(md, sha=None):
     state_mod.save_state(path, state_mod.record_preview(
         state, [2014], preview_mod.item_urls(md.read_text(encoding="utf-8")),
         sha or markdown_sha256(md.read_bytes()),
+        check_sha or _check_sha(md),
     ))
     return path
 
@@ -1271,8 +1289,12 @@ def test_sections_follow_composer_v2_constants(monkeypatch):
     monkeypatch.setattr(composer, "ITEM_SECTIONS",
                         ("신청하세요", "알아두세요"), raising=False)
     items, commentary = sections_mod.declared()
-    assert items == ("✅ 신청하세요 (마감순)", "👀 알아두세요")
-    assert commentary == ("🤝 협의회에서",)
+    # 사이클5: composer 목록을 v1.2·v2 선언 목록과 **합집합**으로 쓴다 —
+    # composer 를 v2 로 바꾼 뒤에도 디스크의 v1 본문이 "항목 0건" 이 되지 않게.
+    assert set(items) >= {"✅ 신청하세요 (마감순)", "👀 알아두세요"}
+    assert set(items) >= set(sections_mod.V1_ITEM_SECTIONS)
+    assert "🤝 협의회에서" in commentary
+    assert not set(items) & set(commentary)
 
 
 def test_item_blocks_counts_blocks_not_links():
@@ -1751,3 +1773,236 @@ def test_forbid_notifier_propagates_when_gate_is_open(tmp_path, monkeypatch):
     _forbid_notifier(monkeypatch, "게이트가 열려 있다")
     with pytest.raises(GateBreached):
         _send(md)
+
+
+# ══ 사이클5 #1: 제외 검사는 본문 전체 URL 기준 ═════════════════════════
+HIDDEN = "https://example.com/hidden"
+
+
+def test_body_links_covers_every_url():
+    """항목·해설·산문·머리말의 모든 링크를 센다 (사이클5 #1)."""
+    body = SAMPLE_MD.replace(
+        preview_mod.MARKER, f"협의회 의견 [참고]({HIDDEN}) 였습니다"
+    ).replace(
+        "### 스마트팜 의견 조사",
+        f"### 스마트팜 의견 조사 [부록]({HIDDEN}2)",
+    )
+    links = prune_mod.body_links(body)
+    assert HIDDEN in links              # 해설의 참고 링크
+    assert f"{HIDDEN}2" in links        # 항목 제목의 두 번째 링크
+    assert "https://example.com/a" in links
+    # 항목 URL 목록보다 넓다
+    assert set(prune_mod.body_links(body)) > {
+        block["url"] for block in prune_mod.item_blocks(body)
+    }
+
+
+def test_send_digest_refuses_excluded_url_hidden_in_commentary(
+    tmp_path, monkeypatch, capsys
+):
+    """제외 URL 을 해설 참고 링크로 옮겨도 거부된다 (Codex 사이클5 #1 재현)."""
+    annotated = SAMPLE_MD.replace(
+        preview_mod.MARKER, f"확정 의견 — 참고 [자료]({HIDDEN})"
+    )
+    md = _write_digest(tmp_path, annotated)
+    _seed_preview(md)
+    state_path = state_mod.state_path_for_markdown(md)
+    state = state_mod.load_state(state_path, "2026-W37")
+    state_mod.save_state(state_path, dict(state, excluded_urls=[HIDDEN]))
+    _forbid_notifier(monkeypatch, "제외 URL 이 해설에 남았는데 발송했다")
+    assert _send(md) == 2
+    assert state_mod.EXCLUDED_NOT_APPLIED_REASON in capsys.readouterr().err
+
+
+def test_send_digest_refuses_excluded_url_as_second_item_link(
+    tmp_path, monkeypatch
+):
+    annotated, _ = apply_commentary(
+        SAMPLE_MD.replace(
+            "요약 한 줄.", f"요약 한 줄. 관련 [부록]({HIDDEN})"
+        ),
+        "확정 의견",
+    )
+    md = _write_digest(tmp_path, annotated)
+    _seed_preview(md)
+    state_path = state_mod.state_path_for_markdown(md)
+    state_mod.save_state(state_path, dict(
+        state_mod.load_state(state_path, "2026-W37"), excluded_urls=[HIDDEN]))
+    _forbid_notifier(monkeypatch, "제외 URL 이 두 번째 링크로 남았는데 발송했다")
+    assert _send(md) == 2
+
+
+# ══ 사이클5 #2: 승인 세대의 검증 결속 ══════════════════════════════════
+def test_send_digest_refuses_when_check_bytes_changed(
+    tmp_path, monkeypatch, capsys
+):
+    """본문 SHA 가 같아도 렌더에 쓴 검증이 바뀌면 거부 (Codex 사이클5 #3 재현)."""
+    annotated, _ = apply_commentary(SAMPLE_MD, "확정 의견")
+    md = _write_digest(tmp_path, annotated)
+    _seed_preview(md)
+    check_path = md.with_suffix(".check.json")
+    payload = json.loads(check_path.read_text(encoding="utf-8"))
+    payload["reason"] = ""          # 같은 본문 SHA, 다른 check 바이트
+    payload["items"] = payload["items"] + [
+        {"url": "https://example.com/a", "url_alive": True, "passed": True}
+    ]
+    check_path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+    _forbid_notifier(monkeypatch, "검증 파일이 바뀌었는데 발송했다")
+    assert _send(md) == 2
+    assert state_mod.STALE_CHECK_APPROVAL_REASON in capsys.readouterr().err
+
+
+def test_check_approval_requires_check_sha():
+    state = state_mod.record_preview(
+        state_mod.default_state("2026-W37"), [1], [], "a" * 64, "c" * 64
+    )
+    approval_id = state_mod.approval_of(state)["id"]
+    assert state_mod.check_approval(state, approval_id, "a" * 64, "c" * 64) == (
+        True, ""
+    )
+    ok, reason = state_mod.check_approval(state, approval_id, "a" * 64, "d" * 64)
+    assert ok is False and reason == state_mod.STALE_CHECK_APPROVAL_REASON
+    # check_sha 를 발급하지 않은 세대는 검증 결속을 요구하면 거부된다
+    legacy = state_mod.record_preview(
+        state_mod.default_state("2026-W37"), [1], [], "a" * 64
+    )
+    legacy_id = state_mod.approval_of(legacy)["id"]
+    assert state_mod.check_approval(legacy, legacy_id, "a" * 64, "c" * 64) == (
+        False, state_mod.STALE_CHECK_APPROVAL_REASON
+    )
+
+
+@pytest.mark.parametrize("patch,expected_block", [
+    ({"pass": False, "reason": "생존 항목 없음"}, "검증 미통과"),
+    ({"items": []}, "검증에 항목이 0건"),
+    ({"item_blocks": 0}, "항목 0건"),
+])
+def test_notify_issues_no_approval_for_failed_check(
+    tmp_path, monkeypatch, patch, expected_block
+):
+    """pass=false·항목 0건이면 승인 세대를 발급하지 않는다 (사이클5 #2)."""
+    from scripts import notify_digest
+
+    annotated, _ = apply_commentary(SAMPLE_MD, "확정 의견")
+    md = _write_digest(tmp_path, annotated, dict(PASS_CHECK, **patch))
+    sent = []
+    monkeypatch.setattr(
+        notify_digest, "resolve_target", lambda topic_key="council": (-100, 2011)
+    )
+    monkeypatch.setattr(notify_digest, "resolve_token", lambda: "123:FAKE")
+    monkeypatch.setattr(
+        notify_digest, "send_chunk",
+        lambda token, chat, thread, text: (sent.append(text), (True, 2014, ""))[1],
+    )
+    monkeypatch.setattr("sys.argv", ["notify_digest.py", str(md)])
+    assert notify_digest.main() == 0
+    assert sent and expected_block in sent[0]
+    assert "1. [" not in sent[0]         # 항목 미리보기 없음
+    state = state_mod.load_state(
+        state_mod.state_path_for_markdown(md), "2026-W37"
+    )
+    assert state["approval"] is None
+
+
+# ══ 사이클5 #3: tombstone ══════════════════════════════════════════════
+def test_tombstone_blocks_send_and_preview(tmp_path, monkeypatch):
+    from scripts import notify_digest
+
+    annotated, _ = apply_commentary(SAMPLE_MD, "확정 의견")
+    md = _write_digest(tmp_path, annotated)
+    _seed_preview(md)
+    tombstone = state_mod.tombstone_path_for_markdown(md)
+    state_mod.write_tombstone(
+        tombstone, "무효화 실패: 디스크 오류", "2026-09-13T03:00:00"
+    )
+    assert state_mod.tombstone_reason(tombstone)
+
+    _forbid_notifier(monkeypatch, "tombstone 이 있는데 발송했다")
+    assert _send(md) == 2
+    assert send_digest(md, dry_run=True) == 2       # 드라이런도 거부
+
+    sent = []
+    monkeypatch.setattr(
+        notify_digest, "resolve_target", lambda topic_key="council": (-100, 2011)
+    )
+    monkeypatch.setattr(notify_digest, "resolve_token", lambda: "123:FAKE")
+    monkeypatch.setattr(
+        notify_digest, "send_chunk",
+        lambda token, chat, thread, text: (sent.append(text), (True, 2014, ""))[1],
+    )
+    monkeypatch.setattr("sys.argv", ["notify_digest.py", str(md)])
+    assert notify_digest.main() == 0
+    assert "무효화 실패" in sent[0] and "1. [" not in sent[0]
+
+    assert state_mod.clear_tombstone(tombstone) is True
+    assert state_mod.tombstone_reason(tombstone) is None
+
+
+# ══ 사이클5 #4: redact 중앙화 ══════════════════════════════════════════
+LEAK_TOKEN = "1401666801:AAHt9Xk2mQpLzR7vNbC3dEfGhIjKlMnOpQrSt"
+
+
+def test_sender_stderr_redacts_check_reason(tmp_path, monkeypatch, capsys):
+    """check.reason 의 토큰이 발송기 stderr 로 새지 않는다 (사이클5 #4)."""
+    annotated, _ = apply_commentary(SAMPLE_MD, "확정 의견")
+    md = _write_digest(
+        tmp_path, annotated,
+        dict(PASS_CHECK, **{"pass": False, "reason": f"검증 실패 {LEAK_TOKEN}"}),
+    )
+    _seed_preview(md)
+    _forbid_notifier(monkeypatch, "pass=false 인데 발송했다")
+    assert _send(md) == 2
+    err = capsys.readouterr().err
+    assert LEAK_TOKEN not in err
+    assert "<redacted>" in err
+
+
+def test_notify_preview_body_redacts_check_reason(tmp_path, monkeypatch):
+    """미리보기 본문에 실리는 check.reason 도 가려진다 (사이클5 #4)."""
+    from scripts import notify_digest
+
+    annotated, _ = apply_commentary(SAMPLE_MD, "확정 의견")
+    md = _write_digest(
+        tmp_path, annotated,
+        dict(PASS_CHECK, **{"pass": False, "reason": f"생존 항목 없음 {LEAK_TOKEN}"}),
+    )
+    sent = []
+    monkeypatch.setattr(
+        notify_digest, "resolve_target", lambda topic_key="council": (-100, 2011)
+    )
+    monkeypatch.setattr(notify_digest, "resolve_token", lambda: "123:FAKE")
+    monkeypatch.setattr(
+        notify_digest, "send_chunk",
+        lambda token, chat, thread, text: (sent.append(text), (True, 2014, ""))[1],
+    )
+    monkeypatch.setattr("sys.argv", ["notify_digest.py", str(md)])
+    assert notify_digest.main() == 0
+    assert sent and LEAK_TOKEN not in sent[0]
+    assert "<redacted>" in sent[0]
+
+
+# ══ 사이클5 #5: 발송 중에는 미리보기를 보내지 않는다 ═══════════════════
+def test_notify_skips_preview_while_send_holds_lock(tmp_path, monkeypatch):
+    from scripts import notify_digest
+
+    annotated, _ = apply_commentary(SAMPLE_MD, "확정 의견")
+    md = _write_digest(tmp_path, annotated)
+    _seed_preview(md)
+    holder = state_mod.acquire_lock(state_mod.lock_path_for_markdown(md))
+    sent = []
+    monkeypatch.setattr(
+        notify_digest, "resolve_target", lambda topic_key="council": (-100, 2011)
+    )
+    monkeypatch.setattr(notify_digest, "resolve_token", lambda: "123:FAKE")
+    monkeypatch.setattr(
+        notify_digest, "send_chunk",
+        lambda token, chat, thread, text: (sent.append(text), (True, 2014, ""))[1],
+    )
+    monkeypatch.setattr("sys.argv", ["notify_digest.py", str(md)])
+    try:
+        assert notify_digest.main() == 3
+    finally:
+        state_mod.release_lock(holder)
+    assert len(sent) == 1
+    assert "발송 진행 중" in sent[0]
+    assert "1. [" not in sent[0]         # 미리보기 본문은 나가지 않았다

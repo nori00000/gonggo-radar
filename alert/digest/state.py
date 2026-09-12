@@ -69,6 +69,8 @@ STALE_PREVIEW_BODY_REASON = "미리보기와 본문이 다릅니다 — 재검�
 EXCLUDED_NOT_APPLIED_REASON = "제외 미반영 — 제외한 항목이 본문에 남아 있습니다"
 REBUILD_FAILED_REASON = "재조립 실패 상태 — 다시 조립해야 합니다"
 VERIFICATION_BROKEN_REASON = "검증 파일 무효화 실패 상태 — `/digest 재검토` 필요"
+TOMBSTONE_REASON = "검증 파괴 표식(.broken) 존재 — `/digest 재검토` 성공 전까지 발송 불가"
+STALE_CHECK_APPROVAL_REASON = "승인 이후 검증 파일이 바뀌었습니다 — 재검토 필요"
 
 # 승인 세대 id 길이 (callback_data 64바이트 한도 안에 들어가야 한다)
 APPROVAL_ID_LEN = 12
@@ -101,6 +103,46 @@ def lock_path(week: str, out_dir="digests") -> Path:
 def lock_path_for_markdown(markdown_path) -> Path:
     """다이제스트 마크다운 경로 → 같은 주차의 잠금 파일 경로."""
     return Path(markdown_path).with_suffix(".lock")
+
+
+def tombstone_path(week: str, out_dir="digests") -> Path:
+    """검증 파괴 표식 (사이클5 #3). 존재하면 발송·미리보기를 무조건 거부한다."""
+    return Path(out_dir) / f"{week}.broken"
+
+
+def tombstone_path_for_markdown(markdown_path) -> Path:
+    return Path(markdown_path).with_suffix(".broken")
+
+
+def write_tombstone(path, reason: str, now_iso: str) -> None:
+    """표식 기록. 실패는 예외로 올린다 — 호출자가 마지막 수단을 택해야 한다."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        f"{now_iso}\n{reason}\n", encoding="utf-8"
+    )
+
+
+def tombstone_reason(path) -> Optional[str]:
+    """표식이 있으면 그 내용(사유). 없으면 None."""
+    path = Path(path)
+    if not path.exists():
+        return None
+    try:
+        return path.read_text(encoding="utf-8").strip() or "(사유 미기록)"
+    except OSError:
+        return "(표식 읽기 실패)"
+
+
+def clear_tombstone(path) -> bool:
+    """표식 제거 — `/digest 재검토` 가 재조립+재검증에 성공했을 때만 부른다."""
+    try:
+        Path(path).unlink()
+        return True
+    except FileNotFoundError:
+        return True
+    except OSError:
+        return False
 
 
 def week_from_markdown(markdown_path) -> str:
@@ -377,7 +419,8 @@ def new_approval_id() -> str:
 
 
 def record_preview(state: Dict, message_ids, item_urls=None,
-                   approval_sha: Optional[str] = None) -> Dict:
+                   approval_sha: Optional[str] = None,
+                   check_sha: Optional[str] = None) -> Dict:
     """이번 미리보기의 message_id·항목 URL·**새 승인 세대**를 기록.
 
     **status 는 절대 건드리지 않는다** (사이클2 #1) — 미리보기 전송이 발송 상태를
@@ -386,6 +429,10 @@ def record_preview(state: Dict, message_ids, item_urls=None,
     사이클4 #2: 새 미리보기는 **이전 승인 세대를 폐기**하고 새 id 를 발급한다.
     승인 카드의 callback_data 는 이 id 를 싣고, 발송기는 id 와 전체 SHA 를 함께
     확인한다 — 접두 충돌로 옛 카드가 되살아나는 길을 없앤다.
+
+    사이클5 #2: 세대에 **검증 결속**(check_sha = 그 시점 check.json 바이트의 SHA)도
+    싣는다. 본문 SHA 가 같아도 렌더에 쓴 검증이 바뀌면(분류 개편으로 0건 → 수정 후
+    pass) 세대가 무효가 된다.
     """
     updated = dict(state)
     ids = [int(mid) for mid in message_ids]
@@ -403,6 +450,7 @@ def record_preview(state: Dict, message_ids, item_urls=None,
         {
             "id": new_approval_id(),
             "sha": str(approval_sha),
+            "check_sha": str(check_sha) if check_sha else None,
             "card_message_id": None,
         }
         if approval_sha
@@ -445,10 +493,12 @@ def card_message_id(state: Optional[Dict]):
 
 
 def check_approval(state: Optional[Dict], approval_id: str,
-                   current_sha: str) -> Tuple[bool, str]:
-    """승인 세대 검증 (사이클4 #2). (ok, 거부 사유).
+                   current_sha: str,
+                   current_check_sha: Optional[str] = None) -> Tuple[bool, str]:
+    """승인 세대 검증 (사이클4 #2 · 사이클5 #2). (ok, 거부 사유).
 
-    id 와 **전체 64자 SHA** 를 모두 확인한다 — 접두 비교는 폐지했다.
+    id 와 **전체 64자 본문 SHA** 를 확인하고, current_check_sha 가 오면
+    **검증 파일 바이트 SHA** 까지 대조한다 — 접두 비교는 폐지했다.
     """
     approval = approval_of(state)
     if not approval.get("id"):
@@ -457,6 +507,11 @@ def check_approval(state: Optional[Dict], approval_id: str,
         return False, STALE_APPROVAL_REASON
     if approval.get("sha") != current_sha:
         return False, STALE_PREVIEW_BODY_REASON
+    if current_check_sha is not None:
+        if not approval.get("check_sha"):
+            return False, STALE_CHECK_APPROVAL_REASON
+        if approval["check_sha"] != current_check_sha:
+            return False, STALE_CHECK_APPROVAL_REASON
     return True, ""
 
 

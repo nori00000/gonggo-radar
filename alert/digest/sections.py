@@ -64,14 +64,26 @@ def from_composer() -> Optional[Tuple[Tuple[str, ...], Tuple[str, ...]]]:
 
 
 def declared() -> Tuple[Tuple[str, ...], Tuple[str, ...]]:
-    """composer 상수 → 없으면 선언 목록(v1.2 + v2 합집합)."""
+    """항목·산문 헤딩의 선언 목록 = composer 상수 **∪** v1.2 ∪ v2 (사이클5).
+
+    합집합인 이유: composer 를 v2 로 바꾼 뒤에도 디스크에는 v1 본문이 남아 있다.
+    composer 목록으로만 판정하면 그 본문이 "항목 0건" 으로 오분류된다(Codex 재현).
+    삭제된 섹션 이름을 계속 알아보는 것은 손해가 없다 — 판정은 정확 일치이고,
+    본문에 없는 헤딩은 resolve 가 걸러낸다.
+    """
+    items = list(V1_ITEM_SECTIONS + V2_ITEM_SECTIONS)
+    commentary = list(V1_COMMENTARY_SECTIONS + V2_COMMENTARY_SECTIONS)
     from_mod = from_composer()
     if from_mod is not None:
-        return from_mod
-    return (
-        V1_ITEM_SECTIONS + V2_ITEM_SECTIONS,
-        V1_COMMENTARY_SECTIONS + V2_COMMENTARY_SECTIONS,
-    )
+        for name in from_mod[0]:
+            if name not in items:
+                items.append(name)
+        for name in from_mod[1]:
+            if name not in commentary and name not in items:
+                commentary.append(name)
+    # 항목 목록에 있는 이름은 산문에서 뺀다 (항목 판정이 우선)
+    commentary = [name for name in commentary if name not in items]
+    return tuple(items), tuple(commentary)
 
 
 def _string_list(value) -> Optional[Tuple[str, ...]]:

@@ -900,6 +900,7 @@ class TestSendDigest:
         seeded = state_mod.record_preview(
             state_mod.default_state(week), [2014], [],
             markdown_sha256(md_path.read_bytes()),
+            markdown_sha256(check_path.read_bytes()),
         )
         state_mod.save_state(state_path, seeded)
 
