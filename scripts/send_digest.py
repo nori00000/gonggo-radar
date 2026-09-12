@@ -45,8 +45,9 @@ def _out(message) -> None:
     """발송기의 stdout 출력 (봇이 수신자 수를 파싱한다)."""
     print(redact(message))
 
-# [텍스트](URL) — URL 안의 괄호 한 단계까지 균형 있게 소비 (javascript:alert(1) 대응)
-LINK_PATTERN = r"\[([^\]]+)\]\(([^()\s]*(?:\([^()]*\)[^()\s]*)*)\)"
+# 링크 파서는 **prune 하나만** 쓴다 (사이클7 #3). 렌더러가 만드는 href 와
+# 검사기(body_urls)가 보는 URL 이 갈리면 "검사한 곳과 다른 데로 가는" 링크가 생긴다.
+LINK_PATTERN = prune.LINK_PATTERN
 
 
 def markdown_to_html(markdown_text: str) -> str:
@@ -116,7 +117,7 @@ def markdown_to_html(markdown_text: str) -> str:
         # sentinel(\x00LINK{n}\x00)로 먼저 치환한다.
         link_placeholders = {}
         modified_line = line
-        for i, match in enumerate(re.finditer(LINK_PATTERN, line)):
+        for i, match in enumerate(prune.link_matches(line)):
             url = match.group(2)
             text = match.group(1)
             parsed = urlparse(url)

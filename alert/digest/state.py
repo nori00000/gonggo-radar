@@ -19,6 +19,7 @@ import fcntl
 import json
 import os
 import re
+import time
 import uuid
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -80,9 +81,37 @@ APPROVAL_ID_LEN = 12
 WEEK_RE = re.compile(r"\A\d{4}-W(0[1-9]|[1-4]\d|5[0-3])\Z")
 
 
+# 발송기 외의 작성자가 잠금을 기다리는 한도 (사이클7 #1)
+LOCK_TIMEOUT_SECONDS = 60.0
+LOCK_POLL_SECONDS = 0.1
+# 재현·테스트에서 대기 한도를 줄이는 유일한 손잡이 (기본값은 코드가 정본)
+LOCK_TIMEOUT_ENV = "DIGEST_LOCK_TIMEOUT"
+
+
+def lock_timeout() -> float:
+    """블로킹 대기 한도. 환경변수가 숫자면 그것, 아니면 LOCK_TIMEOUT_SECONDS."""
+    raw = os.environ.get(LOCK_TIMEOUT_ENV)
+    if raw:
+        try:
+            return max(0.0, float(raw))
+        except ValueError:
+            pass
+    return LOCK_TIMEOUT_SECONDS
+
+
 def valid_week(week) -> bool:
     """엄격한 주차 형식 검사."""
     return bool(isinstance(week, str) and WEEK_RE.match(week))
+
+
+def require_week(week) -> str:
+    """주차 형식이 아니면 ValueError — 경로 조립에 쓰기 전 관문.
+
+    `state_path("../x")` 같은 직접 호출이 digests/ 밖을 가리키던 경로를 막는다.
+    """
+    if not valid_week(week):
+        raise ValueError(f"주차 형식이 아닙니다: {week!r}")
+    return week
 
 
 class StateError(RuntimeError):
@@ -94,8 +123,8 @@ class TransitionError(RuntimeError):
 
 
 def state_path(week: str, out_dir="digests") -> Path:
-    """주차 → 상태 파일 경로."""
-    return Path(out_dir) / f"{week}.state.json"
+    """주차 → 상태 파일 경로 (주차 형식 검증 후)."""
+    return Path(out_dir) / f"{require_week(week)}.state.json"
 
 
 def state_path_for_markdown(markdown_path) -> Path:
@@ -106,7 +135,7 @@ def state_path_for_markdown(markdown_path) -> Path:
 
 def lock_path(week: str, out_dir="digests") -> Path:
     """주차 → 상태·발송 잠금 파일 경로 (계약 W10 크리틱 #1)."""
-    return Path(out_dir) / f"{week}.lock"
+    return Path(out_dir) / f"{require_week(week)}.lock"
 
 
 def lock_path_for_markdown(markdown_path) -> Path:
@@ -116,7 +145,7 @@ def lock_path_for_markdown(markdown_path) -> Path:
 
 def tombstone_path(week: str, out_dir="digests") -> Path:
     """검증 파괴 표식 (사이클5 #3). 존재하면 발송·미리보기를 무조건 거부한다."""
-    return Path(out_dir) / f"{week}.broken"
+    return Path(out_dir) / f"{require_week(week)}.broken"
 
 
 def tombstone_path_for_markdown(markdown_path) -> Path:
@@ -248,13 +277,14 @@ def apply_state(path, current: Dict, new: Dict, escape: bool = False) -> Dict:
 
 
 def update_state(state_path_, lock_path_, week: str, mutate,
-                 escape: bool = False) -> Dict:
+                 escape: bool = False, blocking: bool = True,
+                 timeout: float = None) -> Dict:
     """flock 하 read-modify-write.
 
     mutate(state) → 새 상태 (None 이면 쓰지 않는다). 잠금을 쥔 뒤에 **다시 읽으므로**
     "읽고 나서 남이 바꾼 상태를 덮어쓰는" 경합이 생기지 않는다(사이클2 #1).
     """
-    handle = acquire_lock(lock_path_)
+    handle = acquire_lock(lock_path_, blocking=blocking, timeout=timeout)
     try:
         current = load_state(state_path_, week)
         new = mutate(current)
@@ -263,6 +293,20 @@ def update_state(state_path_, lock_path_, week: str, mutate,
         return apply_state(state_path_, current, new, escape=escape)
     finally:
         release_lock(handle)
+
+
+def update_state_locked(state_path_, week: str, mutate,
+                        escape: bool = False) -> Dict:
+    """**잠금을 이미 쥔** 호출자용 read-modify-write (사이클7 #1).
+
+    잠금을 쥔 채 update_state 를 부르면 같은 프로세스의 다른 fd 로 flock 을 다시
+    걸려다 대기·실패한다. 잠금 구간 안에서는 이 함수를 쓴다.
+    """
+    current = load_state(state_path_, week)
+    new = mutate(current)
+    if new is None:
+        return current
+    return apply_state(state_path_, current, new, escape=escape)
 
 
 def can_send(state: Dict) -> Tuple[bool, str]:
@@ -561,20 +605,35 @@ class LockHandle:
         return f"LockHandle({self.path}, fd={self.fd}, pid={os.getpid()})"
 
 
-def acquire_lock(path) -> LockHandle:
-    """발송·상태 잠금 (`flock(LOCK_EX|LOCK_NB)`). 실패는 즉시 LockBusy — 재시도 없음.
+def acquire_lock(path, blocking: bool = False,
+                 timeout: float = None) -> LockHandle:
+    """발송·상태 잠금 (`flock`). 사이클7 #1: **모든 작성자가 같은 잠금을 따른다.**
 
-    파일 회수·nonce·pid 검사를 전부 버렸다 (사이클4 #1): 커널이 배타성을 보장하고,
-    보유 프로세스가 죽으면 잠금이 즉시 풀린다.
+    · 발송기는 `blocking=False` — 즉시 LockBusy(재시도 없음).
+    · 그 밖의 작성자(recheck·weekly·apply_commentary·notify·봇)는
+      `blocking=True` 로 최대 timeout 초(기본 LOCK_TIMEOUT_SECONDS) 기다린 뒤 실패한다.
+
+    파일 회수·nonce·pid 검사는 없다 — 커널이 배타성을 보장하고 프로세스가 죽으면
+    즉시 해제된다.
     """
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
+    limit = lock_timeout() if timeout is None else timeout
     fd = os.open(str(path), os.O_CREAT | os.O_RDWR, 0o644)
-    try:
-        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except OSError as exc:
-        os.close(fd)
-        raise LockBusy(f"잠금이 사용 중입니다: {path}") from exc
+    deadline = time.monotonic() + max(0.0, limit)
+    while True:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            break
+        except OSError as exc:
+            if not blocking:
+                os.close(fd)
+                raise LockBusy(f"잠금이 사용 중입니다: {path}") from exc
+            if time.monotonic() >= deadline:
+                os.close(fd)
+                raise LockBusy(
+                    f"잠금 대기 시간 초과({limit:g}초): {path}") from exc
+            time.sleep(LOCK_POLL_SECONDS)
     try:
         os.ftruncate(fd, 0)
         os.write(fd, f"{os.getpid()}\n".encode("utf-8"))

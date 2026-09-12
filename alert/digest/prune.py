@@ -14,6 +14,7 @@ weekly_digest 는 재조립(compose)으로 죽은 항목을 빼지만, `/digest 
 """
 
 import re
+import unicodedata
 from typing import Dict, List, Optional, Sequence, Tuple
 
 from alert.digest import sections as sections_mod
@@ -21,43 +22,96 @@ from alert.digest import sections as sections_mod
 EMPTY_SECTION_LINE = "*(항목 없음)*"
 
 _ORIGIN_RE = re.compile(r"^\*\*원문:\*\*\s*(.+)$")
-# 링크 치환용(단순) — 렌더 경로에서만 쓴다
-_LINK_RE = re.compile(r"\[([^\]]+)\]\(([^)]+)\)")
-# URL 추출용(괄호 한 단계 균형) — `[자료](https://x/report(1))` 를 통째로 잡는다
-_BALANCED_LINK_RE = re.compile(
-    r"\[([^\]]+)\]\(([^()\s]*(?:\([^()]*\)[^()\s]*)*)\)"
-)
-# 베어 URL — 공백·꺾쇠·따옴표에서 끊는다. 끝 구두점·불균형 괄호는 _trim_url 이 깎는다.
+# ─── 링크 파서 (렌더러와 검사기가 **같은 함수**를 쓴다, 사이클7 #3) ─────
+# 이 패턴이 send_digest.markdown_to_html 의 링크 패턴이다. 렌더러가 만드는 href 와
+# 검사하는 URL 이 갈리면 "검사한 곳과 다른 데로 보내는" 링크가 생긴다.
+LINK_PATTERN = r"\[([^\]]+)\]\(([^()\s]*(?:\([^()]*\)[^()\s]*)*)\)"
+_LINK_RE = re.compile(LINK_PATTERN)
+# 베어 URL — 공백·꺾쇠·따옴표에서 끊는다. 산문의 베어는 끝 구두점을 깎는다.
 _BARE_URL_RE = re.compile(r"https?://[^\s<>\"']+")
 _BLANKS_RE = re.compile(r"\n{3,}")
 
-# 본문에 허용되는 제어 문자는 개행·탭 뿐이다 (사이클6 #2).
-# 나머지(특히 splitlines 가 줄바꿈으로 보는 \r \v \f \x1c-\x1e \x85 U+2028/9)는
-# 파서마다 줄 수가 달라져 "같은 본문, 다른 항목 수" 를 만든다 → fail-closed.
-CONTROL_CHARS_RE = re.compile(
-    "[\x00-\x08\x0b\x0c\x0d\x0e-\x1f\x7f\x85\u2028\u2029]"
-)
 _TRAILING_PUNCT = ".,;:!?"
 _CLOSERS = {")": "(", "]": "[", "}": "{"}
 
 
 def control_chars(text):
-    """본문에 있는 허용되지 않은 제어 문자 목록 (중복 제거, 발견 순서)."""
+    """허용 목록 밖의 문자 (사이클7 #4).
+
+    허용되는 것은 `\n`·`\t` 뿐이다. 그 밖에 unicodedata category 가
+    Cc(제어)·Cf(포맷: BOM·ZWSP·LRM·RLO·LRI…)·Zl·Zp 인 코드포인트가 하나라도 있으면
+    fail-closed 다 — 블랙리스트로는 U+0080~U+009F·양방향 제어를 계속 놓쳤다.
+    """
     found = []
-    for match in CONTROL_CHARS_RE.finditer(text or ""):
-        char = match.group(0)
-        if char not in found:
-            found.append(char)
+    for char in text or "":
+        if char in ("\n", "\t"):
+            continue
+        if unicodedata.category(char) in ("Cc", "Cf", "Zl", "Zp"):
+            if char not in found:
+                found.append(char)
     return found
 
 
 def control_chars_label(text):
-    """사람이 읽을 제어 문자 표기 (예: `\\x0b, \\r`)."""
+    """사람이 읽을 표기 (예: `\\x0b, \\ufeff`)."""
     return ", ".join(repr(char).strip("'") for char in control_chars(text))
 
 
-def _trim_url(url):
-    """끝 구두점과 불균형 닫는 괄호를 깎는다 (사이클6 #3)."""
+def strip_control_chars(text):
+    """허용 목록 밖의 문자를 제거 (composer 가 저장 시 쓴다)."""
+    return "".join(
+        char for char in (text or "")
+        if char in ("\n", "\t")
+        or unicodedata.category(char) not in ("Cc", "Cf", "Zl", "Zp")
+    )
+
+
+def _item_sections(
+    markdown_text: str, item_sections: Optional[Sequence[str]] = None
+) -> Tuple[str, ...]:
+    """판정에 쓸 항목 섹션 헤딩 목록 (정확 일치용)."""
+    if item_sections is not None:
+        return tuple(item_sections)
+    resolved, _ = sections_mod.resolve(None, markdown_text)
+    return resolved
+
+
+def _origin_url(line: str) -> Optional[str]:
+    """`**원문:** [x](href)` 줄에서 href. 원문 줄이 아니면 None.
+
+    링크가 아니면 원시값을 돌려준다 — body_urls 와 같은 규칙이다.
+    """
+    matched = _ORIGIN_RE.match(line.strip())
+    if not matched:
+        return None
+    link = _LINK_RE.search(matched.group(1))
+    return link.group(2).strip() if link else matched.group(1).strip()
+
+
+def markdown_links(text):
+    """`[표시](href)` 쌍 목록 — (표시문자열, href). href 는 **그대로** 돌려준다.
+
+    렌더러(send_digest.markdown_to_html)가 이 href 를 그대로 `<a href>` 로 쓰므로,
+    끝 구두점을 깎으면 "검사한 URL ≠ 실제 목적지" 가 된다 (사이클7 #3).
+    """
+    return [
+        (match.group(1), match.group(2))
+        for line in (text or "").split("\n")
+        for match in _LINK_RE.finditer(line)
+    ]
+
+
+def link_matches(line):
+    """한 줄의 `[표시](href)` 정규식 match 목록.
+
+    `send_digest.markdown_to_html` 가 치환에 쓸 `match.group(0)` 까지 필요하므로
+    쌍(markdown_links)이 아니라 match 를 그대로 준다 — **같은 `_LINK_RE`** 다.
+    """
+    return list(_LINK_RE.finditer(line or ""))
+
+
+def _trim_prose_url(url):
+    """산문 베어 URL 의 끝 구두점·불균형 괄호를 깎는다."""
     url = (url or "").strip()
     while url:
         last = url[-1]
@@ -72,54 +126,34 @@ def _trim_url(url):
 
 
 def body_urls(text):
-    """본문에 실린 **모든** URL — 단일 추출 함수 (사이클6 #3).
+    """본문에 실린 **모든** URL — 단일 추출 함수 (사이클6 #3 · 사이클7 #3).
 
-    ① 마크다운 링크(괄호 한 단계 균형) ② 베어 URL(`https?://`) ③ `**원문:**` 값.
-    checker·notify·봇 guard·발송기가 **모두 이 함수**를 쓴다 — 추출 규칙이 갈리면
-    "제외했는데 본문에 남은 URL" 이 검사를 통과한다.
+    집합 = ① 모든 링크 href(**그대로**, 끝 구두점 포함)
+          ∪ ② 표시문자열 안의 베어 URL (`[https://a/hidden](https://a/ok)`)
+          ∪ ③ 산문의 베어 URL (끝 구두점 제거)
+          ∪ ④ `**원문:**` 의 링크 아닌 원시값
+
+    checker·notify·봇 guard·발송기가 모두 이 함수를 쓴다.
     """
     found = []
 
     def _add(url):
-        url = _trim_url(url)
+        url = (url or "").strip()
         if url and url not in found:
             found.append(url)
 
     for line in (text or "").split("\n"):
-        for match in _BALANCED_LINK_RE.finditer(line):
-            _add(match.group(2))
-        # 베어 URL 은 마크다운 링크를 **가린 뒤** 찾는다 — 가리지 않으면
-        # `[https://x/c](https://x/c)` 가 `https://x/c](https://x/c)` 로 잡힌다.
-        masked = _BALANCED_LINK_RE.sub(
-            lambda m: " " * len(m.group(0)), line)
-        for match in _BARE_URL_RE.finditer(masked):
-            _add(match.group(0))
+        for display, href in markdown_links(line):
+            _add(href)                              # ① 렌더러가 쓰는 값 그대로
+            for match in _BARE_URL_RE.finditer(display):
+                _add(_trim_prose_url(match.group(0)))   # ② 표시문자열 안의 URL
+        prose = _LINK_RE.sub(lambda m: " " * len(m.group(0)), line)
+        for match in _BARE_URL_RE.finditer(prose):
+            _add(_trim_prose_url(match.group(0)))       # ③ 산문의 베어
         origin = _ORIGIN_RE.match(line.strip())
-        if origin:
-            # 링크 형태면 URL 만, 아니면 원시값 (링크는 위에서 이미 잡혔다)
-            link = _BALANCED_LINK_RE.search(origin.group(1))
-            if not link:
-                _add(origin.group(1))
+        if origin and not _LINK_RE.search(origin.group(1)):
+            _add(origin.group(1))                       # ④ 링크 아닌 원문값
     return found
-
-
-def _item_sections(
-    markdown_text: str, item_sections: Optional[Sequence[str]] = None
-) -> Tuple[str, ...]:
-    """판정에 쓸 항목 섹션 헤딩 목록 (정확 일치용)."""
-    if item_sections is not None:
-        return tuple(item_sections)
-    resolved, _ = sections_mod.resolve(None, markdown_text)
-    return resolved
-
-
-def _origin_url(line: str) -> Optional[str]:
-    """`**원문:** [x](url)` 줄에서 URL. 원문 줄이 아니면 None."""
-    matched = _ORIGIN_RE.match(line.strip())
-    if not matched:
-        return None
-    link = _LINK_RE.search(matched.group(1))
-    return link.group(2).strip() if link else matched.group(1).strip()
 
 
 def parse_blocks(

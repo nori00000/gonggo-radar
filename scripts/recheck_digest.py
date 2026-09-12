@@ -19,15 +19,30 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from alert.digest import prune
 from alert.digest import sections as sections_mod
+from alert.digest import state as state_mod
 from alert.digest.checker import (
     check_digest,
     dead_urls,
     markdown_sha256,
     write_check_result,
 )
+from alert.utils.redact import redact
 
 # 죽은 URL 제거 → 재검증을 반복하는 최대 횟수 (무한 루프 방지)
 MAX_PRUNE_ROUNDS = 3
+
+
+def _err(message) -> None:
+    """재검증의 **모든** stderr 출력 (사이클7 #5).
+
+    check_digest 가 올리는 예외 문자열에 토큰·URL 자격이 섞여 launchd 로그로
+    새지 않도록 한 곳에서 redact 한다.
+    """
+    print(redact(message), file=sys.stderr)
+
+
+def _out(message) -> None:
+    print(redact(message))
 
 
 def _merge_dropped(accumulated, from_check):
@@ -69,14 +84,14 @@ def recheck(markdown_path: Path, db_path: str, check_path: Path):
         dropped.extend(removed)
         dropped.extend(duplicates)
         for item in duplicates:
-            print(f"  중복 제목 제거: {item['title']}")
+            _out(f"  중복 제목 제거: {item['title']}")
         # 해설·본문에서 링크만 떼어낸 죽은 URL도 check.json 에 남긴다 —
         # 미리보기 헤더의 "죽은 URL 제외 N건" 이 실제 제거 건수와 맞아야 한다.
         dropped.extend({"title": "본문 링크", "url": url} for url in unlinked)
         for url in unlinked:
-            print(f"  죽은 링크 제거(문장 보존): {url}")
+            _out(f"  죽은 링크 제거(문장 보존): {url}")
         for item in removed:
-            print(f"  죽은 항목 제거: {item['title']} ({item['url']})")
+            _out(f"  죽은 항목 제거: {item['title']} ({item['url']})")
 
     result["dropped"] = _merge_dropped(dropped, result.get("dropped"))
     write_check_result(check_path, result)
@@ -97,7 +112,8 @@ def write_failure(check_path: Path, markdown_path: Path, reason: str) -> None:
         "item_blocks": 0,
         "item_sections": [],
         "commentary_sections": [],
-        "reason": f"재검증 실패: {reason}",
+        # 사이클7 #5: 사유는 미리보기로 흐른다 — 토큰을 남기지 않는다.
+        "reason": f"재검증 실패: {redact(reason)}",
         "markdown_sha256": md_sha,
     })
 
@@ -113,33 +129,75 @@ def main():
     args = parser.parse_args()
 
     markdown_path = Path(args.markdown)
-    if not markdown_path.exists():
-        print(f"✗ 파일 없음: {markdown_path}", file=sys.stderr)
+    week = state_mod.week_from_markdown(markdown_path)
+    if not state_mod.valid_week(week):
+        _err(f"✗ 주차 파일명이 아닙니다: {markdown_path.name}")
         return 2
 
-    check_path = markdown_path.with_suffix(".check.json")
+    state_path = state_mod.state_path_for_markdown(markdown_path)
+    lock_path = state_mod.lock_path_for_markdown(markdown_path)
+
+    # 사이클7 #1: 재검증도 **같은 잠금**을 따른다. 발송기가 쥐고 있으면 기다리고,
+    # 한도를 넘기면 본문·검증·표식을 하나도 건드리지 않고 끝낸다.
     try:
-        result, dropped = recheck(markdown_path, args.db, check_path)
-    except Exception as exc:  # noqa: BLE001 — 체크 자체 예외는 fail-closed
-        # 예외·타임아웃·DB 오류로 검증을 못 했으면 이전 check.json 을 무효화한다.
-        write_failure(check_path, markdown_path, str(exc))
-        print(f"✗ 검증 실패: {exc}", file=sys.stderr)
-        print(f"  check.json 을 pass=false 로 덮어썼습니다: {check_path}",
-              file=sys.stderr)
-        return 1
+        handle = state_mod.acquire_lock(lock_path, blocking=True)
+    except (state_mod.LockBusy, OSError) as exc:
+        _err(f"✗ 재검증 거부: 잠금 대기 실패({redact(exc)})")
+        return 2
 
-    print(f"✓ 검증 완료: {check_path}")
-    if result["pass"]:
-        print(
-            "  통과 항목 {}건 / 제거 {}건".format(
-                len(result["items"]), len(dropped)
+    try:
+        if not markdown_path.exists():
+            _err(f"✗ 파일 없음: {markdown_path}")
+            return 2
+
+        # 사이클7 #2: **첫 동작은 승인 세대 폐기**다. 실패하면 즉시 중단한다 —
+        # 옛 승인이 살아 있는 채로 본문·검증을 바꾸면 그 카드로 발송이 된다.
+        try:
+            state_mod.update_state_locked(
+                state_path, week, state_mod.clear_approval)
+        except (state_mod.StateError, state_mod.TransitionError, OSError) as exc:
+            _err(
+                f"✗ 재검증 중단: 승인 폐기 실패({redact(exc)}) "
+                "— 본문·검증을 건드리지 않았습니다"
             )
-        )
-        return 0
+            return 2
 
-    print(f"  ⚠️  {result.get('reason', '검증 실패')}")
-    return 1
+        check_path = markdown_path.with_suffix(".check.json")
+        try:
+            result, dropped = recheck(markdown_path, args.db, check_path)
+        except Exception as exc:  # noqa: BLE001 — 체크 자체 예외는 fail-closed
+            # 예외·타임아웃·DB 오류로 검증을 못 했으면 이전 check.json 을 무효화한다.
+            write_failure(check_path, markdown_path, str(exc))
+            _err(f"✗ 검증 실패: {exc}")
+            _err(f"  check.json 을 pass=false 로 덮어썼습니다: {check_path}")
+            return 1
+
+        _out(f"✓ 검증 완료: {check_path}")
+        if result["pass"]:
+            _out(
+                "  통과 항목 {}건 / 제거 {}건".format(
+                    len(result["items"]), len(dropped)
+                )
+            )
+            return 0
+
+        _out(f"  ⚠️  {result.get('reason', '검증 실패')}")
+        return 1
+    finally:
+        state_mod.release_lock(handle)
+
+
+def guarded_main():
+    """예외·traceback 까지 redact 해서 내보낸다 (사이클6 #7 · 사이클7 #5)."""
+    try:
+        return main()
+    except SystemExit:
+        raise
+    except BaseException:       # noqa: BLE001
+        import traceback
+        _err(traceback.format_exc())
+        return 70
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    sys.exit(guarded_main())

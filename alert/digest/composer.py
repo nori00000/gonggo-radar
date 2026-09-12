@@ -48,9 +48,9 @@ def strip_controls(text: str) -> str:
     줄 수가 달라져 "같은 본문, 다른 항목 수" 가 된다. 저장 시점에 없앤다.
     (검증 단계에도 fail-closed 게이트가 있다 — 여기는 애초에 만들지 않는 쪽.)
     """
-    from alert.digest.prune import CONTROL_CHARS_RE
+    from alert.digest.prune import strip_control_chars
 
-    return CONTROL_CHARS_RE.sub("", text or "")
+    return strip_control_chars(text)
 
 
 def normalize_title(title: str) -> str:

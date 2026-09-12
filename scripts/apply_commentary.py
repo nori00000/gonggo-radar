@@ -131,8 +131,10 @@ def main():
     # 계약 W10 사이클3 #6: **잠금을 먼저 쥐고 상태를 확인한 뒤** 본문을 쓴다.
     state_path = state_mod.state_path(args.week, args.out_dir)
     lock_path = state_mod.lock_path(args.week, args.out_dir)
+    # 사이클7 #1: 발송기만 즉시 거부(LOCK_NB)다. 그 밖의 작성자는 블로킹 대기 후
+    # 한도를 넘기면 본문을 건드리지 않고 실패한다.
     try:
-        handle = state_mod.acquire_lock(lock_path)
+        handle = state_mod.acquire_lock(lock_path, blocking=True)
     except (state_mod.LockBusy, OSError) as exc:
         _err(f"✗ {label} 적용 거부: {exc}")
         return 2
@@ -171,11 +173,12 @@ def main():
         if kind != "commentary":
             return 0
         try:
-            state_mod.apply_state(
-                state_path, state, state_mod.mark_annotated(state, text)
+            state_mod.update_state_locked(
+                state_path, args.week,
+                lambda current: state_mod.mark_annotated(current, text),
             )
             _out(f"✓ 상태 기록: {state_path} (status=annotated)")
-        except (state_mod.TransitionError, OSError) as exc:
+        except (state_mod.StateError, state_mod.TransitionError, OSError) as exc:
             _err(f"⚠️  상태 기록 실패(본문은 적용됨): {exc}")
             return 1
     finally:

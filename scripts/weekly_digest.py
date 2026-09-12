@@ -12,9 +12,19 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from alert.digest.composer import compose_digest
 from alert.digest.checker import check_digest, write_check_result
 from alert.digest import state as state_mod
+from alert.utils.redact import redact
 
 # 죽은 URL 제외 → 재조립을 반복하는 최대 횟수 (무한 루프 방지)
 MAX_RECOMPOSE_ROUNDS = 3
+
+
+def _err(message) -> None:
+    """생성기의 **모든** stderr 출력 (사이클7 #5)."""
+    print(redact(message), file=sys.stderr)
+
+
+def _out(message) -> None:
+    print(redact(message))
 
 
 def main():
@@ -56,7 +66,40 @@ def main():
     else:
         week = args.week
 
+    if not state_mod.valid_week(week):
+        _err(f"✗ 주차 형식이 아닙니다: {week!r}")
+        return 2
+
     out_dir = Path(args.out_dir)
+    state_path = state_mod.state_path(week, out_dir)
+    lock_path = state_mod.lock_path(week, out_dir)
+
+    # 사이클7 #1: 생성·재조립도 **같은 잠금**을 따른다 (발송기가 쥐고 있으면 대기).
+    try:
+        handle = state_mod.acquire_lock(lock_path, blocking=True)
+    except (state_mod.LockBusy, OSError) as exc:
+        _err(f"✗ 생성 거부: 잠금 대기 실패({redact(exc)})")
+        return 2
+
+    try:
+        # 사이클7 #2: **첫 동작은 승인 세대 폐기**다. 실패하면 즉시 중단한다 —
+        # 생성이 실패(rc=1)해도 옛 승인이 살아 있으면 그 카드로 발송이 된다.
+        try:
+            state_mod.update_state_locked(
+                state_path, week, state_mod.clear_approval)
+        except (state_mod.StateError, state_mod.TransitionError, OSError) as exc:
+            _err(
+                f"✗ 생성 중단: 승인 폐기 실패({redact(exc)}) "
+                "— 본문·검증을 건드리지 않았습니다"
+            )
+            return 2
+        return _run(args, week, out_dir)
+    finally:
+        state_mod.release_lock(handle)
+
+
+def _run(args, week, out_dir):
+    """잠금·승인 폐기를 끝낸 뒤의 생성 본체."""
     markdown_path = out_dir / f"{week}.md"
     check_path = out_dir / f"{week}.check.json"
 
@@ -77,16 +120,16 @@ def main():
         try:
             state = state_mod.load_state(state_path, week)
         except state_mod.StateError as exc:
-            print(f"✗ 상태 파일 손상: {exc}", file=sys.stderr)
+            _err(f"✗ 상태 파일 손상: {exc}")
             return 1
         state_excluded = state_mod.excluded_urls(state)
         if state_excluded:
             dropped_urls.update(state_excluded)
-            print(f"제외 상태 반영: {len(state_excluded)}건")
+            _out(f"제외 상태 반영: {len(state_excluded)}건")
 
     for attempt in range(1, MAX_RECOMPOSE_ROUNDS + 1):
         label = "다이제스트 생성" if attempt == 1 else "재조립"
-        print(f"Composing digest for {week}... (round {attempt})")
+        _out(f"Composing digest for {week}... (round {attempt})")
         try:
             compose_digest(
                 db_path=args.db,
@@ -96,12 +139,12 @@ def main():
                 warnings_out=warnings if attempt == 1 else None,
                 exclude_urls=dropped_urls or None,
             )
-            print(f"✓ {label}: {markdown_path}")
+            _out(f"✓ {label}: {markdown_path}")
         except Exception as e:
-            print(f"✗ {label} 실패: {e}", file=sys.stderr)
+            _err(f"✗ {label} 실패: {e}")
             return 1
 
-        print("Checking digest items...")
+        _out("Checking digest items...")
         try:
             result = check_digest(
                 db_path=args.db,
@@ -111,7 +154,7 @@ def main():
                 warnings=warnings,
             )
         except Exception as e:
-            print(f"✗ 검증 실패: {e}", file=sys.stderr)
+            _err(f"✗ 검증 실패: {e}")
             return 1
 
         round_dropped = [
@@ -121,9 +164,9 @@ def main():
         if not round_dropped:
             break
 
-        print(f"  ⚠️  죽은 URL {len(round_dropped)}건 제외 후 재조립")
+        _out(f"  ⚠️  죽은 URL {len(round_dropped)}건 제외 후 재조립")
         for item in round_dropped:
-            print(f"     - {item['title']} ({item['url']})")
+            _out(f"     - {item['title']} ({item['url']})")
             dropped.append(item)
             dropped_urls.add(item["url"])
     else:
@@ -136,15 +179,27 @@ def main():
     # 누적 제외 목록을 기록 (items는 최종 산출물에 실린 항목)
     result["dropped"] = dropped
     write_check_result(check_path, result)
-    print(f"✓ 검증 완료: {check_path}")
+    _out(f"✓ 검증 완료: {check_path}")
 
     if result["pass"]:
-        print(f"  통과 항목 {len(result['items'])}건 / 제외 {len(dropped)}건")
+        _out(f"  통과 항목 {len(result['items'])}건 / 제외 {len(dropped)}건")
         return 0
 
-    print(f"  ⚠️  {result.get('reason', '검증 실패')}")
+    _out(f"  ⚠️  {result.get('reason', '검증 실패')}")
     return 1
 
 
+def guarded_main():
+    """예외·traceback 까지 redact 해서 내보낸다 (사이클6 #7 · 사이클7 #5)."""
+    try:
+        return main()
+    except SystemExit:
+        raise
+    except BaseException:       # noqa: BLE001
+        import traceback
+        _err(traceback.format_exc())
+        return 70
+
+
 if __name__ == "__main__":
-    sys.exit(main())
+    sys.exit(guarded_main())
