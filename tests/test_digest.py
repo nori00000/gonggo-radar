@@ -1116,6 +1116,8 @@ class TestWeeklyDigestScript:
 
 
 
+from alert.digest.checker import _now_utc          # noqa: E402
+
 def _bind_send_fixture(md_path):
     """발송 픽스처의 정본 사슬 — items.json + 대조 DB (통합 1 #1).
 
@@ -1209,6 +1211,8 @@ class TestSendDigest:
             "network_checked": True,
             "reason": "",
             "markdown_sha256": markdown_sha256(md_path.read_bytes()),
+            # 통합 2 #1: 생존 판정 시각이 없으면 "검증 만료" 로 막힌다
+            "checked_at": _now_utc().isoformat(),
         }))
         db_path = _bind_send_fixture(md_path)
 
@@ -1285,6 +1289,8 @@ class TestSendDigest:
             "network_checked": True,
             "reason": "",
             "markdown_sha256": markdown_sha256(md_path.read_bytes()),
+            # 통합 2 #1: 생존 판정 시각이 없으면 "검증 만료" 로 막힌다
+            "checked_at": _now_utc().isoformat(),
         }))
         db_path = _bind_send_fixture(md_path)
 
@@ -1323,6 +1329,8 @@ class TestSendDigest:
             "network_checked": True,
             "reason": "",
             "markdown_sha256": markdown_sha256(md_path.read_bytes()),
+            # 통합 2 #1: 생존 판정 시각이 없으면 "검증 만료" 로 막힌다
+            "checked_at": _now_utc().isoformat(),
         }))
         db_path = _bind_send_fixture(md_path)
 

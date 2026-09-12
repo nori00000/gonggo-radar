@@ -22,7 +22,14 @@ from alert.digest import sections as sections_mod
 from alert.digest.composer import fit_prose_urls, load_items_manifest
 from alert.digest import state as state_mod
 from alert.digest.preview import MARKER
-from alert.digest.checker import markdown_sha256, recheck_manifest
+from alert.digest.checker import (
+    check_expired,
+    liveness_problem,
+    liveness_snapshot,
+    markdown_sha256,
+    recheck_manifest,
+)
+from alert.digest.checker import CHECK_EXPIRED_REASON
 from alert.utils.redact import redact
 from alert.utils.safe_argparse import (
     RedactingArgumentParser,
@@ -313,6 +320,12 @@ def send_digest(
         _err(f"✗ 발송 거부: 잠금 생성 실패 — {exc}")
         return 2
 
+    # ⓪ 잠금 **밖** 1단계: URL 생존 스냅샷 (통합 2 #1).
+    # 네트워크는 느리다 — 잠금을 쥔 채 기다리면 봇·재검토가 함께 멈춘다(사이클7
+    # 크리틱 #4 와 같은 이유). 대신 "이 바이트를 봤다" 는 SHA 를 함께 담고,
+    # 잠금 안에서 바이트가 그대로인지 확인한다. 판정은 잠금 안에서만 내린다.
+    snapshot = liveness_snapshot(markdown_path)
+
     try:
         return _send_locked(
             markdown_path=markdown_path,
@@ -322,6 +335,7 @@ def send_digest(
             approved_by=approved_by,
             approval_id=approval,
             db_path=db_path,
+            snapshot=snapshot,
         )
     finally:
         state_mod.release_lock(lock_handle)
@@ -341,6 +355,7 @@ def _send_locked(
     approved_by,
     approval_id: str,
     db_path: str = DEFAULT_DB_PATH,
+    snapshot=None,
 ) -> int:
     """flock 을 쥔 상태의 전 과정 (사이클6 #1).
 
@@ -464,6 +479,19 @@ def _send_locked(
         markdown_path, markdown_bytes, markdown_text, check_result, db_path)
     if manifest_issues:
         _err("✗ 발송 거부: 정본 대조 실패 — {}".format(manifest_issues[0]))
+        return 2
+
+    # ⑨-3 생존 판정의 나이 (통합 2 #1). 검증은 "그때 살아 있었다" 는 기록이다 —
+    # 하루가 지난 판정을 근거로 보내면 죽은 링크가 실린 메일이 나간다.
+    if check_expired(check_result):
+        _err(f"✗ 발송 거부: {CHECK_EXPIRED_REASON}")
+        return 2
+
+    # ⑨-4 발송 직전 URL 생존 (통합 2 #1). 스냅샷은 잠금 밖에서 찍었고, 여기서
+    # **지금 바이트와 같은지** 확인한다 — 다르면 스냅샷은 무효다.
+    dead_problem = liveness_problem(snapshot, current_sha)
+    if dead_problem:
+        _err(f"✗ 발송 거부: {dead_problem}")
         return 2
 
     # ⑩ 제외 미반영 — 본문 **전체** URL 기준 (사이클6 #3)

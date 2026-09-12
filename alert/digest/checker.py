@@ -22,7 +22,7 @@ sections·holds 양쪽에서 사라졌다). 해소는 재조립뿐이다.
 import hashlib
 import json
 import sqlite3
-from datetime import date
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Dict, List, Optional
 import requests
@@ -245,6 +245,88 @@ def _schema_problems(manifest: Dict) -> List[str]:
 def today() -> date:
     """오늘 날짜 (테스트가 갈아 끼우는 단 한 곳)."""
     return date.today()
+
+
+def _now_utc() -> datetime:
+    """지금 (UTC). 테스트가 갈아 끼우는 단 한 곳."""
+    return datetime.now(timezone.utc)
+
+
+# 검증 생존 판정의 유효 기간 (통합 2 #1).
+CHECK_MAX_AGE_HOURS = 24
+CHECK_EXPIRED_REASON = "검증 만료 — 재검토 필요"
+DEAD_LINK_REASON = "죽은 링크 — 재검토 필요"
+SNAPSHOT_CHANGED_REASON = "생존 검사 뒤 본문이 바뀌었습니다 — 재검토 필요"
+
+
+def check_expired(check_result: Optional[Dict]) -> bool:
+    """검증의 생존 판정이 낡았는가 (checked_at 이 없으면 낡은 것으로 본다).
+
+    fail-closed 다: 시각을 모르는 검증은 "언제 본 것인지 모르는 생존 판정" 이고,
+    그것을 믿고 보내면 죽은 링크가 실린 메일이 나간다(위협 모델 ②).
+    """
+    stamped = (check_result or {}).get("checked_at")
+    if not stamped:
+        return True
+    try:
+        when = datetime.fromisoformat(str(stamped))
+    except ValueError:
+        return True
+    if when.tzinfo is None:
+        when = when.replace(tzinfo=timezone.utc)
+    age = _now_utc() - when
+    return age > timedelta(hours=CHECK_MAX_AGE_HOURS)
+
+
+def liveness_snapshot(markdown_path, timeout: int = 8) -> Dict:
+    """**잠금 밖**에서 찍는 URL 생존 스냅샷 (통합 2 #1).
+
+    구조가 요점이다. 네트워크는 느리므로 잠금을 쥔 채 기다리지 않는다. 대신
+    ①이 바이트를 봤다는 SHA 와 ②그 바이트의 모든 URL 생존 결과를 함께 담고,
+    잠금 안에서 "지금 바이트의 SHA 가 스냅샷과 같은가" 를 확인한다 — 다르면
+    스냅샷은 무효다(TOCTOU 를 바이트로 닫는다).
+
+    검사 대상·함수·타임아웃은 checker 와 **같다**(`blocks.body_urls` +
+    `check_url_alive`) — 두 판정이 다른 URL 을 보면 "검사한 곳과 다른 곳으로
+    보내는" 링크가 다시 생긴다.
+
+    Returns:
+        {"sha": str|None, "dead": [url], "checked": int, "error": str|None}
+    """
+    try:
+        markdown_bytes = Path(markdown_path).read_bytes()
+        markdown_text = markdown_bytes.decode("utf-8")
+    except (OSError, UnicodeDecodeError) as exc:
+        return {"sha": None, "dead": [], "checked": 0, "error": str(exc)}
+
+    dead: List[str] = []
+    checked = 0
+    for url in blocks_mod.body_urls(markdown_text):
+        checked += 1
+        if not check_url_alive(url, timeout=timeout):
+            dead.append(url)
+    return {
+        "sha": markdown_sha256(markdown_bytes),
+        "dead": dead,
+        "checked": checked,
+        "error": None,
+    }
+
+
+def liveness_problem(snapshot: Optional[Dict], current_sha: str):
+    """스냅샷을 지금 바이트에 대고 판정 (None 이면 문제 없음).
+
+    잠금 안에서 부른다 — 판정 문구는 세 경로가 공유한다.
+    """
+    if not snapshot or snapshot.get("error"):
+        return "생존 검사 실패 — 재검토 필요 ({})".format(
+            (snapshot or {}).get("error") or "스냅샷 없음")
+    if snapshot.get("sha") != current_sha:
+        return SNAPSHOT_CHANGED_REASON
+    dead = snapshot.get("dead") or []
+    if dead:
+        return "{} ({}건, 예: {})".format(DEAD_LINK_REASON, len(dead), dead[0])
+    return None
 
 
 def _expiry_problems(item_id: str, entry: Dict, row) -> List[str]:
@@ -747,6 +829,9 @@ def check_digest(
         "network_checked": network_checked,
         "reason": reason,
         "markdown_sha256": content_hash,
+        # 통합 2 #1: 이 검증이 **언제** 네트워크를 봤는가. 생존 판정은 시간이
+        # 지나면 낡는다 — 발송기가 이 시각으로 만료를 판정한다.
+        "checked_at": _now_utc().isoformat(),
     }
     result = _apply_warnings(result, warnings)
 

@@ -51,6 +51,7 @@ STATE_KEYS = (
     "commentary",
     "preview_message_ids",
     "preview_items",
+    "notice_message_ids",
     "approval",
     "rebuild_failed",
     "verification_broken",
@@ -197,6 +198,9 @@ def default_state(week: str) -> Dict:
         "commentary": "",
         "preview_message_ids": [],
         "preview_items": {},
+        # 통합 2 #2: 차단 안내의 message_id 는 미리보기와 **다른 자리**다.
+        # 같은 자리에 쓰면 늦게 끝난 안내가 최신 번호 좌표를 지운다.
+        "notice_message_ids": [],
         "approval": None,
         "rebuild_failed": False,
         "verification_broken": False,
@@ -217,7 +221,7 @@ def normalize_state(data, week: str) -> Dict:
     state["week"] = data.get("week") or week
     if state.get("status") not in STATUSES:
         raise StateError(f"알 수 없는 status: {state.get('status')!r}")
-    for key in ("excluded_urls", "preview_message_ids"):
+    for key in ("excluded_urls", "preview_message_ids", "notice_message_ids"):
         if not isinstance(state.get(key), list):
             raise StateError(f"{key}가 리스트가 아님")
     if not isinstance(state.get("preview_items"), dict):
@@ -490,6 +494,19 @@ def record_preview_messages(state: Dict, message_ids, item_urls=None) -> Dict:
         for key in list(items)[: len(items) - PREVIEW_ITEMS_MAX]:
             items.pop(key)
     updated["preview_items"] = items
+    return updated
+
+
+def record_notice_messages(state: Dict, message_ids) -> Dict:
+    """차단 안내의 message_id 만 기록한다 (통합 2 #2).
+
+    미리보기(preview_message_ids·preview_items)는 **건드리지 않는다**. 안내는
+    "지금은 승인할 수 없다" 는 통지일 뿐 번호 좌표를 만들지 않으므로, 그 자리를
+    덮으면 그 사이 완료된 최신 미리보기의 좌표가 사라진다(`제외 2` 가 아무것도
+    가리키지 못한다).
+    """
+    updated = dict(state)
+    updated["notice_message_ids"] = [int(mid) for mid in message_ids]
     return updated
 
 

@@ -96,3 +96,18 @@ def sample_application_record():
         assigned_domain="moss_agriculture",
         priority=2,
     )
+
+
+@pytest.fixture(autouse=True)
+def _default_url_probe(monkeypatch):
+    """URL 생존 검사의 기본값은 **alive** — 테스트는 네트워크를 쓰지 않는다.
+
+    통합 2 #1 부터 발송기·notify 도 발송 직전에 생존을 확인한다(checker 와 같은
+    함수). 기본 스텁이 없으면 모든 발송 테스트가 실제 HTTP 를 때린다.
+    죽은 링크를 보려는 테스트는 자기 자리에서 다시 덮어쓴다(뒤에 적용된다).
+    """
+    monkeypatch.setattr(
+        "alert.digest.checker.check_url_alive",
+        lambda url, timeout=8: True,
+        raising=False,
+    )

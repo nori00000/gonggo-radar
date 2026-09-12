@@ -20,7 +20,14 @@ from alert.digest import preview as preview_mod
 from alert.digest import prune
 from alert.digest import sections as sections_mod
 from alert.digest import state as state_mod
-from alert.digest.checker import markdown_sha256, recheck_manifest
+from alert.digest.checker import (
+    CHECK_EXPIRED_REASON,
+    check_expired,
+    liveness_problem,
+    liveness_snapshot,
+    markdown_sha256,
+    recheck_manifest,
+)
 from alert.digest.composer import load_items_manifest
 from alert.utils.redact import redact
 from alert.utils.safe_argparse import (
@@ -159,7 +166,8 @@ def load_check(markdown_path):
 
 
 def _blocking_reason(markdown_path, week, check, current_sha, markdown_text,
-                     markdown_bytes=b"", db_path=DEFAULT_DB_PATH):
+                     markdown_bytes=b"", db_path=DEFAULT_DB_PATH,
+                     snapshot=None):
     """미리보기를 "검증 필요" 안내로 대체해야 하는 이유. 없으면 None (사이클4 #3·#4·#6)."""
     broken = state_mod.tombstone_reason(
         state_mod.tombstone_path_for_markdown(markdown_path))
@@ -209,6 +217,14 @@ def _blocking_reason(markdown_path, week, check, current_sha, markdown_text,
         markdown_path, markdown_bytes, markdown_text, check, db_path)
     if issues:
         return "정본 대조 실패 — {}".format(issues[0])
+    # 통합 2 #1: 승인 세대를 발급하기 전에 **지금** 링크가 살아 있는지 본다.
+    # 승인은 "이 본문을 보내도 좋다" 는 사람의 판단이고, 그 판단의 전제가
+    # 생존이다 — 죽은 링크가 있으면 승인 자체를 만들지 않는다.
+    if check_expired(check):
+        return CHECK_EXPIRED_REASON
+    dead = liveness_problem(snapshot, current_sha)
+    if dead:
+        return dead
     return None
 
 
@@ -268,6 +284,11 @@ def main():
             _err(f"✗ 전송 대상 확인 실패: {redact(exc)}")
             return 2
 
+    # 통합 2 #1: URL 생존 스냅샷도 잠금 **밖**에서 찍는다 — 네트워크 왕복이
+    # 잠금을 붙들면 다른 작성자의 대기 한도를 잡아먹는다(텔레그램과 같은 이유).
+    # 바이트 결속은 스냅샷의 SHA 가 맡는다: 잠금 안에서 읽은 본문과 다르면 무효다.
+    snapshot = liveness_snapshot(markdown_path)
+
     # ── 잠금 ①: 파일 읽기·판정·승인 초안 발급까지. 텔레그램 왕복은 하지 않는다.
     # 사이클8 #4: 잠금 안에서는 파일 IO 만 한다 — 카드 제거·청크 전송을 잠금 안에서
     # 하면 다른 작성자의 60초 한도를 텔레그램 지연이 잡아먹는다.
@@ -307,7 +328,8 @@ def main():
         # 사이클4 #6 · 사이클5 #2: 렌더 **전에** 이 본문·이 검증으로 승인해도 되는지 본다.
         # 차단이면 항목 미리보기를 만들지 않고 승인 세대도 발급하지 않는다.
         blocked = _blocking_reason(markdown_path, week, check, current_sha,
-                                   markdown_text, markdown_bytes, args.db)
+                                   markdown_text, markdown_bytes, args.db,
+                                   snapshot)
         if blocked:
             body = (
                 "🏛 협의회 주간 정책브리핑 {}\n\n⚠️ {}\n\n"
@@ -422,15 +444,16 @@ def _finish_locked(state_path, week, prepared, message_ids, item_urls,
         return 1, None, f"⚠️  상태 기록 실패(미리보기는 전송됨): {redact(exc)}"
 
     if prepared is None:
-        # 차단 안내만 보냈다 — 승인은 이미 폐기됐다. 그래도 안내의 message_id 는
-        # 기록한다: "최신 미리보기" 가 항목 0건이 되어 옛 번호 좌표가 무효가 된다.
+        # 차단 안내만 보냈다 — 승인은 이미 폐기됐다. 안내의 message_id 는 **별도
+        # 필드**(notice_message_ids)에 남긴다: 통합 2 #2 이전에는 안내가
+        # preview_message_ids 를 덮어써서, 늦게 끝난 차단 안내가 그 사이 완료된
+        # 최신 미리보기의 번호 좌표를 `[]` 로 지웠다(제외 n 이 아무것도 못 가리킨다).
         if send_error:
             return 2, None, f"✗ {send_error}"
         try:
             state_mod.update_state_locked(
                 state_path, week,
-                lambda cur: state_mod.record_preview_messages(
-                    cur, message_ids, []),
+                lambda cur: state_mod.record_notice_messages(cur, message_ids),
             )
         except (state_mod.StateError, state_mod.TransitionError,
                 OSError) as exc:

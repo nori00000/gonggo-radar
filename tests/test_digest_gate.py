@@ -10,6 +10,7 @@ from pathlib import Path
 import pytest
 
 from alert.digest import blocks as blocks_mod
+from alert.digest import checker as checker_mod
 from alert.digest import composer as composer_mod
 from alert.digest import prune as prune_mod
 from alert.digest import sections as sections_mod
@@ -337,6 +338,8 @@ def _write_digest(tmp_path, markdown_text=None, check=None):
     md.write_text(text, encoding="utf-8")
     payload = dict(check or PASS_CHECK)
     payload.setdefault("markdown_sha256", markdown_sha256(md.read_bytes()))
+    # 통합 2 #1: 생존 판정의 나이 — 없으면 발송기가 "검증 만료" 로 막는다.
+    payload.setdefault("checked_at", checker_mod._now_utc().isoformat())
     (tmp_path / "2026-W37.check.json").write_text(
         json.dumps(payload, ensure_ascii=False), encoding="utf-8"
     )
@@ -1293,7 +1296,9 @@ def test_notify_preview_does_not_overwrite_sent(tmp_path, monkeypatch):
 
     state = state_mod.load_state(state_path, "2026-W37")
     assert state["status"] == "sent"                    # 덮어쓰이지 않았다
-    assert state["preview_message_ids"] == [2014]       # 기록은 됐다
+    # 통합 2 #2: 차단 안내의 message_id 는 미리보기 자리를 건드리지 않는다
+    assert state["notice_message_ids"] == [2014]        # 기록은 됐다
+    assert state["preview_message_ids"] == []           # 번호 좌표는 그대로
     assert state["recipients_count"] == 3
 
 
@@ -4350,8 +4355,12 @@ def test_notify_reads_body_after_acquiring_lock(tmp_path, monkeypatch):
     """notify 는 **잠금을 쥔 뒤** 본문·검증을 읽는다 (사이클6 크리틱 MEDIUM #6).
 
     예전에는 읽고 판정한 뒤 잠금을 쥐어서, 그 사이에 본문이 바뀌면 낡은 미리보기를
-    보내고 옛 바이트로 승인을 발급했다. 잠금 획득 직후 본문을 교체해 두면,
-    발급된 승인의 sha 가 **새 바이트**여야 한다.
+    보내고 옛 바이트로 승인을 발급했다.
+
+    통합 2 #1 이후 기대값이 한 칸 더 엄해진다: 생존 스냅샷은 잠금 **밖**에서
+    옛 바이트를 봤으므로, 잠금 안에서 새 바이트를 읽으면 스냅샷이 무효다 →
+    승인을 발급하지 않고 "재검토 필요" 로 막는다. 잠금 전에 읽었다면 스냅샷과
+    본문이 같아 그냥 통과했을 것이므로, 이 차단 자체가 "잠금 뒤에 읽었다" 는 증거다.
     """
     from scripts import notify_digest
 
@@ -4371,6 +4380,7 @@ def test_notify_reads_body_after_acquiring_lock(tmp_path, monkeypatch):
         check_path.write_text(json.dumps(dict(
             PASS_CHECK,
             markdown_sha256=markdown_sha256(md.read_bytes()),
+            checked_at=checker_mod._now_utc().isoformat(),
         ), ensure_ascii=False), encoding="utf-8")
         return handle
 
@@ -4391,9 +4401,11 @@ def test_notify_reads_body_after_acquiring_lock(tmp_path, monkeypatch):
     state = state_mod.load_state(
         state_mod.state_path_for_markdown(md), "2026-W37")
     approval = state_mod.approval_of(state)
-    assert approval["sha"] == markdown_sha256(swapped.encode("utf-8"))
-    assert approval["check_sha"] == markdown_sha256(check_path.read_bytes())
-    assert any("잠금 뒤 교체" in chunk for chunk in sent)
+    assert approval == {}, approval            # 옛 바이트의 승인은 발급되지 않는다
+    assert any("본문이 바뀌었습니다" in text for text in sent), sent
+    # 안내만 나갔으므로 번호 좌표도 생기지 않는다 (통합 2 #2)
+    assert state["preview_message_ids"] == []
+    assert state["notice_message_ids"] == [2014]
 
 
 # ══ #2 승인 폐기 실패 = 중단 ════════════════════════════════════════════
@@ -4912,8 +4924,14 @@ def test_notify_blocked_notice_drops_old_approval(tmp_path, monkeypatch):
 
     state = state_mod.load_state(state_path, "2026-W37")
     assert state_mod.approval_of(state) == {}            # 옛 승인 폐기
-    assert state["preview_message_ids"] == [3014]         # 최신은 안내(항목 0건)
-    assert state_mod.preview_urls(state) == []
+    # 통합 2 #2: 안내는 별도 자리에 남고, 마지막 **실제 미리보기**의 번호 좌표는
+    # 그대로다 — 늦게 끝난 안내가 최신 좌표를 `[]` 로 지우던 경로를 닫았다.
+    assert state["notice_message_ids"] == [3014]
+    assert state["preview_message_ids"] == [2014]
+    # 통합 2 #2: 안내는 좌표를 만들지도 지우지도 않는다 — 마지막 실제 미리보기의
+    # 좌표가 남는다(제외 n 이 가리킬 곳이 사라지지 않는다).
+    assert state_mod.preview_urls(state) == blocks_mod.item_urls(
+        md.read_text(encoding="utf-8"))
     assert any("재검증 필요" in text or "검증" in text for text in sent)
 
 
@@ -5263,3 +5281,144 @@ def test_recheck_kakao_failure_is_redacted(tmp_path, monkeypatch, capsys):
     err = capsys.readouterr().err
     assert "카톡 평문 재생성 실패" in err
     assert LEAK_TOKEN not in err
+
+
+# ══ 통합 사이클 2: 발송 직전 생존 재검사 · 검증 만료 · 안내 좌표 ═══════
+def _dead(monkeypatch, dead_urls):
+    """주어진 URL 만 죽은 것으로 응답 (네트워크 없음)."""
+    dead_set = set(dead_urls)
+    monkeypatch.setattr(
+        "alert.digest.checker.check_url_alive",
+        lambda url, timeout=8: url not in dead_set,
+    )
+
+
+def test_send_refuses_when_url_died_after_check(tmp_path, monkeypatch, capsys):
+    """검증 뒤 링크가 죽으면 발송하지 않는다 (통합 2 #1).
+
+    Codex 통합 게이트 HIGH 재현: 파일·DB 는 그대로 두고 생존 응답만 실패로 바꾸면
+    새 checker 는 pass=false 였지만 발송기는 **네트워크를 한 번도 보지 않고**
+    rc=0 이었다. 검증은 "그때 살아 있었다" 는 기록일 뿐이다.
+    """
+    annotated, _ = apply_headline(SAMPLE_MD, "확정 의견")
+    md = _write_digest(tmp_path, annotated)
+    _seed_preview(md)
+    _dead(monkeypatch, ["https://example.com/b"])
+    _forbid_notifier(monkeypatch, "죽은 링크가 있는데 발송했다")
+    assert _send(md) == 2
+    err = capsys.readouterr().err
+    assert "죽은 링크" in err and "example.com/b" in err
+
+
+def test_notify_blocks_when_url_died_after_check(tmp_path, monkeypatch):
+    """notify 도 승인 발급 전에 같은 검사를 한다 (통합 2 #1)."""
+    from scripts import notify_digest
+
+    annotated, _ = apply_headline(SAMPLE_MD, "확정 의견")
+    md = _write_digest(tmp_path, annotated)
+    _dead(monkeypatch, ["https://example.com/a"])
+    sent = []
+    _notify_stubs(monkeypatch, notify_digest,
+                  lambda token, chat, thread, text: (
+                      sent.append(text), (True, 2014, ""))[1])
+    monkeypatch.setattr("sys.argv",
+                        ["notify_digest.py", str(md), "--db", _db_for(md)])
+    assert notify_digest.main() == 0
+    state = state_mod.load_state(
+        state_mod.state_path_for_markdown(md), "2026-W37")
+    assert state_mod.approval_of(state).get("id") is None
+    assert "죽은 링크" in sent[0]
+
+
+def test_send_refuses_when_body_changed_after_liveness_snapshot(
+    tmp_path, monkeypatch, capsys
+):
+    """생존 스냅샷과 발송 바이트가 다르면 거부 (통합 2 #1 — TOCTOU 를 바이트로)."""
+    annotated, _ = apply_headline(SAMPLE_MD, "확정 의견")
+    md = _write_digest(tmp_path, annotated)
+    _seed_preview(md)
+    real_snapshot = checker_mod.liveness_snapshot
+
+    def snapshot_of_other_bytes(markdown_path, timeout=8):
+        snap = real_snapshot(markdown_path, timeout=timeout)
+        snap["sha"] = markdown_sha256(b"another body")    # 다른 바이트를 본 척
+        return snap
+
+    monkeypatch.setattr("scripts.send_digest.liveness_snapshot",
+                        snapshot_of_other_bytes)
+    _forbid_notifier(monkeypatch, "스냅샷과 다른 바이트를 발송했다")
+    assert _send(md) == 2
+    assert "생존 검사 뒤 본문이 바뀌었습니다" in capsys.readouterr().err
+
+
+def test_send_refuses_expired_check(tmp_path, monkeypatch, capsys):
+    """25시간 전 검증은 만료다 (통합 2 #1)."""
+    from datetime import timedelta
+
+    annotated, _ = apply_headline(SAMPLE_MD, "확정 의견")
+    stale = (checker_mod._now_utc() - timedelta(hours=25)).isoformat()
+    md = _write_digest(tmp_path, annotated,
+                       dict(PASS_CHECK, checked_at=stale))
+    _seed_preview(md)
+    _forbid_notifier(monkeypatch, "만료된 검증으로 발송했다")
+    assert _send(md) == 2
+    assert checker_mod.CHECK_EXPIRED_REASON in capsys.readouterr().err
+
+
+def test_send_refuses_check_without_checked_at(tmp_path, monkeypatch, capsys):
+    """검증 시각이 없으면 fail-closed (언제 본 판정인지 모른다)."""
+    annotated, _ = apply_headline(SAMPLE_MD, "확정 의견")
+    md = _write_digest(tmp_path, annotated)
+    check_path = md.with_suffix(".check.json")
+    check = json.loads(check_path.read_text(encoding="utf-8"))
+    del check["checked_at"]
+    check_path.write_text(json.dumps(check, ensure_ascii=False),
+                          encoding="utf-8")
+    _seed_preview(md)
+    _forbid_notifier(monkeypatch, "시각 없는 검증으로 발송했다")
+    assert _send(md) == 2
+    assert checker_mod.CHECK_EXPIRED_REASON in capsys.readouterr().err
+
+
+def test_fresh_check_records_checked_at(tmp_path, monkeypatch):
+    """checker 가 생존을 본 시각을 남긴다 (만료 판정의 근거)."""
+    _alive(monkeypatch)
+    md = tmp_path / "2026-W37.md"
+    md.write_text(SAMPLE_MD, encoding="utf-8")
+    db = _bind(md)
+    result = check_digest(db_path=str(db), markdown_path=md,
+                          output_path=md.with_suffix(".check.json"))
+    assert result["checked_at"]
+    assert checker_mod.check_expired(result) is False
+    stored = json.loads(
+        md.with_suffix(".check.json").read_text(encoding="utf-8"))
+    assert stored["checked_at"] == result["checked_at"]
+
+
+def test_notice_does_not_overwrite_preview_coordinates(tmp_path):
+    """늦게 끝난 차단 안내가 최신 번호 좌표를 지우지 않는다 (통합 2 #2).
+
+    Codex 통합 게이트 MEDIUM 재현: A 차단 안내 준비 → B 정상 미리보기 완료 →
+    A 완료 순서에서 `preview_message_ids` 가 A 로 교체되고 좌표가 `[]` 가 됐다.
+    """
+    from scripts import notify_digest
+
+    md = _write_digest(tmp_path)
+    state_path = state_mod.state_path_for_markdown(md)
+    urls = blocks_mod.item_urls(md.read_text(encoding="utf-8"))
+    live_b = state_mod.record_preview_messages(
+        state_mod.record_preview(
+            state_mod.default_state("2026-W37"), [], urls, "sha-b", "check-b"),
+        [2020], urls)
+    state_mod.save_state(state_path, live_b)
+
+    code, drop_card, message = notify_digest._finish_locked(
+        state_path, "2026-W37", None, [3030], [], None)
+
+    assert code == 0 and drop_card is None
+    state = state_mod.load_state(state_path, "2026-W37")
+    assert state["notice_message_ids"] == [3030]     # 안내는 자기 자리에
+    assert state["preview_message_ids"] == [2020]    # 좌표는 그대로
+    assert state_mod.preview_urls(state) == urls
+    assert state_mod.approval_of(state).get("id") == \
+        state_mod.approval_of(live_b).get("id")      # B 승인도 그대로
