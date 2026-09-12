@@ -15,6 +15,8 @@ import requests.exceptions
 from alert.digest.composer import (
     MARKER,
     SECTION_HEADINGS,
+    HOLD_REASON_DIVERSITY,
+    HOLD_REASON_SECTION_CAP,
     SECTION_LIMITS,
     SOURCE_DIVERSITY_LIMIT,
     VERDICT_APPLY,
@@ -1661,7 +1663,7 @@ class TestFixCycle1:
         overflow = [
             item
             for item in data["holds"]
-            if item["reason"].startswith("소스 다양성 상한")
+            if item["reason"] == HOLD_REASON_DIVERSITY
         ]
         assert len(overflow) == 2
         assert [item["url"] for item in overflow] == [
@@ -1774,3 +1776,99 @@ class TestFixCycle1:
             str(db_path), week_str=W13, today=W13_TODAY
         )
         assert len(data["sections"][VERDICT_APPLY]) == 1
+
+
+class TestFixCycle2:
+    """개정 v2.3 (판단 티어 판정 G1·G2)."""
+
+    # ─── G1: "참여자"는 중립어 ──────────────────────────────────────────
+    @pytest.mark.parametrize(
+        "title",
+        [
+            "「2026년 산림부문 배출권거래제 외부사업 등록·인증 지원」 참여자 추가모집 공고",
+            "[모집] 산양삼 등 산촌자원 활용 시제품 개발 지원 참여자 모집(연중 상시 모집)",
+        ],
+    )
+    def test_participant_wording_no_longer_blocks_business_notices(self, title):
+        result = classify_item(title, "", "kofpi")
+        assert result.verdict == VERDICT_APPLY, result
+
+    @pytest.mark.parametrize(
+        "title",
+        [
+            "2026년「건강출산 행복가정 지원사업」사업 수시모집 공고문(숲동행-10월)",
+            "2026년 4분기 2차 국립횡성숲체원 「나눔의 숲 캠프」모집 공고",
+            "2026년 산림복지 취업아카데미 참가 모집(~9.16.)",
+        ],
+    )
+    def test_b2c_recruitment_still_held(self, title):
+        result = classify_item(title, "", "fowi")
+        assert result.verdict == VERDICT_HOLD, result
+        assert result.reason.startswith("참가자 모집(B2C)"), result
+
+    # ─── G2: 다양성 사유 vs 상한 초과 사유 ──────────────────────────────
+    DIVERSITY_ROWS = (
+        ("kofpi", "산림분야 오픈이노베이션 참여기업 모집 공고"),
+        ("kofpi", "임산물 가공유통 지원사업 참여업체 모집"),
+        ("kofpi", "목재산업 시설 개선 지원 참여기업 모집"),
+        ("fowi", "산림복지전문업 플랫폼 입점 지원사업 모집"),
+        ("fowi", "숲길 운영 위탁 사업자 공모"),
+        ("coop", "사회적협동조합 공공조달 컨설팅 참여기업 모집"),
+        ("coop", "협동조합 유통채널 입점 설명회 참여업체 모집"),
+        ("forest_service", "산림형 예비사회적기업 지정 계획 공고"),
+    )
+
+    def _seed(self, db_path):
+        _create_announcements_table(db_path)
+        for index, (source, title) in enumerate(self.DIVERSITY_ROWS):
+            _insert_one(
+                db_path,
+                source=source,
+                source_id=f"g2_{index}",
+                title=title,
+                url=f"https://example.com/g2-{index}",
+                period_end=f"2026-12-{20 + index}",
+            )
+
+    def test_diversity_reason_only_for_items_pushed_out_by_diversity(
+        self, tmp_path
+    ):
+        db_path = tmp_path / "g2.db"
+        self._seed(db_path)
+
+        data = compose_digest_data(
+            str(db_path), week_str=W13, today=W13_TODAY
+        )
+        published = [item["url"] for item in data["sections"][VERDICT_APPLY]]
+        reasons = {
+            item["url"]: item["reason"]
+            for item in data["holds"]
+            if item["reason"]
+            in (HOLD_REASON_DIVERSITY, HOLD_REASON_SECTION_CAP)
+        }
+
+        # 상한 5칸: kofpi 2 + fowi 2 + coop 1
+        assert published == [
+            "https://example.com/g2-0",
+            "https://example.com/g2-1",
+            "https://example.com/g2-3",
+            "https://example.com/g2-4",
+            "https://example.com/g2-5",
+        ]
+        # kofpi 3번째만 다양성 때문에 밀렸다
+        assert reasons["https://example.com/g2-2"] == HOLD_REASON_DIVERSITY
+        # 상한이 찬 뒤에 남은 항목은 다양성 사유를 달지 않는다
+        assert reasons["https://example.com/g2-6"] == HOLD_REASON_SECTION_CAP
+        assert reasons["https://example.com/g2-7"] == HOLD_REASON_SECTION_CAP
+
+    def test_cap_overflow_is_recorded_not_silently_dropped(self, tmp_path):
+        db_path = tmp_path / "g2md.db"
+        self._seed(db_path)
+
+        markdown = compose_digest(
+            db_path=str(db_path), week_str=W13, today=W13_TODAY
+        )
+        assert _count_items(_section_body(markdown, APPLY_HEADING)) == 5
+        assert f"| {HOLD_REASON_DIVERSITY} -->" in markdown
+        assert f"| {HOLD_REASON_SECTION_CAP} -->" in markdown
+        assert markdown.count(f"| {HOLD_REASON_SECTION_CAP} -->") == 2

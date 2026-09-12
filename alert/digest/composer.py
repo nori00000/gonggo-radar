@@ -165,9 +165,10 @@ NOISE_KEYWORDS = (
 # 제목에 B2C 신호가 있고 사업자 신호가 없으면 **보류**다(배제 아님 — `핀 n` 복구 가능).
 # W37 실측: "숲동행 건강출산 지원사업 수시모집", "나눔의 숲 캠프 모집 공고"가
 # 신청하세요 5칸 중 2칸을 먹었다. 둘 다 회원사가 신청할 사업이 아니라 개인·가족 모집이다.
+# 개정 v2.3 G1: `참여자`는 중립어라 목록에서 뺐다 — 임업 사업자 공고가 "참여자 모집"으로
+# 쓰이는 사례가 실재한다(배출권거래제 외부사업, 시제품 개발 지원).
 B2C_SIGNAL_KEYWORDS = (
     "참가자",
-    "참여자",
     "참가",
     "체험단",
     "캠프",
@@ -192,10 +193,21 @@ B2B_SIGNAL_KEYWORDS = (
     "입점",
     "조달",
     "위탁",
+    # 개정 v2.3 G1: 사업자만 신청하는 사업의 표지
+    "시제품",
+    "배출권",
+    "외부사업",
+    "개발 지원",
+    "인증 지원",
+    "등록",
 )
 
 # 신청 섹션의 소스 다양성 상한 (개정 v2.2 F2). 초과분은 보류로 내려간다.
 SOURCE_DIVERSITY_LIMIT = 2
+
+# 보류 사유 (개정 v2.3 G2: 다양성 때문에 밀린 것과 상한 때문에 밀린 것을 구분한다)
+HOLD_REASON_DIVERSITY = f"소스 다양성 상한(같은 소스 {SOURCE_DIVERSITY_LIMIT}건)"
+HOLD_REASON_SECTION_CAP = "상한 초과"
 
 # ─── 대상 태그 (판정 ①) ──────────────────────────────────────────────────
 TAG_SOCIAL_COOP = "사협"          # 사회적협동조합
@@ -907,21 +919,32 @@ def compose_digest_data(
         else:
             holds.append(item)
 
-    # 개정 v2.2 F2: 같은 소스가 신청 섹션을 독식하지 못하게 한다. 초과분은 보류로.
+    # 개정 v2.2 F2 + v2.3 G2: 정렬 상위부터 상한(5)을 채우며 같은 소스 3번째부터 건너뛴다.
+    # 다양성 사유는 **실제로 다양성 때문에 밀린 항목에만** 붙고, 상한이 이미 찬 뒤에 남은
+    # 항목은 `상한 초과`로만 기록한다(편집자에게 사유가 과장돼 보이지 않게).
     selected: List[Dict] = []
+    diversity_skipped: List[Dict] = []
+    cap_overflow: List[Dict] = []
     per_source: Counter = Counter()
     for item in _sort_apply(apply_candidates):
+        if len(selected) >= SECTION_LIMITS[VERDICT_APPLY]:
+            cap_overflow.append(item)
+            continue
         if per_source[item["source"]] >= SOURCE_DIVERSITY_LIMIT:
-            item["verdict"] = VERDICT_HOLD
-            item["reason"] = (
-                f"소스 다양성 상한(같은 소스 {SOURCE_DIVERSITY_LIMIT}건)"
-            )
-            holds.append(item)
+            diversity_skipped.append(item)
             continue
         per_source[item["source"]] += 1
         selected.append(item)
 
-    sections[VERDICT_APPLY] = selected[: SECTION_LIMITS[VERDICT_APPLY]]
+    for item, reason in (
+        [(item, HOLD_REASON_DIVERSITY) for item in diversity_skipped]
+        + [(item, HOLD_REASON_SECTION_CAP) for item in cap_overflow]
+    ):
+        item["verdict"] = VERDICT_HOLD
+        item["reason"] = reason
+        holds.append(item)
+
+    sections[VERDICT_APPLY] = selected
     sections[VERDICT_NOTICE] = _sort_notice(sections[VERDICT_NOTICE])[
         : SECTION_LIMITS[VERDICT_NOTICE]
     ]
