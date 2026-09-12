@@ -5,6 +5,9 @@
 
 상태 기계 (사이클2 #1): 쓰기는 **전부 잠금 하 read-modify-write** 다. 잠금 없이
 읽고 나중에 쓰면 "notify 가 sent 를 draft 로 덮어쓰는" 경합이 생긴다.
+잠금은 `fcntl.flock` 이다 (사이클4 #1) — 파일 회수 기반 잠금은 세 사이클 동안
+경합이 남았다. flock 은 커널이 배타성을 보장하고 프로세스 종료 시 자동 해제되므로
+nonce·stale 회수·pid 검사·유예 시간이 전부 불필요하다.
 허용 전이는 TRANSITIONS 가 정본이며, `sending` 은 `sent` 로만 나아간다 —
 되돌리는 길은 두 개뿐이다:
   · release_sending() — 사람의 `/digest 해제` (소유자 전용, 사유 로그)
@@ -12,9 +15,9 @@
 notify·보류·해설은 어떤 경우에도 sending 을 풀지 못한다.
 """
 
+import fcntl
 import json
 import os
-import time
 import uuid
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -46,8 +49,9 @@ STATE_KEYS = (
     "commentary",
     "preview_message_ids",
     "preview_items",
-    "preview_sha",
-    "card_message_id",
+    "approval",
+    "rebuild_failed",
+    "verification_broken",
     "approved_by",
     "approved_at",
     "sending_at",
@@ -59,15 +63,15 @@ STATE_KEYS = (
 PREVIEW_ITEMS_MAX = 30
 
 SENDING_REASON = "발송 중/미확정 상태 — 사람 확인 필요 (`/digest 해제 <주차>`)"
+NO_APPROVAL_REASON = "승인 세대가 없습니다 — 미리보기를 먼저 보내세요"
+STALE_APPROVAL_REASON = "오래된 승인 카드입니다 — 새 미리보기로 다시 승인하세요"
+STALE_PREVIEW_BODY_REASON = "미리보기와 본문이 다릅니다 — 재검토 필요"
+EXCLUDED_NOT_APPLIED_REASON = "제외 미반영 — 제외한 항목이 본문에 남아 있습니다"
+REBUILD_FAILED_REASON = "재조립 실패 상태 — 다시 조립해야 합니다"
+VERIFICATION_BROKEN_REASON = "검증 파일 무효화 실패 상태 — `/digest 재검토` 필요"
 
-# 잠금 회수 규율 (사이클3 #1)
-#  · 살아 있는 pid 의 잠금은 **나이와 무관하게 회수하지 않는다**. 오래 쥐고 있으면
-#    경고만 한다(자동 회수가 곧 중복 발송의 문이었다).
-#  · 빈/부분 파일(JSON 쓰기 전)은 생성 후 유예 시간이 지난 뒤에만 회수한다.
-LOCK_PARTIAL_GRACE_SECONDS = 5.0
-LOCK_WARN_SECONDS = 3600.0
-# 회수 자체를 직렬화하는 마커의 수명 (회수 중 크래시가 영구 차단이 되지 않게)
-LOCK_RECLAIM_MARKER_TTL = 30.0
+# 승인 세대 id 길이 (callback_data 64바이트 한도 안에 들어가야 한다)
+APPROVAL_ID_LEN = 12
 
 
 class StateError(RuntimeError):
@@ -113,8 +117,9 @@ def default_state(week: str) -> Dict:
         "commentary": "",
         "preview_message_ids": [],
         "preview_items": {},
-        "preview_sha": None,
-        "card_message_id": None,
+        "approval": None,
+        "rebuild_failed": False,
+        "verification_broken": False,
         "approved_by": None,
         "approved_at": None,
         "sending_at": None,
@@ -192,13 +197,13 @@ def apply_state(path, current: Dict, new: Dict, escape: bool = False) -> Dict:
 
 
 def update_state(state_path_, lock_path_, week: str, mutate,
-                 on_reclaim=None, escape: bool = False, on_warn=None) -> Dict:
-    """잠금 하 read-modify-write.
+                 escape: bool = False) -> Dict:
+    """flock 하 read-modify-write.
 
     mutate(state) → 새 상태 (None 이면 쓰지 않는다). 잠금을 쥔 뒤에 **다시 읽으므로**
     "읽고 나서 남이 바꾼 상태를 덮어쓰는" 경합이 생기지 않는다(사이클2 #1).
     """
-    handle = acquire_lock(lock_path_, on_reclaim=on_reclaim, on_warn=on_warn)
+    handle = acquire_lock(lock_path_)
     try:
         current = load_state(state_path_, week)
         new = mutate(current)
@@ -210,13 +215,49 @@ def update_state(state_path_, lock_path_, week: str, mutate,
 
 
 def can_send(state: Dict) -> Tuple[bool, str]:
-    """발송 가능한가. status=sent는 불변이고, sending은 사람 확인 전까지 막는다."""
+    """발송 가능한가. status=sent는 불변이고, sending은 사람 확인 전까지 막는다.
+
+    사이클4 #3·#4: 재조립 실패·검증 무효화 실패 플래그가 있으면 발송하지 않는다.
+    """
     status = state.get("status")
     if status == "sent":
         return False, "이미 발송됨"
     if status == "sending":
         return False, SENDING_REASON
+    if state.get("verification_broken"):
+        return False, VERIFICATION_BROKEN_REASON
+    if state.get("rebuild_failed"):
+        return False, REBUILD_FAILED_REASON
     return True, ""
+
+
+def mark_rebuild_failed(state: Dict, failed: bool = True) -> Dict:
+    """재조립 실패 표시 (사이클4 #3). 다음 성공 재조립까지 발송·미리보기 거부."""
+    updated = dict(state)
+    updated["rebuild_failed"] = bool(failed)
+    if failed:
+        updated["approval"] = None      # 신뢰할 수 없는 본문의 승인은 폐기
+    return updated
+
+
+def mark_verification_broken(state: Dict, broken: bool = True) -> Dict:
+    """검증 파일 무효화 실패 표시 (사이클4 #4). `/digest 재검토` 성공 시 해제."""
+    updated = dict(state)
+    updated["verification_broken"] = bool(broken)
+    if broken:
+        updated["approval"] = None
+    return updated
+
+
+def excluded_still_present(state: Optional[Dict], item_urls) -> List[str]:
+    """제외 목록과 현재 본문 항목 URL 의 교집합 (사이클4 #3).
+
+    비어 있지 않으면 재조립이 반영되지 않은 것이다 — 발송·미리보기를 거부한다.
+    """
+    excluded = set(excluded_urls(state))
+    if not excluded:
+        return []
+    return [url for url in (item_urls or []) if url in excluded]
 
 
 def mark_sending(state: Dict, now_iso: str) -> Dict:
@@ -261,8 +302,8 @@ def revert_sending(state: Dict) -> Dict:
 def release_sending(state: Dict) -> Dict:
     """사람의 `/digest 해제` — 미확정 발송 표시를 수동으로 푼다 (사이클2 #1).
 
-    사이클3 판정: **draft 로 되돌리고 미리보기·카드도 무효화한다.** 해제 후에는
-    새 미리보기·새 카드 없이는 발송할 수 없다(preview_sha 삭제 → 게이트가 거부).
+    사이클3 판정 + 사이클4 #2: **draft 로 되돌리고 승인 세대를 폐기한다.** 해제 후에는
+    새 미리보기·새 카드 없이는 발송할 수 없다(approval 삭제 → 옛 카드 영구 무효).
     사유는 호출자가 로그에 남긴다(상태 파일 스키마는 늘리지 않는다).
     apply_state(..., escape=True) 로만 저장된다.
     """
@@ -271,8 +312,7 @@ def release_sending(state: Dict) -> Dict:
     updated = dict(state)
     updated["status"] = "draft"
     updated["sending_at"] = None
-    updated["preview_sha"] = None
-    updated["card_message_id"] = None
+    updated["approval"] = None      # 옛 카드 영구 무효 (사이클4 #2)
     return updated
 
 
@@ -331,12 +371,21 @@ def excluded_urls(state: Optional[Dict]) -> List[str]:
     return list(state.get("excluded_urls") or [])
 
 
+def new_approval_id() -> str:
+    """승인 세대 id (uuid4 앞 12자) — callback_data 에 실린다."""
+    return uuid.uuid4().hex[:APPROVAL_ID_LEN]
+
+
 def record_preview(state: Dict, message_ids, item_urls=None,
-                   preview_sha: Optional[str] = None) -> Dict:
-    """이번 미리보기의 message_id 목록 + 그 미리보기가 보여준 항목 URL을 기록.
+                   approval_sha: Optional[str] = None) -> Dict:
+    """이번 미리보기의 message_id·항목 URL·**새 승인 세대**를 기록.
 
     **status 는 절대 건드리지 않는다** (사이클2 #1) — 미리보기 전송이 발송 상태를
     덮어쓰면 재발송이 열린다. 호출자는 잠금 하 read-modify-write 로 써야 한다.
+
+    사이클4 #2: 새 미리보기는 **이전 승인 세대를 폐기**하고 새 id 를 발급한다.
+    승인 카드의 callback_data 는 이 id 를 싣고, 발송기는 id 와 전체 SHA 를 함께
+    확인한다 — 접두 충돌로 옛 카드가 되살아나는 길을 없앤다.
     """
     updated = dict(state)
     ids = [int(mid) for mid in message_ids]
@@ -350,21 +399,65 @@ def record_preview(state: Dict, message_ids, item_urls=None,
         for key in list(items)[: len(items) - PREVIEW_ITEMS_MAX]:
             items.pop(key)
     updated["preview_items"] = items
-    if preview_sha is not None:
-        # 사이클3 #3: 사람이 **본** 본문의 지문. 승인 카드는 이 값으로 발급되고,
-        # 발송 게이트는 approved-sha·현재 본문 해시·이 값 셋의 일치를 요구한다.
-        updated["preview_sha"] = str(preview_sha)
-    updated["card_message_id"] = None   # 새 미리보기 → 이전 승인 카드는 무효
+    updated["approval"] = (
+        {
+            "id": new_approval_id(),
+            "sha": str(approval_sha),
+            "card_message_id": None,
+        }
+        if approval_sha
+        else None
+    )
     return updated
 
 
 def record_card(state: Dict, card_message_id) -> Dict:
-    """이번에 띄운 승인 카드의 message_id (status 는 건드리지 않는다)."""
+    """이번 승인 세대에 카드 message_id 를 붙인다 (status 는 건드리지 않는다)."""
+    approval = state.get("approval")
+    if not isinstance(approval, dict):
+        return dict(state)
     updated = dict(state)
-    updated["card_message_id"] = (
-        int(card_message_id) if card_message_id is not None else None
+    updated["approval"] = dict(
+        approval,
+        card_message_id=(
+            int(card_message_id) if card_message_id is not None else None
+        ),
     )
     return updated
+
+
+def clear_approval(state: Dict) -> Dict:
+    """승인 세대 폐기 — 옛 카드는 영구 무효가 된다 (사이클4 #2)."""
+    updated = dict(state)
+    updated["approval"] = None
+    return updated
+
+
+def approval_of(state: Optional[Dict]) -> Dict:
+    """승인 세대 dict (없으면 빈 dict)."""
+    approval = (state or {}).get("approval")
+    return approval if isinstance(approval, dict) else {}
+
+
+def card_message_id(state: Optional[Dict]):
+    """현재 승인 카드의 message_id (없으면 None)."""
+    return approval_of(state).get("card_message_id")
+
+
+def check_approval(state: Optional[Dict], approval_id: str,
+                   current_sha: str) -> Tuple[bool, str]:
+    """승인 세대 검증 (사이클4 #2). (ok, 거부 사유).
+
+    id 와 **전체 64자 SHA** 를 모두 확인한다 — 접두 비교는 폐지했다.
+    """
+    approval = approval_of(state)
+    if not approval.get("id"):
+        return False, NO_APPROVAL_REASON
+    if approval.get("id") != approval_id:
+        return False, STALE_APPROVAL_REASON
+    if approval.get("sha") != current_sha:
+        return False, STALE_PREVIEW_BODY_REASON
+    return True, ""
 
 
 def preview_urls(state: Optional[Dict], message_id=None) -> Optional[List[str]]:
@@ -381,221 +474,61 @@ def preview_urls(state: Optional[Dict], message_id=None) -> Optional[List[str]]:
     return None
 
 
-# ─── 잠금 (소유권 nonce + 원자적 stale 회수) ────────────────────────────
+# ─── 잠금 (fcntl.flock — 커널이 배타성을 보장한다) ──────────────────────
 class LockBusy(RuntimeError):
-    """같은 주차의 발송·상태 쓰기가 이미 진행 중 (살아 있는 잠금)."""
+    """같은 주차의 발송·상태 쓰기가 이미 진행 중 (flock 이 다른 프로세스에 있다)."""
 
 
 class LockHandle:
-    """획득한 잠금. nonce 가 소유권 증명이다 (사이클3 #1).
+    """flock 을 쥔 파일 디스크립터 (사이클4 #1).
 
-    release 는 파일에 적힌 nonce 가 **내 것일 때만** 삭제한다 — 회수 경합 후
-    남의 잠금을 지워 두 프로세스가 동시에 발송에 들어가는 경로를 닫는다.
+    잠금 파일은 **삭제하지 않는다** — 삭제하면 같은 경로를 새로 만든 프로세스가
+    다른 inode 에 flock 을 걸어 배타성이 깨진다. 파일은 남고 잠금만 오간다.
+    프로세스가 죽으면 커널이 flock 을 자동 해제하므로 stale 회수 로직이 필요 없다.
     """
 
-    __slots__ = ("path", "fd", "nonce")
+    __slots__ = ("path", "fd")
 
-    def __init__(self, path, fd, nonce):
+    def __init__(self, path, fd):
         self.path = Path(path)
         self.fd = fd
-        self.nonce = nonce
 
     def __repr__(self):     # pragma: no cover - 진단용
-        return f"LockHandle({self.path}, pid={os.getpid()}, nonce={self.nonce[:8]})"
+        return f"LockHandle({self.path}, fd={self.fd}, pid={os.getpid()})"
 
 
-def _lock_holder(path) -> Tuple[Optional[int], Optional[str], Optional[float]]:
-    """잠금 파일의 (pid, nonce, started_at). 못 읽으면 (None, None, None)."""
-    try:
-        with open(str(path), "r", encoding="utf-8") as fh:
-            data = json.load(fh)
-    except (OSError, json.JSONDecodeError, ValueError):
-        return None, None, None
-    if not isinstance(data, dict):
-        return None, None, None
-    pid = data.get("pid")
-    nonce = data.get("nonce")
-    started = data.get("started_at")
-    return (
-        pid if isinstance(pid, int) else None,
-        nonce if isinstance(nonce, str) and nonce else None,
-        float(started) if isinstance(started, (int, float)) else None,
-    )
+def acquire_lock(path) -> LockHandle:
+    """발송·상태 잠금 (`flock(LOCK_EX|LOCK_NB)`). 실패는 즉시 LockBusy — 재시도 없음.
 
-
-def _pid_alive(pid: int) -> bool:
-    """pid 생존 확인. 권한 문제로 못 보내면 살아 있다고 본다."""
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return True
-    except OSError:
-        return True
-    return True
-
-
-def _file_age(path) -> float:
-    try:
-        return max(0.0, time.time() - os.path.getmtime(str(path)))
-    except OSError:
-        return 0.0
-
-
-def stale_reason(
-    path,
-    partial_grace: float = LOCK_PARTIAL_GRACE_SECONDS,
-) -> Optional[str]:
-    """잠금을 회수해도 되는 이유. 회수하면 안 되면 None (사이클3 #1).
-
-    살아 있는 pid 의 잠금은 나이와 무관하게 회수하지 않는다. 빈/부분 파일은
-    생성 직후 유예를 준다(O_EXCL 생성과 JSON 쓰기 사이의 창을 회수하지 않기 위해).
-    """
-    pid, _nonce, _started = _lock_holder(path)
-    if pid is None:
-        age = _file_age(path)
-        if age < partial_grace:
-            return None
-        return f"잠금 파일 손상/미완성(생성 후 {age:.0f}초)"
-    if not _pid_alive(pid):
-        return f"보유 프로세스 없음(pid={pid})"
-    return None
-
-
-def long_held_warning(path, warn_seconds: float = LOCK_WARN_SECONDS) -> Optional[str]:
-    """살아 있는 pid 가 오래 쥐고 있다 — 경고만 한다(회수 금지, 사이클3 #1)."""
-    pid, _nonce, started = _lock_holder(path)
-    if pid is None or not _pid_alive(pid) or started is None:
-        return None
-    held = time.time() - started
-    if held <= warn_seconds:
-        return None
-    return f"잠금을 오래 보유 중(pid={pid}, {int(held)}초) — 회수하지 않음"
-
-
-def _create_lock(path) -> Optional[LockHandle]:
-    """O_EXCL 생성 + 소유권 기록. 이미 있으면 None."""
-    try:
-        fd = os.open(str(path), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
-    except FileExistsError:
-        return None
-    nonce = uuid.uuid4().hex
-    try:
-        os.write(fd, json.dumps({
-            "pid": os.getpid(), "nonce": nonce, "started_at": time.time(),
-        }).encode("utf-8") + b"\n")
-    except OSError:
-        pass
-    return LockHandle(path, fd, nonce)
-
-
-def _claim_reclaim_marker(marker, ttl: float = LOCK_RECLAIM_MARKER_TTL):
-    """회수 권한을 O_EXCL 로 한 명에게만 준다. 못 얻으면 None.
-
-    회수 중 크래시로 남은 마커는 ttl 이 지나면 치운다.
-    """
-    for attempt in (1, 2):
-        try:
-            return os.open(str(marker), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
-        except FileExistsError:
-            if attempt == 2 or _file_age(marker) <= ttl:
-                return None
-            try:
-                os.unlink(str(marker))
-            except OSError:
-                return None
-        except OSError:
-            return None
-    return None
-
-
-def acquire_lock(path, on_reclaim=None, on_warn=None,
-                 partial_grace: float = LOCK_PARTIAL_GRACE_SECONDS) -> LockHandle:
-    """발송·상태 잠금. 반환은 LockHandle (release_lock 에 그대로 넘긴다).
-
-    stale 회수는 **원자적 rename** 으로 한 명만 이긴다 (사이클3 #1):
-    `.lock` → `.lock.stale-<ts>` 로 옮긴 쪽만 재생성을 시도하고, rename 에 실패한
-    쪽은 포기한다. 이전 구현은 두 회수자가 각각 unlink+create 해서 **둘 다** 잠금을
-    쥐었다.
+    파일 회수·nonce·pid 검사를 전부 버렸다 (사이클4 #1): 커널이 배타성을 보장하고,
+    보유 프로세스가 죽으면 잠금이 즉시 풀린다.
     """
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-
-    handle = _create_lock(path)
-    if handle is not None:
-        return handle
-
-    reason = stale_reason(path, partial_grace)
-    if reason is None:
-        warning = long_held_warning(path)
-        if warning and on_warn is not None:
-            on_warn(warning)
-        pid, _nonce, _started = _lock_holder(path)
-        raise LockBusy(
-            f"잠금이 살아 있습니다: {path}"
-            + (f" (pid={pid})" if pid is not None else " (내용 확인 불가)")
-        )
-
-    # 회수는 한 명만 한다. 회수 마커(O_EXCL)가 회수 구간 전체를 직렬화한다 —
-    # 마커 없이 rename 만 쓰면 "A 회수·재생성 → B 가 A 의 **새** 잠금을 rename" 으로
-    # 둘 다 잠금을 쥔다(Codex 사이클3 #1 재현). 마커 안에서 관측값을 재확인한다.
-    observed = _lock_holder(path)
-    marker = path.with_name(path.name + ".reclaim")
-    marker_fd = _claim_reclaim_marker(marker)
-    if marker_fd is None:
-        raise LockBusy(f"잠금 회수 경합에서 밀렸습니다: {path}")
-
+    fd = os.open(str(path), os.O_CREAT | os.O_RDWR, 0o644)
     try:
-        if _lock_holder(path) != observed:
-            # 우리가 본 잠금이 아니다 (그 사이 회수·재생성됐다) → 포기.
-            raise LockBusy(f"회수 중 잠금이 교체되었습니다: {path}")
-
-        stale_path = path.with_name(
-            f"{path.name}.stale-{int(time.time() * 1000)}-{os.getpid()}"
-        )
-        try:
-            os.rename(str(path), str(stale_path))
-        except OSError as exc:
-            # rename 에 실패한 쪽은 포기한다.
-            raise LockBusy(f"잠금 회수 경합에서 밀렸습니다: {path}") from exc
-
-        if on_reclaim is not None:
-            on_reclaim(reason)
-
-        handle = _create_lock(path)
-        if handle is None:
-            raise LockBusy(f"회수 직후 다른 프로세스가 잠금을 잡았습니다: {path}")
-        return handle
-    finally:
-        try:
-            os.close(marker_fd)
-        except OSError:
-            pass
-        try:
-            os.unlink(str(marker))
-        except OSError:
-            pass
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError as exc:
+        os.close(fd)
+        raise LockBusy(f"잠금이 사용 중입니다: {path}") from exc
+    try:
+        os.ftruncate(fd, 0)
+        os.write(fd, f"{os.getpid()}\n".encode("utf-8"))
+    except OSError:
+        pass        # 진단용 기록일 뿐 — 소유권은 flock 이 증명한다
+    return LockHandle(path, fd)
 
 
-def release_lock(handle: Optional[LockHandle]) -> bool:
-    """내 잠금만 해제한다. 남의 잠금(nonce 불일치)은 건드리지 않는다.
-
-    Returns:
-        실제로 삭제했으면 True.
-    """
+def release_lock(handle) -> bool:
+    """flock 해제 + fd 닫기. 잠금 파일은 삭제하지 않는다."""
     if handle is None:
         return False
     try:
-        os.close(handle.fd)
+        fcntl.flock(handle.fd, fcntl.LOCK_UN)
     except OSError:
         pass
-    _pid, nonce, _started = _lock_holder(handle.path)
-    if nonce is not None and nonce != handle.nonce:
-        # 회수 경합 뒤 남의 잠금이 들어섰다 — 지우면 그쪽이 무방비가 된다.
-        return False
     try:
-        os.unlink(str(handle.path))
+        os.close(handle.fd)
     except OSError:
         return False
     return True

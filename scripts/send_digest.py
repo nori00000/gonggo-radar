@@ -17,6 +17,8 @@ from urllib.parse import urlparse
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from alert.notifiers.email_sender import UNSENT_STAGES, EmailNotifier
+from alert.digest import prune
+from alert.digest import sections as sections_mod
 from alert.digest import state as state_mod
 from alert.digest.checker import markdown_sha256
 
@@ -24,9 +26,8 @@ from alert.digest.checker import markdown_sha256
 STATE_SAVE_ATTEMPTS = 3
 STATE_SAVE_BACKOFF = 0.5
 
-# 승인 지문은 8자 이상 64자 이하의 16진수만 받는다 (사이클3 #4).
-# 빈 문자열·공백·1자를 받으면 startswith("") 가 언제나 참이 되어 게이트가 뚫린다.
-APPROVED_SHA_RE = re.compile(r"^[0-9a-f]{8,64}$")
+# 승인 세대 id 형식 (사이클4 #2). 접두 비교를 폐지했으므로 지문 대신 세대 id 를 받는다.
+APPROVAL_ID_RE = re.compile(r"^[0-9a-f]{%d}$" % state_mod.APPROVAL_ID_LEN)
 
 # [텍스트](URL) — URL 안의 괄호 한 단계까지 균형 있게 소비 (javascript:alert(1) 대응)
 LINK_PATTERN = r"\[([^\]]+)\]\(([^()\s]*(?:\([^()]*\)[^()\s]*)*)\)"
@@ -190,6 +191,12 @@ def _check_fail_closed_bytes(
     if not check_result.get("network_checked", False):
         return False, "네트워크 검증이 실행되지 않음"
 
+    # 사이클4 #5: 빈 본문은 pass 여도 발송하지 않는다 — 계약상 독립 조건이다.
+    if len(check_result.get("items") or []) < 1:
+        return False, "검증에 항목이 0건"
+    if int(check_result.get("item_blocks") or 0) < 1:
+        return False, "항목 0건 (공고 블록 없음)"
+
     return True, ""
 
 
@@ -215,7 +222,7 @@ def send_digest(
     to_email: str = None,
     dry_run: bool = True,
     approved_by=None,
-    approved_sha: str = None,
+    approval_id: str = None,
 ) -> int:
     """다이제스트 발송.
 
@@ -224,8 +231,9 @@ def send_digest(
         to_email: 수신자 이메일 (기본: config에서)
         dry_run: 드라이런 모드 (기본: True)
         approved_by: 발송을 승인한 텔레그램 user_id (계약 W10, 상태 파일에 기록)
-        approved_sha: 승인 카드가 본 본문의 해시(접두) — `--send` 에는 필수다
-            (계약 W10 사이클2 #2). 잠금 안에서 현재 본문 해시와 다시 대조한다.
+        approval_id: 승인 카드의 세대 id — `--send` 에는 필수다 (사이클4 #2).
+            잠금 안에서 state.approval.id 와, approval.sha == 현재 원시 바이트
+            전체 SHA == check.json.markdown_sha256 을 모두 대조한다.
 
     Returns:
         종료 코드 (0: 성공, 2: 실패, 1: 발송 후 기록 실패)
@@ -260,18 +268,13 @@ def send_digest(
         )
         return 0
 
-    # 사이클2 #2·사이클3 #4: 승인 지문 없는 실발송은 없다. 형식도 검증한다 —
-    # 공백·1자를 허용하면 startswith 가 언제나 참이 되어 게이트가 통째로 뚫린다.
-    approved = (approved_sha or "").strip().lower()
-    if not APPROVED_SHA_RE.match(approved):
-        try:
-            current = markdown_sha256(markdown_path.read_bytes())
-        except OSError:
-            current = "?"
-        problem = "없습니다" if not approved else f"형식이 아닙니다: {approved!r}"
+    # 사이클4 #2: 승인 세대 id 없는 실발송은 없다. 형식도 검증한다.
+    approval = (approval_id or "").strip().lower()
+    if not APPROVAL_ID_RE.match(approval):
+        problem = "없습니다" if not approval else f"형식이 아닙니다: {approval!r}"
         print(
-            f"✗ 발송 거부: --approved-sha 가 {problem} "
-            f"(8자 이상 16진수 · 현재 본문 지문: {current[:8]})",
+            f"✗ 발송 거부: --approval-id 가 {problem} "
+            f"({state_mod.APPROVAL_ID_LEN}자 16진수)",
             file=sys.stderr,
         )
         return 2
@@ -280,14 +283,8 @@ def send_digest(
     state_path = state_mod.state_path_for_markdown(markdown_path)
     lock_path = state_mod.lock_path_for_markdown(markdown_path)
 
-    def _reclaimed(reason):
-        print(f"⚠️  잔존 잠금 회수: {reason}", file=sys.stderr)
-
     try:
-        lock_handle = state_mod.acquire_lock(
-            lock_path, on_reclaim=_reclaimed,
-            on_warn=lambda why: print(f"⚠️  {why}", file=sys.stderr),
-        )
+        lock_handle = state_mod.acquire_lock(lock_path)
     except state_mod.LockBusy as exc:
         print(f"✗ 발송 거부: {exc}", file=sys.stderr)
         return 2
@@ -301,13 +298,12 @@ def send_digest(
             check_json_path=check_json_path,
             to_email=to_email,
             approved_by=approved_by,
-            approved_sha=approved,
+            approval_id=approval,
             week=week,
             state_path=state_path,
         )
     finally:
-        if not state_mod.release_lock(lock_handle):
-            print("⚠️  잠금 해제 생략(내 잠금이 아님)", file=sys.stderr)
+        state_mod.release_lock(lock_handle)
 
 
 def _subject(markdown_text: str) -> str:
@@ -321,7 +317,7 @@ def _send_locked(
     check_json_path: Path,
     to_email,
     approved_by,
-    approved_sha: str,
+    approval_id: str,
     week: str,
     state_path: Path,
 ) -> int:
@@ -343,14 +339,6 @@ def _send_locked(
         return 2
 
     current_sha = markdown_sha256(markdown_bytes)
-    approved = str(approved_sha).strip().lower()
-    if not current_sha.startswith(approved):
-        print(
-            "✗ 발송 거부: 승인된 본문이 아닙니다 "
-            f"(승인 {approved} ≠ 현재 {current_sha[:len(approved)]})",
-            file=sys.stderr,
-        )
-        return 2
 
     passed, msg = _check_fail_closed_bytes(markdown_bytes, check_json_path)
     if not passed:
@@ -375,19 +363,28 @@ def _send_locked(
             )
         return 2
 
-    # 사이클3 #3: 사람이 **본** 본문(최신 미리보기)과 지금 발송할 본문이 같아야 한다.
-    #   approved-sha == 현재 본문 해시 == 최신 preview_sha — 셋이 일치할 때만 발송.
-    preview_sha = state.get("preview_sha")
-    if not preview_sha:
-        print(
-            "✗ 발송 거부: 미리보기 기록이 없습니다 — 미리보기를 먼저 보내세요",
-            file=sys.stderr,
-        )
+    # 사이클4 #2: 승인 세대 검증 — id 일치 **그리고** 전체 SHA 3중 일치.
+    #   state.approval.id == --approval-id
+    #   state.approval.sha == 현재 원시 바이트 전체 SHA == check.json.markdown_sha256
+    # (뒤쪽 항등식의 check.json 쪽은 _check_fail_closed_bytes 가 이미 확인했다)
+    ok, reason = state_mod.check_approval(state, approval_id, current_sha)
+    if not ok:
+        print(f"✗ 발송 거부: {reason}", file=sys.stderr)
         return 2
-    if preview_sha != current_sha:
+
+    # 사이클4 #3: 제외한 항목이 본문에 남아 있으면 재조립이 반영되지 않은 것이다.
+    try:
+        check_result = json.loads(check_json_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        check_result = {}
+    item_sections, _ = sections_mod.resolve(check_result, markdown_text)
+    leftover = state_mod.excluded_still_present(
+        state, [block["url"] for block in prune.item_blocks(markdown_text, item_sections)]
+    )
+    if leftover:
         print(
-            "✗ 발송 거부: 미리보기와 본문이 다릅니다 "
-            f"(미리보기 {str(preview_sha)[:8]} ≠ 현재 {current_sha[:8]}) — 재검토 필요",
+            f"✗ 발송 거부: {state_mod.EXCLUDED_NOT_APPLIED_REASON} "
+            f"({len(leftover)}건, 예: {leftover[0]})",
             file=sys.stderr,
         )
         return 2
@@ -523,8 +520,8 @@ def main():
         help="발송을 승인한 텔레그램 user_id (상태 파일에 기록)",
     )
     parser.add_argument(
-        "--approved-sha",
-        help="승인 카드가 본 본문 해시(16진수 8~64자). --send 에 필수",
+        "--approval-id",
+        help=f"승인 카드의 세대 id(16진수 {state_mod.APPROVAL_ID_LEN}자). --send 에 필수",
     )
 
     args = parser.parse_args()
@@ -537,7 +534,7 @@ def main():
         to_email=args.to,
         dry_run=dry_run,
         approved_by=args.approved_by,
-        approved_sha=args.approved_sha,
+        approval_id=args.approval_id,
     )
 
 

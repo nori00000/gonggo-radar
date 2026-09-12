@@ -26,7 +26,7 @@ def markdown_sha256(markdown_bytes: bytes) -> str:
 
     정본은 파일 바이트다 — CRLF 만 바뀐 본문도 해시가 달라져 재검증을 요구한다.
     check.json 의 키는 `markdown_sha256` 하나이고, 텍스트 정규화 해시는 쓰지 않는다.
-    미리보기 지문(state.preview_sha)·승인 카드 지문·`--approved-sha` 도 모두 이 값이다.
+    state 의 approval.sha(승인 세대 지문)도 이 값이다 — 승인 카드는 세대 id 를 싣는다.
     """
     return hashlib.sha256(markdown_bytes).hexdigest()
 

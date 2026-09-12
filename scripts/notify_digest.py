@@ -18,6 +18,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import requests
 
 from alert.digest import preview as preview_mod
+from alert.digest import prune
 from alert.digest import sections as sections_mod
 from alert.digest import state as state_mod
 from alert.digest.checker import markdown_sha256
@@ -133,6 +134,33 @@ def load_check(markdown_path):
         return {}
 
 
+def _blocking_reason(markdown_path, week, check, current_sha, markdown_text):
+    """미리보기를 "검증 필요" 안내로 대체해야 하는 이유. 없으면 None (사이클4 #3·#4·#6)."""
+    recorded = (check or {}).get("markdown_sha256")
+    if not recorded:
+        return "검증 파일이 이 본문을 본 기록이 없습니다"
+    if recorded != current_sha:
+        return "검증 파일이 다른 본문의 것입니다 (재검증 필요)"
+    try:
+        state = state_mod.load_state(
+            state_mod.state_path_for_markdown(markdown_path), week)
+    except state_mod.StateError as exc:
+        return f"상태 파일 손상: {exc}"
+    if state.get("verification_broken"):
+        return state_mod.VERIFICATION_BROKEN_REASON
+    if state.get("rebuild_failed"):
+        return state_mod.REBUILD_FAILED_REASON
+    item_sections, _ = sections_mod.resolve(check, markdown_text)
+    leftover = state_mod.excluded_still_present(
+        state,
+        [block["url"] for block in prune.item_blocks(markdown_text, item_sections)],
+    )
+    if leftover:
+        return "{} ({}건)".format(
+            state_mod.EXCLUDED_NOT_APPLIED_REASON, len(leftover))
+    return None
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="다이제스트 미리보기를 텔레그램 협의회 토픽으로 전송"
@@ -156,7 +184,7 @@ def main():
         return 2
 
     week = state_mod.week_from_markdown(markdown_path)
-    # 미리보기 지문(preview_sha)은 발송 게이트와 같은 **원시 바이트** 해시다.
+    # 승인 지문(approval.sha)은 발송 게이트와 같은 **원시 바이트** 해시다.
     # 렌더에 쓰는 텍스트도 같은 읽기에서 나와야 지문과 화면이 어긋나지 않는다.
     try:
         markdown_bytes = markdown_path.read_bytes()
@@ -165,9 +193,25 @@ def main():
         print(f"✗ 마크다운 읽기 실패: {exc}", file=sys.stderr)
         return 2
     check = load_check(markdown_path)
+    current_sha = markdown_sha256(markdown_bytes)
 
-    body = preview_mod.render_preview(week, markdown_text, check)
-    chunks = preview_mod.chunk_text(body)
+    # 사이클4 #6: 렌더 **전에** check.json 이 이 바이트를 본 것인지 확인한다.
+    # 불일치면 항목 미리보기를 만들지 않는다 — 항목 0건 화면이 승인 대상이 되던
+    # 경로(다른 계약의 check 로 렌더)가 닫힌다. 섹션 목록도 그 check.json 의 것을 쓴다.
+    blocked = _blocking_reason(markdown_path, week, check, current_sha,
+                               markdown_text)
+    if blocked:
+        body = "🏛 협의회 주간 정책브리핑 {}\n\n⚠️ {}\n\n`/digest 재검토` 로 다시 검증하세요.".format(
+            week, blocked)
+        chunks = [body]
+        item_urls = []
+        approval_sha = None
+    else:
+        item_sections, _ = sections_mod.resolve(check, markdown_text)
+        body = preview_mod.render_preview(week, markdown_text, check)
+        chunks = preview_mod.chunk_text(body)
+        item_urls = preview_mod.item_urls(markdown_text, item_sections)
+        approval_sha = current_sha
 
     if args.dry_run:
         print(f"[DRY-RUN] {week} 미리보기 {len(chunks)}개 메시지")
@@ -189,7 +233,8 @@ def main():
     state_path = state_mod.state_path_for_markdown(markdown_path)
     lock_path = state_mod.lock_path_for_markdown(markdown_path)
     try:
-        stale_card = state_mod.load_state(state_path, week).get("card_message_id")
+        stale_card = state_mod.card_message_id(
+            state_mod.load_state(state_path, week))
     except state_mod.StateError as exc:
         print(f"⚠️  상태 확인 실패(미리보기는 계속 전송): {exc}", file=sys.stderr)
         stale_card = None
@@ -214,22 +259,19 @@ def main():
     # 텔레그램 왕복 동안 다른 발송이 sent 를 썼을 수 있으므로, 여기서 다시 읽고
     # message_id 만 더한다(record_preview 는 status 를 건드리지 않는다).
     #
-    # 사이클3 #3: 사람이 **본** 본문의 지문(preview_sha)을 같이 남긴다. 승인 카드는
-    # 이 값으로 발급되고, 발송 게이트가 approved-sha·현재 해시·이 값의 일치를 본다.
-    item_sections, _ = sections_mod.resolve(check, markdown_text)
-    item_urls = preview_mod.item_urls(markdown_text, item_sections)
-    preview_sha = markdown_sha256(markdown_bytes)
+    # 사이클4 #2: 사람이 **본** 본문의 지문으로 **새 승인 세대**를 발급한다.
+    # 차단 상태(검증 불일치·제외 미반영 등)면 승인 세대를 발급하지 않는다 —
+    # approval=None 이므로 어떤 카드도 발송 게이트를 통과하지 못한다.
     try:
-        state_mod.update_state(
+        new_state = state_mod.update_state(
             state_path, lock_path, week,
             lambda current: state_mod.record_preview(
-                current, message_ids, item_urls, preview_sha
-            ),
-            on_reclaim=lambda reason: print(
-                f"⚠️  잔존 잠금 회수: {reason}", file=sys.stderr
+                current, message_ids, item_urls, approval_sha
             ),
         )
-        print(f"✓ 상태 기록: {state_path} (preview_sha={preview_sha[:8]})")
+        approval = state_mod.approval_of(new_state)
+        print("✓ 상태 기록: {} (approval={})".format(
+            state_path, approval.get("id") or "없음(검증 필요)"))
     except (state_mod.StateError, state_mod.TransitionError,
             state_mod.LockBusy, OSError) as exc:
         print(f"⚠️  상태 기록 실패(미리보기는 전송됨): {redact(exc)}",

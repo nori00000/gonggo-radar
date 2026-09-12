@@ -72,13 +72,7 @@ def main():
     state_path = state_mod.state_path(args.week, args.out_dir)
     lock_path = state_mod.lock_path(args.week, args.out_dir)
     try:
-        handle = state_mod.acquire_lock(
-            lock_path,
-            on_reclaim=lambda reason: print(
-                f"⚠️  잔존 잠금 회수: {reason}", file=sys.stderr
-            ),
-            on_warn=lambda why: print(f"⚠️  {why}", file=sys.stderr),
-        )
+        handle = state_mod.acquire_lock(lock_path)
     except (state_mod.LockBusy, OSError) as exc:
         print(f"✗ 해설 적용 거부: {exc}", file=sys.stderr)
         return 2
@@ -117,8 +111,7 @@ def main():
             print(f"⚠️  상태 기록 실패(본문은 적용됨): {exc}", file=sys.stderr)
             return 1
     finally:
-        if not state_mod.release_lock(handle):
-            print("⚠️  잠금 해제 생략(내 잠금이 아님)", file=sys.stderr)
+        state_mod.release_lock(handle)
 
     return 0
 

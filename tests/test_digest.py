@@ -791,6 +791,7 @@ class TestSendDigest:
         check_path = md_path.with_suffix(".check.json")
         check_path.write_text(json.dumps({
             "items": [{"url": "https://example.com", "url_alive": True, "deadline_parsed": True, "passed": True}],
+            "item_blocks": 1,
             "pass": True,
             "network_checked": True,
             "reason": "",
@@ -828,6 +829,7 @@ class TestSendDigest:
         check_path.write_text(json.dumps({
             "items": [{"url": "https://example.com", "url_alive": True,
                        "deadline_parsed": True, "passed": True}],
+            "item_blocks": 1,
             "pass": True,
             "network_checked": True,
             "reason": "",
@@ -856,6 +858,7 @@ class TestSendDigest:
         check_path.write_text(json.dumps({
             "items": [{"url": "https://example.com", "url_alive": True,
                        "deadline_parsed": True, "passed": True}],
+            "item_blocks": 1,
             "pass": True,
             "network_checked": True,
             "reason": "",
@@ -893,13 +896,15 @@ class TestSendDigest:
         from alert.digest import state as state_mod
 
         state_path = state_mod.state_path_for_markdown(md_path)
-        state_mod.save_state(state_path, state_mod.record_preview(
-            state_mod.default_state(state_mod.week_from_markdown(md_path)),
-            [2014], [], markdown_sha256(md_path.read_bytes()),
-        ))
+        week = state_mod.week_from_markdown(md_path)
+        seeded = state_mod.record_preview(
+            state_mod.default_state(week), [2014], [],
+            markdown_sha256(md_path.read_bytes()),
+        )
+        state_mod.save_state(state_path, seeded)
 
         rc = send_digest(md_path, to_email="third@example.com", dry_run=False,
-                         approved_sha=markdown_sha256(md_path.read_bytes())[:8])
+                         approval_id=state_mod.approval_of(seeded)["id"])
 
         assert rc == 0
         assert sent["to"] == "third@example.com"
