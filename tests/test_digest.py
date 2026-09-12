@@ -37,11 +37,12 @@ from alert.digest.composer import (
     hold_comment,
     jaccard,
     kakao_blocks,
+    kakao_blocks_from_markdown,
     kakao_file_text,
+    kakao_file_text_from_markdown,
     kst_date,
     normalize_title,
     parse_deadline,
-    refresh_kakao_headline,
     render_kakao_chunks,
     render_kakao,
     render_markdown,
@@ -53,6 +54,7 @@ from alert.digest.composer import (
     week_bounds,
     window_prefilter_bounds,
 )
+from alert.digest import blocks as blocks_mod
 from alert.digest.checker import (
     body_links,
     check_digest,
@@ -984,6 +986,24 @@ class TestSendDigest:
         assert "href=" not in html
         # 링크가 아니므로 잔여 ')' 없이 원문 그대로 이스케이프되어 남는다
         assert "[클릭](javascript:alert(1))" in html
+
+    def test_markdown_to_html_keeps_balanced_parens_in_url(self):
+        """사이클 6 #4: URL 안의 괄호를 잘라먹지 않는다 (`…/report(2026)`)."""
+        url = "https://example.com/report(2026)"
+        html = markdown_to_html(f"[원문]({url})")
+
+        assert f'href="{url}"' in html
+        assert html.count("<a ") == 1
+
+    def test_markdown_to_html_never_marks_up_inside_href(self):
+        """사이클 6 #4: href 안에서는 `**` 를 마크업으로 해석하지 않는다."""
+        url = "https://example.com/**bold**/x"
+        html = markdown_to_html(f"[원문]({url}) 그리고 **강조**")
+
+        assert f'href="{url}"' in html
+        assert "<strong>bold</strong>" not in html
+        # 링크 밖의 강조는 그대로 렌더된다
+        assert "<strong>강조</strong>" in html
 
     def test_markdown_to_html_keeps_non_url_parenthesis(self):
         """`[모집](~9.30)` 같은 비URL 괄호는 링크가 아니라 본문 그대로 남는다.
@@ -2560,15 +2580,58 @@ class TestFixCycle4:
         assert KAKAO_HEADLINE_PLACEHOLDER not in kakao_text
         assert "이번 주는 산림형 예비사회적기업 지정 공고" in kakao_text
 
-    def test_refresh_kakao_headline_rechunks(self):
-        text = (
-            "📋 협의회 주간 정책브리핑 2026-W37 (9/7~9/13)\n"
-            f"{KAKAO_HEADLINE_PREFIX}{KAKAO_HEADLINE_PLACEHOLDER}\n\n"
-            "✅ 신청하세요 (마감순)\n"
+    def test_kakao_item_blocks_match_the_block_parser(self):
+        """사이클 6 #1·#5: 카톡 항목 덩어리와 블록 파서의 항목이 1:1로 맞는다."""
+        md = (
+            "# 📋 협의회 주간 정책브리핑 2026-W37 (9/7~9/13)\n\n"
+            "이번 주 한 줄: 확정 문구\n\n"
+            "## ✅ 신청하세요 (마감순)\n\n"
+            "[D-9] 산림 공고 — 산림청 · 대상: 산림사업자 · 마감 9/22\n"
+            "  [원문](https://example.com/a)\n\n"
+            "## 👀 알아두세요\n\n"
+            "입법예고 — 국민참여입법센터 · 대상: 산림사업자 · 의견 10/19까지\n"
+            "  [원문](https://example.com/d)\n"
         )
-        updated = refresh_kakao_headline(text, "확정 문구")
-        assert f"{KAKAO_HEADLINE_PREFIX}확정 문구" in updated
-        assert KAKAO_HEADLINE_PLACEHOLDER not in updated
+        items = blocks_mod.item_blocks(md)
+        assert len(items) == 2
+
+        pairs = [
+            block
+            for block in kakao_blocks_from_markdown(md)
+            if "https://" in block
+        ]
+        assert len(pairs) == len(items)
+        for item, block in zip(items, pairs):
+            assert block == f"{item['title']}\n  {item['url']}"
+            assert block.count("\n") == 1
+
+    def test_kakao_is_regenerated_from_markdown(self):
+        """사이클 6 #5: 카톡은 자기 파일을 손보지 않고 md 에서 재생성된다."""
+        md = (
+            "<!-- lane: test -->\n\n"
+            "# 📋 협의회 주간 정책브리핑 2026-W37 (9/7~9/13)\n\n"
+            f"이번 주 한 줄: {MARKER}\n\n"
+            "## ✅ 신청하세요 (마감순)\n\n"
+            "[D-9] 산림 공고 — 산림청 · 대상: 산림사업자 · 마감 9/22\n"
+            "  [원문](https://example.com/a)\n\n"
+            "<!-- 보류: 1. 보류 항목 | 이유 | id=1 -->\n"
+        )
+        placeholder = kakao_file_text_from_markdown(md)
+        assert KAKAO_HEADLINE_PLACEHOLDER in placeholder
+        # 레인 표기·보류 주석은 카톡 발송본에 실리지 않는다
+        assert "lane:" not in placeholder
+        assert "보류 항목" not in placeholder
+
+        confirmed = kakao_file_text_from_markdown(
+            md.replace(MARKER, "확정 문구")
+        )
+        assert f"{KAKAO_HEADLINE_PREFIX}확정 문구" in confirmed
+        assert KAKAO_HEADLINE_PLACEHOLDER not in confirmed
+        # 항목은 제목 줄 + URL 줄 한 덩어리로 남는다
+        assert (
+            "[D-9] 산림 공고 — 산림청 · 대상: 산림사업자 · 마감 9/22\n"
+            "  https://example.com/a"
+        ) in confirmed
 
     # ─── #13 보류 주석 구분자·id ────────────────────────────────────────
     def test_hold_comment_escapes_pipe_and_carries_id(self):
@@ -2841,6 +2904,14 @@ class TestFixCycle5:
         )
         chunks = render_kakao_chunks(data)
         assert any(long_url in chunk for chunk in chunks)
+        # 사이클 6 #5: 제목을 줄여도 URL 이 한도를 넘으면 그 조각만 한도를 넘긴다.
+        # 쪼개서 URL 줄을 다음 메시지 맨 앞으로 밀지 않는다.
+        holder = [chunk for chunk in chunks if long_url in chunk]
+        assert len(holder) == 1
+        assert not holder[0].lstrip().startswith("http")
+        assert "산림 지원사업" in holder[0]
+        for chunk in chunks:
+            assert not chunk.lstrip().startswith("https://")
 
     def test_kakao_blocks_keep_item_with_its_url(self, tmp_path):
         db_path = tmp_path / "c5_5c.db"

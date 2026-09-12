@@ -290,6 +290,28 @@ LABEL_STANDING = "상시"
 NEW_WINDOW_DAYS = 7
 QUOTE_FALLBACK = "원문 확인"
 
+# ─── 항목 줄 형식 (형식 v2.1) — 블록 파서의 정본 (사이클 6 #1) ───────────
+#   신청하세요: `[라벨] 제목 — 기관 · 대상: … · 마감 …`
+#   알아두세요: `제목 — 기관 · 대상: … · 의견 …까지`
+# 라벨은 _deadline_fields 가 만드는 것만 인정한다 — 제목에 원래 있던 임의의
+# 대괄호(`[모집]`·`[공고]`)는 제목의 일부이며 항목 판정 근거가 아니다.
+# 이 정규식을 쓰는 곳은 alert.digest.blocks 하나이며, 항목 판정은 여기에
+# **다음 줄이 `  [원문](URL)`** 이라는 조건을 더해서만 성립한다.
+ITEM_LABELS = (LABEL_NEW, LABEL_STANDING, "마감 미정")
+ITEM_LABEL_PATTERN = "(?:D-\\d+|{})".format(
+    "|".join(re.escape(label) for label in ITEM_LABELS)
+)
+ITEM_LINE_RE = re.compile(
+    r"^(?:\[(?P<label>" + ITEM_LABEL_PATTERN + r")\]\s+)?"
+    r"(?P<title>\S.*?)\s+—\s+(?P<rest>\S.*)$"
+)
+
+# 항목이 하나도 없는 항목 섹션에 남기는 표시 (블록 파서·prune 이 같은 문자열을 쓴다)
+EMPTY_SECTION_LINE = "*(항목 없음)*"
+# 카톡 평문에서의 같은 표시
+KAKAO_EMPTY_SECTION_LINE = "  (항목 없음)"
+_BOLD_RE = re.compile(r"\*\*([^*]+)\*\*")
+
 # 중복 병합 임계값 (판정 ⑥): 같은 소스·같은 주 제목 3-gram Jaccard
 DEDUP_JACCARD = 0.6
 NGRAM_SIZE = 3
@@ -1433,7 +1455,7 @@ def render_markdown(data: Dict) -> str:
         lines.append("")
         items = data["sections"].get(section) or []
         if not items:
-            lines.append("*(항목 없음)*")
+            lines.append(EMPTY_SECTION_LINE)
             lines.append("")
             continue
         for item in items:
@@ -1500,12 +1522,17 @@ def _is_url_line(line: str) -> bool:
     return stripped.startswith("http://") or stripped.startswith("https://")
 
 
+def _is_item_block(block: str) -> bool:
+    """카톡 항목 블록인가 (제목 줄 + URL 줄, 딱 두 줄)."""
+    lines = block.split("\n")
+    return len(lines) == 2 and _is_url_line(lines[1])
+
+
 def _shrink_item_block(block: str, limit: int) -> str:
     """항목 블록이 한도를 넘으면 **제목만** 줄이고 URL은 보존한다 (개정 v2.6 (5))."""
-    lines = block.split("\n")
-    if len(lines) != 2 or not _is_url_line(lines[1]):
+    if not _is_item_block(block):
         return block
-    head, url_line = lines
+    head, url_line = block.split("\n")
     room = limit - len(url_line) - 1
     if room <= 1:
         # URL 자체가 한도를 넘는다 — 자르지 않고 그대로 둔다(링크 보존이 우선).
@@ -1531,7 +1558,13 @@ def _pack_blocks(blocks: Sequence[str], limit: int) -> List[str]:
         block = _shrink_item_block(block, limit)
         if len(block) > limit:
             flush()
-            chunks.extend(chunk_plaintext(block, limit))
+            if _is_item_block(block):
+                # 제목을 줄여도 URL 자체가 한도를 넘는다 (사이클 6 #5).
+                # 링크 보존이 우선이므로 이 조각만 한도를 넘긴 채 통째로 보낸다 —
+                # 쪼개면 URL 줄이 다음 메시지 맨 앞으로 밀려 링크가 죽는다.
+                chunks.append(block)
+            else:
+                chunks.extend(chunk_plaintext(block, limit))
             continue
         candidate = len("\n".join(current + [block]))
         if current and candidate > limit:
@@ -1593,23 +1626,71 @@ def kakao_file_text(data: Dict, headline: Optional[str] = None) -> str:
     return separator.join(render_kakao_chunks(data, headline)) + "\n"
 
 
-def refresh_kakao_headline(text: str, headline: str) -> str:
-    """`.kakao.txt`의 "이번 주 한 줄" 자리를 확정 문구로 바꾸고 다시 분할 (#12)."""
-    body = [
-        line
-        for line in text.splitlines()
-        if line.strip() != KAKAO_CHUNK_SEPARATOR
-    ]
-    replaced = []
-    done = False
-    for line in body:
-        if not done and line.startswith(KAKAO_HEADLINE_PREFIX):
-            replaced.append(f"{KAKAO_HEADLINE_PREFIX}{headline.strip()}")
-            done = True
+def _kakao_prose_line(text: str) -> str:
+    """마크다운 산문 줄을 카톡 평문으로 (강조·글머리 기호만 평탄화)."""
+    line = text.strip()
+    if line == EMPTY_SECTION_LINE:
+        return KAKAO_EMPTY_SECTION_LINE
+    line = line.replace(MARKER, KAKAO_HEADLINE_PLACEHOLDER)
+    line = _BOLD_RE.sub(r"\1", line)
+    if line.startswith("- "):
+        line = "· " + line[2:]
+    return line
+
+
+def kakao_blocks_from_markdown(markdown_text: str) -> List[str]:
+    """**발송본 마크다운에서** 카톡 평문 블록을 만든다 (사이클 6 #5).
+
+    `.kakao.txt` 를 md 와 따로 손보면 둘이 갈라진다 — 재검토가 md 에서 죽은 링크를
+    지워도 카톡에는 그대로 남았다(Codex 신규 #8). 그래서 갱신 경로는 하나다:
+    **md → 이 렌더러 → .kakao.txt**. 항목 판정은 alert.digest.blocks 가 정본이므로
+    카톡의 항목 덩어리와 게이트의 항목 계수가 갈라질 수 없다.
+    """
+    from alert.digest import blocks as blocks_mod
+
+    head: List[str] = []
+    body: List[str] = []
+    seen_section = False
+
+    for block in blocks_mod.parse_blocks(markdown_text):
+        kind = block["kind"]
+        if kind == "comment":
+            # 레인 표기·보류 목록은 발송 대상이 아니다
             continue
-        replaced.append(line)
+        if kind == "section":
+            if body:
+                body.append("")
+            body.append(block["name"])
+            seen_section = True
+            continue
+        if kind == "item":
+            # 항목은 제목 줄 + URL 줄이 **한 덩어리**다 (쪼개지 않는다)
+            body.append(f"{block['title']}\n  {block['url']}")
+            continue
+        for raw in block["lines"]:
+            text = raw.strip()
+            if not text:
+                continue
+            if text.startswith("# "):
+                text = text[2:]
+            (body if seen_section else head).append(_kakao_prose_line(text))
+
+    blocks: List[str] = []
+    if head:
+        blocks.append("\n".join(head))
+        blocks.append("")
+    blocks.extend(body)
+    blocks.append("")
+    return blocks
+
+
+def kakao_file_text_from_markdown(markdown_text: str) -> str:
+    """`.kakao.txt` 내용을 발송본 마크다운에서 재생성 (사이클 6 #5)."""
     separator = f"\n{KAKAO_CHUNK_SEPARATOR}\n"
-    return separator.join(chunk_plaintext("\n".join(replaced))) + "\n"
+    chunks = _pack_blocks(
+        kakao_blocks_from_markdown(markdown_text), KAKAO_CHUNK_LIMIT
+    )
+    return separator.join(chunks) + "\n"
 
 
 def render_kakao(data: Dict, headline: Optional[str] = None) -> str:

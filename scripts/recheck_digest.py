@@ -18,6 +18,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from alert.digest import prune
+from alert.digest.composer import kakao_file_text_from_markdown
 from alert.digest.checker import (
     check_digest,
     dead_urls,
@@ -60,13 +61,15 @@ def recheck(markdown_path: Path, db_path: str, check_path: Path):
         if pruned == text:
             # 제거 대상을 본문에서 찾지 못했다 → 더 돌려도 같다. 아래에서 pass=false.
             break
-        # 사이클2 #7: 링크를 떼어내면 제목이 겹칠 수 있다 → 중복 재검사.
-        pruned, duplicates = prune.dedupe_titles(pruned)
+        # 사이클 6 #3: 같은 URL 을 가리키는 블록만 접는다. 제목이 같아도 URL 이
+        # 다르면 남긴다 — 소스 간 비병합 계약(같은 사안을 forest_service·
+        # forest_press 가 각자 게시)을 재검토가 뒤집으면 안 된다.
+        pruned, duplicates = prune.dedupe_urls(pruned)
         markdown_path.write_text(pruned, encoding="utf-8")
         dropped.extend(removed)
         dropped.extend(duplicates)
         for item in duplicates:
-            print(f"  중복 제목 제거: {item['title']}")
+            print(f"  중복 URL 제거: {item['title']} ({item['url']})")
         # 해설·본문에서 링크만 떼어낸 죽은 URL도 check.json 에 남긴다 —
         # 미리보기 헤더의 "죽은 URL 제외 N건" 이 실제 제거 건수와 맞아야 한다.
         dropped.extend({"title": "본문 링크", "url": url} for url in unlinked)
@@ -77,7 +80,24 @@ def recheck(markdown_path: Path, db_path: str, check_path: Path):
 
     result["dropped"] = _merge_dropped(dropped, result.get("dropped"))
     write_check_result(check_path, result)
+    # 사이클 6 #5: `.kakao.txt` 는 **항상 md 에서** 재생성한다. 예전에는 재검토가
+    # md 의 죽은 링크만 지워서, 카톡 발송본에는 죽은 링크가 그대로 남았다.
+    _refresh_kakao(markdown_path)
     return result, dropped
+
+
+def _refresh_kakao(markdown_path: Path) -> None:
+    """`<주차>.kakao.txt` 를 발송본 마크다운에서 다시 렌더한다."""
+    kakao_path = markdown_path.with_name(f"{markdown_path.stem}.kakao.txt")
+    try:
+        kakao_path.write_text(
+            kakao_file_text_from_markdown(
+                markdown_path.read_text(encoding="utf-8")
+            ),
+            encoding="utf-8",
+        )
+    except OSError as exc:
+        print(f"⚠️  카톡 평문 재생성 실패: {exc}", file=sys.stderr)
 
 
 def write_failure(check_path: Path, markdown_path: Path, reason: str) -> None:

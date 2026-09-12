@@ -16,6 +16,7 @@ from urllib.parse import urlparse
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from alert.notifiers.email_sender import UNSENT_STAGES, EmailNotifier
+from alert.digest import blocks as blocks_mod
 from alert.digest import state as state_mod
 from alert.digest.checker import markdown_sha256
 
@@ -23,18 +24,10 @@ from alert.digest.checker import markdown_sha256
 STATE_SAVE_ATTEMPTS = 3
 STATE_SAVE_BACKOFF = 0.5
 
-# [텍스트](URL) — URL 안의 괄호 한 단계까지 균형 있게 소비.
-#
-# 괄호 안이 **URL 로 보일 때만** 링크로 읽는다 (http/https/www). 제목에는
-# `[모집](~9.30)` 처럼 링크가 아닌 괄호 표기가 실제로 등장하는데, 그것을 링크로
-# 오인하면 발송 HTML에서 `(~9.30)` 이 조용히 사라진다 (마감 정보 손실).
-# 스킴이 없거나 다른 스킴(javascript: 등)이면 링크 문법으로 읽지 않으므로
-# 앵커가 만들어지지 않는다 — 아래 urlparse 검사는 www. 를 걸러내는 몫으로 남는다.
-LINK_PATTERN = (
-    r"\[([^\]]+)\]\("
-    r"((?:https?://|www\.)[^()\s]*(?:\([^()]*\)[^()\s]*)*)"
-    r"\)"
-)
+# 링크 추출은 alert.digest.blocks.find_links 가 정본이다 (사이클 6 #1·#4).
+# 자체 정규식을 두면 ①`…/report(2026)` 같은 괄호 포함 URL을 잘라 먹고
+# ②checker·prune 과 다른 URL을 보게 되어 "완전한 주소는 살아 있는데 잘린 주소가
+# 죽어서" 정상 링크가 삭제된다. 스킴이 없는 괄호(`[모집](~9.30)`)는 링크가 아니다.
 
 
 def markdown_to_html(markdown_text: str) -> str:
@@ -101,38 +94,42 @@ def markdown_to_html(markdown_text: str) -> str:
             continue
 
         # 링크는 이스케이프 전에 처리해야 하므로, 원문에 등장할 수 없는
-        # sentinel(\x00LINK{n}\x00)로 먼저 치환한다.
+        # sentinel(\x00LINK{n}\x00)로 먼저 치환한다. 치환은 **위치 기반**이다 —
+        # 문자열 replace 는 같은 링크가 두 번 나오면 엉뚱한 곳을 바꾼다.
         link_placeholders = {}
-        modified_line = line
-        for i, match in enumerate(re.finditer(LINK_PATTERN, line)):
-            url = match.group(2)
-            text = match.group(1)
-            parsed = urlparse(url)
-            if parsed.scheme in ("http", "https"):
+        pieces = []
+        cursor = 0
+        for i, link in enumerate(blocks_mod.find_links(line)):
+            pieces.append(line[cursor:link.start])
+            if urlparse(link.url).scheme in ("http", "https"):
                 placeholder = f"\x00LINK{i}\x00"
                 link_placeholders[placeholder] = (
-                    f'<a href="{html_module.escape(url, quote=True)}">'
-                    f"{html_module.escape(text)}</a>"
+                    f'<a href="{html_module.escape(link.url, quote=True)}">'
+                    f"{html_module.escape(link.text)}</a>"
                 )
-                modified_line = modified_line.replace(match.group(0), placeholder, 1)
+                pieces.append(placeholder)
             else:
-                # javascript: 등 허용 안 함 - 링크 전체 제거, 텍스트만 남김
-                # (뒤에서 라인 전체를 이스케이프하므로 여기서는 원문 그대로)
-                modified_line = modified_line.replace(match.group(0), text, 1)
+                # http/https 가 아닌 링크(www. 등)는 앵커를 만들지 않고 텍스트만 남긴다
+                pieces.append(link.text)
+            cursor = link.end
+        pieces.append(line[cursor:])
+        modified_line = "".join(pieces)
 
         # 이제 라인 전체 이스케이프 (sentinel은 이스케이프 영향 없음)
         escaped_line = html_module.escape(modified_line)
 
-        # sentinel을 실제 링크로 복원
-        for placeholder, link_html in link_placeholders.items():
-            escaped_line = escaped_line.replace(placeholder, link_html)
-
-        # **굵은텍스트** 처리 (이스케이프 후: \*\*...\*\*)
+        # **굵은텍스트** 처리 — sentinel 복원 **전에** 한다 (사이클 6 #4 /
+        # Codex 신규 #7). 뒤에 하면 href 안의 `**` 가 <strong> 으로 바뀌어
+        # 링크가 깨진다. href 에는 이스케이프만 적용되고 마크업은 해석되지 않는다.
         escaped_line = re.sub(
             r"\*\*([^*]+)\*\*",
             r"<strong>\1</strong>",
             escaped_line
         )
+
+        # sentinel을 실제 링크로 복원
+        for placeholder, link_html in link_placeholders.items():
+            escaped_line = escaped_line.replace(placeholder, link_html)
 
         html_body += f"<p>{escaped_line}</p>"
 

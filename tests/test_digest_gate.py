@@ -6,12 +6,18 @@ from pathlib import Path
 
 import pytest
 
+from alert.digest import blocks as blocks_mod
 from alert.digest import prune as prune_mod
 from alert.digest import state as state_mod
 from alert.digest import preview as preview_mod
 from alert.digest.checker import check_digest, markdown_sha256
+from alert.digest.composer import KAKAO_CHUNK_SEPARATOR
 from alert.utils.redact import redact
-from scripts.apply_commentary import apply_commentary, commentary_error
+from scripts.apply_commentary import (
+    apply_commentary,
+    commentary_error,
+    main as apply_commentary_main,
+)
 from scripts.recheck_digest import main as recheck_main
 from scripts.send_digest import send_digest
 
@@ -1152,7 +1158,7 @@ def test_prune_keeps_prose_section_blocks(tmp_path, monkeypatch):
     assert "### 검토 의견" in text
     assert "자격 요건 완화를 건의했습니다" in text
     assert "https://dead.invalid/opinion" not in text
-    assert prune_mod.item_block_count(text) == 4     # 공고 4건 그대로
+    assert blocks_mod.item_block_count(text) == 4     # 공고 4건 그대로
 
 
 def test_section_key_only_matches_item_sections():
@@ -1161,61 +1167,109 @@ def test_section_key_only_matches_item_sections():
     이모지·부제가 붙은 발송본 헤딩(`## ✅ 신청하세요 (마감순)`)에서도 키를 찾아야
     한다 — 못 찾으면 게이트가 조용히 "항목 0건"을 센다.
     """
-    assert prune_mod.section_key("✅ 신청하세요 (마감순)") == "신청하세요"
-    assert prune_mod.section_key("👀 알아두세요") == "알아두세요"
+    assert blocks_mod.section_key("✅ 신청하세요 (마감순)") == "신청하세요"
+    assert blocks_mod.section_key("👀 알아두세요") == "알아두세요"
     for prose in ("🤝 협의회에서", "🏢 회원사 소식", "협의회 의견",
                   "회원사 동정", "이번 주 한 줄", ""):
-        assert prune_mod.section_key(prose) is None
+        assert blocks_mod.section_key(prose) is None
 
 
 def test_section_key_follows_composer_rename(monkeypatch):
-    """섹션 이름이 바뀌면 composer 를 따라간다 (계약 v1.2 이름으로 되돌려도)."""
+    """섹션 이름이 바뀌면 composer 를 따라간다 (임의의 이름으로 갈아도)."""
     from alert.digest import composer
 
     monkeypatch.setattr(
-        composer,
-        "SECTION_LIMITS",
-        {"산림 정책 동향": 5, "지원사업 공고": 5, "사회연대경제 동향": 3},
+        composer, "SECTION_LIMITS", {"산림 정책 동향": 5, "지원사업 공고": 5}
     )
-    assert prune_mod.section_key("산림 정책 동향") == "산림 정책 동향"
-    assert prune_mod.section_key("지원사업 공고") == "지원사업 공고"
+    assert blocks_mod.section_key("산림 정책 동향") == "산림 정책 동향"
+    assert blocks_mod.section_key("지원사업 공고") == "지원사업 공고"
     for prose in ("✅ 신청하세요 (마감순)", "🏢 회원사 소식", "이번 주 한 줄"):
-        assert prune_mod.section_key(prose) is None
+        assert blocks_mod.section_key(prose) is None
 
 
-def test_prune_reads_the_v2_send_format():
-    """prune 의 블록 파서가 계약 v2 발송본 형식을 그대로 읽는다.
+def test_blocks_read_the_v2_send_format():
+    """블록 파서가 계약 v2 발송본 형식을 그대로 읽는다 (사이클 6 #1).
 
-    v2 는 `### ` 머리글도 `**원문:**` 도 쓰지 않는다 — 제목 줄 + `  [원문](URL)`
+    v2 는 `### ` 머리글도 `**원문:**` 도 쓰지 않는다 — 항목 줄 + `  [원문](URL)`
     두 줄이 한 블록이다. 여기가 어긋나면 checker 의 항목 수·상한 게이트와
     미리보기 번호가 조용히 갈라진다.
     """
-    blocks = prune_mod.item_blocks(SAMPLE_MD)
+    blocks = blocks_mod.item_blocks(SAMPLE_MD)
     assert [block["key"] for block in blocks] == [
         "신청하세요", "신청하세요", "신청하세요", "알아두세요",
     ]
-    # 미리보기 번호 좌표(preview)와 게이트 계수(prune)는 언제나 같은 순서·같은 URL
-    assert [block["url"] for block in blocks] == preview_mod.item_urls(SAMPLE_MD)
-    assert prune_mod.section_block_counts(SAMPLE_MD) == {
+    assert blocks_mod.section_block_counts(SAMPLE_MD) == {
         "✅ 신청하세요 (마감순)": 3,
         "👀 알아두세요": 1,
     }
-    assert prune_mod.cap_violations(SAMPLE_MD) == []
-
-
-def test_fallback_item_keys_cover_both_contracts():
-    """composer 를 못 읽어도 v1.2·v2 항목 섹션 이름을 모두 알아본다."""
-    assert prune_mod.FALLBACK_ITEM_SECTION_KEYS == (
-        "신청하세요", "알아두세요", "산림", "지원사업", "사회연대경제",
+    assert blocks_mod.cap_violations(SAMPLE_MD) == []
+    # 블록들의 줄을 이으면 원문과 정확히 같다 (삭제·재조립이 손실 없이 돈다)
+    rejoined = "\n".join(
+        line for block in blocks_mod.parse_blocks(SAMPLE_MD)
+        for line in block["lines"]
     )
-    monkeypatched = prune_mod.FALLBACK_ITEM_SECTION_KEYS
-    assert any("신청하세요" in key for key in monkeypatched)
+    assert rejoined == SAMPLE_MD
+
+
+def test_every_consumer_counts_the_same_items():
+    """사이클 6 #1: preview·blocks·checker 의 항목 계수는 하나다."""
+    assert (
+        len(preview_mod.parse_digest(SAMPLE_MD)["items"])
+        == blocks_mod.item_block_count(SAMPLE_MD)
+        == len(blocks_mod.item_urls(SAMPLE_MD))
+        == 4
+    )
+    assert preview_mod.item_urls(SAMPLE_MD) == blocks_mod.item_urls(SAMPLE_MD)
+
+
+def test_prose_line_with_link_is_not_an_item():
+    """산문 줄 + 링크 줄은 항목이 아니다 (Codex 신규 #6 재현 입력).
+
+    예전에는 preview=0·prune=1 로 갈라져서 "공고 0건인데 pass" 가 났다.
+    """
+    body = (
+        "# 📋 협의회 주간 정책브리핑 2026-W37 (9/7~9/13)\n\n"
+        f"이번 주 한 줄: {preview_mod.MARKER}\n\n"
+        "## ✅ 신청하세요 (마감순)\n\n"
+        "자료를 참고해 주세요.\n"
+        "  [원문](https://example.com/live)\n"
+    )
+    assert blocks_mod.item_block_count(body) == 0
+    assert len(preview_mod.parse_digest(body)["items"]) == 0
+    assert preview_mod.item_urls(body) == []
+    # 링크 자체는 본문 링크로 여전히 검사 대상이다
+    assert "https://example.com/live" in blocks_mod.body_link_urls(body)
+
+
+def test_item_line_needs_a_composer_label_or_notice_shape():
+    """항목 줄 판정은 composer.ITEM_LINE_RE 가 정본 (사이클 6 #1)."""
+    from alert.digest import composer
+
+    assert composer.ITEM_LINE_RE.match(
+        "[D-9] 산림 공고 — 산림청 · 대상: 산림사업자 · 마감 9/22"
+    )
+    assert composer.ITEM_LINE_RE.match("입법예고 — 국민참여입법센터 · 의견 10/19까지")
+    # 제목에 원래 있던 대괄호는 라벨이 아니다 (제목의 일부로 읽힌다)
+    matched = composer.ITEM_LINE_RE.match("[모집] 산림 공고 — 산림청 · 마감 9/22")
+    assert matched and matched.group("label") is None
+    assert matched.group("title") == "[모집] 산림 공고"
+    # 구분자(` — `)가 없으면 항목 줄이 아니다
+    assert composer.ITEM_LINE_RE.match("자료를 참고해 주세요.") is None
+
+
+def test_fallback_item_keys_are_the_v2_sections():
+    """composer 를 못 읽어도 계약 v2 항목 섹션 이름은 알아본다.
+
+    구형 v1.2 이름은 더 이상 생성되지 않으므로 폴백에서 뺐다 (사이클 6 #1) —
+    지원하는 척하면 두 형식의 계수가 또 갈라진다.
+    """
+    assert blocks_mod.FALLBACK_ITEM_SECTION_KEYS == ("신청하세요", "알아두세요")
 
 
 def test_item_blocks_counts_blocks_not_links():
     """해설의 참고 링크는 항목이 아니다 (Codex 신규 #6)."""
-    assert prune_mod.item_block_count(SAMPLE_MD) == 4
-    assert prune_mod.item_block_count(COMMENTARY_WITH_BLOCK) == 4
+    assert blocks_mod.item_block_count(SAMPLE_MD) == 4
+    assert blocks_mod.item_block_count(COMMENTARY_WITH_BLOCK) == 4
     assert len(preview_mod.item_urls(COMMENTARY_WITH_BLOCK)) == 4
 
 
@@ -1246,31 +1300,54 @@ def test_checker_fails_when_no_item_blocks(tmp_path, monkeypatch):
 
 
 DUP_TAIL = " — 산림청 · 대상: 사회적기업 · 마감 미정"
-DUP_LINKED = "동향 [자료](https://dead.invalid/t)" + DUP_TAIL
-DUP_PLAIN = "동향 자료" + DUP_TAIL
+DUP_PLAIN = "[상시] 동향 자료" + DUP_TAIL
 
 
 def _duplicate_title_body() -> str:
-    """죽은 링크를 떼어내면 제목이 겹치게 되는 본문 (형식 v2.1)."""
-    body = _replace_item_title(SAMPLE_MD, "https://example.com/b", DUP_LINKED)
+    """제목이 같고 **URL이 다른** 두 항목 (소스 간 비병합 계약의 재현 입력)."""
+    body = _replace_item_title(SAMPLE_MD, "https://example.com/b", DUP_PLAIN)
     return _replace_item_title(body, "https://example.com/c", DUP_PLAIN)
 
 
-def test_dedupe_titles_drops_later_duplicate():
-    """링크를 떼어내 제목이 겹치면 뒤 블록을 지운다 (Codex 신규 #7)."""
-    body = _duplicate_title_body()
-    pruned, _, stripped = prune_mod.strip_dead_urls(body, ["https://dead.invalid/t"])
-    assert stripped == ["https://dead.invalid/t"]
-    assert pruned.count(DUP_PLAIN) == 2
-    deduped, removed = prune_mod.dedupe_titles(pruned)
-    assert [item["title"] for item in removed] == [DUP_PLAIN]
-    assert deduped.count(DUP_PLAIN) == 1
-    assert prune_mod.item_block_count(deduped) == 3
+def _duplicate_url_body() -> str:
+    """같은 URL 을 두 번 가리키는 본문 (재조립 사고의 재현 입력)."""
+    return SAMPLE_MD.replace("https://example.com/c", "https://example.com/b")
 
 
-def test_recheck_dedupes_after_link_strip(tmp_path, monkeypatch):
+def test_dedupe_urls_keeps_same_title_from_different_sources():
+    """제목이 같아도 URL 이 다르면 남긴다 (사이클 6 #3 / Codex 신규 #5).
+
+    병합 판정은 compose 단계의 몫이다 — forest_service·forest_press 가 같은 사안을
+    각자 게시하는 비병합 계약을 재검토가 뒤집으면 안 된다.
+    """
     body = _duplicate_title_body()
-    annotated, _ = apply_commentary(body, "확정 의견")
+    assert body.count(DUP_PLAIN) == 2
+    deduped, removed = prune_mod.dedupe_urls(body)
+    assert removed == []
+    assert deduped == body
+    assert blocks_mod.item_block_count(deduped) == 4
+
+
+def test_dedupe_urls_drops_later_same_url_block():
+    """같은 URL 을 가리키는 뒤쪽 블록만 지운다 (사이클 6 #3)."""
+    body = _duplicate_url_body()
+    assert blocks_mod.item_block_count(body) == 4
+    deduped, removed = prune_mod.dedupe_urls(body)
+    assert [item["url"] for item in removed] == ["https://example.com/b"]
+    assert blocks_mod.item_block_count(deduped) == 3
+    assert blocks_mod.item_urls(deduped) == [
+        "https://example.com/a", "https://example.com/b", "https://example.com/d",
+    ]
+
+
+def test_prune_has_no_title_dedupe():
+    """제목 기반 중복 제거는 폐지됐다 (사이클 6 #3)."""
+    assert not hasattr(prune_mod, "dedupe_titles")
+
+
+def test_recheck_dedupes_same_url_after_link_strip(tmp_path, monkeypatch):
+    body = _duplicate_url_body()
+    annotated, _ = apply_commentary(body, f"확정 의견 [자료]({DEAD}) 참고")
     md = tmp_path / "2026-W37.md"
     md.write_text(annotated, encoding="utf-8")
     monkeypatch.setattr(
@@ -1283,11 +1360,13 @@ def test_recheck_dedupes_after_link_strip(tmp_path, monkeypatch):
     )
     assert recheck_main() == 0
     final = md.read_text(encoding="utf-8")
-    assert final.count(DUP_PLAIN) == 1
+    assert DEAD not in final
+    assert "확정 의견 자료 참고" in final       # 산문은 문장을 보존한다
+    assert final.count("[원문](https://example.com/b)") == 1
     check = json.loads((tmp_path / "2026-W37.check.json").read_text(encoding="utf-8"))
     assert check["pass"] is True
     assert check["item_blocks"] == 3
-    assert DUP_PLAIN in [item["title"] for item in check["dropped"]]
+    assert "https://example.com/b" in [item["url"] for item in check["dropped"]]
 
 
 def test_cap_violation_fails_the_gate(tmp_path, monkeypatch):
@@ -1300,7 +1379,7 @@ def test_cap_violation_fails_the_gate(tmp_path, monkeypatch):
     body = SAMPLE_MD.replace(
         "\n## 🤝 협의회에서", "\n" + extra + "## 🤝 협의회에서"
     )
-    violations = prune_mod.cap_violations(body)
+    violations = blocks_mod.cap_violations(body)
     # 알아두세요 상한 3 · 실제 4건 (SAMPLE 1건 + 추가 3건)
     assert violations and violations[0][0] == "👀 알아두세요"
     assert violations[0][1:] == (4, 3)
@@ -1317,10 +1396,10 @@ def test_cap_violation_fails_the_gate(tmp_path, monkeypatch):
 def test_section_caps_come_from_composer():
     from alert.digest import composer
 
-    assert prune_mod.section_caps() == {
+    assert blocks_mod.section_caps() == {
         str(key): int(value) for key, value in composer.SECTION_LIMITS.items()
     }
-    assert set(prune_mod.item_section_keys()) == set(composer.SECTION_LIMITS)
+    assert set(blocks_mod.item_section_keys()) == set(composer.SECTION_LIMITS)
 
 
 # ══ 사이클2: redact bare 토큰 (#8) ══════════════════════════════════════
@@ -1334,3 +1413,142 @@ def test_redact_hides_bare_token_without_secrets():
 def test_redact_keeps_ordinary_colon_numbers():
     for text in ("12:30:45", "exit 2 — 2026-W37", "port 443:8080"):
         assert redact(text) == text
+
+
+# ══ 사이클 6: 블록 경계 (Codex 신규 #4) ════════════════════════════════
+def _body_with_neighbours() -> str:
+    """죽은 항목 **바로 뒤에** 살아 있는 항목·산문·보류 주석이 붙은 본문."""
+    lines = SAMPLE_MD.split("\n")
+    index = lines.index("  [원문](https://example.com/a)")
+    lines[index + 1:index + 1] = [
+        "<!-- 보류: 9. 죽은 항목에 붙은 보류 | 복구 정보 | id=77 -->",
+        "*산림 제도 개정 — 산림청",
+        "  [원문](https://example.com/prose)",
+    ]
+    return "\n".join(lines)
+
+
+def test_dead_block_removal_spares_neighbours():
+    """죽은 항목만 지운다 — 뒤따르는 살아 있는 항목·산문·보류 주석은 남는다."""
+    body = _body_with_neighbours()
+    text, removed, stripped = prune_mod.strip_dead_urls(
+        body, ["https://example.com/a"]
+    )
+
+    assert [item["url"] for item in removed] == ["https://example.com/a"]
+    assert stripped == []
+    # 죽은 항목의 두 줄만 사라진다
+    assert "https://example.com/a" not in text
+    assert "공공조달 1:1 컨설팅" not in text
+    # 이웃은 전부 살아 있다 (Codex 신규 #4: live 블록·보류 복구 정보 동반 삭제)
+    assert "id=77" in text
+    assert "*산림 제도 개정 — 산림청" in text
+    assert "https://example.com/prose" in text
+    for url in ("https://example.com/b", "https://example.com/c",
+                "https://example.com/d"):
+        assert url in text
+
+
+def test_hold_comment_is_never_part_of_an_item_block():
+    """보류 주석은 항상 자기 블록이다 (항목과 묶이면 복구 정보가 함께 사라진다)."""
+    body = _body_with_neighbours()
+    kinds = [block["kind"] for block in blocks_mod.parse_blocks(body)]
+    assert "comment" in kinds
+    for block in blocks_mod.parse_blocks(body):
+        if block["kind"] == "item":
+            assert not any("<!--" in line for line in block["lines"])
+            assert len([line for line in block["lines"] if line.strip()]) == 2
+
+
+# ══ 사이클 6 #4: URL 추출 단일화 ═══════════════════════════════════════
+PARENS_URL = "https://example.com/report(2026)"
+
+
+def test_url_extraction_keeps_balanced_parentheses():
+    """`…/report(2026)` 를 잘라먹지 않는다 (Codex 신규 #7)."""
+    line = f"  [원문]({PARENS_URL})"
+    assert blocks_mod.origin_url(line) == PARENS_URL
+    assert blocks_mod.body_link_urls(line) == [PARENS_URL]
+    # 잘린 주소를 따로 검사 대상으로 세지 않는다
+    assert "https://example.com/report(2026" not in blocks_mod.body_link_urls(line)
+
+
+def test_non_url_parenthesis_is_not_a_url_candidate():
+    """`~9.30`·`산림사업자` 같은 괄호는 URL 후보가 아니다 (스킴 필수)."""
+    line = "[모집](~9.30) 산림 공고 [대상](산림사업자) — 산림청"
+    assert blocks_mod.body_link_urls(line) == []
+    assert blocks_mod.origin_url("  [원문](~9.30)") is None
+
+
+def test_checker_and_prune_share_the_url_extractor():
+    """체크·prune·HTML 렌더가 같은 추출 결과를 본다 (사이클 6 #4)."""
+    from alert.digest.checker import body_links, extract_item_urls
+    from scripts.send_digest import markdown_to_html
+
+    body = _replace_item_title(
+        SAMPLE_MD, "https://example.com/a",
+        "[D-9] 괄호 포함 공고 — 산림청 · 대상: 산림사업자 · 마감 9/22",
+    ).replace("https://example.com/a", PARENS_URL)
+
+    assert PARENS_URL in extract_item_urls(body)
+    assert PARENS_URL in body_links(body)
+    assert PARENS_URL in blocks_mod.item_urls(body)
+    assert f'href="{PARENS_URL}"' in markdown_to_html(body)
+
+
+# ══ 사이클 6 #5: 카톡은 md 에서 재생성 ══════════════════════════════════
+def test_recheck_regenerates_kakao_from_markdown(tmp_path, monkeypatch):
+    """재검토가 md 에서 죽은 링크를 지우면 카톡에서도 사라진다 (Codex 신규 #8)."""
+    md = tmp_path / "2026-W37.md"
+    annotated, _ = apply_commentary(SAMPLE_MD, "확정 의견")
+    md.write_text(annotated, encoding="utf-8")
+    kakao = tmp_path / "2026-W37.kakao.txt"
+    kakao.write_text("낡은 카톡본 https://example.com/b\n", encoding="utf-8")
+
+    dead_item = "https://example.com/b"
+    monkeypatch.setattr(
+        "alert.digest.checker.check_url_alive",
+        lambda url, timeout=8: url != dead_item,
+    )
+    monkeypatch.setattr(
+        "sys.argv",
+        ["recheck_digest.py", str(md), "--db", str(_empty_db(tmp_path))],
+    )
+    assert recheck_main() == 0
+
+    text = kakao.read_text(encoding="utf-8")
+    assert dead_item not in text
+    assert "낡은 카톡본" not in text
+    assert "https://example.com/a" in text
+
+
+def test_kakao_chunk_boundaries_match_item_boundaries(tmp_path):
+    """해설 갱신 후에도 조각 경계가 항목 경계와 일치한다 (Codex 신규 #9)."""
+    marker = "긴제목표식"
+    body = _replace_item_title(
+        SAMPLE_MD, "https://example.com/a",
+        f"[D-9] {marker} " + "가" * 3900
+        + " — 산림청 · 대상: 산림사업자 · 마감 9/22",
+    )
+    md = tmp_path / "2026-W37.md"
+    md.write_text(body, encoding="utf-8")
+
+    assert apply_commentary_main(
+        ["2026-W37", "확정 문구", "--out-dir", str(tmp_path)]
+    ) in (0, 1)
+
+    text = (tmp_path / "2026-W37.kakao.txt").read_text(encoding="utf-8")
+    chunks = text.split(f"\n{KAKAO_CHUNK_SEPARATOR}\n")
+    assert len(chunks) > 1
+    assert "확정 문구" in text
+
+    for chunk in chunks:
+        # 어떤 조각도 URL 줄로 시작하지 않는다 (URL 앞에서 자르지 않았다는 뜻)
+        assert not chunk.lstrip().startswith("http")
+
+    for block in blocks_mod.item_blocks(md.read_text(encoding="utf-8")):
+        holders = [chunk for chunk in chunks if block["url"] in chunk]
+        assert len(holders) == 1, block["url"]
+        # 제목(축약됐을 수도 있다)과 URL 이 같은 조각에 있다
+        head = block["title"][:12]
+        assert head in holders[0]

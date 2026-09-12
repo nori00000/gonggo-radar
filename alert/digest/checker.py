@@ -2,13 +2,12 @@
 
 import hashlib
 import json
-import re
 import sqlite3
 from pathlib import Path
 from typing import Dict, List, Optional
 import requests
 
-from alert.digest import prune
+from alert.digest import blocks as blocks_mod
 from alert.digest.composer import parse_deadline
 
 
@@ -59,51 +58,26 @@ PROBE_HEADERS = {
 # 생존 확인에는 응답 본문이 필요 없다. 연결만 확인하고 최대 이만큼만 읽는다.
 MAX_PROBE_BYTES = 64 * 1024
 
-# 항목 링크는 `  [원문](URL)` 한 줄뿐이다 (형식 v2.1).
-_ORIGIN_LINK_RE = re.compile(r"^\[원문\]\((\S+)\)$")
-# 어떤 형태든 마크다운 링크 (본문 잔존 검사용)
-_ANY_LINK_RE = re.compile(r"\[([^\]]+)\]\(([^)\s]+)\)")
-# HTML 주석 줄 (형식 v2.1의 보류 목록). 발송본에 실리지 않으므로 게이트 대상도 아니다.
-_COMMENT_LINE_RE = re.compile(r"^\s*<!--")
-
-
 def extract_item_urls(markdown_text: str) -> List[str]:
-    """검사 대상 URL을 문서 순서대로, 중복 없이 뽑는다.
+    """항목 블록의 원문 URL을 문서 순서대로, 중복 없이 뽑는다.
 
-    개정 v2.5 (#2): **"원문" 링크 구조에서만** 뽑는다. 제목에 주입된 마크다운 링크를
-    검사 대상으로 세면, 재조립이 원문 URL만 제외하는 사이 제목 속 죽은 링크가
-    발송본에 남는다. 제목 쪽은 composer.sanitize_title이 링크 문법을 제거하고,
-    weekly_digest가 "제외된 URL이 본문에 남아 있지 않은지"를 따로 확인한다.
-
-    여기서 빠진 링크(해설·산문·제목에 남은 링크)는 검사 대상에서 사라지는 것이
-    아니다 — check_digest가 body_links()로 이어 붙여 함께 확인한다(계약 W10 #2).
-    이 함수의 반환값은 "재조립이 제외할 수 있는 항목 좌표"라는 좁은 뜻이다.
+    사이클 6 #1: 판정은 `alert.digest.blocks` 가 정본이다 — 여기서 따로 세지 않는다.
+    반환값의 뜻은 "재조립이 제외할 수 있는 항목 좌표"라는 좁은 것이고, 해설·산문·
+    제목에 남은 링크는 check_digest 가 body_links() 로 이어 붙여 함께 검사한다
+    (계약 W10 #2).
     """
     urls: List[str] = []
     seen = set()
-    for line in markdown_text.splitlines():
-        if _COMMENT_LINE_RE.match(line):
-            continue
-        matched = _ORIGIN_LINK_RE.match(line.strip())
-        if not matched:
-            continue
-        url = matched.group(1).strip()
-        if not url or url in seen:
-            continue
-        seen.add(url)
-        urls.append(url)
+    for url in blocks_mod.item_urls(markdown_text):
+        if url and url not in seen:
+            seen.add(url)
+            urls.append(url)
     return urls
 
 
 def body_links(markdown_text: str) -> List[str]:
-    """본문(주석 제외)에 실제로 남아 있는 모든 마크다운 링크 URL."""
-    urls: List[str] = []
-    for line in markdown_text.splitlines():
-        if _COMMENT_LINE_RE.match(line):
-            continue
-        for _text, url in _ANY_LINK_RE.findall(line):
-            urls.append(url.strip())
-    return urls
+    """본문(주석 제외)에 남아 있는 모든 링크 URL (균형 괄호·스킴 필수)."""
+    return blocks_mod.body_link_urls(markdown_text)
 
 
 def check_url_alive(url: str, timeout: int = 8) -> bool:
@@ -286,8 +260,8 @@ def check_digest(
     #
     # 사이클2 #6·#7: 항목 수는 **링크 수가 아니라 항목 블록 수**다(해설의 참고 링크가
     # 항목으로 세어지면 "공고 0건인데 pass" 가 난다). 섹션 상한 초과도 fail 이다.
-    item_blocks = prune.item_block_count(markdown_text)
-    cap_violations = prune.cap_violations(markdown_text)
+    item_blocks = blocks_mod.item_block_count(markdown_text)
+    cap_violations = blocks_mod.cap_violations(markdown_text)
 
     if not network_checked:
         reason = "네트워크 미검사"
