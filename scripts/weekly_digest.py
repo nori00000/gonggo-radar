@@ -11,6 +11,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from alert.digest.composer import compose_digest
 from alert.digest.checker import check_digest, write_check_result
+from alert.digest import state as state_mod
 
 # 죽은 URL 제외 → 재조립을 반복하는 최대 횟수 (무한 루프 방지)
 MAX_RECOMPOSE_ROUNDS = 3
@@ -38,6 +39,11 @@ def main():
         "--forms",
         help="폼 CSV 경로 (기본: forms/responses.csv)",
     )
+    parser.add_argument(
+        "--exclude-state",
+        action="store_true",
+        help="상태 파일(YYYY-Www.state.json)의 excluded_urls를 조회 단계에서 제외",
+    )
 
     args = parser.parse_args()
 
@@ -63,6 +69,20 @@ def main():
     dropped: list[dict] = []
     dropped_urls: set[str] = set()
     result = None
+
+    # 계약 W10: 사람이 텔레그램에서 제외한 항목은 상태 파일이 정본이다.
+    # 조회 단계에서 빼므로 섹션 상한이 남은 후보로 다시 채워진다.
+    if args.exclude_state:
+        state_path = state_mod.state_path(week, out_dir)
+        try:
+            state = state_mod.load_state(state_path, week)
+        except state_mod.StateError as exc:
+            print(f"✗ 상태 파일 손상: {exc}", file=sys.stderr)
+            return 1
+        state_excluded = state_mod.excluded_urls(state)
+        if state_excluded:
+            dropped_urls.update(state_excluded)
+            print(f"제외 상태 반영: {len(state_excluded)}건")
 
     for attempt in range(1, MAX_RECOMPOSE_ROUNDS + 1):
         label = "다이제스트 생성" if attempt == 1 else "재조립"

@@ -6,6 +6,7 @@ import html as html_module
 import json
 import re
 import sys
+from datetime import datetime
 from pathlib import Path
 from typing import Tuple
 from urllib.parse import urlparse
@@ -14,6 +15,7 @@ from urllib.parse import urlparse
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from alert.notifiers.email_sender import EmailNotifier
+from alert.digest import state as state_mod
 
 # [텍스트](URL) — URL 안의 괄호 한 단계까지 균형 있게 소비 (javascript:alert(1) 대응)
 LINK_PATTERN = r"\[([^\]]+)\]\(([^()\s]*(?:\([^()]*\)[^()\s]*)*)\)"
@@ -180,6 +182,7 @@ def send_digest(
     markdown_path: Path,
     to_email: str = None,
     dry_run: bool = True,
+    approved_by=None,
 ) -> int:
     """다이제스트 발송.
 
@@ -187,6 +190,7 @@ def send_digest(
         markdown_path: 마크다운 파일 경로
         to_email: 수신자 이메일 (기본: config에서)
         dry_run: 드라이런 모드 (기본: True)
+        approved_by: 발송을 승인한 텔레그램 user_id (계약 W10, 상태 파일에 기록)
 
     Returns:
         종료 코드 (0: 성공, 2: 실패)
@@ -222,6 +226,20 @@ def send_digest(
         print(f"[DRY-RUN] 본문 길이: {len(markdown_text)} bytes (마크다운), {len(html_text)} bytes (HTML)")
         return 0
 
+    # 계약 W10: status=sent 는 불변이다 — 같은 주차 재발송을 거부한다.
+    # 상태 파일이 손상돼 판정할 수 없으면 발송하지 않는다(fail-closed).
+    week = state_mod.week_from_markdown(markdown_path)
+    state_path = state_mod.state_path_for_markdown(markdown_path)
+    try:
+        state = state_mod.load_state(state_path, week)
+    except state_mod.StateError as exc:
+        print(f"✗ 발송 거부: {exc}", file=sys.stderr)
+        return 2
+    allowed, reason = state_mod.can_send(state)
+    if not allowed:
+        print(f"✗ 발송 거부: {reason}", file=sys.stderr)
+        return 2
+
     # 실제 발송 - EmailNotifier 재사용
     try:
         notifier = EmailNotifier()
@@ -246,6 +264,23 @@ def send_digest(
             return 2
 
         print(f"✓ 발송 성공: {len(recipients)}명")
+
+        try:
+            state_mod.save_state(
+                state_path,
+                state_mod.mark_sent(
+                    state,
+                    approved_by,
+                    len(recipients),
+                    datetime.now().isoformat(timespec="seconds"),
+                ),
+            )
+            print(f"✓ 상태 기록: {state_path} (status=sent)")
+        except OSError as exc:
+            # 발송은 이미 끝났다 — 상태 기록 실패는 크게 알리고 비정상 종료한다.
+            print(f"⚠️  상태 기록 실패(발송은 완료됨): {exc}", file=sys.stderr)
+            return 1
+
         return 0
 
     except Exception as exc:
@@ -276,6 +311,10 @@ def main():
         action="store_true",
         help="실제 발송 (기본은 드라이런)",
     )
+    parser.add_argument(
+        "--approved-by",
+        help="발송을 승인한 텔레그램 user_id (상태 파일에 기록)",
+    )
 
     args = parser.parse_args()
 
@@ -286,6 +325,7 @@ def main():
         markdown_path=args.markdown,
         to_email=args.to,
         dry_run=dry_run,
+        approved_by=args.approved_by,
     )
 
 
