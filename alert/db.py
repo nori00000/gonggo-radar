@@ -437,13 +437,7 @@ class Database:
         if not fresh:
             return False
 
-        row = self._conn.execute(
-            _sql(
-                "SELECT id, raw_data FROM announcements"
-                " WHERE source = ? AND source_id = ?"
-            ),
-            (announcement.source, announcement.source_id),
-        ).fetchone()
+        row = self._find_row("id, raw_data", announcement)
         if row is None:
             return False
 
@@ -486,6 +480,90 @@ class Database:
         if self._backend == "sqlite":
             self._conn.commit()
         return True
+
+    def _find_row(self, columns: str, announcement: RawAnnouncement) -> Optional[Any]:
+        """``(source, source_id)`` 로 찾고, 없으면 **같은 URL** 로 찾는다.
+
+        source_id 체계가 바뀌어도(예: seis 가 ``42`` -> ``fnc:42``) 예전에
+        저장된 행을 같은 공고로 인식해야 한다 - 그러지 않으면 같은 공고가
+        두 행이 되고, 예전 행의 기간은 영원히 정리되지 않는다 (11차 게이트).
+
+        Args:
+            columns: 읽을 컬럼 목록 (내부 상수만 넘긴다)
+            announcement: 조회 기준이 되는 수집 결과
+
+        Returns:
+            찾은 행 또는 None
+        """
+        row = self._conn.execute(
+            _sql(
+                f"SELECT {columns} FROM announcements"
+                " WHERE source = ? AND source_id = ?"
+            ),
+            (announcement.source, announcement.source_id),
+        ).fetchone()
+        if row is not None:
+            return row
+
+        url = (announcement.url or "").strip()
+        if not url:
+            return None
+        return self._conn.execute(
+            _sql(
+                f"SELECT {columns} FROM announcements"
+                " WHERE source = ? AND url = ?"
+            ),
+            (announcement.source, url),
+        ).fetchone()
+
+    def exists(self, announcement: RawAnnouncement) -> bool:
+        """이 공고가 이미 저장돼 있는가 (source_id 또는 같은 URL)."""
+        return self._find_row("id", announcement) is not None
+
+    def revalidate_periods(self, source: str, recompute) -> int:
+        """저장된 행의 기간을 **raw_data 근거로 다시 산출**한다 (멱등).
+
+        전용 추출기가 있는 소스라도, 목록에서 내려간 공고는 재수집되지
+        않아 관문을 다시 지나지 않는다. 그래서 예전 규칙으로 심긴 기간이
+        알림까지 살아남았다 (11차 게이트 MEDIUM). 근거가 없으면 NULL 이다.
+
+        Args:
+            source: 소스 이름
+            recompute: ``raw_data`` 문자열 -> ``(start, end)`` 순수 함수
+
+        Returns:
+            실제로 값이 바뀐 행 수
+        """
+        rows = self._conn.execute(
+            _sql(
+                "SELECT id, raw_data, period_start, period_end FROM announcements"
+                " WHERE source = ?"
+            ),
+            (source,),
+        ).fetchall()
+
+        changed = 0
+        for row in rows:
+            try:
+                start, end = recompute(row["raw_data"])
+            except Exception:                       # noqa: BLE001
+                start, end = None, None             # 근거를 못 읽으면 기간 없음
+            if (row["period_start"] or None) == (start or None) and (
+                row["period_end"] or None
+            ) == (end or None):
+                continue
+            self._conn.execute(
+                _sql(
+                    "UPDATE announcements SET period_start = ?, period_end = ?,"
+                    " updated_at = ? WHERE id = ?"
+                ),
+                (start or None, end or None, datetime.now().isoformat(), row["id"]),
+            )
+            changed += 1
+
+        if changed and self._backend == "sqlite":
+            self._conn.commit()
+        return changed
 
     def clear_periods_for_sources(self, sources: Sequence[str]) -> int:
         """전용 추출기가 없는 소스의 기간을 **일괄 NULL** 로 만든다 (멱등).
@@ -538,13 +616,7 @@ class Database:
         Returns:
             실제로 값이 바뀌었으면 True (같으면 건드리지 않는다)
         """
-        row = self._conn.execute(
-            _sql(
-                "SELECT id, period_start, period_end FROM announcements"
-                " WHERE source = ? AND source_id = ?"
-            ),
-            (announcement.source, announcement.source_id),
-        ).fetchone()
+        row = self._find_row("id, period_start, period_end", announcement)
         if row is None:
             return False
 

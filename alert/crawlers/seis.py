@@ -11,8 +11,8 @@ from .date_labels import (
     header_labels,
     label_for,
 )
-from .dedupe_keys import ALWAYS_OPEN_TOKENS, group_key, normalize_title
-from .period_extractors import SEIS_CARD_DATE_FIELD, seis_period
+from .dedupe_keys import ALWAYS_OPEN_TOKENS, normalize_title, replica_key
+from .period_extractors import SEIS_CARD_DATE_FIELD
 from ..models import RawAnnouncement
 
 try:
@@ -277,35 +277,26 @@ class SeisCrawler(BaseCrawler):
         """같은 공고 묶음에서 대표를 고르는 순위 - 최신 회차가 이긴다."""
         round_match = self._ROUND_RE.search(item.get("round", "") or "")
         round_no = int(round_match.group(1)) if round_match else -1
-        post_id = self._extract_post_id(item.get("link", ""))
-        post_no = int(post_id) if post_id.isdigit() else -1
+        post_no = self._post_number(self._extract_post_id(item.get("link", "")))
         return (item.get("date", "") or "", round_no, post_no)
 
     def _group_key(self, item: dict) -> tuple:
-        """중복 판별 키 - 제목·지역·접수 종료일이 **모두** 같아야 한 공고다.
+        """수집 단계 병합 키 - **같은 링크**의 진짜 복제만 합친다.
 
-        지역은 ``span.sub`` 와 ``ul.info`` 를 **함께** 후보로 넣어 그중
-        지역을 말하는 값을 쓴다(Codex 재검토 #4). 한쪽만 보면 사업명이 같고
-        지역만 다른 공고(서울/부산)가 한 건으로 합쳐진다.
+        11차 게이트: 예전 키는 "목록에 적힌 날짜가 같으면 같은 공고" 였다.
+        그래서 같은 제목·같은 센터의 **1차와 2차**가 게시일이 같다는 이유로
+        합쳐져 한 건이 사라졌다. 날짜는 회차를 가르지 못한다.
 
-        접수 종료일을 키에 넣는 이유: 같은 제목의 1차·2차 공고는 접수기간이
-        다른 **별개 공고**다. 종료일이 다르면 병합하지 않는다.
-
-        정리 스크립트의 규칙 B도 같은 함수(``dedupe_keys.group_key``)를 쓴다.
+        기관(author/sub)이 다르면 절대 병합하지 않는 규칙(v2final7 #4)은
+        그대로다 - 주체 서명이 키에 들어 있다.
         """
-        # 마감 키는 **관문과 같은 함수**로 판정한다 - 크롤러가 따로
-        # 계산하면 키와 저장값이 갈라진다.
-        _start, period_end = seis_period(item)
-        # 기관(author/sub)이 다르면 절대 병합하지 않는다 (v2final7 #4):
-        # table.board_list 의 같은 제목·같은 게시일 두 행이 td.author=서울센터/
-        # 부산센터인데 병합되어 부산만 남았다.
         candidates = [item.get("sub", "") or "", item.get("author", "") or ""]
         candidates.extend(item.get("info", []) or [])
-        # 회차 후보: 카드의 round 필드 + 주체 + 분류 (제목은 group_key가 본다)
+        # 회차 후보: 카드의 round 필드 + 주체 + 분류 (제목은 replica_key가 본다)
         rounds = [item.get("round", "") or ""] + candidates
-        return group_key(
-            item.get("title", ""), candidates, period_end,
-            round_candidates=rounds, date_text=item.get("date", "") or "",
+        return replica_key(
+            item.get("title", ""), candidates,
+            item.get("link", "") or "", round_candidates=rounds,
         )
 
     def _dedupe_items(self, items: List[dict]) -> List[dict]:
@@ -544,31 +535,49 @@ class SeisCrawler(BaseCrawler):
 
         return items
 
+    # 공고 종류별 고유 ID. **번호만 쓰면 종류가 다른 공고가 충돌한다**
+    # (11차 게이트 HIGH): ``fncPbofrSn=42`` 재정지원과 ``dsgnPbofrSn=42``
+    # 지정공모가 둘 다 ``"42"`` 여서, 하나가 다른 하나의 기간을 덮어썼다.
+    # 그래서 ID 는 ``종류:번호`` 다.
+    #
+    # 범용 파라미터(seq/idx/no)는 반드시 ?/& 뒤에서만 인정한다 - 그렇지
+    # 않으면 "epsdNo=4" 가 "no=4" 로 잡히는 접두사 오매칭이 생긴다.
+    ID_PARAMS = (
+        ("fnc", r"fncPbofrSn=(\d+)"),
+        ("dsgn", r"dsgnPbofrSn=(\d+)"),
+        ("itgrd", r"itgrdAplyPbancSn=(\d+)"),
+        ("epsd", r"epsdNo=(\d+)"),
+        ("ann", r"announcementId=(\d+)"),
+        ("ntfy", r"notifyId=(\d+)"),
+        ("ntt", r"nttId=(\d+)"),
+        ("artcl", r"articleId=(\d+)"),
+        ("artcl", r"artclId=(\d+)"),
+        ("seq", r"[?&]seq=(\d+)"),
+        ("idx", r"[?&]idx=(\d+)"),
+        ("no", r"[?&]no=(\d+)"),
+    )
+
     def _extract_post_id(self, link: str) -> str:
-        """URL에서 공고 ID를 추출한다."""
+        """URL에서 ``종류:번호`` 형태의 공고 ID를 추출한다."""
         if not link:
             return ""
 
-        # 공고 종류별 고유 ID를 먼저 본다. 범용 파라미터(seq/idx/no)는 반드시
-        # ?/& 뒤에서만 인정한다 - 그렇지 않으면 "epsdNo=4" 가 "no=4" 로 잡히는
-        # 접두사 오매칭이 생겨 서로 다른 공고가 같은 ID를 쓰게 된다.
-        id_params = [
-            r"fncPbofrSn=(\d+)", r"dsgnPbofrSn=(\d+)",
-            r"itgrdAplyPbancSn=(\d+)", r"epsdNo=(\d+)",
-            r"announcementId=(\d+)", r"notifyId=(\d+)", r"nttId=(\d+)",
-            r"articleId=(\d+)", r"artclId=(\d+)",
-            r"[?&]seq=(\d+)", r"[?&]idx=(\d+)", r"[?&]no=(\d+)",
-        ]
-        for pattern in id_params:
+        for kind, pattern in self.ID_PARAMS:
             match = re.search(pattern, link, re.I)
             if match:
-                return match.group(1)
+                return f"{kind}:{match.group(1)}"
 
         path_match = re.search(r"/(\d{3,})", link)
         if path_match:
-            return path_match.group(1)
+            return f"path:{path_match.group(1)}"
 
         return hashlib.md5(link.encode("utf-8")).hexdigest()[:16]
+
+    @staticmethod
+    def _post_number(source_id: str) -> int:
+        """``종류:번호`` 에서 번호만 (정렬용). 번호가 없으면 -1."""
+        tail = (source_id or "").rsplit(":", 1)[-1]
+        return int(tail) if tail.isdigit() else -1
 
     def _normalize_url(self, link: str, base_url: str) -> str:
         """상대 URL을 절대 URL로 변환한다."""

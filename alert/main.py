@@ -160,31 +160,48 @@ def _finalize_periods(source: str, item: RawAnnouncement) -> RawAnnouncement:
     Returns:
         같은 객체 (호출 편의)
     """
-    item.period_start = None
-    item.period_end = None
+    start, end = _periods_from_raw(source, item.raw_data)
+    item.period_start = start
+    item.period_end = end
+    return item
 
+
+def _periods_from_raw(
+    source: str, raw_data: Optional[str]
+) -> Tuple[Optional[str], Optional[str]]:
+    """``raw_data`` 원문에서 기간을 산출한다 - **근거 산출의 단일 구현**.
+
+    저장 직전 관문(``_finalize_periods``)과 기존 행 재검증
+    (``Database.revalidate_periods``)이 같은 함수를 쓴다. 두 자리가 갈리면
+    "재수집된 행" 과 "안 된 행" 의 기준이 달라진다.
+
+    Args:
+        source: 소스 이름
+        raw_data: 크롤러가 남긴 JSON 문자열
+
+    Returns:
+        ``(period_start, period_end)`` - 근거가 없으면 ``(None, None)``
+    """
     extractor = PERIOD_EXTRACTORS.get((source or "").strip())
     if extractor is None:
-        return item                    # 전용 추출기가 없는 소스 = 기간 없음
+        return None, None              # 전용 추출기가 없는 소스 = 기간 없음
 
     try:
-        raw = json.loads(item.raw_data or "{}")
+        raw = json.loads(raw_data or "{}")
     except (ValueError, TypeError):
-        return item
+        return None, None
     if not isinstance(raw, dict):
-        return item
+        return None, None
 
     try:
         start, end = extractor(raw)
     except Exception as exc:           # noqa: BLE001
         logging.getLogger(__name__).error(
-            f"{source}: 기간 추출 실패 ({exc}) - 기간 없이 저장한다"
+            f"{source}: 기간 추출 실패 ({exc}) - 기간 없이 둔다"
         )
-        return item
+        return None, None
 
-    item.period_start = start or None
-    item.period_end = end or None
-    return item
+    return start or None, end or None
 
 
 # ---------------------------------------------------------------------------
@@ -254,6 +271,18 @@ def run_pipeline(test_mode: bool = False) -> None:
         )
     except Exception as e:
         logger.error(f"기간 정규화 실패: {e}")
+
+    # 추출기가 있는 소스도 **기존 행의 근거를 다시 본다**. 목록에서 내려간
+    # 공고는 재수집되지 않아 관문을 다시 지나지 않는다 (11차 게이트).
+    for extractor_source in PERIOD_EXTRACTORS:
+        try:
+            fixed = db.revalidate_periods(
+                extractor_source,
+                lambda raw, name=extractor_source: _periods_from_raw(name, raw),
+            )
+            logger.info(f"기간 재검증({extractor_source}): {fixed} 행을 고쳤다")
+        except Exception as e:
+            logger.error(f"기간 재검증 실패({extractor_source}): {e}")
     keyword_analyzer = KeywordAnalyzer(db=db)
     claude_analyzer = ClaudeAnalyzer()
     telegram = TelegramNotifier(db=db)
@@ -353,7 +382,9 @@ def run_pipeline(test_mode: bool = False) -> None:
                 # DB 에 닿는 두 경로가 모두 이 한 호출을 지난다.
                 _finalize_periods(raw_ann.source, raw_ann)
 
-                if db.is_duplicate(raw_ann.source, raw_ann.source_id):
+                # 같은 URL 이면 같은 공고다 - source_id 체계가 바뀐 예전
+                # 행도 새 행으로 갈라지지 않는다 (11차 게이트)
+                if db.exists(raw_ann):
                     duplicate_count += 1
                     # 기존 행의 기간도 **재수집 값으로 덮어쓴다** (None
                     # 포함) - 예전 실행이 심은 가짜 마감을 재수집이 지운다.

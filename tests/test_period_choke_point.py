@@ -42,6 +42,7 @@ from alert.main import (
     COUNCIL_SOURCES_WITHOUT_EXTRACTORS,
     _finalize_periods,
     _import_crawlers,
+    _periods_from_raw,
 )
 from alert.models import AnalyzedAnnouncement, RawAnnouncement
 
@@ -200,16 +201,17 @@ class TestTheGateSitsBeforeEveryWrite:
         source = self.pipeline_source()
         assert source.count("_finalize_periods(") == 1, "관문 호출은 한 곳이다"
         gate = source.index("_finalize_periods(")
-        for call in ("db.is_duplicate(", "db.overwrite_periods(",
+        for call in ("db.exists(", "db.overwrite_periods(",
                      "db.insert_announcement("):
             assert gate < source.index(call), f"{call} 이 관문보다 앞에 있다"
 
-    def test_only_two_known_statements_write_period_columns(self):
-        """기간 컬럼을 쓰는 SQL 은 **두 자리**뿐이다.
+    def test_only_known_statements_write_period_columns(self):
+        """기간 컬럼을 쓰는 SQL 은 **세 자리**뿐이다.
 
-        ``overwrite_periods``(관문 값 기록)와
-        ``clear_periods_for_sources``(기존 오염 정규화). 다른 자리가
-        생기면 이 테스트가 먼저 깨진다.
+        ``revalidate_periods``(기존 행 근거 재검증),
+        ``clear_periods_for_sources``(추출기 없는 소스 정규화),
+        ``overwrite_periods``(관문 값 기록). 다른 자리가 생기면 이 테스트가
+        먼저 깨진다.
         """
         db_source = (REPO / "alert" / "db.py").read_text(encoding="utf-8")
         writes = [
@@ -217,9 +219,25 @@ class TestTheGateSitsBeforeEveryWrite:
             if "UPDATE announcements SET period_start" in line
         ]
         assert writes == [
+            '"UPDATE announcements SET period_start = ?, period_end = ?,"',
             '"UPDATE announcements SET period_start = NULL,"',
             '"UPDATE announcements SET period_start = ?, period_end = ?,"',
         ]
+
+    def test_revalidation_runs_before_notification(self):
+        """추출기 소스의 기존 행 재검증도 알림보다 앞에서 돈다."""
+        source = self.pipeline_source()
+        assert source.count("revalidate_periods(") == 1
+        assert source.index("revalidate_periods(") < source.index(
+            "db.get_unnotified("
+        )
+
+    def test_period_derivation_has_a_single_implementation(self):
+        """관문과 재검증이 같은 함수를 쓴다."""
+        main_source = (REPO / "alert" / "main.py").read_text(encoding="utf-8")
+        assert main_source.count("def _periods_from_raw(") == 1
+        # 추출기를 직접 부르는 곳은 그 함수 하나뿐이다
+        assert main_source.count("extractor(raw)") == 1
 
     def test_normalisation_runs_before_notification(self):
         """정규화는 알림 조회보다 **앞**에서 한 번 돈다."""
@@ -332,10 +350,21 @@ class TestSeisExtractor:
             None, None
         )
 
-    def test_weekday_notes_do_not_break_the_range(self):
+    @pytest.mark.parametrize("value", [
+        # 11차 게이트: 전체 일치 **전에 아무 것도 지우지 않는다**.
+        # 괄호 안의 말도 필드가 무엇을 말하는지의 일부다.
+        "(교육기간) 2026.10.01 ~ 2026.10.31",
+        "(접수기간 미정 / 심사기간) 2026.10.01 ~ 2026.10.31",
+        # 요일 주석도 예외가 아니다 - 커버리지 손실을 감수한다
+        # (실 카드·실 셀에는 요일 표기가 없다, 2026-09-13 실측).
+        "접수기간 2026.09.01(화) ~ 2026.09.30(수)",
+    ])
+    def test_nothing_is_stripped_before_the_whole_match(self, value):
+        assert seis_period({"date": value}) == (None, None)
         assert seis_period(
-            {"date": "접수기간 2026.09.01(화) ~ 2026.09.30(수)"}
-        ) == ("2026-09-01", "2026-09-30")
+            {"date": value, "date_field": SEIS_CARD_DATE_FIELD}
+        ) == (None, None)
+        assert lawmaking_period({"period": value}) == (None, None)
 
 
 class TestLawmakingExtractor:
@@ -716,6 +745,151 @@ class TestLegacyPollutionIsNormalised:
         self.seed(db, "fowi", PLANTED)
         assert db.clear_periods_for_sources([]) == 0
         assert db.clear_periods_for_sources(["", None]) == 0
+
+
+class TestGate11Reproductions:
+    """11차 게이트 재현 - ID 충돌과 기존 행 근거 재검증."""
+
+    @pytest.fixture
+    def db(self, tmp_path):
+        yield Database(db_path=tmp_path / "announcements.db")
+
+    def card(self, kind_param, number, period):
+        return (
+            '<li class="swiper-slide" data-type="사업공고">'
+            '<span class="sub">서울센터</span>'
+            f'<p class="tit"><a href="subPage.do?{kind_param}={number}">'
+            "지원사업 공고</a></p>"
+            '<ul class="info"><li>교육</li></ul>'
+            f'<p class="date">{period}</p></li>'
+        )
+
+    def test_same_number_in_two_kinds_stays_two_rows(self, db):
+        """``fncPbofrSn=42`` 와 ``dsgnPbofrSn=42`` 는 **두 행**이다.
+
+        예전에는 둘 다 ``source_id="42"`` 여서 하나만 저장되고, 나중에
+        수집된 쪽의 기간이 먼저 저장된 다른 공고를 덮어썼다.
+        """
+        crawler = make(SeisCrawler)
+        soup = BeautifulSoup(
+            "<ul>"
+            + self.card("fncPbofrSn", 42, "2026.09.01 ~ 2026.09.30")
+            + self.card("dsgnPbofrSn", 42, "2026.11.01 ~ 2026.11.30")
+            + "</ul>",
+            "html.parser",
+        )
+        items = crawler._dedupe_items(crawler._parse_main_cards(soup))
+        assert len(items) == 2
+
+        saved = []
+        for item in items:
+            announcement = _finalize_periods(
+                "seis", crawler._to_announcement(item, "https://www.seis.or.kr")
+            )
+            assert db.exists(announcement) is False
+            db.insert_announcement(
+                AnalyzedAnnouncement(
+                    **announcement.__dict__, relevance_score=0.9
+                )
+            )
+            saved.append(announcement)
+
+        assert {a.source_id for a in saved} == {"fnc:42", "dsgn:42"}
+        rows = db._conn.execute(
+            "SELECT source_id, period_start, period_end FROM announcements"
+            " ORDER BY source_id"
+        ).fetchall()
+        assert len(rows) == 2
+        assert {(r["source_id"], r["period_end"]) for r in rows} == {
+            ("dsgn:42", "2026-11-30"), ("fnc:42", "2026-09-30"),
+        }
+
+    def test_legacy_row_is_matched_by_url(self, db):
+        """ID 체계가 바뀌어도 **같은 URL** 이면 같은 행이다."""
+        url = "https://www.seis.or.kr/subPage.do?fncPbofrSn=42"
+        db.insert_announcement(
+            AnalyzedAnnouncement(
+                source="seis", source_id="42", title="지원사업 공고", url=url,
+                period_start="2099-01-01", period_end=PLANTED,
+                raw_data="{}", fetched_at=datetime.now().isoformat(),
+            )
+        )
+        fresh = RawAnnouncement(
+            source="seis", source_id="fnc:42", title="지원사업 공고", url=url,
+            raw_data=json.dumps({"date": "2026.09.01 ~ 2026.09.30"}),
+        )
+        assert db.exists(fresh) is True          # 새 행으로 갈라지지 않는다
+        assert db.overwrite_periods(_finalize_periods("seis", fresh)) is True
+        rows = db._conn.execute(
+            "SELECT source_id, period_end FROM announcements"
+        ).fetchall()
+        assert len(rows) == 1
+        assert rows[0]["period_end"] is None     # 근거(라벨·출처) 없음
+
+    def test_stale_seis_row_is_revalidated_and_not_notified(self, db):
+        """재수집되지 않은 seis 행도 **근거를 다시 본다**."""
+        db.insert_announcement(
+            AnalyzedAnnouncement(
+                source="seis", source_id="fnc:1", title="교육 공고",
+                url="https://www.seis.or.kr/subPage.do?fncPbofrSn=1",
+                period_start="2099-01-01", period_end="2099-12-31",
+                relevance_score=0.9,
+                raw_data=json.dumps(
+                    {"date": "교육기간 2099.01.01 ~ 2099.12.31",
+                     "date_field": SEIS_CARD_DATE_FIELD},
+                    ensure_ascii=False,
+                ),
+                fetched_at=datetime.now().isoformat(),
+            )
+        )
+        assert [a.period_end for a in db.get_unnotified()] == ["2099-12-31"]
+
+        changed = db.revalidate_periods(
+            "seis", lambda raw: _periods_from_raw("seis", raw)
+        )
+        assert changed == 1
+        assert [a.period_end for a in db.get_unnotified()] == [None]
+        # 멱등
+        assert db.revalidate_periods(
+            "seis", lambda raw: _periods_from_raw("seis", raw)
+        ) == 0
+
+    def test_revalidation_restores_evidence_backed_periods(self, db):
+        """근거가 있으면 재검증이 **값을 되살린다**."""
+        db.insert_announcement(
+            AnalyzedAnnouncement(
+                source="lawmaking", source_id="88388", title="입법예고",
+                url="https://opinion.lawmaking.go.kr/gcom/ogLmPp/88388",
+                period_start=None, period_end=None, relevance_score=0.9,
+                raw_data=json.dumps(
+                    {"period": "2026. 9. 7. ~2026. 10. 19."}, ensure_ascii=False
+                ),
+                fetched_at=datetime.now().isoformat(),
+            )
+        )
+        assert db.revalidate_periods(
+            "lawmaking", lambda raw: _periods_from_raw("lawmaking", raw)
+        ) == 1
+        row = db._conn.execute(
+            "SELECT period_start, period_end FROM announcements"
+        ).fetchone()
+        assert (row["period_start"], row["period_end"]) == (
+            "2026-09-07", "2026-10-19"
+        )
+
+    def test_broken_raw_data_revalidates_to_null(self, db):
+        db.insert_announcement(
+            AnalyzedAnnouncement(
+                source="seis", source_id="fnc:2", title="공고",
+                url="https://www.seis.or.kr/subPage.do?fncPbofrSn=2",
+                period_end=PLANTED, relevance_score=0.9,
+                raw_data="{not json", fetched_at=datetime.now().isoformat(),
+            )
+        )
+        assert db.revalidate_periods(
+            "seis", lambda raw: _periods_from_raw("seis", raw)
+        ) == 1
+        assert db.get_unnotified()[0].period_end is None
 
 
 class TestStaleRowsAreOverwritten:

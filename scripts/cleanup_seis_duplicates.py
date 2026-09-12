@@ -160,6 +160,8 @@ def id_matches_url(source: str, source_id: str, url: str) -> bool:
     """
     if not source_id or not url:
         return False
+    # seis 는 ``종류:번호`` 형태다 (11차 게이트) - 번호만 대조한다
+    source_id = source_id.rsplit(":", 1)[-1]
     for param in POST_ID_PARAMS.get(source, ()):
         if re.search(rf"[?&]{re.escape(param)}={re.escape(source_id)}(?:&|$)", url, re.I):
             return True

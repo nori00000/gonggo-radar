@@ -45,13 +45,13 @@ class TestSeisCrawler:
         with patch("alert.crawlers.base.get_config", return_value=mock_seis_config):
             crawler = SeisCrawler()
 
-            # Parameter-based ID
-            assert crawler._extract_post_id("https://example.com?nttId=12345") == "12345"
-            assert crawler._extract_post_id("https://example.com?seq=67890") == "67890"
-            assert crawler._extract_post_id("https://example.com?idx=54321") == "54321"
+            # Parameter-based ID - **종류 접두**를 포함한다 (11차 게이트)
+            assert crawler._extract_post_id("https://example.com?nttId=12345") == "ntt:12345"
+            assert crawler._extract_post_id("https://example.com?seq=67890") == "seq:67890"
+            assert crawler._extract_post_id("https://example.com?idx=54321") == "idx:54321"
 
             # Path-based ID
-            assert crawler._extract_post_id("https://example.com/view/123456") == "123456"
+            assert crawler._extract_post_id("https://example.com/view/123456") == "path:123456"
 
             # Empty link
             assert crawler._extract_post_id("") == ""
@@ -265,36 +265,52 @@ class TestSeisMainCards:
         # D-day 배지는 어느 필드에도 섞이지 않는다
         assert not any(value.startswith("D-") for value in card["info"])
 
-    def test_duplicate_rounds_collapse_to_one_item(self, crawler, soup):
-        """같은 제목·지역의 회차별 링크 9건이 1건으로 합쳐진다."""
+    def test_separate_rounds_are_never_merged(self, crawler, soup):
+        """11차 게이트: 링크가 다르면 회차별 공고를 합치지 않는다.
+
+        예전에는 "목록에 적힌 날짜가 같으면 같은 공고" 로 봐서 1차·2차가
+        합쳐졌고, 합쳐진 쪽은 알림에서 사라졌다. 중복이 남는 비용이
+        공고가 사라지는 비용보다 싸다.
+        """
         items = crawler._parse_main_cards(soup)
-        duplicates = [
+        rounds = [
             i for i in items
             if i["title"].startswith("2026년 경기도 사회적기업 사회보험료")
         ]
-        assert len(duplicates) == 9
+        assert len(rounds) == 9
+        assert len({i["link"] for i in rounds}) == 9      # 링크가 전부 다르다
 
         deduped = crawler._dedupe_items(items)
-        assert len(deduped) == 14
+        assert len(deduped) == 22                          # 하나도 잃지 않는다
+        assert not any(i.get("merged_count") for i in deduped)
 
-        merged = [
-            i for i in deduped
-            if i["title"].startswith("2026년 경기도 사회적기업 사회보험료")
-        ]
-        assert len(merged) == 1
-        assert merged[0]["merged_count"] == 9
+    def test_true_replicas_still_collapse(self, crawler):
+        """같은 링크가 두 번 나오면(진짜 복제) 1건으로 합친다."""
+        card = (
+            '<li class="swiper-slide" data-type="사업공고">'
+            '<span class="sub">서울센터</span>'
+            '<p class="tit"><a href="subPage.do?tabId=view&itgrdAplyPbancSn=7">'
+            "공고</a></p>"
+            '<ul class="info"><li>교육</li></ul>'
+            '<p class="date">2026.09.01 ~ 2026.09.30</p></li>'
+        )
+        soup = BeautifulSoup("<ul>" + card + card + "</ul>", "html.parser")
+        items = crawler._parse_main_cards(soup)
+        assert len(items) == 2
+        deduped = crawler._dedupe_items(items)
+        assert len(deduped) == 1
+        assert deduped[0]["merged_count"] == 2
 
-    def test_canonical_item_is_the_current_round(self, crawler, soup):
-        """대표는 접수 시작일이 가장 늦은 최신 회차(9차)다."""
+    def test_each_round_keeps_its_own_identity(self, crawler, soup):
+        """회차마다 자기 링크·자기 ID 로 남는다 (9차 회차 확인)."""
         deduped = crawler._dedupe_items(crawler._parse_main_cards(soup))
         merged = next(
-            i for i in deduped
-            if i["title"].startswith("2026년 경기도 사회적기업 사회보험료")
+            i for i in deduped if "fncPbofrSn=8371" in i["link"]
         )
 
         announcement = crawler._to_announcement(merged, "https://www.seis.or.kr")
         assert announcement is not None
-        assert announcement.source_id == "8371"
+        assert announcement.source_id == "fnc:8371"
         assert announcement.url == (
             "https://www.seis.or.kr/subPage.do"
             "?menuId=30200&tabId=pbancMainView&fncPbofrSn=8371"
@@ -308,21 +324,22 @@ class TestSeisMainCards:
         )
         assert announcement.author == "한국사회적기업진흥원"
 
-    def test_merged_links_are_auditable(self, crawler, soup):
-        """병합된 나머지 링크 ID와 회차가 raw_data에 남는다."""
+    def test_no_round_is_swallowed_by_a_merge(self, crawler, soup):
+        """어떤 회차도 다른 회차의 ``merged_source_ids`` 로 흡수되지 않는다."""
         deduped = crawler._dedupe_items(crawler._parse_main_cards(soup))
-        merged = next(
-            i for i in deduped
-            if i["title"].startswith("2026년 경기도 사회적기업 사회보험료")
-        )
-        announcement = crawler._to_announcement(merged, "https://www.seis.or.kr")
-        payload = json.loads(announcement.raw_data)
-
-        assert payload["merged_count"] == 9
-        assert payload["merged_source_ids"] == [
-            "8370", "8369", "8368", "8367", "8366", "8365", "8364", "8339"
+        built = [
+            crawler._to_announcement(i, "https://www.seis.or.kr") for i in deduped
         ]
-        assert len(payload["merged_rounds"]) == 9
+        swallowed = [
+            sid
+            for a in built
+            for sid in json.loads(a.raw_data).get("merged_source_ids", [])
+        ]
+        assert swallowed == []
+        # 9개 회차가 각각 독립된 행으로 남는다
+        rounds = [a for a in built if "사회보험료" in a.title]
+        assert len(rounds) == 9
+        assert len({a.source_id for a in rounds}) == 9
 
     def test_distinct_subjects_stay_separate(self, crawler, soup):
         """지정공모는 주체(span.sub)가 달라 각각 남는다."""
@@ -356,23 +373,36 @@ class TestSeisMainCards:
             for i in deduped
         ]
         assert len(ids) == len(set(ids))
-        assert "8371" in ids
+        assert "fnc:8371" in ids
         # 인·지정 공모는 dsgnPbofrSn 을 쓴다 (예전에는 MD5 해시로 떨어졌다)
-        assert "8322" in ids
+        assert "dsgn:8322" in ids
+        # 종류 접두가 있으므로 같은 번호라도 종류가 다르면 다른 ID 다
+        assert len({i.split(":", 1)[0] for i in ids}) > 1
 
     def test_epsd_no_is_not_matched_as_generic_no_param(self, crawler):
         """"epsdNo=4" 가 범용 "no=" 패턴에 걸려 다른 공고와 충돌하지 않는다."""
         link = (
             "/subPage.do?menuId=30100&tabId=certPageView&statsYr=2026&epsdNo=4"
         )
-        assert crawler._extract_post_id(link) == "4"
+        assert crawler._extract_post_id(link) == "epsd:4"
         # 같은 자리에 다른 파라미터가 와도 고유번호를 먼저 본다
         assert crawler._extract_post_id(
             "/subPage.do?menuId=30200&tabId=pbancMainView&fncPbofrSn=8371"
-        ) == "8371"
+        ) == "fnc:8371"
         assert crawler._extract_post_id(
             "/subPage.do?menuId=30100&tabId=certPageView&dsgnPbofrSn=8322"
-        ) == "8322"
+        ) == "dsgn:8322"
+
+    def test_same_number_in_different_kinds_never_collides(self, crawler):
+        """11차 게이트: ``fncPbofrSn=42`` 와 ``dsgnPbofrSn=42`` 는 다른 공고다."""
+        financial = crawler._extract_post_id(
+            "/subPage.do?menuId=30200&tabId=pbancMainView&fncPbofrSn=42"
+        )
+        designation = crawler._extract_post_id(
+            "/subPage.do?menuId=30100&tabId=certPageView&dsgnPbofrSn=42"
+        )
+        assert (financial, designation) == ("fnc:42", "dsgn:42")
+        assert financial != designation
 
     def test_normalize_title_ignores_spacing_noise(self, crawler):
         """제목 정규화는 공백·구분기호 차이를 무시한다."""
@@ -456,39 +486,46 @@ class TestSeisCardRegionCritique:
         ]
         assert {a.period_end for a in built} == {"2026-08-31", "2026-09-30"}
 
-    def test_genuine_round_duplication_still_merges(self, crawler):
-        """주체·제목·종료일이 모두 같은 회차 중복은 여전히 1건으로 합친다."""
+    def test_different_links_are_never_merged(self, crawler):
+        """종료일이 같아도 **링크가 다르면** 별개 공고다 (11차 게이트)."""
         _items, deduped = self.build(crawler, [
             self.CARD.format(sub="사회보험료 지원 사업", sid="8371", info="경기도",
                              period="2026.09.01 ~ 2026.12.31"),
             self.CARD.format(sub="사회보험료 지원 사업", sid="8370", info="경기도",
                              period="2026.08.01 ~ 2026.12.31"),
         ])
-        assert len(deduped) == 1
-        assert deduped[0]["merged_count"] == 2
-        announcement = crawler._to_announcement(deduped[0], "https://www.seis.or.kr")
-        assert announcement.source_id == "8371"          # 최신 회차가 대표
-        assert _finalize_periods("seis", announcement).period_end == "2026-12-31"
+        assert len(deduped) == 2
+        built = [
+            _finalize_periods(
+                "seis", crawler._to_announcement(i, "https://www.seis.or.kr")
+            )
+            for i in deduped
+        ]
+        assert {a.source_id for a in built} == {"itgrd:8371", "itgrd:8370"}
+        assert {a.period_end for a in built} == {"2026-12-31"}
 
     def test_group_key_components(self, crawler):
-        """중복 판별 키는 제목·주체·종료일 세 조각이다."""
-        # 11차(허용목록): 접수기간 라벨이 있어야 마감이 키에 들어간다
+        """수집 단계 키는 제목·주체·**링크**·회차 네 조각이다 (11차 게이트)."""
         base = {
             "title": "같은 제목",
             "sub": "서울센터",
+            "link": "subPage.do?tabId=view&itgrdAplyPbancSn=1",
             "date": "2026.09.01 ~ 2026.09.30",
-            "date_label": "접수기간",
         }
         assert crawler._group_key(base) == crawler._group_key(dict(base))
         assert crawler._group_key(base) != crawler._group_key(
             {**base, "sub": "부산센터"}
         )
+        # 링크가 다르면 다른 공고다 - 날짜는 키에 들어가지 않는다
         assert crawler._group_key(base) != crawler._group_key(
+            {**base, "link": "subPage.do?tabId=view&itgrdAplyPbancSn=2"}
+        )
+        assert crawler._group_key(base) == crawler._group_key(
             {**base, "date": "2026.09.01 ~ 2026.10.31"}
         )
-        # 양쪽 다 기간이 없으면 같은 키다
-        assert crawler._group_key({**base, "date": ""}) == crawler._group_key(
-            {**base, "date": ""}
+        # 회차 토큰이 다르면 같은 링크여도 합치지 않는다
+        assert crawler._group_key({**base, "round": "1차"}) != crawler._group_key(
+            {**base, "round": "2차"}
         )
 
 
@@ -638,46 +675,45 @@ class TestGate6RoundInKey:
         ])
         assert len(deduped) == 2
 
-    def test_same_round_without_dates_merges(self, crawler):
+    def test_same_round_but_different_links_stays_two(self, crawler):
+        """회차가 같아도 링크가 다르면 합치지 않는다 (11차 게이트)."""
         _items, deduped = self.build(crawler, [
             self.CARD.format(sid="300", rnd="2차", period=""),
             self.CARD.format(sid="301", rnd="2차", period=""),
         ])
+        assert len(deduped) == 2
+
+    def test_same_link_twice_merges(self, crawler):
+        """같은 링크가 두 번 = 진짜 복제 -> 1건."""
+        _items, deduped = self.build(crawler, [
+            self.CARD.format(sid="400", rnd="교육", period=""),
+            self.CARD.format(sid="400", rnd="교육", period=""),
+        ])
         assert len(deduped) == 1
         assert deduped[0]["merged_count"] == 2
 
-    def test_no_round_anywhere_merges(self, crawler):
-        """양쪽 다 회차 표기가 없으면 같은 공고로 본다."""
-        _items, deduped = self.build(crawler, [
-            self.CARD.format(sid="400", rnd="교육", period=""),
-            self.CARD.format(sid="401", rnd="교육", period=""),
-        ])
-        assert len(deduped) == 1
+    def test_equal_deadline_no_longer_merges_rounds(self, crawler):
+        """11차 게이트: 마감이 같아도 **회차가 다르면** 합치지 않는다.
 
-    def test_known_equal_deadline_still_merges_rounds(self, crawler):
-        """마감이 같고 알려져 있으면 회차별 재게시는 여전히 1건이다.
-
-        원래 수리(계약 v2.1 판정 6-①)를 되돌리지 않는다 - SEIS 메인은
-        같은 공고를 1~9차로 나열하면서 같은 마감을 쓴다.
+        예전에는 같은 마감이면 회차를 무시하고 합쳤다. 그 규칙이 게시일
+        슬롯과 만나면서 별개 회차가 사라졌다 - 이제 어느 쪽도 잃지 않는다.
         """
         _items, deduped = self.build(crawler, [
             self.CARD.format(sid="8371", rnd="9차", period="2026.09.01 ~ 2026.12.31"),
             self.CARD.format(sid="8370", rnd="8차", period="2026.08.01 ~ 2026.12.31"),
         ])
-        assert len(deduped) == 1
-        assert deduped[0]["merged_count"] == 2
+        assert len(deduped) == 2
 
-    def test_live_fixture_still_collapses_to_fourteen(self, crawler):
-        """실측 fixture 회귀: 22 카드 -> 14 건, 9건 병합 유지."""
+    def test_live_fixture_keeps_every_card(self, crawler):
+        """실측 fixture 회귀: 22 카드 -> 22 건 (진짜 복제 없음)."""
         soup = BeautifulSoup(
             (FIXTURES / "seis_main_cards.html").read_text(encoding="utf-8"),
             "html.parser",
         )
         items = crawler._parse_main_cards(soup)
         deduped = crawler._dedupe_items(items)
-        assert (len(items), len(deduped)) == (22, 14)
-        merged = [i for i in deduped if i.get("merged_count")]
-        assert len(merged) == 1 and merged[0]["merged_count"] == 9
+        assert (len(items), len(deduped)) == (22, 22)
+        assert not any(i.get("merged_count") for i in deduped)
 
     def test_extract_round_tokens(self):
         from alert.crawlers.dedupe_keys import extract_round
@@ -687,13 +723,23 @@ class TestGate6RoundInKey:
         assert extract_round(["추가 모집", "1차"]) == "1차|추가"
         assert extract_round(["교육", "시설/공간"]) == ""
 
-    def test_round_only_enters_the_key_when_the_deadline_is_unknown(self):
+    def test_round_only_enters_the_cleanup_key_when_the_deadline_is_unknown(self):
+        """정리 스크립트가 쓰는 ``group_key`` 의 규칙은 그대로다."""
         from alert.crawlers.dedupe_keys import group_key
 
         known = group_key("공고", ["서울"], "2026-12-31", round_candidates=["9차"])
         unknown = group_key("공고", ["서울"], None, "2026-09", round_candidates=["9차"])
         assert known[3] == ""          # 마감을 알면 회차는 키에서 빠진다
         assert unknown[3] == "9차"
+
+    def test_collection_key_always_keeps_the_round(self):
+        """수집 단계 키(``replica_key``)는 회차를 **항상** 담는다."""
+        from alert.crawlers.dedupe_keys import replica_key
+
+        first = replica_key("공고", ["서울"], "/view?id=1", round_candidates=["9차"])
+        second = replica_key("공고", ["서울"], "/view?id=1", round_candidates=["8차"])
+        assert first[3] == "9차" and second[3] == "8차"
+        assert first != second
 
 
 class TestGate7AlwaysOpenToken:
@@ -858,8 +904,8 @@ class TestCycle11SeisWhitelist:
             )
             for i in deduped
         ]
-        assert len(announcements) == 14           # 병합은 그대로 동작한다
-        assert sum(1 for a in announcements if a.period_end) == 14
+        assert len(announcements) == 22           # 어떤 카드도 잃지 않는다
+        assert sum(1 for a in announcements if a.period_end) == 22
         # 날짜 자체도 잃지 않는다
         assert all(json.loads(a.raw_data).get("posted") for a in announcements)
 
@@ -868,7 +914,6 @@ class TestCycle11SeisWhitelist:
         base = {
             "title": "2026년 사회적기업 지원사업 참여기업 모집 공고",
             "date": "2026.09.01 ~ 2026.12.31",
-            "date_label": "접수기간",
             "info": ["경기도"],
         }
         deduped = crawler._dedupe_items([
@@ -877,8 +922,15 @@ class TestCycle11SeisWhitelist:
         ])
         assert len(deduped) == 2
 
-        same = crawler._dedupe_items([
+        # 11차 게이트: 주체가 같아도 **링크가 다르면** 합치지 않는다
+        other_link = crawler._dedupe_items([
             {**base, "sub": "사회보험료 지원 사업", "link": "subPage.do?fncPbofrSn=1"},
             {**base, "sub": "사회보험료 지원 사업", "link": "subPage.do?fncPbofrSn=2"},
         ])
-        assert len(same) == 1
+        assert len(other_link) == 2
+
+        same_link = crawler._dedupe_items([
+            {**base, "sub": "사회보험료 지원 사업", "link": "subPage.do?fncPbofrSn=1"},
+            {**base, "sub": "사회보험료 지원 사업", "link": "subPage.do?fncPbofrSn=1"},
+        ])
+        assert len(same_link) == 1

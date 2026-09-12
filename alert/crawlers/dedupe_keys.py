@@ -14,10 +14,11 @@
   그대로 쓴다. 토큰만 잘라 쓰지 않는 이유는 "경기 광주시" 와 "광주광역시"
   처럼 다른 지역이 같은 토큰을 공유하기 때문이다 - 값 전체를 쓰면 최악의
   경우 병합을 놓칠 뿐이고, 토큰만 쓰면 다른 공고를 합쳐 버린다.
-- **마감 키**: 접수 종료일. 13차부터는 대부분의 소스가 종료일이 없으므로
-  ``slot_key`` 가 **목록에 적힌 마지막 날짜**를 슬롯으로 쓴다(저장하지
-  않는다 - 기간이라고 주장하지 않고 그룹만 가른다). 날짜도 없으면 적재
-  월(``YYYY-MM``)·회차로 갈라 회차가 다른 공고가 합쳐지지 않게 한다.
+- **마감 키**: 접수 종료일. 종료일이 없으면 적재 월(``YYYY-MM``)·회차로
+  갈라 회차가 다른 공고가 합쳐지지 않게 한다.
+
+수집 단계(크롤러)의 병합은 이 키가 아니라 ``replica_key`` 를 쓴다 -
+**같은 링크**일 때만 합친다 (11차 게이트).
 """
 import re
 from typing import Iterable, Optional, Sequence, Tuple
@@ -125,32 +126,37 @@ def extract_round(candidates: Iterable[str]) -> str:
     return "|".join(sorted(found))
 
 
-# 목록에 **적혀 있는** 날짜 (기간으로 승격하지 않고 병합 슬롯으로만 쓴다)
-_LISTED_DATE = re.compile(r"\d{4}\s*[-./년]\s*\d{1,2}\s*[-./월]\s*\d{1,2}")
+def replica_key(
+    title: str,
+    region_candidates: Sequence[str],
+    url: str,
+    round_candidates: Optional[Sequence[str]] = None,
+) -> Tuple[str, Tuple[str, ...], str, str]:
+    """**수집 단계** 병합 키 - 진짜 복제(같은 링크)만 합친다 (11차 게이트).
 
+    예전에는 "목록에 적힌 날짜가 같으면 같은 공고" 로 봤다. 그래서 같은
+    제목·같은 센터의 **1차와 2차**가 게시일이 같다는 이유로 합쳐져
+    한 건이 사라졌다. 한 목록 안에서 같은 공고가 두 번 나오는 경우는
+    **같은 상세 링크**로 나오므로, 병합 조건을 그것으로 좁힌다.
 
-def slot_key(period_end: Optional[str], date_text: str = "") -> str:
-    """그룹 키의 **회차 슬롯**.
-
-    13차부터 기간은 소스 전용 추출기만 만들므로 대부분의 소스는 종료일이
-    없다. 그래도 같은 제목·같은 기관의 **다른 회차**를 합치면 공고가
-    사라지므로, 종료일이 없으면 **목록에 적힌 마지막 날짜**를 슬롯으로
-    쓴다 - 이 값은 저장되지 않고 그룹을 가르는 데만 쓴다(기간이라고
-    주장하지 않는다).
+    회차 토큰이 다르면 URL 이 같아도 합치지 않는다 - 어느 쪽도 잃지 않는
+    방향이다(중복이 남는 비용 < 공고가 사라지는 비용).
 
     Args:
-        period_end: 확정 종료일 (있으면 그것이 슬롯이다)
-        date_text: 목록 날짜 원문
+        title: 공고 제목
+        region_candidates: 주체·지역 후보 문자열들 (sub, info…)
+        url: 상세 링크 (정규화 전 원문이어도 같은 목록 안에서는 일관된다)
+        round_candidates: 회차 후보 문자열들
 
     Returns:
-        슬롯 문자열. 날짜가 전혀 없으면 빈 문자열
+        ``(정규화 제목, 주체 서명, URL, 회차 키)``
     """
-    if period_end:
-        return period_end
-    listed = [match.group(0) for match in _LISTED_DATE.finditer(date_text or "")]
-    if not listed:
-        return ""
-    return "listed:" + re.sub(r"[^0-9]", "", listed[-1])
+    return (
+        normalize_title(title),
+        subject_signature(region_candidates),
+        (url or "").strip(),
+        extract_round(list(round_candidates or ()) + [title]),
+    )
 
 
 def deadline_key(period_end: Optional[str], ingested_month: str = "") -> str:
@@ -176,7 +182,6 @@ def group_key(
     period_end: Optional[str],
     ingested_month: str = "",
     round_candidates: Optional[Sequence[str]] = None,
-    date_text: str = "",
 ) -> Tuple[str, Tuple[str, ...], str, str]:
     """중복 판별 키를 만든다.
 
@@ -197,14 +202,13 @@ def group_key(
     Returns:
         ``(정규화 제목, 주체 서명, 마감 키, 회차 키)``
     """
-    slot = slot_key(period_end, date_text)
     round_key = ""
-    if not slot:
+    if not period_end:
         round_key = extract_round(list(round_candidates or ()) + [title])
     return (
         normalize_title(title),
         subject_signature(region_candidates),
-        deadline_key(slot, ingested_month),
+        deadline_key(period_end, ingested_month),
         round_key,
     )
 

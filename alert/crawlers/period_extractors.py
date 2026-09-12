@@ -22,8 +22,6 @@ import re
 from datetime import datetime
 from typing import Callable, Dict, Optional, Tuple
 
-from .date_labels import strip_notes
-
 Period = Tuple[Optional[str], Optional[str]]
 
 # 완전 날짜(연·월·일) 와 월·일만 있는 날짜. 구분자는 **점**만 받는다
@@ -72,10 +70,15 @@ _DIGITS = re.compile(r"\d+")
 
 
 def _normalize(text: object) -> str:
-    """공백을 하나로 줄이고 요일 같은 **숫자 없는 괄호 주석**을 벗긴다."""
+    """**공백만** 정리한다 - 다른 전처리는 하지 않는다 (11차 게이트 HIGH).
+
+    예전에는 숫자 없는 괄호 주석을 벗겼다. 그 전처리가 의미를 지워
+    ``(교육기간) 2026.10.01 ~ 2026.10.31`` 이 전체 일치를 통과했다.
+    괄호 안의 말도 **필드가 무엇을 말하는지**의 일부다.
+    """
     if not isinstance(text, str):
         return ""
-    return re.sub(r"\s+", " ", strip_notes(text)).strip()
+    return re.sub(r"\s+", " ", text).strip()
 
 
 def _calendar_date(year: int, month: int, day: int) -> Optional[str]:
