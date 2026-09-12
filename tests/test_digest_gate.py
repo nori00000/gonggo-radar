@@ -1,5 +1,6 @@
 """텔레그램 승인 게이트: 상태 파일·미리보기 렌더·해설 치환·발송 기록 테스트 (계약 W10)."""
 
+import hashlib
 import json
 from pathlib import Path
 
@@ -9,7 +10,7 @@ from alert.digest import state as state_mod
 from alert.digest import preview as preview_mod
 from scripts.apply_commentary import apply_commentary
 from scripts.recheck_digest import main as recheck_main
-from scripts.send_digest import send_digest
+from scripts.send_digest import check_fail_closed, send_digest
 
 
 SAMPLE_MD = """<!-- lane: Codex(gpt-5.6) -->
@@ -217,10 +218,41 @@ def test_record_preview_stores_message_ids():
 def _write_digest(tmp_path, markdown_text=None, check=None):
     md = tmp_path / "2026-W37.md"
     md.write_text(markdown_text or SAMPLE_MD, encoding="utf-8")
+    result = dict(check or PASS_CHECK)
+    result.setdefault(
+        "markdown_sha256",
+        hashlib.sha256(md.read_text(encoding="utf-8").encode("utf-8")).hexdigest(),
+    )
     (tmp_path / "2026-W37.check.json").write_text(
-        json.dumps(check or PASS_CHECK, ensure_ascii=False), encoding="utf-8"
+        json.dumps(result, ensure_ascii=False), encoding="utf-8"
     )
     return md
+
+
+def test_check_hash_binds_valid_markdown_to_a_passed_gate(tmp_path):
+    annotated, _ = apply_commentary(SAMPLE_MD, "확정 의견")
+    md = _write_digest(tmp_path, annotated)
+
+    assert check_fail_closed(md, md.with_suffix(".check.json")) == (True, "")
+
+
+def test_send_gate_rejects_markdown_changed_after_check(tmp_path):
+    annotated, _ = apply_commentary(SAMPLE_MD, "확정 의견")
+    md = _write_digest(tmp_path, annotated)
+    md.write_text(annotated + "\n사후 변경", encoding="utf-8")
+
+    assert send_digest(md, dry_run=True) == 2
+
+
+def test_send_gate_rejects_check_without_markdown_hash(tmp_path):
+    annotated, _ = apply_commentary(SAMPLE_MD, "확정 의견")
+    md = _write_digest(tmp_path, annotated)
+    check_path = md.with_suffix(".check.json")
+    check = json.loads(check_path.read_text(encoding="utf-8"))
+    del check["markdown_sha256"]
+    check_path.write_text(json.dumps(check), encoding="utf-8")
+
+    assert send_digest(md, dry_run=True) == 2
 
 
 def test_send_digest_refuses_already_sent_week(tmp_path, monkeypatch):
@@ -313,6 +345,9 @@ def test_recheck_digest_preserves_commentary(tmp_path, monkeypatch):
         (tmp_path / "2026-W37.check.json").read_text(encoding="utf-8")
     )
     assert check["pass"] is True
+    assert check["markdown_sha256"] == hashlib.sha256(
+        annotated.encode("utf-8")
+    ).hexdigest()
     assert len(check["items"]) == 3
     assert md.read_text(encoding="utf-8") == annotated
     assert preview_mod.MARKER not in md.read_text(encoding="utf-8")

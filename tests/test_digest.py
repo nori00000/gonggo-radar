@@ -20,6 +20,7 @@ from alert.digest.composer import (
 )
 from alert.digest.checker import (
     check_digest,
+    markdown_sha256,
     parse_period_end,
     check_url_alive,
 )
@@ -790,7 +791,8 @@ class TestSendDigest:
             "items": [{"url": "https://example.com", "url_alive": True, "deadline_parsed": True, "passed": True}],
             "pass": True,
             "network_checked": True,
-            "reason": ""
+            "reason": "",
+            "markdown_sha256": markdown_sha256(md_path.read_text()),
         }))
 
         # dry_run=True가 기본값이므로 발송 안 함
@@ -826,6 +828,7 @@ class TestSendDigest:
             "pass": True,
             "network_checked": True,
             "reason": "",
+            "markdown_sha256": markdown_sha256(md_path.read_text()),
         }))
 
         smtp_mock = mock.MagicMock()
@@ -852,6 +855,7 @@ class TestSendDigest:
             "pass": True,
             "network_checked": True,
             "reason": "",
+            "markdown_sha256": markdown_sha256(md_path.read_text()),
         }))
 
         monkeypatch.setenv("EMAIL_SENDER", "sender@x.com")

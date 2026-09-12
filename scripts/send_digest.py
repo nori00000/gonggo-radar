@@ -3,6 +3,7 @@
 
 import argparse
 import html as html_module
+import hmac
 import json
 import re
 import sys
@@ -15,6 +16,7 @@ from urllib.parse import urlparse
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from alert.notifiers.email_sender import EmailNotifier
+from alert.digest.checker import markdown_sha256
 from alert.digest import state as state_mod
 
 # [텍스트](URL) — URL 안의 괄호 한 단계까지 균형 있게 소비 (javascript:alert(1) 대응)
@@ -157,6 +159,15 @@ def check_fail_closed(markdown_path: Path, check_json_path: Path) -> Tuple[bool,
     except (json.JSONDecodeError, OSError) as e:
         return False, f"검증 파일 손상: {e}"
 
+    # check.json은 검증한 바로 그 마크다운에만 유효하다. 사람이 검증 후 본문을
+    # 바꾸거나 다른 주차의 결과 파일을 복사해도 발송하면 안 된다.
+    recorded_hash = check_result.get("markdown_sha256")
+    if not isinstance(recorded_hash, str):
+        return False, "검증 파일에 마크다운 SHA-256이 없음"
+    actual_hash = markdown_sha256(markdown_text)
+    if not hmac.compare_digest(recorded_hash, actual_hash):
+        return False, "마크다운이 검증 후 변경됨"
+
     # pass=false 확인
     if not check_result.get("pass", False):
         failed_items = [
@@ -223,7 +234,10 @@ def send_digest(
         recipients = to_email if to_email else "[config에서 설정]"
         print(f"[DRY-RUN] 발송 대상: {recipients}")
         print(f"[DRY-RUN] 제목: {subject}")
-        print(f"[DRY-RUN] 본문 길이: {len(markdown_text)} bytes (마크다운), {len(html_text)} bytes (HTML)")
+        print(
+            f"[DRY-RUN] 본문 길이: {len(markdown_text)} bytes (마크다운), "
+            f"{len(html_text)} bytes (HTML)"
+        )
         return 0
 
     # 계약 W10: status=sent 는 불변이다 — 같은 주차 재발송을 거부한다.

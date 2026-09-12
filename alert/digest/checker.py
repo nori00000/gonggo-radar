@@ -1,11 +1,17 @@
 """다이제스트 항목 검증: URL 생존성 및 마감일 파싱."""
 
+import hashlib
 import json
 import re
 import sqlite3
 from pathlib import Path
 from typing import Dict, List, Optional
 import requests
+
+
+def markdown_sha256(markdown_text: str) -> str:
+    """Return the SHA-256 digest that binds a check result to its source text."""
+    return hashlib.sha256(markdown_text.encode("utf-8")).hexdigest()
 
 
 def parse_period_end(period_end_str: Optional[str]) -> bool:
@@ -120,7 +126,7 @@ def check_digest(
 
     Returns:
         {"items": [...], "dropped": [...], "pass": bool, "network_checked": bool,
-        "reason": str} 형태의 검증 결과.
+        "reason": str, "markdown_sha256": str} 형태의 검증 결과.
 
         계약 v1.2: deadline_parsed는 정보 필드이며 게이트가 아니다. url_alive=False
         항목은 dropped에 기록되고 다이제스트에서 제외된다. pass=False 조건은
@@ -143,6 +149,7 @@ def check_digest(
     # 마크다운에서 URL 추출
     with open(markdown_path, "r", encoding="utf-8") as f:
         markdown_text = f.read()
+    content_hash = markdown_sha256(markdown_text)
 
     # [텍스트](URL) 형식에서 URL 추출
     url_pattern = r'\[([^\]]+)\]\(([^)]+)\)'
@@ -155,7 +162,8 @@ def check_digest(
             "dropped": [],
             "pass": False,
             "network_checked": False,
-            "reason": "항목 없음"
+            "reason": "항목 없음",
+            "markdown_sha256": content_hash,
         }
         result = _apply_warnings(result, warnings)
         write_check_result(output_path, result)
@@ -224,7 +232,8 @@ def check_digest(
         "pass": network_checked and alive_count > 0,
         # 실제로 네트워크 검사한 URL이 0건이면 False
         "network_checked": network_checked,
-        "reason": reason
+        "reason": reason,
+        "markdown_sha256": content_hash,
     }
     result = _apply_warnings(result, warnings)
 
