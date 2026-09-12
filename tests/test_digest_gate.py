@@ -3579,3 +3579,82 @@ def test_preview_keeps_prose_headings(tmp_path):
     assert f"■ {sub}" in rendered              # 섹션 제목 표기는 종전대로
     # 문서 제목 **하나만** 생략된다 (미리보기 자체 머리글 뒤에는 없다)
     assert "협의회 주간 정책브리핑 2026-W37 (9/7~9/13)" not in rendered.split("\n", 1)[1]
+
+
+# ══ 사이클 14: 기관 대조 · 중간 괄호 지역 · 링크 표시문 치환 기록 ═══════
+def test_manifest_org_must_match_the_db_source(tmp_path, monkeypatch):
+    """정본의 기관 표시명도 DB source 에서 재계산한 값이어야 한다 (사이클 14 #1).
+
+    항목 줄에 실리는 세 값(기관·대상·지역) 중 기관만 정본을 그대로 믿으면, 그 값은
+    검증 밖이다 — 기관은 독자가 신뢰를 거는 이름이라 바뀌면 안 된다.
+    """
+    _alive(monkeypatch)
+    md = tmp_path / "2026-W37.md"
+    md.write_text(SAMPLE_MD, encoding="utf-8")
+    db = _bind(md)
+    manifest = composer_mod.load_items_manifest(md)
+    manifest["items"][0]["org"] = "산림청"        # DB source 는 kofpi
+    composer_mod.write_items_manifest(md, manifest)
+    result = check_digest(db_path=str(db), markdown_path=md, output_path=None)
+    assert result["pass"] is False
+    joined = " ".join(result["manifest_problems"])
+    assert "DB 기관 변경" in joined and "재조립 필요" in joined
+    assert "한국임업진흥원" in joined
+
+
+def test_db_source_change_requires_recompose(tmp_path, monkeypatch):
+    """DB 의 source 가 바뀌면(기관 표시명이 달라지면) 재조립을 요구한다 (사이클 14 #1)."""
+    _alive(monkeypatch)
+    md = tmp_path / "2026-W37.md"
+    md.write_text(SAMPLE_MD, encoding="utf-8")
+    db = _bind(md)
+    conn = sqlite3.connect(db)
+    conn.execute("UPDATE announcements SET source = ? WHERE id = 11", ("fowi",))
+    conn.commit()
+    conn.close()
+    result = check_digest(db_path=str(db), markdown_path=md, output_path=None)
+    assert result["pass"] is False
+    assert "DB 기관 변경" in " ".join(result["manifest_problems"])
+
+
+SELF_LINK_URL = "https://example.com/self/" + "s" * 4100
+
+
+def test_link_whose_text_is_the_url_passes(tmp_path, monkeypatch):
+    """`[U](U)` 의 정상 치환은 pass 다 (사이클 14 #3).
+
+    표시문에도 URL 이 있으면 원본 출현은 2 인데 치환 기록은 목적지 1 뿐이어서,
+    사이클 13 의 출현 수 검증이 **정상 치환을 유실로** 잡았다. 기록 단위를
+    "지워지는 구간의 모든 URL 출현" 으로 바꿔 맞춘다.
+    """
+    _alive(monkeypatch)
+    body = SAMPLE_MD.replace(
+        "· (면담·건의·수렴 현황 — 이번 주 기록 없음)",
+        f"· 참고 [{SELF_LINK_URL}]({SELF_LINK_URL}) 입니다",
+    )
+    source_count = blocks_mod.body_urls(body, unique=False).count(SELF_LINK_URL)
+    assert source_count == 2, source_count
+    _, replaced = composer_mod.fit_prose_urls(body)
+    assert replaced.count(SELF_LINK_URL) == 2, replaced
+
+    assert composer_mod.markdown_kakao_problems(body) == []
+    kakao = composer_mod.kakao_file_text_from_markdown(body)
+    assert SELF_LINK_URL not in kakao
+    assert composer_mod.URL_TOO_LONG_NOTICE in kakao
+
+    md = tmp_path / "2026-W37.md"
+    md.write_text(body, encoding="utf-8")
+    db = _bind(md)
+    result = check_digest(db_path=str(db), markdown_path=md, output_path=None)
+    assert result["kakao_problems"] == []
+    assert result["pass"] is True, result["reason"]
+
+
+def test_middle_bracket_region_reaches_the_item_line(tmp_path):
+    """중간 괄호의 지역이 항목 줄 대상 표기까지 간다 (사이클 14 #2)."""
+    title = "사회적기업 지원사업 [경기 소재 기업] 모집"
+    classification = composer_mod.classify_item(title, "", "kofpi")
+    assert classification.region == "경기"
+    assert composer_mod.target_display(
+        classification.tags, classification.region
+    ) == "사회적기업(경기)"

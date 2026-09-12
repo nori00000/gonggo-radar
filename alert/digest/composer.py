@@ -470,9 +470,6 @@ _LEADING_ORDERED_RE = re.compile(r"^(\d+)\.")
 _ANY_BRACKET_GROUP_RE = re.compile(
     r"[(\[（【［]([^()\[\]（）【】［］]*)[)\]）】］]"
 )
-_TRAILING_BRACKET_RE = re.compile(
-    r"[(\[（【［]([^()\[\]（）【】［］]*)[)\]）】］]\s*$"
-)
 # 항목 줄의 구분자와 겹치는 em dash — 제목 안에 있으면 제목/꼬리 경계가 흔들린다.
 _EM_DASH = "—"
 _EN_DASH = "–"
@@ -686,9 +683,10 @@ def prefix_signature(title: str) -> str:
 def bracket_regions(title: str) -> Tuple[str, ...]:
     """제목의 **모든** 괄호 그룹에서 찾은 지역 (선두·중간·후미, 등장 순서).
 
-    선두만 보면 후미 괄호(`… 모집 [경기]`)를 놓친다 — 지역이 양쪽 None 이 되어
-    병합 키가 같아졌다(Codex 5차 HIGH #3). 진단·테스트용이며, 판정 정본은
-    infer_region 이다(이 함수와 같은 그룹 집합을 본다).
+    선두만 보면 후미 괄호(`… 모집 [경기]`)를, 선두·후미만 보면 중간 괄호
+    (`… 지원사업 [경기 소재 기업] 모집`)를 놓친다 — 지역이 양쪽 None 이 되어 병합
+    키가 같아졌다(Codex 5차 HIGH #3 · 10차 MEDIUM). 사이클 14 #2 부터 infer_region
+    이 **이 함수의 첫 값**을 쓴다 — 스캔 규칙이 한 곳에만 있어야 갈라지지 않는다.
     """
     found = []
     for group in _ANY_BRACKET_GROUP_RE.findall(normalize_title(title)):
@@ -698,19 +696,6 @@ def bracket_regions(title: str) -> Tuple[str, ...]:
         if region and region not in found:
             found.append(region)
     return tuple(found)
-
-
-def trailing_brackets(title: str) -> List[str]:
-    """제목 **후미**에 붙은 괄호 그룹의 내용 (뒤에서부터 순서대로)."""
-    groups: List[str] = []
-    rest = normalize_title(title).rstrip()
-    while True:
-        matched = _TRAILING_BRACKET_RE.search(rest)
-        if not matched or matched.end() != len(rest):
-            break
-        groups.append(matched.group(1).strip())
-        rest = rest[: matched.start()].rstrip()
-    return groups
 
 
 def _drop_venue_context(text: str) -> str:
@@ -730,37 +715,25 @@ def is_venue_group(group: str) -> bool:
 def infer_region(title: str) -> Optional[str]:
     """제목에서 **신청 자격 지역**을 추론 (개정 v2.4 (b) + v2.6 (2)(4)).
 
-    ① 접두 괄호 그룹을 **순서대로 전부** 훑는다 (`[모집][경기]`). 지역을 만나면
-       거기서 확정하고 끝낸다 — 2차 탐색을 하면 행사 장소(`(설명회 장소: 서울)`)가
-       섞여 자격 지역이 사라진다. 인식된 비지역 태그(`[모집]`)는 건너뛰고,
-       알 수 없는 접두사(기관명)에서는 멈춘다.
-    ② 접두 괄호에 지역이 없으면 괄호 밖 본문을 본다(장소 문맥 제거 후).
+    ① 괄호 그룹을 **등장 순서대로 전부** 훑는다 — 선두·중간·후미
+       (`[모집][경기]` · `사회적기업 지원사업 [경기 소재 기업] 모집` · `… 모집 [경기]`).
+       행사 장소 문맥인 그룹은 건너뛰고, 지역을 만나면 거기서 확정하고 끝낸다.
+    ② 괄호에 지역이 없으면 괄호 밖 본문을 본다(장소 문맥 제거 후).
     여러 시·도가 섞여 있으면 권역명을 쓰고, 권역명도 없으면 붙이지 않는다.
 
     주의: announcements 스키마에는 소스별 지역 필드가 없다(스키마 변경 금지). 그래서
     판정 근거는 제목뿐이다 — 소스 지역 필드가 생기면 여기에 합친다.
     """
-    # 사이클 9 #2: 접두 괄호 그룹을 **전부** 훑는다. 예전에는 알 수 없는 태그
-    # (`[모집공고]`)에서 멈춰서 그 뒤의 `[경기]` 를 놓쳤다 — 지역이 None 이 되어
-    # 경기/강원 공고가 하나로 병합됐다(Codex 5차 HIGH #3·HIGH #1 잔여).
-    for group in prefix_brackets(title):
-        # 사이클 10 #6 + 11 #5: 선두 괄호에도 장소 문맥을 걷어낸다 —
-        # `[설명회 장소: 서울]`·`[설명회 장소 서울]` 은 자격 지역이 아니다.
-        if is_venue_group(group):
-            continue
-        region = _region_from(_drop_venue_context(group))
-        if region:
-            # 괄호에서 확정하고 끝낸다 — 괄호 밖 2차 탐색을 하면 행사 장소
-            # (`(설명회 장소: 서울)`)가 섞여 자격 지역이 사라진다.
-            return region
-
-    # **후미** 괄호도 본다 (`… 지원사업 모집 [경기]`·`…(충청 권역)`).
-    for group in trailing_brackets(title):
-        if is_venue_group(group):
-            continue
-        region = _region_from(_drop_venue_context(group))
-        if region:
-            return region
+    # 사이클 9 #2 → 14 #2: 괄호 그룹을 **전부** 훑는다(선두·중간·후미 = 등장 순서).
+    # 선두만 보면 후미(`… 모집 [경기]`)를, 선두·후미만 보면 중간
+    # (`… 지원사업 [경기 소재 기업] 모집`)을 놓친다 — 지역이 None 이 되어 경기/강원
+    # 공고가 하나로 병합됐다(Codex 5차 HIGH #3 · 10차 MEDIUM).
+    # 첫 지역에서 확정하고 끝낸다 — 뒤 그룹을 더 보면 행사 장소
+    # (`(설명회 장소: 서울)`)가 섞여 자격 지역이 사라진다. 장소 문맥 필터는
+    # bracket_regions 안에서 위치와 무관하게 같은 규칙으로 걸린다.
+    regions = bracket_regions(title)
+    if regions:
+        return regions[0]
 
     body = _drop_venue_context(strip_brackets(title))
     return _region_from(body)
@@ -1835,6 +1808,17 @@ def kakao_item_fits(item: Dict, limit: int = KAKAO_CHUNK_LIMIT) -> bool:
     return len(_shrink_item_block(block, limit)) <= limit
 
 
+def _removed_urls(segment: str) -> List[str]:
+    """치환으로 사라지는 구간에 들어 있던 URL 출현 목록 (사이클 14 #3).
+
+    본문 URL 추출기와 **같은 함수**를 쓴다 — 기록과 원본 대조가 같은 규칙이어야
+    출현 수가 맞는다(`[U](U)` 는 2, 끝 구두점이 붙은 베어 URL 은 정규형 1).
+    """
+    from alert.digest import blocks as blocks_mod
+
+    return blocks_mod.body_urls(segment, unique=False)
+
+
 def fit_prose_urls(text: str, limit: int = KAKAO_CHUNK_LIMIT) -> Tuple[str, List[str]]:
     """한도를 넘기는 URL 을 안내 문구로 치환 (사이클 9 #5 — 모든 렌더러가 이 함수만 쓴다).
 
@@ -1864,13 +1848,16 @@ def fit_prose_urls(text: str, limit: int = KAKAO_CHUNK_LIMIT) -> Tuple[str, List
         # 나머지 링크의 좌표가 밀려서, 옛 좌표로 자른 두 번째 링크는 실제로 남는데
         # "치환 완료" 로 기록됐다(사이클 10 #4).
         # 기록은 **출현마다** 남긴다 (사이클 13 #3: 같은 URL 이 여러 번 나오면
-        # 그중 몇 번을 치환했는지가 판정에 필요하다).
+        # 그중 몇 번을 치환했는지가 판정에 필요하다). 사이클 14 #3: 기록 단위는
+        # "링크의 목적지" 가 아니라 **지워지는 구간에 있던 모든 URL 출현** 이다 —
+        # `[U](U)` 처럼 표시문에도 URL 이 있으면 원본 출현은 2, 기록은 1 이 되어
+        # 정상 치환이 출현 불일치로 잡혔다.
         while len(line) > limit:
             links = blocks_mod.find_links(line)
             if not links:
                 break
             link = max(links, key=lambda found: len(found.url))
-            replaced.append(link.url)
+            replaced.extend(_removed_urls(line[link.start:link.end]))
             line = line[:link.start] + URL_TOO_LONG_NOTICE + line[link.end:]
 
         # ② 맨몸 URL 토큰 (`· https://…`) — 글머리·들여쓰기는 보존한다
@@ -1886,8 +1873,7 @@ def fit_prose_urls(text: str, limit: int = KAKAO_CHUNK_LIMIT) -> Tuple[str, List
             # 사이클 13 #3: 기록은 **본문 URL 추출기와 같은 형태**로 남긴다.
             # 토큰에는 끝 구두점(`…/x.`)이 붙어 있을 수 있는데, 그대로 기록하면
             # 출현 대조에서 원본 URL 과 다른 문자열이 되어 정상 치환이 유실로 잡힌다.
-            canonical = blocks_mod.bare_urls(tokens[index])
-            replaced.append(canonical[0] if canonical else tokens[index])
+            replaced.extend(_removed_urls(tokens[index]) or [tokens[index]])
             tokens[index] = URL_TOO_LONG_NOTICE
             line = " ".join(tokens)
         lines.append(line)

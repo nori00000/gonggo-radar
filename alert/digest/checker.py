@@ -38,6 +38,7 @@ from alert.digest.composer import (
     markdown_kakao_problems,
     parse_deadline,
     sanitize_title,
+    source_display_name,
     target_display,
 )
 
@@ -226,12 +227,21 @@ def _schema_problems(manifest: Dict) -> List[str]:
 
 
 def _classification_problems(item_id: str, entry: Dict, row) -> List[str]:
-    """대상 태그·지역을 DB 행에서 재계산해 정본과 대조 (사이클 13 #2).
+    """대상 태그·지역·기관을 DB 행에서 재계산해 정본과 대조 (사이클 13 #2 · 14 #1).
 
     정본에 적힌 값을 그대로 믿으면, DB 의 summary 를 고쳐 대상이 바뀌어도 재검토가
     통과한다(Codex 9차 MEDIUM #4). 근거는 언제나 DB 이고 정본은 그 사본일 뿐이다.
+
+    기관 표시명도 같다 (사이클 14 #1): 항목 줄에 실리는 세 값(기관·대상·지역)이
+    모두 DB 재계산과 맞아야 한다 — 하나라도 정본만 믿으면 그 값은 검증 밖이다.
     """
     problems: List[str] = []
+    expected_org = source_display_name(row[5] or "")
+    if (entry.get("org") or "") != expected_org:
+        problems.append(
+            f"id={item_id} DB 기관 변경: {expected_org!r} "
+            f"≠ 정본 {entry.get('org')!r} — 재조립 필요"
+        )
     try:
         classification = classify_item(row[1] or "", row[4] or "", row[5] or "")
     except Exception as exc:      # noqa: BLE001 — 분류 실패는 fail-closed

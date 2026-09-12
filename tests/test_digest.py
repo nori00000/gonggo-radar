@@ -696,6 +696,14 @@ class TestComposer:
         # `장` 이 자격 조건에 든 괄호는 장소가 아니다
         assert infer_region("[경기 사업장 보유 기업] 사회적기업 지원사업 모집") == "경기"
         assert infer_region("[강원 교육장 운영 기업] 지원사업 모집") == "강원"
+        # 사이클 14 #2: 지역 탐색은 선두·중간·후미 순으로 **모든** 괄호를 본다
+        assert infer_region("사회적기업 지원사업 [경기 소재 기업] 모집") == "경기"
+        assert infer_region("2026년 [강원 소재 기업] 지원사업 모집") == "강원"
+        # 중간 괄호에도 장소 문맥 필터는 똑같이 적용된다
+        assert infer_region("사회적기업 지원사업 [설명회 장소: 서울] 모집") is None
+        assert infer_region("사회적기업 지원사업 [서울에서 개최] 모집") is None
+        # 선두가 먼저다 — 중간·후미보다 앞선 그룹에서 확정한다
+        assert infer_region("[경기] 지원사업 [강원 설명회] 모집") == "경기"
         # 사이클 13 #4: `에서` 는 **장소 동사가 따를 때만** 장소 신호다
         assert infer_region("[경기에서 사업하는 기업] 사회적기업 지원사업 모집") == "경기"
         assert infer_region("[강원에서 창업한 기업] 지원사업 모집") == "강원"
@@ -2902,6 +2910,8 @@ class TestFixCycle4:
         assert infer_region("지원사업 모집(충청 권역)") == "충청"
         assert bracket_regions("[모집공고][경기] 지원") == ("경기",)
         assert bracket_regions("지원사업 모집 [강원]") == ("강원",)
+        # 사이클 14 #2: 제목 **중간** 괄호도 같은 규칙으로 본다
+        assert bracket_regions("사회적기업 지원사업 [경기 소재 기업] 모집") == ("경기",)
         assert bracket_regions("지원사업 모집(~9.30)") == ()
         # 행사 장소는 여전히 자격 지역이 아니다
         assert infer_region("전국 지원사업 모집(설명회 장소: 서울)") is None
