@@ -14,14 +14,19 @@
 끊는다. 그래서 ``<th>접수기간</th><td>상시</td></tr><tr><th>작성일</th>
 <td>2026.09.11</td>`` 에서 게시일이 마감으로 새어 들어오지 않는다.
 """
+import json
 import re
+import sys
+import time
 from datetime import date
+from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
 
 try:
-    from bs4 import BeautifulSoup, NavigableString
+    from bs4 import BeautifulSoup, Comment, NavigableString
 except ImportError:  # pragma: no cover - bs4 없는 환경
     BeautifulSoup = None  # type: ignore
+    Comment = None  # type: ignore
     NavigableString = None  # type: ignore
 
 # 상세 페이지 요청 규약 (계약 v2.1 V2 + Codex 크리틱 #8)
@@ -30,6 +35,8 @@ BROWSER_USER_AGENT = (
     "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
 )
 DETAIL_TIMEOUT = 10
+DETAIL_CONNECT_TIMEOUT = 10         # 연결 상한
+DETAIL_READ_TIMEOUT = 10            # 청크 사이 간격 상한
 DETAIL_DELAY_SEC = 1.0
 # 실행시간 상한 - 상세 수집이 크롤 주기를 잡아먹지 못하게 한다
 # (2026-09-13 조정자 판정: kofpi 20건 전부 훑고 698KB 상세도 읽도록 상향)
@@ -44,6 +51,7 @@ QUOTE_AMOUNT = "quote_amount"
 ALWAYS_OPEN = "always_open"
 EARLY_CLOSE = "early_close"
 DETAIL_TRUNCATED = "detail_truncated"
+QUOTES_ATTEMPTED_AT = "quotes_attempted_at"
 
 # 인용 최대 길이 - 항목당 2줄 브리핑에 들어갈 수 있는 상한
 MAX_QUOTE_LEN = 300
@@ -78,12 +86,12 @@ _MARKS = _ROW_MARK + _CELL_MARK + _INNER_MARK
 # 공백과 경계 표시를 한데 묶어 "낱말 사이" 를 뜻하는 패턴
 _GAP = r"[\s\uE000-\uE002]"
 
-# 절단 복구용 - 여기까지는 "블록이 닫혔다" 고 말할 수 있다
-_BLOCK_CLOSE = re.compile(
-    r"</(?:p|div|tr|td|th|li|table|tbody|thead|tfoot|ul|ol|dl|dd|dt"
-    r"|section|article|h[1-6]|blockquote)\s*>",
-    re.I,
-)
+# 절단된 응답은 **파싱하지 않는다** (4차 게이트 #2·#9).
+# 어디서 잘렸는지 정규식으로 알 수 없다는 것이 세 번 실증됐다:
+#   - 속성 안쪽에서 잘려도 `</p>` 가 뒤에 있으면 완결로 보였다
+#   - 셀 안 `2026.09.<div>3</div>` 뒤 절단이 09-03을 만들었다
+# 그래서 "안전한 절단 지점" 을 찾는 대신 절단 자체를 실패로 다룬다.
+# 인용을 잃는 것은 안전하고, 없는 마감을 만드는 것은 안전하지 않다.
 
 # 글머리표 - 인용의 끝 경계. ※/* 는 보충설명이라 경계로 쓰지 않는다.
 _BULLET_BOUNDARY = "ㅁ□ㅇ○◦▶■●◆"
@@ -143,59 +151,61 @@ def _collapse_boundaries(match: "re.Match") -> str:
     return _INNER_MARK
 
 
-def complete_html_prefix(html: str) -> str:
-    """절단된 HTML에서 **마지막 완결 블록**까지만 남긴다 (최종 게이트 #3).
+def _strip_noise(soup) -> None:
+    """주석·스크립트·스타일을 **먼저** 제거한다 (4차 게이트 #3).
 
-    마지막 ``>`` 까지만 남기는 것으로는 부족했다:
-
-    - ``2026.09.<span>3</span>`` 뒤에서 자르면 ``</span>`` 가 완결 태그이므로
-      살아남아 ``2026.09.3`` → **09-03** 이 만들어졌다.
-    - ``<div title="접수기간 …09.30 >`` 처럼 속성 **안쪽** 의 ``>`` 에서 자르면
-      끊긴 태그가 텍스트로 읽혀 숨은 날짜가 인용됐다.
-
-    그래서 문단·행·셀이 **닫힌 자리**까지만 남긴다. 블록이 닫힌 뒤의 조각은
-    값의 일부일 수 없으므로 버려도 정보를 잃지 않는다. 닫힌 블록이 없으면
-    아무것도 돌려주지 않는다 - 지어내지 않는 쪽을 고른다.
-
-    Args:
-        html: 절단된 HTML 문자열
-
-    Returns:
-        마지막 완결 블록까지의 접두사. 없으면 빈 문자열
+    ``Comment`` 는 ``NavigableString`` 의 하위 클래스라 트리 순회가 본문
+    텍스트로 읽어 버렸다. 주석에 들어 있는 옛 접수기간이 실제 마감을
+    덮어쓰는 것이 실측됐다.
     """
-    if not html:
-        return ""
-    last = None
-    for match in _BLOCK_CLOSE.finditer(html):
-        last = match
-    if last is None:
-        return ""
-    return html[:last.end()]
+    for tag in soup(list(_SKIP_TAGS)):
+        tag.decompose()
+    if Comment is not None:
+        for node in soup.find_all(string=lambda text: isinstance(text, Comment)):
+            node.extract()
 
-def _walk(node, in_cell: bool, out: list) -> None:
-    """트리를 훑어 텍스트와 경계 표시를 순서대로 모은다.
 
-    셀 안쪽인지(``in_cell``)에 따라 div/p/br 의 등급이 달라진다 - 한 셀
-    안의 나열은 값의 일부이고, 셀 밖의 문단은 다른 이야기다.
+def _walk(root, root_in_cell: bool, out: list) -> None:
+    """트리를 훑어 텍스트와 경계 표시를 순서대로 모은다 (**재귀 없음**).
+
+    재귀 순회는 1,100단 중첩 div(12KB)에서 ``RecursionError`` 를 내고 그
+    소스의 수집 **전체**를 잃게 만들었다 (4차 게이트 #5). 명시적 스택을
+    쓰면 깊이에 상한이 없다.
+
+    셀 안쪽인지에 따라 div/p/br 의 등급이 달라진다 - 한 셀 안의 나열은
+    값의 일부이고, 셀 밖의 문단은 다른 이야기다.
     """
-    for child in node.children:
-        if NavigableString is not None and isinstance(child, NavigableString):
-            out.append(str(child))
+    # (node, in_cell, closing) - closing=True 면 그 태그의 경계를 적을 차례
+    stack = [(root, root_in_cell, False)]
+    while stack:
+        node, in_cell, closing = stack.pop()
+        if closing:
+            name = (getattr(node, "name", "") or "").lower()
+            if name in _ROW_TAGS:
+                out.append(_INNER_MARK if in_cell else _ROW_MARK)
+            elif name in _CELL_TAGS:
+                out.append(_INNER_MARK if in_cell else _CELL_MARK)
+            elif name in _INNER_TAGS:
+                cell = in_cell or name in _CELL_TAGS
+                out.append(_INNER_MARK if cell else _ROW_MARK)
             continue
-        name = (getattr(child, "name", "") or "").lower()
+
+        if NavigableString is not None and isinstance(node, NavigableString):
+            if Comment is not None and isinstance(node, Comment):
+                continue
+            out.append(str(node))
+            continue
+
+        name = (getattr(node, "name", "") or "").lower()
         if not name or name in _SKIP_TAGS:
             continue
+
         cell = in_cell or name in _CELL_TAGS
-        _walk(child, cell, out)
-        # **셀 안쪽의 표는 값의 일부다** (최종 게이트 #4). 중첩 표의 행·셀
-        # 경계를 단단하게 끊으면 1·2차가 첫 내부 셀에서 잘려 지난 회차가
-        # 선택된다. 그래서 이미 셀 안이면 모든 경계를 INNER로 낮춘다.
-        if name in _ROW_TAGS:
-            out.append(_INNER_MARK if in_cell else _ROW_MARK)
-        elif name in _CELL_TAGS:
-            out.append(_INNER_MARK if in_cell else _CELL_MARK)
-        elif name in _INNER_TAGS:
-            out.append(_INNER_MARK if cell else _ROW_MARK)
+        # 닫는 경계를 먼저 넣고(스택이므로 나중에 처리됨) 자식을 역순으로 쌓는다
+        stack.append((node, in_cell, True))
+        children = list(getattr(node, "children", ()))
+        for child in reversed(children):
+            stack.append((child, cell, False))
 
 
 def normalize_text(html: str) -> str:
@@ -217,8 +227,7 @@ def normalize_text(html: str) -> str:
         return ""
 
     soup = BeautifulSoup(html, "html.parser")
-    for tag in soup(list(_SKIP_TAGS)):
-        tag.decompose()
+    _strip_noise(soup)
 
     element = None
     for selector in CONTENT_SELECTORS:
@@ -300,7 +309,10 @@ def _foreign_label_start(window: str, key: str, own_label: str) -> Optional[int]
             continue
         for match in re.finditer(re.escape(word), window):
             index = match.start()
-            prefix = window[:index].rstrip(" ")
+            # 라벨 앞의 괄호·대괄호·콜론·공백은 장식이므로 벗겨 낸다.
+            # "(교육기간) 2026.09.20~09.30" 이 경계로 잡히지 않아 접수
+            # 마감에 09-20이 새어 들어왔다 (4차 게이트 #6).
+            prefix = window[:index].rstrip(" ()[]{}<>【】「」:：·-–—")
             if prefix and prefix[-1] not in _MARKS + _BULLET_BOUNDARY:
                 continue  # 문장 중간에 우연히 나온 낱말
             if best is None or index < best:
@@ -707,3 +719,224 @@ def has_quote_keys(payload: Dict[str, object]) -> bool:
     keys: Sequence[str] = (QUOTE_DEADLINE, QUOTE_ELIGIBILITY, QUOTE_AMOUNT)
     return any(payload.get(key) for key in keys)
 
+# ---------------------------------------------------------------------------
+# 격리 실행 (자식 프로세스)
+# ---------------------------------------------------------------------------
+#
+# 상세 수집은 **별도 프로세스**에서 돌린다 (4차 게이트 #1·#2).
+#
+# 시간 상한을 프로세스 안에서 강제하려는 시도는 세 번 실패했다:
+#   1) 청크마다 벽시계 확인 -> urllib3 iterator가 chunk_size 만큼 모일 때까지
+#      돌아오지 않아 검사에 진입조차 못 했다
+#   2) 작업 스레드 + join(timeout) -> 이어지는 동기 ``response.close()`` 가
+#      스트림 종료를 기다려 1.3초 지연, 비차단 close 에서는 스레드가 남았다
+#   3) GET·close·파싱이 상한 밖에 있어 축소 예산에서도 초과했다
+#
+# 그래서 협조가 필요 없는 경계를 쓴다: 부모는 ``subprocess.run(timeout=…)``
+# 으로 **프로세스 전체**를 죽인다. 부분 결과는 자식이 한 줄씩 flush 하므로
+# 살아남는다.
+
+WORKER_MODULE = "alert.crawlers.detail_quotes"
+
+
+class _ItemTimeout(Exception):
+    """항목별 상한 초과 (자식 프로세스 내부)."""
+
+
+def build_session(user_agent: str = BROWSER_USER_AGENT):
+    """상세 수집용 세션 (브라우저 User-Agent)."""
+    import requests
+
+    session = requests.Session()
+    session.headers.update({
+        "User-Agent": user_agent,
+        "Accept": "text/html,application/xhtml+xml,*/*",
+    })
+    return session
+
+
+def fetch_detail_quotes(session, url: str, deadline: Optional[float] = None) -> dict:
+    """상세 페이지 하나에서 인용을 뽑는다 (자식 프로세스에서 호출).
+
+    **절단되면 인용을 내지 않는다** (4차 게이트 #2). 본문이 상한을 넘거나
+    읽기가 끊기면 어디서 잘렸는지 알 수 없고, "안전한 절단 지점" 을 찾으려는
+    시도는 속성 안쪽·중첩 블록에서 거짓 날짜를 세 번 만들었다. 인용을 잃는
+    것은 안전하고 없는 마감을 만드는 것은 안전하지 않다.
+
+    Args:
+        session: requests 세션
+        url: 상세 페이지 URL
+        deadline: 이 monotonic 시각을 넘기면 포기한다 (항목별 상한)
+
+    Returns:
+        ``{"quotes": {...}}`` 또는 ``{"truncated": True}`` /
+        ``{"error": "..."}`` / ``{"skipped": "deadline"}``
+    """
+    import requests
+
+    if not url:
+        return {"error": "empty url"}
+    if deadline is not None and time.monotonic() > deadline:
+        return {"skipped": "deadline"}
+
+    response = None
+    try:
+        response = session.get(
+            url, timeout=(DETAIL_CONNECT_TIMEOUT, DETAIL_READ_TIMEOUT), stream=True
+        )
+        response.raise_for_status()
+
+        declared = response.headers.get("Content-Length")
+        if declared and declared.isdigit() and int(declared) > MAX_DETAIL_BYTES:
+            return {"truncated": True, "reason": f"content-length {declared}"}
+
+        chunks = []
+        total = 0
+        for chunk in response.iter_content(chunk_size=8192):
+            if deadline is not None and time.monotonic() > deadline:
+                return {"skipped": "deadline"}
+            if not chunk:
+                continue
+            total += len(chunk)
+            if total > MAX_DETAIL_BYTES:
+                return {"truncated": True, "reason": f"body over {MAX_DETAIL_BYTES}"}
+            chunks.append(chunk)
+        body = b"".join(chunks)
+    except _ItemTimeout:
+        raise                       # 항목 상한은 호출자가 "skipped" 로 분류한다
+    except requests.RequestException as exc:
+        return {"error": f"{type(exc).__name__}: {exc}"}
+    except Exception as exc:  # 파싱 밖의 예상 못 한 실패도 한 항목에 가둔다
+        return {"error": f"{type(exc).__name__}: {exc}"}
+    finally:
+        if response is not None:
+            try:
+                response.close()
+            except Exception:
+                pass
+
+    encoding = None
+    if response is not None:
+        encoding = response.encoding
+    html = decode_body(body, encoding)
+    try:
+        quotes = extract_quotes(normalize_text(html))
+    except Exception as exc:
+        # 한 페이지의 파싱 실패가 다른 항목에 번지지 않게 한다 (게이트 #5)
+        return {"error": f"parse {type(exc).__name__}: {exc}"}
+    return {"quotes": quotes}
+
+
+def decode_body(body: bytes, header_encoding: Optional[str]) -> str:
+    """응답 본문을 디코드한다 (헤더 우선, 그다음 utf-8/cp949)."""
+    for encoding in (header_encoding, "utf-8", "cp949"):
+        if not encoding:
+            continue
+        try:
+            return body.decode(encoding)
+        except (UnicodeDecodeError, LookupError):
+            continue
+    return body.decode("utf-8", errors="replace")
+
+
+def _install_item_alarm(seconds: float) -> bool:
+    """항목별 상한을 SIGALRM으로 걸어 둔다.
+
+    ``iter_content`` 는 ``chunk_size`` 만큼 모일 때까지 돌아오지 않으므로
+    루프 안의 시간 검사만으로는 한 항목에 갇힐 수 있다. 알람을 걸면 그
+    항목만 버리고 **다음 항목으로 넘어갈 수 있다** - 부모의 프로세스 kill이
+    최후의 경계이고, 이 알람은 부분 결과를 더 건지기 위한 것이다.
+
+    Returns:
+        알람을 걸었으면 True (걸 수 없는 환경이면 False)
+    """
+    try:
+        import signal
+
+        def _raise(_signum, _frame):
+            raise _ItemTimeout()
+
+        signal.signal(signal.SIGALRM, _raise)
+        signal.setitimer(signal.ITIMER_REAL, max(0.1, seconds))
+        return True
+    except (ImportError, ValueError, AttributeError, OSError):
+        return False
+
+
+def _clear_item_alarm() -> None:
+    """걸어 둔 알람을 해제한다."""
+    try:
+        import signal
+
+        signal.setitimer(signal.ITIMER_REAL, 0)
+    except (ImportError, ValueError, AttributeError, OSError):
+        pass
+
+
+def _worker_main(argv: Optional[Sequence[str]] = None) -> int:
+    """자식 프로세스 진입점.
+
+    표준입력(또는 ``--items-file``)으로 ``[{"source_id":…, "url":…}, …]`` 을
+    받아 항목마다 JSON 한 줄을 **즉시 flush** 해 내보낸다. 부모가 프로세스를
+    죽여도 그때까지의 줄은 살아남는다.
+    """
+    import argparse
+
+    parser = argparse.ArgumentParser(description="상세 인용 수집 워커")
+    parser.add_argument("--source", default="", help="소스 이름 (로그용)")
+    parser.add_argument(
+        "--items-file", default="-",
+        help="항목 JSON 경로. '-' 이면 표준입력 (기본)",
+    )
+    parser.add_argument(
+        "--item-deadline", type=float, default=DETAIL_REQUEST_DEADLINE,
+        help="항목당 벽시계 상한(초)",
+    )
+    parser.add_argument("--delay", type=float, default=DETAIL_DELAY_SEC)
+    args = parser.parse_args(argv)
+
+    if args.items_file == "-":
+        payload = sys.stdin.read()
+    else:
+        payload = Path(args.items_file).read_text(encoding="utf-8")
+    try:
+        items = json.loads(payload or "[]")
+    except ValueError as exc:
+        print(f"invalid items json: {exc}", file=sys.stderr)
+        return 2
+    if not isinstance(items, list):
+        print("items must be a list", file=sys.stderr)
+        return 2
+
+    session = build_session()
+    for index, item in enumerate(items):
+        if not isinstance(item, dict):
+            continue
+        source_id = str(item.get("source_id", ""))
+        url = str(item.get("url", ""))
+        if index and args.delay:
+            time.sleep(args.delay)
+        deadline = time.monotonic() + max(0.1, args.item_deadline)
+        armed = _install_item_alarm(args.item_deadline)
+        try:
+            result = fetch_detail_quotes(session, url, deadline=deadline)
+        except _ItemTimeout:
+            result = {"skipped": "item-deadline"}
+            # 소켓이 매달려 있을 수 있으니 세션을 새로 만든다
+            try:
+                session.close()
+            except Exception:
+                pass
+            session = build_session()
+        except Exception as exc:  # pragma: no cover - 최후의 그물
+            result = {"error": f"{type(exc).__name__}: {exc}"}
+        finally:
+            if armed:
+                _clear_item_alarm()
+        result["source_id"] = source_id
+        print(json.dumps(result, ensure_ascii=False), flush=True)
+    return 0
+
+
+if __name__ == "__main__":  # pragma: no cover - 자식 프로세스 경로
+    sys.exit(_worker_main())

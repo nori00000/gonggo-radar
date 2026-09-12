@@ -70,7 +70,7 @@ crawler:
     socialenterprise:
       enabled: true
       base_url: "https://www.socialenterprise.or.kr"
-      fetch_detail: true
+      fetch_detail: false
     ekr:
       enabled: true
       base_url: "https://www.ekr.or.kr"
@@ -133,7 +133,7 @@ crawler:
       enabled: true
       base_url: "https://www.coop.go.kr"
       bypass_threshold: true
-      fetch_detail: true
+      fetch_detail: false
 
 analyzer:
   keyword_threshold: 0.3

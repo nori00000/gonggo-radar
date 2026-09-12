@@ -77,6 +77,11 @@ _RANGE_MARK = re.compile(r"[~∼〜]|부터")
 _DATE_TOKEN = re.compile(r"\d{4}\s*[.\-/년]\s*\d{1,2}\s*[.\-/월]\s*\d{1,2}")
 # 원문이 접수를 이야기하고 있다는 신호 (날짜와 함께 있을 때만 의미가 있다)
 _RECEPTION_WORDS = re.compile(r"당일|접수|신청|모집|공모|마감")
+# 시작만 말하는 표현 - 종료 근거로 쓰면 안 된다 (4차 게이트 #4)
+_START_ONLY = re.compile(r"부터|이후|개시|시작")
+# 기간을 말하는 필드는 게시일 후보가 아니다 (4차 게이트 #4).
+# "2026-09-30까지" 를 게시일로 넣은 탓에 정상 마감이 교정 대상이 됐다.
+_PERIOD_WORDS = re.compile(r"까지|부터|기간|마감|접수|신청|모집|공모")
 
 
 def load_raw(raw_data: Optional[str]) -> dict:
@@ -284,6 +289,29 @@ def find_duplicates(
             for row in group:
                 if row["id"] in canonical:
                     continue
+                # 같은 URL이면 글번호가 맞든 틀리든 같은 글이다 (4차 게이트 #8).
+                # 예전에는 "제 글번호를 가진 행" 이라는 이유로 같은 URL의
+                # 중복을 하나도 지우지 못했다.
+                same_url_keeper = next(
+                    (
+                        keeper for keeper in provable
+                        if keeper["id"] != row["id"]
+                        and (row["url"] or "")
+                        and (row["url"] or "") == (keeper["url"] or "")
+                        and keys_compatible(
+                            row_key(row), row_key(keeper), ignore_deadline=True
+                        )
+                    ),
+                    None,
+                )
+                if same_url_keeper is not None:
+                    doomed[row["id"]] = row
+                    absorbed[row["id"]] = same_url_keeper["id"]
+                    reasons.append(
+                        f"  [C] id={row['id']} source_id={row['source_id']} -> 대표 "
+                        f"source_id={same_url_keeper['source_id']} (같은 URL)"
+                    )
+                    continue
                 if id_matches_url(source, row["source_id"], row["url"] or ""):
                     continue  # 제 글번호를 가진 행은 별개 공고로 본다
                 # **모든** 정상 대표와 대조한다 - 최대 순위 하나만 보면 다른
@@ -397,13 +425,32 @@ def states_reception_period(payload: dict) -> bool:
 
 
 def posting_dates(payload: dict, created_date: str) -> Set[str]:
-    """이 행의 **게시일** 후보 - 단일 날짜 필드와 적재일."""
+    """이 행의 **게시일** 후보 - 기간을 말하지 않는 단일 날짜와 적재일.
+
+    범위 표기가 있거나 "까지/부터/기간/마감" 처럼 접수 이야기를 하는 필드는
+    게시일이 아니다. 그런 필드의 날짜를 게시일로 취급하면 정상 마감이
+    "게시일과 같다" 는 이유로 교정 대상이 된다 (4차 게이트 #4).
+
+    Args:
+        payload: raw_data 딕셔너리
+        created_date: 적재일 (``YYYY-MM-DD``)
+
+    Returns:
+        게시일로 볼 수 있는 날짜 집합
+    """
     found: Set[str] = set()
     if created_date:
         found.add(created_date)
+
     posted = str(payload.get("posted") or "")
-    for value in [posted] + _raw_date_fields(payload):
-        if _RANGE_MARK.search(value):
+    for year, month, day in re.findall(
+        r"(\d{4})\s*[.\-/년]\s*(\d{1,2})\s*[.\-/월]\s*(\d{1,2})", posted
+    ):
+        found.add(f"{int(year):04d}-{int(month):02d}-{int(day):02d}")
+
+    for key in ("date", "WRITE_DATE"):
+        value = str(payload.get(key) or "")
+        if not value or _RANGE_MARK.search(value) or _PERIOD_WORDS.search(value):
             continue
         matches = re.findall(
             r"(\d{4})\s*[.\-/년]\s*(\d{1,2})\s*[.\-/월]\s*(\d{1,2})", value
@@ -435,6 +482,10 @@ def deadline_evidence(payload: dict) -> Optional[str]:
         _start, end = period_from_quote(value)
         if end:
             return end
+        # **시작일은 종료 근거가 아니다** (4차 게이트 #4). "…2026.09.01부터"
+        # 만 있는 인용을 종료일로 승격해 정상 마감 09-30을 09-01로 바꿨다.
+        if _START_ONLY.search(value):
+            continue
         dates = _DATE_TOKEN.findall(value)
         if len(dates) == 1 and _RECEPTION_WORDS.search(value):
             match = re.search(

@@ -34,6 +34,11 @@ _REGION_RE = re.compile("|".join(re.escape(token) for token in REGION_TOKENS))
 
 _TITLE_NOISE = re.compile(r"[\s·.,()\[\]{}「」『』\-~/]+")
 
+# "전국" 은 특정 지역이 아니라 **모든 지역** 을 뜻한다. 같은 공고를
+# 한쪽은 "서울", 한쪽은 "전국" 으로 적어 두면 별개 공고로 갈렸다
+# (4차 게이트 #8). 와일드카드로 다룬다.
+NATIONWIDE_TOKENS = ("전국", "전지역", "전 지역")
+
 
 def normalize_title(title: str) -> str:
     """공백·구분기호를 없앤 비교용 제목."""
@@ -124,6 +129,12 @@ def group_key(
     )
 
 
+def is_nationwide(signature: Sequence[str]) -> bool:
+    """주체 서명이 "전국" 을 말하는지 본다."""
+    joined = " ".join(signature or ())
+    return any(token in joined for token in NATIONWIDE_TOKENS)
+
+
 def keys_compatible(
     first: Tuple[str, Tuple[str, ...], str],
     second: Tuple[str, Tuple[str, ...], str],
@@ -132,30 +143,29 @@ def keys_compatible(
     """두 키가 **같은 공고**를 가리킬 수 있는지 본다.
 
     그룹핑에는 완전 일치를 쓰지만, 이미 기록된 병합(규칙 A)이나 같은 URL을
-    확인할 때는 조금 느슨해야 한다 (최종 게이트 #7):
+    확인할 때는 조금 느슨해야 한다:
 
-    - 한쪽에 주체 메타데이터가 **없으면**(구 파서가 남기지 않았다) 주체는
-      비교하지 않는다 - 대표에만 메타데이터가 추가된 정상 병합을 거부하면
-      안 된다.
-    - ``ignore_deadline`` 이면 마감 키를 보지 않는다 (같은 URL은 적재월이
-      달라도 같은 글이다).
+    - 한쪽에 주체 메타데이터가 **없으면** 주체를 비교하지 않는다 - 대표에만
+      메타데이터가 추가된 정상 병합을 거부하면 안 된다.
+    - 한쪽이 **"전국"** 이면 어떤 지역과도 호환된다 (4차 게이트 #8).
+    - ``ignore_deadline`` 이면 **마감을 모르는 경우에만** 마감 키를 넘긴다.
+      실제 종료일이 서로 다르면 같은 공고가 아니다.
 
     Args:
         first: 키 하나
         second: 키 둘
-        ignore_deadline: 마감 키 비교를 건너뛴다
+        ignore_deadline: 마감을 모를 때 마감 키 비교를 건너뛴다
 
     Returns:
         같은 공고로 볼 수 있으면 True
     """
     if first[0] != second[0]:
         return False
-    if first[1] and second[1] and first[1] != second[1]:
+    subjects_differ = bool(first[1]) and bool(second[1]) and first[1] != second[1]
+    if subjects_differ and not (is_nationwide(first[1]) or is_nationwide(second[1])):
         return False
     if first[2] == second[2]:
         return True
-    # 마감 키가 다르다 - 완화는 **마감을 모르는 경우**(month: 대체값)에만
-    # 허용한다. 실제 종료일이 서로 다르면 같은 공고가 아니다 (같은 URL이라도).
     if ignore_deadline and (
         first[2].startswith("month:") or second[2].startswith("month:")
         or not first[2] or not second[2]

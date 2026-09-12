@@ -47,14 +47,20 @@ def make_stub() -> _Stub:
         return _Stub(source_name="stub")
 
 
-def fake_response(html: str):
-    body = html.encode("utf-8")
-    response = MagicMock()
-    response.encoding = "utf-8"
-    response.headers = {"Content-Length": str(len(body))}
-    response.iter_content.return_value = [body]
-    response.raise_for_status.return_value = None
-    return response
+def worker_html(html: str):
+    """``run_detail_worker`` 대역 - 상세 수집은 자식 프로세스가 한다."""
+    from alert.crawlers.detail_quotes import extract_quotes, normalize_text
+
+    def run(items):
+        return (
+            [
+                {"source_id": str(item["source_id"]),
+                 "quotes": extract_quotes(normalize_text(html))}
+                for item in items
+            ],
+            False,
+        )
+    return run
 
 
 def raw_items():
@@ -100,18 +106,22 @@ class TestQuoteReCollectionReachesTheDatabase:
         """한 번의 수집 - DB에서 인용 보유 목록을 받아 상세를 훑고 다시 저장."""
         crawler = crawler or make_stub()
         crawler.set_quoted_source_ids(database.get_quoted_source_ids("stub"))
+        crawler.set_quote_attempts(database.get_quote_attempts("stub"))
         items = raw_items()
-        with patch.object(
-            crawler.session, "get", return_value=fake_response(DETAIL_HTML)
-        ) as mock_get:
-            with patch("alert.crawlers.base.DETAIL_DELAY_SEC", 0.0):
-                crawler.enrich_with_quotes(items)
+        sent: list = []
+
+        def run(payload):
+            sent.extend(payload)
+            return worker_html(DETAIL_HTML)(payload)
+
+        with patch.object(crawler, "run_detail_worker", run):
+            crawler.enrich_with_quotes(items)
         merged = 0
         for item in items:
             if database.is_duplicate(item.source, item.source_id):
                 if database.merge_quote_fields(item):
                     merged += 1
-        return mock_get.call_count, merged
+        return len(sent), merged
 
     def test_three_runs_cover_every_item(self, db):
         """25건 목록: 요청 20/5/0, DB 인용 20/25/25."""
@@ -224,3 +234,128 @@ class TestFinalGateRegionKey:
         second = group_key("공고", [], None, "2026-09")
         assert first != second
         assert keys_compatible(first, second, ignore_deadline=True) is True
+
+
+class TestNoQuotePagesStillGetCovered:
+    """4차 게이트 #6: 인용이 **없는** 목록도 전부 훑어야 한다.
+
+    이전에는 인용을 못 얻은 항목에 아무 기록도 남지 않아, 목록이 요청
+    상한보다 길면 같은 앞쪽 20건만 영원히 다시 요청했다(요청 20/20/20,
+    고유 URL 20개). 시도 시각을 남기면 다음 실행이 나머지를 본다.
+    """
+
+    EMPTY_HTML = "<div class='board_view'>본문에 기간 문구가 없다</div>"
+
+    def run_once(self, database):
+        crawler = make_stub()
+        crawler.set_quoted_source_ids(database.get_quoted_source_ids("stub"))
+        crawler.set_quote_attempts(database.get_quote_attempts("stub"))
+        items = raw_items()
+        sent: list = []
+
+        def run(payload):
+            sent.extend(payload)
+            return worker_html(self.EMPTY_HTML)(payload)
+
+        with patch.object(crawler, "run_detail_worker", run):
+            crawler.enrich_with_quotes(items)
+        for item in items:
+            if database.is_duplicate(item.source, item.source_id):
+                database.merge_quote_fields(item)
+        return [entry["source_id"] for entry in sent]
+
+    def test_two_runs_visit_every_url(self, db):
+        """인용이 없어도 두 번째 실행이 **아직 안 본 5건을 먼저** 본다.
+
+        인용을 못 얻은 항목은 계속 후보로 남는 것이 맞다(나중에 기간 문구가
+        붙을 수 있다). 지켜야 하는 것은 "같은 앞쪽 20건만 영원히 다시
+        요청" 하지 않는 것이다 - 그래서 검증 대상은 **우선순위와 도달률**이다.
+        """
+        first = self.run_once(db)
+        assert len(first) == MAX_DETAIL_REQUESTS
+        assert set(first) == {str(i) for i in range(MAX_DETAIL_REQUESTS)}
+
+        attempts = db.get_quote_attempts("stub")
+        assert len(attempts) == MAX_DETAIL_REQUESTS
+
+        second = self.run_once(db)
+        unseen = [str(i) for i in range(MAX_DETAIL_REQUESTS, TOTAL_ITEMS)]
+        # 아직 안 본 5건이 맨 앞에 온다
+        assert second[:len(unseen)] == unseen
+        # 두 실행으로 25건 전부에 도달한다
+        assert set(first) | set(second) == {str(i) for i in range(TOTAL_ITEMS)}
+
+    def test_previously_attempted_items_are_retried_last(self, db):
+        """이미 본 항목은 버려지지 않고 **맨 뒤로** 밀린다."""
+        self.run_once(db)
+        second = self.run_once(db)
+        retried = second[TOTAL_ITEMS - MAX_DETAIL_REQUESTS:]
+        assert retried, "이미 본 항목이 재시도 목록에 남아야 한다"
+        assert all(int(source_id) < MAX_DETAIL_REQUESTS for source_id in retried)
+
+    def test_attempt_only_merge_does_not_touch_quotes(self, db):
+        """시도 기록만 병합해도 기존 인용은 남는다 (게이트 #7)."""
+        item = raw_items()[0]
+        item.raw_data = json.dumps(
+            {"quote_deadline": "접수기간 2026.09.01 ~ 2026.09.30",
+             "quote_period_end": "2026-09-30"},
+            ensure_ascii=False,
+        )
+        assert db.merge_quote_fields(item) is True
+
+        attempt_only = raw_items()[0]
+        attempt_only.raw_data = json.dumps(
+            {"quotes_attempted_at": "2026-09-13T03:00:00"}, ensure_ascii=False
+        )
+        assert db.merge_quote_fields(attempt_only) is True
+
+        stored = db._conn.execute(
+            "SELECT raw_data, period_end FROM announcements"
+            " WHERE source = 'stub' AND source_id = '0'"
+        ).fetchone()
+        payload = json.loads(stored["raw_data"])
+        assert payload["quote_deadline"] == "접수기간 2026.09.01 ~ 2026.09.30"
+        assert stored["period_end"] == "2026-09-30"
+
+    def test_empty_value_never_erases_a_quote(self, db):
+        """빈 값으로는 정상 인용을 덮지 않는다 (게이트 #7)."""
+        item = raw_items()[0]
+        item.raw_data = json.dumps(
+            {"quote_deadline": "접수기간 2026.09.01 ~ 2026.09.30"}, ensure_ascii=False
+        )
+        db.merge_quote_fields(item)
+
+        blank = raw_items()[0]
+        blank.raw_data = json.dumps({"quote_deadline": ""}, ensure_ascii=False)
+        assert db.merge_quote_fields(blank) is False
+
+        stored = db._conn.execute(
+            "SELECT raw_data FROM announcements"
+            " WHERE source = 'stub' AND source_id = '0'"
+        ).fetchone()
+        assert json.loads(stored["raw_data"])["quote_deadline"].startswith("접수기간")
+
+    def test_partial_merge_keeps_other_quotes(self, db):
+        """자격 인용만 새로 와도 기존 마감 인용이 지워지지 않는다."""
+        item = raw_items()[0]
+        item.raw_data = json.dumps(
+            {"quote_deadline": "접수기간 2026.09.01 ~ 2026.09.30",
+             "quote_period_end": "2026-09-30"},
+            ensure_ascii=False,
+        )
+        db.merge_quote_fields(item)
+
+        eligibility = raw_items()[0]
+        eligibility.raw_data = json.dumps(
+            {"quote_eligibility": "지원대상 사회적기업"}, ensure_ascii=False
+        )
+        assert db.merge_quote_fields(eligibility) is True
+
+        stored = db._conn.execute(
+            "SELECT raw_data, period_end FROM announcements"
+            " WHERE source = 'stub' AND source_id = '0'"
+        ).fetchone()
+        payload = json.loads(stored["raw_data"])
+        assert payload["quote_deadline"].startswith("접수기간")
+        assert payload["quote_eligibility"] == "지원대상 사회적기업"
+        assert stored["period_end"] == "2026-09-30"

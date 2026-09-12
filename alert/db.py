@@ -394,38 +394,47 @@ class Database:
         ).fetchall()
         return {str(row["source_id"]) for row in rows}
 
+    QUOTE_FIELDS = (
+        "quote_deadline", "quote_eligibility", "quote_amount",
+        "quote_period_start", "quote_period_end",
+        "always_open", "early_close", "detail_truncated",
+        "quotes_attempted_at",
+    )
+
     def merge_quote_fields(self, announcement: RawAnnouncement) -> bool:
         """이미 저장된 공고에 **새로 얻은 인용**을 합쳐 넣는다.
 
         상세 인용은 목록보다 늦게 도착한다(요청 상한 때문에 다음 실행에서
         오기도 한다). 중복 필터가 그 공고를 걸러 버리면 인용이 영구히
-        버려진다(최종 게이트 #6). 그래서 인용 관련 필드만 upsert 한다.
+        버려진다. 그래서 인용 관련 필드만 upsert 한다.
 
-        기존 ``raw_data`` 는 보존하고 인용 키만 덮어쓰며, 기간 필드는
-        인용 근거(``quote_period_*``)가 있을 때만 갱신한다.
+        **빈 값으로는 지우지 않는다** (4차 게이트 #7): ``{"quote_deadline": ""}``
+        같은 결과가 정상 인용을 덮어써 사라지게 했고, 자격 인용만 새로
+        들어와도 기존 마감 인용·근거·플래그가 함께 지워졌다. 이제 값이 있는
+        키만 덮어쓰고, 없는 키는 **손대지 않는다**.
+
+        인용을 못 얻은 항목도 ``quotes_attempted_at`` 만 기록해 다음 실행이
+        아직 안 본 항목을 먼저 보게 한다 (4차 게이트 #6).
 
         Args:
-            announcement: 인용을 담은 새 수집 결과
+            announcement: 인용(또는 시도 기록)을 담은 새 수집 결과
 
         Returns:
             실제로 갱신했으면 True
         """
-        quote_keys = (
-            "quote_deadline", "quote_eligibility", "quote_amount",
-            "quote_period_start", "quote_period_end",
-            "always_open", "early_close", "detail_truncated",
-        )
         try:
             incoming = json.loads(announcement.raw_data or "{}")
         except (ValueError, TypeError):
             return False
         if not isinstance(incoming, dict):
             return False
-        fresh = {key: incoming[key] for key in quote_keys if key in incoming}
-        if not any(
-            key in fresh
-            for key in ("quote_deadline", "quote_eligibility", "quote_amount")
-        ):
+
+        fresh = {
+            key: incoming[key]
+            for key in self.QUOTE_FIELDS
+            if key in incoming and incoming[key] not in ("", None, {}, [])
+        }
+        if not fresh:
             return False
 
         row = self._conn.execute(
@@ -444,15 +453,21 @@ class Database:
             stored = {}
         if not isinstance(stored, dict):
             stored = {}
-        # 인용이 교체되면 예전 파생 플래그를 남기지 않는다
-        for key in quote_keys:
-            stored.pop(key, None)
+
+        # 인용 **본문**이 새로 왔을 때만 그 계열의 파생값을 정리한다.
+        # 시도 기록만 왔다면 기존 인용을 건드리지 않는다.
+        has_new_quote = any(
+            key in fresh
+            for key in ("quote_deadline", "quote_eligibility", "quote_amount")
+        )
+        if has_new_quote and "quote_deadline" in fresh:
+            for key in ("quote_period_start", "quote_period_end",
+                        "always_open", "early_close"):
+                stored.pop(key, None)
         stored.update(fresh)
 
         period_start = fresh.get("quote_period_start") or row["period_start"]
         period_end = fresh.get("quote_period_end") or row["period_end"]
-        if fresh.get("always_open") and not fresh.get("quote_period_end"):
-            period_end = row["period_end"]
 
         self._conn.execute(
             _sql(
@@ -470,6 +485,30 @@ class Database:
         if self._backend == "sqlite":
             self._conn.commit()
         return True
+
+    def get_quote_attempts(self, source: str) -> Dict[str, str]:
+        """source_id -> 마지막 상세 시도 시각.
+
+        인용을 얻지 못한 항목도 시도 시각이 남으므로, 다음 실행이 **아직 안
+        본 항목부터** 볼 수 있다. 이것이 없으면 목록이 요청 상한보다 길 때
+        같은 앞쪽 20건만 영원히 다시 요청한다 (4차 게이트 #6).
+        """
+        rows = self._conn.execute(
+            _sql(
+                "SELECT source_id, raw_data FROM announcements"
+                " WHERE source = ? AND raw_data LIKE '%quotes_attempted_at%'"
+            ),
+            (source,),
+        ).fetchall()
+        attempts: Dict[str, str] = {}
+        for row in rows:
+            try:
+                payload = json.loads(row["raw_data"] or "{}")
+            except (ValueError, TypeError):
+                continue
+            if isinstance(payload, dict) and payload.get("quotes_attempted_at"):
+                attempts[str(row["source_id"])] = str(payload["quotes_attempted_at"])
+        return attempts
 
     def search_announcements(self, query: str, limit: int = 20) -> List[AnalyzedAnnouncement]:
         """Full-text search across title and summary.

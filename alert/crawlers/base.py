@@ -1,29 +1,28 @@
 """크롤러 추상 베이스 클래스"""
 import abc
 import json
-import threading
+import subprocess
+import sys
 import time
 import requests
-from typing import Dict, Iterable, List, Optional
+from datetime import datetime
+from pathlib import Path
+from typing import Dict, Iterable, List, Optional, Tuple
 from ..models import RawAnnouncement
 from ..config import get_config
 from ..utils.logger import setup_logger
 from .detail_quotes import (
     ALWAYS_OPEN,
-    BROWSER_USER_AGENT,
     DETAIL_BUDGET_SEC,
     DETAIL_DELAY_SEC,
     DETAIL_REQUEST_DEADLINE,
-    DETAIL_TIMEOUT,
     DETAIL_TRUNCATED,
     EARLY_CLOSE,
-    MAX_DETAIL_BYTES,
     MAX_DETAIL_REQUESTS,
+    QUOTES_ATTEMPTED_AT,
+    WORKER_MODULE,
     apply_quote_period,
-    complete_html_prefix,
-    extract_quotes,
     has_quote_keys,
-    normalize_text,
 )
 
 
@@ -50,6 +49,9 @@ class BaseCrawler(abc.ABC):
         # 이미 인용을 받은 공고의 source_id. 파이프라인이 DB에서 읽어 넣어
         # 주면 그 항목은 요청 예산을 쓰지 않는다 (Codex 재검토 #11).
         self._quoted_source_ids: set = set()
+        # source_id -> 마지막 상세 시도 시각. 오래된 것부터 다시 시도해
+        # 목록 뒤쪽이 영구히 미수집으로 남지 않게 한다 (4차 게이트 #6).
+        self._quote_attempts: Dict[str, str] = {}
 
     @abc.abstractmethod
     def fetch(self) -> List[RawAnnouncement]:
@@ -123,180 +125,137 @@ class BaseCrawler(abc.ABC):
         source_cfg = self.config.crawler.sources.get(self.source_name)
         return getattr(source_cfg, "fetch_detail", False) is True
 
+    def set_quoted_source_ids(self, source_ids: Iterable[str]) -> None:
+        """이미 인용을 받은 공고의 source_id를 알려 준다."""
+        self._quoted_source_ids = {str(value) for value in source_ids}
+
+    def set_quote_attempts(self, attempts: Dict[str, str]) -> None:
+        """source_id -> 마지막 시도 시각. 오래된 것부터 다시 시도한다."""
+        self._quote_attempts = {str(k): str(v or "") for k, v in (attempts or {}).items()}
+
     @staticmethod
-    def _decode(body: bytes, header_encoding: Optional[str]) -> str:
-        """응답 본문을 디코드한다 (헤더 우선, 그다음 utf-8/cp949 시도)."""
-        candidates = [header_encoding, "utf-8", "cp949"]
-        for encoding in candidates:
-            if not encoding:
-                continue
-            try:
-                return body.decode(encoding)
-            except (UnicodeDecodeError, LookupError):
-                continue
-        return body.decode("utf-8", errors="replace")
+    def _worker_cwd() -> str:
+        """``alert`` 패키지를 import 할 수 있는 작업 디렉터리."""
+        return str(Path(__file__).resolve().parent.parent.parent)
 
-    def _read_body(self, response, holder: Dict[str, object]) -> None:
-        """응답 본문을 상한까지 읽어 ``holder`` 에 담는다 (작업 스레드용)."""
-        try:
-            chunks = []
-            total = 0
-            truncated = False
-            for chunk in response.iter_content(chunk_size=8192):
-                if not chunk:
-                    continue
-                remaining = MAX_DETAIL_BYTES - total
-                if len(chunk) >= remaining:
-                    chunks.append(chunk[:remaining])
-                    truncated = True
-                    break
-                chunks.append(chunk)
-                total += len(chunk)
-            holder["body"] = b"".join(chunks)
-            holder["truncated"] = truncated
-            holder["encoding"] = response.encoding
-        except Exception as exc:  # 네트워크·소켓 종료 등
-            holder["error"] = exc
+    def run_detail_worker(
+        self, items: List[dict]
+    ) -> Tuple[List[dict], bool]:
+        """상세 수집을 **자식 프로세스**에 맡긴다.
 
-    def fetch_detail_quotes(
-        self, detail_url: str, deadline: Optional[float] = None
-    ) -> Dict[str, str]:
-        """상세 페이지에서 마감/자격/금액 인용을 가져온다.
-
-        브라우저 User-Agent, 10초 연결/읽기 타임아웃, **재시도 없음**,
-        본문 ``MAX_DETAIL_BYTES`` 상한으로 요청한다.
-
-        **읽는 도중에도 시간을 검사한다** (Codex 재검토 #8 NOT FIXED):
-        ``requests`` 의 timeout은 "청크 사이 간격" 만 보므로 8KB를 9초마다
-        흘려보내는 서버에는 걸리지 않는다(실측 단일 요청 1,152초). 그래서
-        청크마다 벽시계를 확인해 요청당 ``DETAIL_REQUEST_DEADLINE`` 초,
-        그리고 호출자가 준 소스 예산 ``deadline`` 을 넘기면 즉시 중단한다.
-
-        상한을 넘으면 거부하지 않고 거기까지만 읽어 파싱한다. 다만 **절단된
-        꼬리는 버린다**(``complete_html_prefix``) - ``2026.09.30`` 이
-        ``2026.09.3`` 으로 잘려 09-03이 되거나 끊긴 속성이 본문으로 새는
-        것을 막는다 (재검토 #8).
+        프로세스 경계가 유일하게 협조를 요구하지 않는 시간 상한이다.
+        ``subprocess.run(timeout=…)`` 이 프로세스를 죽이므로 느린 소켓,
+        동기 ``close()``, 폭주하는 파서 무엇도 예산을 넘길 수 없다. 자식이
+        항목마다 한 줄씩 flush 하므로 **부분 결과는 살아남는다**.
 
         Args:
-            detail_url: 상세 페이지 URL
-            deadline: 이 monotonic 시각을 넘기면 중단한다 (소스 예산)
+            items: ``[{"source_id":…, "url":…}, …]``
 
         Returns:
-            찾은 인용만 담은 딕셔너리. 실패하거나 문구가 없으면 빈 딕셔너리.
-            절단된 경우 ``detail_truncated`` 키가 함께 들어간다
+            ``(결과 줄 리스트, 시간초과 여부)``
         """
-        if not detail_url:
-            return {}
+        if not items:
+            return [], False
 
-        started = time.monotonic()
-        limit = DETAIL_REQUEST_DEADLINE
-        if deadline is not None:
-            limit = min(limit, max(0.0, deadline - started))
-        if limit <= 0:
-            self.logger.warning(
-                f"{self.source_name}: no time left for detail {detail_url}"
-            )
-            return {}
-
+        command = [
+            sys.executable, "-m", WORKER_MODULE,
+            "--source", self.source_name,
+            "--item-deadline", str(DETAIL_REQUEST_DEADLINE),
+            "--delay", str(DETAIL_DELAY_SEC),
+        ]
+        payload = json.dumps(items, ensure_ascii=False)
+        stdout = ""
+        timed_out = False
+        began = time.monotonic()
         try:
-            response = self.session.get(
-                detail_url,
-                timeout=DETAIL_TIMEOUT,
-                headers={"User-Agent": BROWSER_USER_AGENT},
-                stream=True,
+            completed = subprocess.run(
+                command,
+                input=payload,
+                capture_output=True,
+                text=True,
+                timeout=DETAIL_BUDGET_SEC,
+                cwd=self._worker_cwd(),
             )
-            response.raise_for_status()
-        except requests.RequestException as exc:
-            self.logger.warning(f"Detail fetch failed for {detail_url}: {exc}")
-            return {}
-
-        declared = response.headers.get("Content-Length")
-        if declared and declared.isdigit() and int(declared) > MAX_DETAIL_BYTES:
-            self.logger.info(
-                f"Detail body declared {declared} bytes, reading first "
-                f"{MAX_DETAIL_BYTES} for {detail_url}"
+            stdout = completed.stdout or ""
+            if completed.returncode != 0:
+                self.logger.warning(
+                    f"{self.source_name}: detail worker exited "
+                    f"{completed.returncode}: {(completed.stderr or '')[-300:]}"
+                )
+        except subprocess.TimeoutExpired as exc:
+            timed_out = True
+            partial = exc.stdout or ""
+            if isinstance(partial, bytes):
+                partial = partial.decode("utf-8", errors="replace")
+            stdout = partial
+            self.logger.warning(
+                f"{self.source_name}: detail worker killed at "
+                f"{DETAIL_BUDGET_SEC}s budget after {time.monotonic() - began:.1f}s "
+                f"(부분 결과 {len(stdout.splitlines())}줄 보존)"
             )
+        except (OSError, ValueError) as exc:
+            self.logger.warning(
+                f"{self.source_name}: detail worker could not run: {exc}"
+            )
+            return [], False
 
-        # 본문 읽기는 **작업 스레드**에서 한다. requests/urllib3 의 iterator는
-        # chunk_size 만큼 모일 때까지 반환하지 않으므로, 1바이트를 9초마다
-        # 보내는 서버에서는 첫 청크까지 73,728초가 걸린다 - 청크마다 시간을
-        # 재는 것으로는 막을 수 없었다(최종 게이트 #2). join(timeout) 으로
-        # 벽시계 상한을 **바깥에서** 강제한다.
-        holder: Dict[str, object] = {}
-        worker = threading.Thread(
-            target=self._read_body,
-            args=(response, holder),
-            name=f"detail-{self.source_name}",
-            daemon=True,
-        )
-        worker.start()
-        worker.join(timeout=limit)
-
-        if worker.is_alive():
-            # 소켓을 닫아 읽기를 풀어 주고 (데몬 스레드라) 뒤는 돌아보지 않는다
+        results = []
+        for line in stdout.splitlines():
+            line = line.strip()
+            if not line:
+                continue
             try:
-                response.close()
-            except Exception:  # pragma: no cover - 닫기 실패는 무해하다
-                pass
-            self.logger.warning(
-                f"Detail read hit its wall-clock limit ({limit:.1f}s), "
-                f"abandoning {detail_url}"
-            )
-            return {}
+                parsed = json.loads(line)
+            except ValueError:
+                continue
+            if isinstance(parsed, dict):
+                results.append(parsed)
+        self.logger.info(
+            f"{self.source_name}: detail worker returned {len(results)}/"
+            f"{len(items)} items in {time.monotonic() - began:.1f}s"
+        )
+        return results, timed_out
 
-        try:
-            response.close()
-        except Exception:  # pragma: no cover
-            pass
+    def _detail_candidates(
+        self, announcements: List[RawAnnouncement], skip: set
+    ) -> List[RawAnnouncement]:
+        """상세를 받아야 하는 항목을 **오래 안 본 것부터** 고른다.
 
-        if holder.get("error") is not None:
-            self.logger.warning(
-                f"Detail read failed for {detail_url}: {holder['error']}"
-            )
-            return {}
-
-        body = holder.get("body") or b""
-        truncated = bool(holder.get("truncated"))
-        encoding = holder.get("encoding")
-        html = self._decode(body, encoding)
-        if truncated:
-            html = complete_html_prefix(html)
-            self.logger.warning(
-                f"Detail body truncated for {detail_url} "
-                f"(불완전한 꼬리는 버렸다; 인용 없으면 원문 확인으로 남는다)"
-            )
-        quotes = extract_quotes(normalize_text(html))
-        if quotes and truncated:
-            quotes = dict(quotes)
-            quotes[DETAIL_TRUNCATED] = True
-        return quotes
-
-    def set_quoted_source_ids(self, source_ids: Iterable[str]) -> None:
-        """이미 인용을 받은 공고의 source_id를 알려 준다.
-
-        파이프라인이 DB에서 읽어 넣어 주면 그 항목은 요청 예산을 쓰지 않아
-        목록 뒤쪽 항목이 상한 때문에 영구히 미수집되는 일이 없어진다
-        (Codex 재검토 #11).
+        인용이 이미 있는 항목과 건너뛰라고 받은 항목은 예산을 쓰지 않는다.
+        나머지는 마지막 시도 시각 오름차순(시도 없음이 먼저)으로 정렬해
+        목록이 상한보다 길어도 뒤쪽이 영구히 미수집으로 남지 않게 한다
+        (4차 게이트 #6).
         """
-        self._quoted_source_ids = {str(value) for value in source_ids}
+        candidates = []
+        for announcement in announcements:
+            url = announcement.url or ""
+            if not url or url.endswith("#void"):
+                continue
+            if str(announcement.source_id) in skip:
+                continue
+            payload = self._load_raw(announcement)
+            if has_quote_keys(payload):
+                continue
+            attempted = str(
+                payload.get(QUOTES_ATTEMPTED_AT)
+                or self._quote_attempts.get(str(announcement.source_id), "")
+            )
+            candidates.append((attempted, announcement))
+
+        candidates.sort(key=lambda pair: pair[0])
+        return [announcement for _attempted, announcement in candidates]
 
     def enrich_with_quotes(
         self,
         announcements: List[RawAnnouncement],
         skip_source_ids: Optional[Iterable[str]] = None,
     ) -> List[RawAnnouncement]:
-        """각 공고의 상세 페이지를 1초 1건으로 훑어 인용을 채운다.
+        """상세 페이지 인용을 채운다 (자식 프로세스 격리 실행).
 
         ``fetch_detail`` 이 꺼져 있으면 아무것도 하지 않는다. 인용이 없으면
-        키를 만들지 않는다 - 값을 지어내지 않는 것이 계약이다.
-
-        실행시간 상한: 소스·실행당 새 요청 ``MAX_DETAIL_REQUESTS`` 건,
-        총 ``DETAIL_BUDGET_SEC`` 초(읽는 도중에도 검사), 요청당
-        ``DETAIL_REQUEST_DEADLINE`` 초. 한도에 걸리면 경고를 남기고
-        멈춘다(수집 자체는 실패시키지 않는다).
-
-        이미 인용이 있는 항목, ``skip_source_ids``, DB에서 받은
-        ``set_quoted_source_ids`` 항목은 **예산을 쓰지 않는다**.
+        키를 만들지 않는다 - 값을 지어내지 않는 것이 계약이다. 인용을 얻지
+        못한 항목도 **시도 시각을 남겨** 다음 실행이 다른 항목을 먼저 보게
+        한다.
 
         Args:
             announcements: 목록 단계에서 만든 공고 리스트 (제자리에서 수정)
@@ -310,38 +269,26 @@ class BaseCrawler(abc.ABC):
 
         skip = set(self._quoted_source_ids)
         skip.update(str(value) for value in (skip_source_ids or ()))
-        started = time.monotonic()
-        budget_deadline = started + DETAIL_BUDGET_SEC
-        made = 0
+        candidates = self._detail_candidates(announcements, skip)[
+            :MAX_DETAIL_REQUESTS
+        ]
+        if not candidates:
+            return announcements
 
-        for announcement in announcements:
-            url = announcement.url or ""
-            if not url or url.endswith("#void"):
-                continue
-            if str(announcement.source_id) in skip:
-                continue
-            if has_quote_keys(self._load_raw(announcement)):
-                continue
+        items = [
+            {"source_id": str(a.source_id), "url": a.url} for a in candidates
+        ]
+        results, _timed_out = self.run_detail_worker(items)
+        by_source_id = {str(r.get("source_id", "")): r for r in results}
 
-            if made >= MAX_DETAIL_REQUESTS:
-                self.logger.warning(
-                    f"{self.source_name}: detail request cap "
-                    f"({MAX_DETAIL_REQUESTS}) reached, skipping the rest"
-                )
-                break
-            if time.monotonic() > budget_deadline:
-                self.logger.warning(
-                    f"{self.source_name}: detail time budget "
-                    f"({DETAIL_BUDGET_SEC}s) exhausted after {made} requests"
-                )
-                break
-
-            if made:
-                time.sleep(DETAIL_DELAY_SEC)
-            quotes = self.fetch_detail_quotes(url, deadline=budget_deadline)
-            made += 1
-            if quotes:
-                self._apply_quotes(announcement, quotes)
+        for announcement in candidates:
+            result = by_source_id.get(str(announcement.source_id))
+            if result is None:
+                continue  # 자식이 여기까지 오지 못했다 - 시도로 치지 않는다
+            quotes = result.get("quotes") or {}
+            if not isinstance(quotes, dict):
+                quotes = {}
+            self._apply_quotes(announcement, quotes, result=result)
 
         return announcements
 
@@ -357,17 +304,22 @@ class BaseCrawler(abc.ABC):
         return loaded if isinstance(loaded, dict) else {"list_raw": announcement.raw_data}
 
     def _apply_quotes(
-        self, announcement: RawAnnouncement, quotes: Dict[str, str]
+        self,
+        announcement: RawAnnouncement,
+        quotes: Dict[str, str],
+        result: Optional[dict] = None,
     ) -> None:
         """인용을 raw_data에 싣고, 확신할 수 있는 날짜만 기간 필드에 반영한다.
 
-        **명시된 날짜가 "상시" 보다 우선한다** (Codex 재검토 #9). 인용에서
-        종료일이 잡히면 그 값을 쓰고, "예산 소진 시 조기마감" 은 마감이 있는
-        공고이므로 ``early_close`` 로만 표시한다. 종료일이 전혀 없고
-        "상시/수시/연중" 만 있을 때 ``always_open`` 으로 표시하며, 이 경우에도
-        제목 등에서 이미 확정된 마감은 **지우지 않는다** - 명시된 날짜가 이긴다.
+        **명시된 날짜가 "상시" 보다 우선한다**. 인용에서 종료일이 잡히면 그
+        값을 쓰고, "예산 소진 시 조기마감" 은 마감이 있는 공고이므로
+        ``early_close`` 로만 표시한다. 종료일이 전혀 없고 "상시/수시/연중" 만
+        있을 때 ``always_open`` 이며, 그때도 이미 확정된 마감은 지우지 않는다.
+
+        인용이 없어도 **시도 시각**을 남긴다 - 다음 실행이 아직 안 본 항목을
+        먼저 보게 하는 근거다 (4차 게이트 #6).
         """
-        truncated = bool(quotes.pop(DETAIL_TRUNCATED, False))
+        result = result or {}
         start, end, always_open, early_close = apply_quote_period(quotes)
         if start:
             announcement.period_start = start
@@ -375,26 +327,29 @@ class BaseCrawler(abc.ABC):
             announcement.period_end = end
 
         payload = self._load_raw(announcement)
-        payload.update(quotes)
-        # 인용이 교체되면 예전 파생값을 남기지 않는다 (최종 게이트 #9)
-        payload.pop("quote_period_start", None)
-        payload.pop("quote_period_end", None)
-        if start:
-            payload["quote_period_start"] = start
-        if end:
-            payload["quote_period_end"] = end
-        if always_open:
-            payload[ALWAYS_OPEN] = True
-        else:
-            payload.pop(ALWAYS_OPEN, None)
-        # 조기마감도 **매번 다시 계산**한다. 조건 없는 인용으로 교체되면
-        # 플래그가 남아 브리핑이 없는 조건을 말하게 된다 (최종 게이트 #9).
-        if early_close:
-            payload[EARLY_CLOSE] = True
-        else:
-            payload.pop(EARLY_CLOSE, None)
-        if truncated:
+        payload[QUOTES_ATTEMPTED_AT] = datetime.now().isoformat()
+        if result.get("truncated"):
             payload[DETAIL_TRUNCATED] = True
+        else:
+            payload.pop(DETAIL_TRUNCATED, None)
+
+        if quotes:
+            payload.update(quotes)
+            # 인용이 교체되면 예전 파생값을 남기지 않는다
+            payload.pop("quote_period_start", None)
+            payload.pop("quote_period_end", None)
+            if start:
+                payload["quote_period_start"] = start
+            if end:
+                payload["quote_period_end"] = end
+            if always_open:
+                payload[ALWAYS_OPEN] = True
+            else:
+                payload.pop(ALWAYS_OPEN, None)
+            if early_close:
+                payload[EARLY_CLOSE] = True
+            else:
+                payload.pop(EARLY_CLOSE, None)
 
         announcement.raw_data = json.dumps(payload, ensure_ascii=False)
 

@@ -6,7 +6,8 @@ kofpi / coop / seis 실제 상세 페이지를 잘라 만든 fixture로 검증�
 """
 
 import json
-import threading
+import subprocess
+import sys
 import time
 from datetime import date
 from pathlib import Path
@@ -14,9 +15,11 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+import alert.crawlers.detail_quotes as detail_quotes
 from alert.crawlers.base import BaseCrawler
 from alert.crawlers.detail_quotes import (
     ALWAYS_OPEN,
+    DETAIL_BUDGET_SEC,
     DETAIL_TRUNCATED,
     EARLY_CLOSE,
     MAX_DETAIL_BYTES,
@@ -27,7 +30,8 @@ from alert.crawlers.detail_quotes import (
     extract_quotes,
     flatten,
     has_quote_keys,
-    complete_html_prefix,
+    QUOTES_ATTEMPTED_AT,
+    WORKER_MODULE,
     is_always_open,
     is_early_close,
     normalize_text,
@@ -334,32 +338,59 @@ def make_announcement(source_id: str = "1") -> RawAnnouncement:
     )
 
 
-def fake_response(text: str, chunks: int = 1, content_length: bool = True):
-    """스트리밍 응답 목(mock)."""
-    body = text.encode("utf-8")
-    size = max(1, len(body) // chunks + 1)
-    response = MagicMock()
-    response.encoding = "utf-8"
-    response.headers = {"Content-Length": str(len(body))} if content_length else {}
-    response.iter_content.return_value = [
-        body[i:i + size] for i in range(0, len(body), size)
-    ]
-    response.raise_for_status.return_value = None
-    return response
+def quotes_for(html: str) -> dict:
+    """HTML에서 인용을 뽑는다 (자식 프로세스가 하는 일과 같다)."""
+    return extract_quotes(normalize_text(html))
+
+
+def fake_worker(mapping: dict, timed_out: bool = False):
+    """``run_detail_worker`` 대역 - source_id -> 결과 딕셔너리."""
+    def run(items):
+        results = []
+        for item in items:
+            source_id = str(item["source_id"])
+            if source_id not in mapping:
+                continue
+            payload = dict(mapping[source_id])
+            payload["source_id"] = source_id
+            results.append(payload)
+        return results, timed_out
+    return run
+
+
+def worker_html(html: str):
+    """모든 항목에 같은 HTML의 인용을 주는 워커 대역."""
+    def run(items):
+        return (
+            [
+                {"source_id": str(item["source_id"]), "quotes": quotes_for(html)}
+                for item in items
+            ],
+            False,
+        )
+    return run
+
+
+def collecting_worker(sent: list, results=None, timed_out: bool = False):
+    """워커에 실제로 무엇이 전달됐는지 기록하는 대역."""
+    def run(items):
+        sent.extend(items)
+        return list(results or []), timed_out
+    return run
 
 
 class TestEnrichWithQuotes:
     """상세 수집은 소스별 opt-in이며, 없는 값을 채우지 않는다."""
 
     def test_disabled_by_default(self):
-        """fetch_detail이 꺼져 있으면 요청조차 하지 않는다."""
+        """fetch_detail이 꺼져 있으면 워커를 띄우지 않는다."""
         crawler = make_stub(fetch_detail=False)
         assert crawler.wants_detail() is False
 
         announcement = make_announcement()
-        with patch.object(crawler.session, "get") as mock_get:
+        with patch.object(crawler, "run_detail_worker") as mock_worker:
             crawler.enrich_with_quotes([announcement])
-        mock_get.assert_not_called()
+        mock_worker.assert_not_called()
         assert json.loads(announcement.raw_data) == {"title": "테스트 공고"}
 
     def test_mock_config_does_not_enable_detail(self):
@@ -380,17 +411,8 @@ class TestEnrichWithQuotes:
         announcement = make_announcement()
         html = (FIXTURES / "kofpi_detail.html").read_text(encoding="utf-8")
 
-        with patch.object(
-            crawler.session, "get", return_value=fake_response(html)
-        ) as mock_get:
-            with patch("alert.crawlers.base.time.sleep") as mock_sleep:
-                crawler.enrich_with_quotes([announcement])
-
-        mock_sleep.assert_not_called()  # 첫 건은 대기 없음
-        _, kwargs = mock_get.call_args
-        assert kwargs["timeout"] == 10
-        assert kwargs["headers"]["User-Agent"].startswith("Mozilla/5.0")
-        assert kwargs["stream"] is True
+        with patch.object(crawler, "run_detail_worker", worker_html(html)):
+            crawler.enrich_with_quotes([announcement])
 
         payload = json.loads(announcement.raw_data)
         assert payload["title"] == "테스트 공고"           # 목록 정보 보존
@@ -398,11 +420,11 @@ class TestEnrichWithQuotes:
         assert payload[QUOTE_ELIGIBILITY].startswith("모집대상")
         assert payload["quote_period_start"] == "2026-09-07"
         assert payload["quote_period_end"] == "2026-09-30"
+        assert payload[QUOTES_ATTEMPTED_AT]
         assert announcement.period_start == "2026-09-07"
         assert announcement.period_end == "2026-09-30"
 
     def test_always_open_is_flagged_without_inventing_a_deadline(self):
-        """"상시" 인용은 마감을 만들지 않고 always_open 으로 표시한다."""
         crawler = make_stub(fetch_detail=True)
         announcement = make_announcement()
         html = (
@@ -411,7 +433,7 @@ class TestEnrichWithQuotes:
             "<tr><th>작성일</th><td>2026.09.11</td></tr></table></div>"
         )
 
-        with patch.object(crawler.session, "get", return_value=fake_response(html)):
+        with patch.object(crawler, "run_detail_worker", worker_html(html)):
             crawler.enrich_with_quotes([announcement])
 
         payload = json.loads(announcement.raw_data)
@@ -420,28 +442,23 @@ class TestEnrichWithQuotes:
         assert announcement.period_end is None      # 게시일을 끌어오지 않는다
 
     def test_explicit_deadline_survives_an_always_open_detail(self):
-        """제목에서 확정된 마감은 상세의 "상시" 문구에 지워지지 않는다.
-
-        Codex 재검토 #9: KOFPI 제목 ``마감 변경 모집(~2026.10.31)`` 이
-        상세 ``모집기간 상시`` 때문에 NULL이 되어 살아있는 공고를 잃었다.
-        """
+        """제목에서 확정된 마감은 상세의 "상시" 문구에 지워지지 않는다."""
         crawler = make_stub(fetch_detail=True)
         announcement = make_announcement()
-        announcement.period_end = "2026-10-31"      # 제목에서 뽑은 마감
+        announcement.period_end = "2026-10-31"
         html = (
             '<div class="board_view"><table>'
             "<tr><th>모집기간</th><td>상시</td></tr></table></div>"
         )
 
-        with patch.object(crawler.session, "get", return_value=fake_response(html)):
+        with patch.object(crawler, "run_detail_worker", worker_html(html)):
             crawler.enrich_with_quotes([announcement])
 
         payload = json.loads(announcement.raw_data)
         assert announcement.period_end == "2026-10-31"   # 명시된 날짜가 이긴다
-        assert payload[ALWAYS_OPEN] is True              # 상시 표시는 남긴다
+        assert payload[ALWAYS_OPEN] is True
 
     def test_early_close_keeps_the_deadline(self):
-        """"예산 소진 시 조기마감" 은 마감이 있는 공고다 (재검토 #9)."""
         crawler = make_stub(fetch_detail=True)
         announcement = make_announcement()
         html = (
@@ -450,7 +467,7 @@ class TestEnrichWithQuotes:
             "</tr></table></div>"
         )
 
-        with patch.object(crawler.session, "get", return_value=fake_response(html)):
+        with patch.object(crawler, "run_detail_worker", worker_html(html)):
             crawler.enrich_with_quotes([announcement])
 
         payload = json.loads(announcement.raw_data)
@@ -458,29 +475,38 @@ class TestEnrichWithQuotes:
         assert payload[EARLY_CLOSE] is True
         assert ALWAYS_OPEN not in payload
 
-    def test_rate_limited_to_one_request_per_second(self):
-        """두 번째 건부터 1초 대기한다."""
+    def test_early_close_flag_is_cleared_on_replacement(self):
+        """조건 없는 인용으로 교체되면 조기마감 표시가 사라진다."""
         crawler = make_stub(fetch_detail=True)
-        items = [make_announcement(str(i)) for i in range(3)]
+        announcement = make_announcement()
+        early = (
+            '<div class="board_view"><table><tr><th>접수기간</th>'
+            "<td>2026.09.01 ~ 2026.09.30 (예산 소진 시 조기마감)</td>"
+            "</tr></table></div>"
+        )
+        plain = (
+            '<div class="board_view"><table><tr><th>접수기간</th>'
+            "<td>2026.10.01 ~ 2026.10.31</td></tr></table></div>"
+        )
 
-        with patch.object(
-            crawler.session, "get", return_value=fake_response("<html>내용 없음</html>")
-        ):
-            with patch("alert.crawlers.base.time.sleep") as mock_sleep:
-                crawler.enrich_with_quotes(items)
+        crawler._apply_quotes(announcement, quotes_for(early))
+        assert json.loads(announcement.raw_data)[EARLY_CLOSE] is True
 
-        assert mock_sleep.call_count == 2
-        assert mock_sleep.call_args_list[0][0][0] == 1.0
+        crawler._apply_quotes(announcement, quotes_for(plain))
+        payload = json.loads(announcement.raw_data)
+        assert EARLY_CLOSE not in payload
+        assert payload["quote_period_end"] == "2026-10-31"
+        assert announcement.period_end == "2026-10-31"
 
-    def test_missing_quotes_leave_keys_absent(self):
-        """페이지에 문구가 없으면 키를 만들지 않고 기간도 건드리지 않는다."""
+    def test_missing_quotes_leave_keys_absent_but_record_the_attempt(self):
+        """문구가 없으면 키를 만들지 않지만 **시도는 기록한다** (게이트 #6)."""
         crawler = make_stub(fetch_detail=True)
         announcement = make_announcement()
         announcement.period_end = None
 
         with patch.object(
-            crawler.session, "get",
-            return_value=fake_response("<div class='board_view'>본문 없음</div>"),
+            crawler, "run_detail_worker",
+            worker_html("<div class='board_view'>본문 없음</div>"),
         ):
             crawler.enrich_with_quotes([announcement])
 
@@ -488,274 +514,403 @@ class TestEnrichWithQuotes:
         assert QUOTE_DEADLINE not in payload
         assert QUOTE_ELIGIBILITY not in payload
         assert QUOTE_AMOUNT not in payload
+        assert payload[QUOTES_ATTEMPTED_AT]
         assert announcement.period_end is None
 
-    def test_failed_request_is_not_fatal(self):
-        """상세 요청이 실패해도 목록 데이터는 그대로 남는다."""
-        import requests
-
+    def test_worker_failure_is_not_fatal(self):
         crawler = make_stub(fetch_detail=True)
         announcement = make_announcement()
 
-        with patch.object(
-            crawler.session, "get", side_effect=requests.Timeout("timed out")
-        ):
+        with patch.object(crawler, "run_detail_worker", lambda items: ([], True)):
             crawler.enrich_with_quotes([announcement])
 
         assert json.loads(announcement.raw_data) == {"title": "테스트 공고"}
 
     def test_unresolved_void_url_is_skipped(self):
-        """#void 처럼 해소되지 않은 링크는 요청하지 않는다."""
         crawler = make_stub(fetch_detail=True)
         announcement = make_announcement()
         announcement.url = "https://example.com/#void"
 
-        with patch.object(crawler.session, "get") as mock_get:
+        sent: list = []
+        with patch.object(crawler, "run_detail_worker", collecting_worker(sent)):
+            crawler.enrich_with_quotes([announcement])
+        assert sent == []
+
+    def test_truncated_result_yields_no_quotes(self):
+        """절단된 응답은 인용을 만들지 않고 표시만 남긴다 (게이트 #2)."""
+        crawler = make_stub(fetch_detail=True)
+        announcement = make_announcement()
+
+        with patch.object(
+            crawler, "run_detail_worker",
+            fake_worker({"1": {"truncated": True, "reason": "body over"}}),
+        ):
             crawler.enrich_with_quotes([announcement])
 
-        mock_get.assert_not_called()
+        payload = json.loads(announcement.raw_data)
+        assert payload[DETAIL_TRUNCATED] is True
+        assert QUOTE_DEADLINE not in payload
+        assert payload[QUOTES_ATTEMPTED_AT]
 
 
-class TestCodexCritiqueExecutionLimits:
-    """크리틱 #8: 상세 수집에 실행시간·요청수 상한이 없던 결함."""
+class TestExecutionLimits:
+    """요청 상한·건너뛰기·순서 (부모 쪽 로직)."""
 
     def test_request_cap_per_run(self):
-        """소스·실행당 새 요청은 MAX_DETAIL_REQUESTS 건을 넘지 않는다."""
         crawler = make_stub(fetch_detail=True)
         items = [make_announcement(str(i)) for i in range(MAX_DETAIL_REQUESTS + 10)]
 
-        with patch.object(
-            crawler.session, "get", return_value=fake_response("<html>x</html>")
-        ) as mock_get:
-            with patch("alert.crawlers.base.time.sleep"):
-                crawler.enrich_with_quotes(items)
-
-        assert mock_get.call_count == MAX_DETAIL_REQUESTS
-
-    def test_time_budget_stops_the_loop(self):
-        """예산을 넘기면 경고를 남기고 멈춘다 (수집은 실패시키지 않는다)."""
-        crawler = make_stub(fetch_detail=True)
-        items = [make_announcement(str(i)) for i in range(5)]
-
-        # 호출마다 100초씩 흘려 두 번째 항목 차례에 예산을 넘긴다
-        ticks = {"now": 0.0}
-
-        def clock():
-            ticks["now"] += 100.0
-            return ticks["now"]
-
-        with patch.object(
-            crawler.session, "get", return_value=fake_response("<html>x</html>")
-        ) as mock_get:
-            with patch("alert.crawlers.base.time.sleep"):
-                with patch("alert.crawlers.base.time.monotonic", clock):
-                    crawler.enrich_with_quotes(items)
-
-        assert 1 <= mock_get.call_count < len(items)
+        sent: list = []
+        with patch.object(crawler, "run_detail_worker", collecting_worker(sent)):
+            crawler.enrich_with_quotes(items)
+        assert len(sent) == MAX_DETAIL_REQUESTS
 
     def test_items_that_already_have_quotes_are_skipped(self):
-        """이미 인용이 있는 항목은 다시 요청하지 않는다."""
         crawler = make_stub(fetch_detail=True)
         done = make_announcement("1")
         done.raw_data = json.dumps({QUOTE_DEADLINE: "접수기간 ..."}, ensure_ascii=False)
         todo = make_announcement("2")
 
-        with patch.object(
-            crawler.session, "get", return_value=fake_response("<html>x</html>")
-        ) as mock_get:
-            with patch("alert.crawlers.base.time.sleep"):
-                crawler.enrich_with_quotes([done, todo])
-
-        assert mock_get.call_count == 1
-        assert mock_get.call_args[0][0].endswith("/view/2")
+        sent: list = []
+        with patch.object(crawler, "run_detail_worker", collecting_worker(sent)):
+            crawler.enrich_with_quotes([done, todo])
+        assert [item["source_id"] for item in sent] == ["2"]
 
     def test_skip_source_ids_are_not_requested(self):
-        """호출자가 건너뛰라고 준 source_id는 요청하지 않는다."""
         crawler = make_stub(fetch_detail=True)
         items = [make_announcement("1"), make_announcement("2")]
 
-        with patch.object(
-            crawler.session, "get", return_value=fake_response("<html>x</html>")
-        ) as mock_get:
-            with patch("alert.crawlers.base.time.sleep"):
-                crawler.enrich_with_quotes(items, skip_source_ids={"1"})
+        sent: list = []
+        with patch.object(crawler, "run_detail_worker", collecting_worker(sent)):
+            crawler.enrich_with_quotes(items, skip_source_ids={"1"})
+        assert [item["source_id"] for item in sent] == ["2"]
 
-        assert mock_get.call_count == 1
-
-    def test_oversize_body_is_truncated_not_refused(self):
-        """상한을 넘는 본문은 거부하지 않고 앞부분까지 읽어 파싱한다.
-
-        2026-09-13 조정자 판정: kofpi 상세 중 698KB 페이지가 있어 거부하면
-        마감을 잃는다. 마감 문구는 본문 앞쪽에 있으므로 절단해도 얻을 수 있다.
-        """
+    def test_never_attempted_items_go_first(self):
+        """시도 기록이 오래된 것부터, 시도 없는 것이 가장 먼저다 (게이트 #6)."""
         crawler = make_stub(fetch_detail=True)
-        head = (
-            '<div class="board_view"><table>'
-            "<tr><th>접수기간</th><td>2026.09.01 ~ 2026.09.30</td></tr>"
-            "</table>"
-        )
-        filler = "<p>" + ("가" * 2000) + "</p>"
-        body = (head + filler * 600 + "</div>").encode("utf-8")
-        assert len(body) > MAX_DETAIL_BYTES
+        items = [make_announcement(str(i)) for i in range(4)]
+        crawler.set_quote_attempts({
+            "0": "2026-09-12T00:00:00",
+            "1": "2026-09-10T00:00:00",
+            "2": "2026-09-11T00:00:00",
+        })
 
+        sent: list = []
+        with patch.object(crawler, "run_detail_worker", collecting_worker(sent)):
+            crawler.enrich_with_quotes(items)
+        assert [item["source_id"] for item in sent] == ["3", "1", "2", "0"]
+
+    def test_attempt_stamp_in_raw_data_also_orders(self):
+        """raw_data에 남은 시도 시각도 순서에 쓰인다."""
+        crawler = make_stub(fetch_detail=True)
+        old = make_announcement("old")
+        old.raw_data = json.dumps(
+            {QUOTES_ATTEMPTED_AT: "2026-09-01T00:00:00"}, ensure_ascii=False
+        )
+        fresh = make_announcement("fresh")
+        fresh.raw_data = json.dumps(
+            {QUOTES_ATTEMPTED_AT: "2026-09-12T00:00:00"}, ensure_ascii=False
+        )
+
+        sent: list = []
+        with patch.object(crawler, "run_detail_worker", collecting_worker(sent)):
+            crawler.enrich_with_quotes([fresh, old])
+        assert [item["source_id"] for item in sent] == ["old", "fresh"]
+
+
+class TestChildFetch:
+    """자식 프로세스의 한 항목 수집 (``detail_quotes.fetch_detail_quotes``)."""
+
+    @staticmethod
+    def _response(body: bytes, headers=None, encoding="utf-8"):
         response = MagicMock()
-        response.encoding = "utf-8"
-        response.headers = {"Content-Length": str(len(body))}
+        response.encoding = encoding
+        response.headers = headers if headers is not None else {}
         response.raise_for_status.return_value = None
         response.iter_content.return_value = [
             body[i:i + 8192] for i in range(0, len(body), 8192)
         ]
+        return response
 
-        with patch.object(crawler.session, "get", return_value=response):
-            quotes = crawler.fetch_detail_quotes("https://example.com/x")
+    def test_quotes_are_extracted_with_split_timeouts(self):
+        html = '<div class="board_view"><p>접수기간 2026.09.01 ~ 2026.09.30</p></div>'
+        session = MagicMock()
+        session.get.return_value = self._response(html.encode("utf-8"))
 
-        assert quotes[QUOTE_DEADLINE] == "접수기간 2026.09.01 ~ 2026.09.30"
+        result = detail_quotes.fetch_detail_quotes(session, "https://example.com/x")
+        assert result["quotes"][QUOTE_DEADLINE] == "접수기간 2026.09.01 ~ 2026.09.30"
+        _args, kwargs = session.get.call_args
+        assert kwargs["timeout"] == (10, 10)
+        assert kwargs["stream"] is True
+
+    def test_declared_oversize_is_skipped_without_reading(self):
+        session = MagicMock()
+        response = self._response(
+            b"", headers={"Content-Length": str(MAX_DETAIL_BYTES + 1)}
+        )
+        session.get.return_value = response
+
+        result = detail_quotes.fetch_detail_quotes(session, "https://example.com/x")
+        assert result["truncated"] is True
+        assert "quotes" not in result
+        response.iter_content.assert_not_called()
+
+    def test_oversize_body_yields_no_quotes(self):
+        """상한을 넘는 본문은 **부분 파싱하지 않는다** (게이트 #2).
+
+        예전에는 "안전한 절단 지점" 을 찾으려 했고, 속성 안쪽·중첩 블록에서
+        거짓 날짜(09-03, 숨은 09-30)를 세 번 만들었다.
+        """
+        html = (
+            '<div class="board_view"><p>접수기간 2026.09.01 ~ 2026.09.30</p>'
+            + "<p>" + "가" * 600_000 + "</p>"
+        )
+        session = MagicMock()
+        session.get.return_value = self._response(html.encode("utf-8"))
+
+        result = detail_quotes.fetch_detail_quotes(session, "https://example.com/x")
+        assert result["truncated"] is True
+        assert "quotes" not in result
+
+    def test_request_error_is_captured(self):
+        import requests
+
+        session = MagicMock()
+        session.get.side_effect = requests.Timeout("timed out")
+        result = detail_quotes.fetch_detail_quotes(session, "https://example.com/x")
+        assert "error" in result
+        assert "quotes" not in result
+
+    def test_parse_failure_is_isolated(self):
+        """한 페이지의 파싱 실패가 결과 전체를 죽이지 않는다 (게이트 #5)."""
+        session = MagicMock()
+        session.get.return_value = self._response(b"<div class='board_view'>x</div>")
+        with patch.object(
+            detail_quotes, "normalize_text", side_effect=RecursionError("boom")
+        ):
+            result = detail_quotes.fetch_detail_quotes(session, "https://example.com/x")
+        assert result["error"].startswith("parse RecursionError")
+
+    def test_deadline_in_the_past_skips(self):
+        session = MagicMock()
+        result = detail_quotes.fetch_detail_quotes(
+            session, "https://example.com/x", deadline=time.monotonic() - 1
+        )
+        assert result == {"skipped": "deadline"}
+        session.get.assert_not_called()
+
+    def test_empty_url_is_an_error(self):
+        assert "error" in detail_quotes.fetch_detail_quotes(MagicMock(), "")
+
+
+class TestWorkerIsolation:
+    """4차 게이트 #1: 프로세스 경계만이 협조 없이 시간을 강제한다.
+
+    프로세스 **안에서** 상한을 걸려는 시도는 세 번 실패했다: 청크별 시간
+    검사(iterator가 chunk_size 만큼 모일 때까지 돌아오지 않음), 작업 스레드
+    + join(이어지는 동기 ``close()`` 가 스트림 종료를 기다림), 그리고
+    GET·close·파싱이 상한 밖에 있던 문제. 이제 부모가
+    ``subprocess.run(timeout=…)`` 으로 프로세스를 죽인다.
+    """
+
+    REPO = Path(__file__).resolve().parent.parent
+
+    def test_worker_module_is_runnable(self):
+        completed = subprocess.run(
+            [sys.executable, "-m", WORKER_MODULE, "--source", "t"],
+            input="[]", capture_output=True, text=True, timeout=60,
+            cwd=str(self.REPO),
+        )
+        assert completed.returncode == 0
+        assert completed.stdout.strip() == ""
+
+    def test_worker_emits_one_flushed_line_per_item(self):
+        """항목마다 한 줄씩 즉시 flush 한다 - 부분 결과 보존의 근거."""
+        items = [{"source_id": "a", "url": ""}, {"source_id": "b", "url": ""}]
+        completed = subprocess.run(
+            [sys.executable, "-m", WORKER_MODULE, "--source", "t", "--delay", "0"],
+            input=json.dumps(items), capture_output=True, text=True, timeout=60,
+            cwd=str(self.REPO),
+        )
+        lines = [json.loads(ln) for ln in completed.stdout.splitlines() if ln.strip()]
+        assert [line["source_id"] for line in lines] == ["a", "b"]
+        assert all("error" in line for line in lines)     # 빈 URL
+
+    def test_invalid_items_payload_exits_nonzero(self):
+        completed = subprocess.run(
+            [sys.executable, "-m", WORKER_MODULE],
+            input="not json", capture_output=True, text=True, timeout=60,
+            cwd=str(self.REPO),
+        )
+        assert completed.returncode == 2
+
+    def test_hanging_process_is_killed_and_partial_output_kept(self, tmp_path):
+        """멈춘 자식은 예산에서 죽고 그때까지의 줄은 살아남는다."""
+        hanging = tmp_path / "hang.py"
+        hanging.write_text(
+            "import sys, time\n"
+            'print(\'{"source_id": "0", "quotes": {}}\', flush=True)\n'
+            "time.sleep(60)\n",
+            encoding="utf-8",
+        )
+        began = time.monotonic()
+        killed = False
+        partial = ""
+        try:
+            subprocess.run(
+                [sys.executable, str(hanging)],
+                input="[]", capture_output=True, text=True, timeout=1.0,
+            )
+        except subprocess.TimeoutExpired as exc:
+            killed = True
+            partial = exc.stdout or ""
+            if isinstance(partial, bytes):
+                partial = partial.decode()
+        elapsed = time.monotonic() - began
+
+        assert killed is True
+        assert elapsed < 5.0
+        assert '"source_id": "0"' in partial
+
+    def test_run_detail_worker_parses_json_lines(self):
+        crawler = make_stub(fetch_detail=True)
+        completed = MagicMock()
+        completed.stdout = (
+            '{"source_id": "1", "quotes": {"quote_deadline": "접수기간 2026.09.30까지"}}\n'
+            "쓰레기 줄\n"
+            '{"source_id": "2", "truncated": true}\n'
+        )
+        completed.stderr = ""
+        completed.returncode = 0
+
+        with patch.object(subprocess, "run", return_value=completed):
+            results, timed_out = crawler.run_detail_worker(
+                [{"source_id": "1", "url": "u"}, {"source_id": "2", "url": "u"}]
+            )
+        assert timed_out is False
+        assert [r["source_id"] for r in results] == ["1", "2"]
+
+    def test_run_detail_worker_keeps_partial_output_on_timeout(self):
+        crawler = make_stub(fetch_detail=True)
+        exc = subprocess.TimeoutExpired(cmd="x", timeout=1.0)
+        exc.stdout = '{"source_id": "1", "quotes": {}}\n'
+
+        with patch.object(subprocess, "run", side_effect=exc):
+            results, timed_out = crawler.run_detail_worker(
+                [{"source_id": "1", "url": "u"}]
+            )
+        assert timed_out is True
+        assert [r["source_id"] for r in results] == ["1"]
+
+    def test_run_detail_worker_passes_the_budget_as_the_timeout(self):
+        """부모는 소스 예산을 프로세스 timeout 으로 넘긴다."""
+        crawler = make_stub(fetch_detail=True)
+        completed = MagicMock()
+        completed.stdout = ""
+        completed.stderr = ""
+        completed.returncode = 0
+
+        with patch.object(subprocess, "run", return_value=completed) as mock_run:
+            crawler.run_detail_worker([{"source_id": "1", "url": "u"}])
+        _args, kwargs = mock_run.call_args
+        assert kwargs["timeout"] == DETAIL_BUDGET_SEC
+
+    def test_worker_launch_failure_is_not_fatal(self):
+        crawler = make_stub(fetch_detail=True)
+        with patch.object(subprocess, "run", side_effect=OSError("no exec")):
+            results, timed_out = crawler.run_detail_worker(
+                [{"source_id": "1", "url": "u"}]
+            )
+        assert results == []
+        assert timed_out is False
+
+    def test_no_items_means_no_process(self):
+        crawler = make_stub(fetch_detail=True)
+        with patch.object(subprocess, "run") as mock_run:
+            assert crawler.run_detail_worker([]) == ([], False)
+        mock_run.assert_not_called()
+
+
+class TestHtmlCommentsAndDepth:
+    """4차 게이트 #3·#5: 주석 누출과 재귀 한계."""
+
+    def test_comment_is_not_body_text(self):
+        """주석에 든 옛 접수기간이 실제 마감을 덮지 않는다."""
+        html = (
+            '<div class="board_view">'
+            "<!-- 접수기간 2026.09.01~2026.09.30 -->"
+            "<p>모집기간 2026.10.01~2026.10.31</p></div>"
+        )
+        quotes = extract_quotes(normalize_text(html))
+        assert quotes[QUOTE_DEADLINE] == "모집기간 2026.10.01~2026.10.31"
+        assert period_from_quote(quotes[QUOTE_DEADLINE], today=TODAY) == (
+            "2026-10-01", "2026-10-31"
+        )
+
+    def test_comment_only_yields_nothing(self):
+        html = '<div class="board_view"><!-- 접수기간 2026.09.01~2026.09.30 --></div>'
+        assert extract_quotes(normalize_text(html)) == {}
+
+    def test_script_and_style_are_dropped(self):
+        html = (
+            '<div class="board_view">'
+            "<script>var s='접수기간 2026.01.01~2026.01.31';</script>"
+            "<style>.x{content:'접수기간 2026.02.01~2026.02.28'}</style>"
+            "<p>접수기간 2026.09.01 ~ 2026.09.30</p></div>"
+        )
+        quotes = extract_quotes(normalize_text(html))
         assert period_from_quote(quotes[QUOTE_DEADLINE], today=TODAY) == (
             "2026-09-01", "2026-09-30"
         )
 
-    def test_declared_oversize_body_is_still_read(self):
-        """Content-Length가 크다고 해서 건너뛰지 않는다 (절단 의미론)."""
-        crawler = make_stub(fetch_detail=True)
-        response = MagicMock()
-        response.encoding = "utf-8"
-        response.headers = {"Content-Length": str(MAX_DETAIL_BYTES * 2)}
-        response.raise_for_status.return_value = None
-        response.iter_content.return_value = [
-            b"<div class='board_view'>\xec\xa0\x91\xec\x88\x98\xea\xb8\xb0\xea\xb0\x84"
-        ]
+    def test_deeply_nested_html_does_not_break_the_walk(self):
+        """1,100단 중첩도 견딘다 - 재귀 순회는 소스 전체 수집을 잃었다."""
+        html = (
+            '<div class="board_view">' + "<div>" * 1100
+            + "접수기간 2026.09.01~2026.09.30"
+            + "</div>" * 1100 + "</div>"
+        )
+        quotes = extract_quotes(normalize_text(html))
+        assert period_from_quote(quotes[QUOTE_DEADLINE], today=TODAY) == (
+            "2026-09-01", "2026-09-30"
+        )
 
-        with patch.object(crawler.session, "get", return_value=response):
-            crawler.fetch_detail_quotes("https://example.com/x")
-        response.iter_content.assert_called_once()
-
-    def test_infinite_stream_is_cut_off_at_the_cap(self):
-        """Content-Length를 숨기고 계속 흘려보내도 상한에서 끊고 돌아온다."""
-        crawler = make_stub(fetch_detail=True)
-        chunk = b"x" * 8192
-        served = {"count": 0}
-
-        def endless(chunk_size=8192):
-            while True:
-                served["count"] += 1
-                if served["count"] > 10_000:      # 안전장치 - 상한이 없으면 여기서 터진다
-                    raise AssertionError("본문 상한이 동작하지 않는다")
-                yield chunk
-
-        response = MagicMock()
-        response.encoding = "utf-8"
-        response.headers = {}
-        response.raise_for_status.return_value = None
-        response.iter_content.side_effect = endless
-
-        with patch.object(crawler.session, "get", return_value=response):
-            assert crawler.fetch_detail_quotes("https://example.com/x") == {}
-
-        # 상한(1MB)에 도달하는 데 필요한 청크 수 이상은 읽지 않는다
-        assert served["count"] <= MAX_DETAIL_BYTES // len(chunk) + 2
-
-    def test_no_retries_on_detail_fetch(self):
-        """상세 요청은 재시도하지 않는다 - 인용 하나에 재시도 예산을 쓰지 않는다."""
-        import requests
-
-        crawler = make_stub(fetch_detail=True)
-        with patch.object(
-            crawler.session, "get", side_effect=requests.Timeout("t")
-        ) as mock_get:
-            assert crawler.fetch_detail_quotes("https://example.com/x") == {}
-        assert mock_get.call_count == 1
+    def test_attribute_dates_are_never_extracted(self):
+        """트리 순회이므로 속성 값은 구조적으로 본문이 될 수 없다."""
+        html = (
+            '<div class="board_view"><p>접수기간 2026.09.01 ~ 2026.09.30</p>'
+            '<div title="접수기간 2027.01.01~2027.12.31">보기</div></div>'
+        )
+        quotes = extract_quotes(normalize_text(html))
+        assert "2027" not in quotes[QUOTE_DEADLINE]
 
 
-class TestCodexReviewReadDeadline:
-    """최종 게이트 #2: 청크 **내부** 대기를 막지 못했던 결함.
+class TestParenLabelBoundary:
+    """4차 게이트 #6: 괄호로 감싼 다른 라벨도 경계다."""
 
-    ``requests``/``urllib3`` 의 iterator는 ``chunk_size`` 만큼 모일 때까지
-    반환하지 않는다. 1바이트를 9초마다 보내는 서버는 첫 청크까지 8192×9초
-    = 73,728초를 쓰므로 "청크마다 시간 검사" 로는 진입조차 못 했다. 이제
-    읽기를 작업 스레드에 넘기고 ``join(timeout)`` 으로 바깥에서 끊는다.
+    def test_paren_label_blocks_the_range(self):
+        html = (
+            '<div class="board_view"><table><tr><td>'
+            "접수기간 2026.09.01부터<br>(교육기간) 2026.09.20~2026.09.30"
+            "</td></tr></table></div>"
+        )
+        quotes = extract_quotes(normalize_text(html))
+        assert "2026.09.20" not in quotes[QUOTE_DEADLINE]
+        assert period_from_quote(quotes[QUOTE_DEADLINE], today=TODAY) == (
+            "2026-09-01", None
+        )
 
-    실제 시계로 검증하되 테스트가 오래 걸리지 않도록 상한 상수를 줄여
-    주입한다 - 검증 대상은 "상한이 강제되는가" 이다.
-    """
-
-    @staticmethod
-    def _blocking_response(delay: float = 5.0):
-        """첫 청크를 ``delay`` 초 동안 내놓지 않는 응답 (1바이트/9초 모사).
-
-        ``time.sleep`` 대신 ``Event.wait`` 로 기다린다 - 테스트가
-        ``base.time.sleep`` 를 가로채면 ``time`` 모듈 전체가 바뀌어 이
-        블로킹까지 사라지기 때문이다(그래서 예산 테스트가 20요청을 통과해
-        버렸다).
-        """
-        def iter_content(chunk_size=8192):
-            threading.Event().wait(delay)   # 청크가 모이기를 기다리는 구간
-            yield b"x" * 16
-        response = MagicMock()
-        response.encoding = "utf-8"
-        response.headers = {}
-        response.raise_for_status.return_value = None
-        response.iter_content.side_effect = iter_content
-        return response
-
-    def test_read_gives_up_at_the_request_deadline(self):
-        """청크가 오지 않아도 요청 상한에서 포기한다 (스레드 join)."""
-        crawler = make_stub(fetch_detail=True)
-        response = self._blocking_response(delay=5.0)
-
-        with patch("alert.crawlers.base.DETAIL_REQUEST_DEADLINE", 0.3):
-            with patch.object(crawler.session, "get", return_value=response):
-                began = time.monotonic()
-                result = crawler.fetch_detail_quotes("https://example.com/slow")
-                elapsed = time.monotonic() - began
-
-        assert result == {}
-        assert elapsed < 2.0, f"상한이 강제되지 않았다 ({elapsed:.1f}s)"
-
-    def test_source_budget_bounds_a_single_read(self):
-        """남은 소스 예산이 요청 상한보다 짧으면 그 예산이 먼저 걸린다."""
-        crawler = make_stub(fetch_detail=True)
-        response = self._blocking_response(delay=5.0)
-
-        with patch("alert.crawlers.base.DETAIL_REQUEST_DEADLINE", 30.0):
-            with patch.object(crawler.session, "get", return_value=response):
-                began = time.monotonic()
-                result = crawler.fetch_detail_quotes(
-                    "https://example.com/slow", deadline=time.monotonic() + 0.3
-                )
-                elapsed = time.monotonic() - began
-
-        assert result == {}
-        assert elapsed < 2.0
-
-    def test_no_time_left_skips_the_request(self):
-        """예산이 이미 소진됐으면 요청조차 하지 않는다."""
-        crawler = make_stub(fetch_detail=True)
-        with patch.object(crawler.session, "get") as mock_get:
-            assert crawler.fetch_detail_quotes(
-                "https://example.com/x", deadline=time.monotonic() - 1
-            ) == {}
-        mock_get.assert_not_called()
-
-    def test_whole_source_run_stays_inside_the_budget(self):
-        """느린 상세가 여러 건이어도 소스 예산 안에서 끝난다."""
-        crawler = make_stub(fetch_detail=True)
-        items = [make_announcement(str(i)) for i in range(20)]
-        response = self._blocking_response(delay=5.0)
-
-        # DETAIL_DELAY_SEC 를 줄인다 - time.sleep 을 가로채면 위 블로킹까지
-        # 사라져 검증이 무의미해진다
-        with patch("alert.crawlers.base.DETAIL_REQUEST_DEADLINE", 0.2):
-            with patch("alert.crawlers.base.DETAIL_BUDGET_SEC", 0.5):
-                with patch("alert.crawlers.base.DETAIL_DELAY_SEC", 0.0):
-                    with patch.object(
-                        crawler.session, "get", return_value=response
-                    ) as mock_get:
-                        began = time.monotonic()
-                        crawler.enrich_with_quotes(items)
-                        elapsed = time.monotonic() - began
-
-        assert elapsed < 3.0, f"예산이 강제되지 않았다 ({elapsed:.1f}s)"
-        assert mock_get.call_count < len(items)
+    @pytest.mark.parametrize("decorated", [
+        "(교육기간)", "[교육기간]", "【교육기간】", "교육기간:", "  (교육기간) ",
+    ])
+    def test_decorated_labels_are_recognised(self, decorated):
+        html = (
+            '<div class="board_view"><table><tr><td>'
+            f"접수기간 2026.09.01부터<br>{decorated} 2026.09.20~2026.09.30"
+            "</td></tr></table></div>"
+        )
+        quotes = extract_quotes(normalize_text(html))
+        assert period_from_quote(quotes[QUOTE_DEADLINE], today=TODAY)[1] is None
 
 
 class TestCodexReviewCellInternals:
@@ -793,67 +948,6 @@ class TestCodexReviewCellInternals:
             "</table></div>"
         )
         assert extract_quotes(normalize_text(html)) == {}
-
-
-class TestCodexReviewTruncation:
-    """재검토 #8: 1MB 절단이 날짜를 조작하던 결함."""
-
-    def test_partial_date_is_discarded(self):
-        """``2026.09.30`` 이 ``2026.09.3`` 으로 잘려도 09-03을 만들지 않는다."""
-        html = (
-            '<div class="board_view"><table><tr><th>접수기간</th>'
-            "<td>2026.09.01 ~ 2026.09.3"
-        )
-        trimmed = complete_html_prefix(html)
-        quotes = extract_quotes(normalize_text(trimmed))
-        start, end = period_from_quote(quotes.get(QUOTE_DEADLINE, ""), today=TODAY)
-        assert end != "2026-09-03"
-
-    def test_cut_inside_an_attribute_does_not_leak(self):
-        """속성 중간에서 잘린 조각이 본문 마감으로 추출되지 않는다."""
-        html = (
-            '<div class="board_view"><p>본문</p>'
-            '<div title="접수기간 2026.09.30'
-        )
-        trimmed = complete_html_prefix(html)
-        assert "접수기간" not in trimmed
-        assert extract_quotes(normalize_text(trimmed)) == {}
-
-    def test_complete_prefix_keeps_finished_markup(self):
-        html = '<div class="board_view"><p>접수기간 2026.09.30까지</p></div><span'
-        trimmed = complete_html_prefix(html)
-        assert trimmed.endswith("</div>")
-
-    def test_no_close_bracket_yields_nothing(self):
-        assert complete_html_prefix("2026.09.3") == ""
-        assert complete_html_prefix("") == ""
-
-    def test_truncated_flag_is_recorded(self):
-        """절단된 응답은 raw_data에 표시를 남긴다."""
-        crawler = make_stub(fetch_detail=True)
-        announcement = make_announcement()
-        head = (
-            '<div class="board_view"><table><tr><th>접수기간</th>'
-            "<td>2026.09.01 ~ 2026.09.30</td></tr></table>"
-        )
-        body = (head + "<p>" + "가" * 2000 + "</p>" * 1).encode("utf-8")
-        body = head.encode("utf-8") + ("<p>" + "가" * 400_000 + "</p>").encode("utf-8")
-        assert len(body) > MAX_DETAIL_BYTES
-
-        response = MagicMock()
-        response.encoding = "utf-8"
-        response.headers = {}
-        response.raise_for_status.return_value = None
-        response.iter_content.return_value = [
-            body[i:i + 8192] for i in range(0, len(body), 8192)
-        ]
-
-        with patch.object(crawler.session, "get", return_value=response):
-            crawler.enrich_with_quotes([announcement])
-
-        payload = json.loads(announcement.raw_data)
-        assert payload[DETAIL_TRUNCATED] is True
-        assert payload["quote_period_end"] == "2026-09-30"
 
 
 class TestCodexReviewRoundSelection:
@@ -906,49 +1000,6 @@ class TestResolvePeriodPriority:
         """"예산 소진" 만으로는 상시가 아니다 - 마감이 있는 공고다."""
         assert is_always_open("예산 소진 시 조기마감") is False
         assert is_always_open("상시 모집") is True
-
-
-class TestCodexReviewBudgetStarvation:
-    """재검토 #11: 요청 상한 때문에 목록 뒤쪽이 영구히 미수집되던 결함."""
-
-    def test_quoted_ids_from_db_free_the_budget(self):
-        """DB에서 받은 "이미 인용 있음" 목록은 예산을 쓰지 않는다."""
-        crawler = make_stub(fetch_detail=True)
-        items = [make_announcement(str(i)) for i in range(MAX_DETAIL_REQUESTS + 5)]
-        already = {str(i) for i in range(MAX_DETAIL_REQUESTS)}
-        crawler.set_quoted_source_ids(already)
-
-        with patch.object(
-            crawler.session, "get", return_value=fake_response("<html>x</html>")
-        ) as mock_get:
-            with patch("alert.crawlers.base.time.sleep"):
-                crawler.enrich_with_quotes(items)
-
-        requested = [call[0][0] for call in mock_get.call_args_list]
-        assert len(requested) == 5
-        # 정확히 뒤쪽 5건만 요청한다
-        assert [url.rsplit("/", 1)[-1] for url in requested] == [
-            str(i) for i in range(MAX_DETAIL_REQUESTS, MAX_DETAIL_REQUESTS + 5)
-        ]
-
-    def test_two_runs_cover_a_list_longer_than_the_cap(self):
-        """상한보다 긴 목록도 두 번 실행하면 전부 수집된다."""
-        total = MAX_DETAIL_REQUESTS + 5
-        seen: set = set()
-
-        for _ in range(2):
-            crawler = make_stub(fetch_detail=True)
-            crawler.set_quoted_source_ids(seen)
-            items = [make_announcement(str(i)) for i in range(total)]
-            with patch.object(
-                crawler.session, "get", return_value=fake_response("<html>x</html>")
-            ) as mock_get:
-                with patch("alert.crawlers.base.time.sleep"):
-                    crawler.enrich_with_quotes(items)
-            for call in mock_get.call_args_list:
-                seen.add(call[0][0].rsplit("/", 1)[-1])
-
-        assert seen == {str(i) for i in range(total)}
 
 
 class TestFinalGateBlockScope:
@@ -1012,48 +1063,6 @@ class TestFinalGateBlockScope:
         assert "선착순 접수" in quotes[QUOTE_AMOUNT]
 
 
-class TestFinalGateTruncationSafety:
-    """최종 게이트 #3: 완결 태그가 완결 인용을 보장하지 않았다."""
-
-    def test_span_split_partial_date_is_dropped(self):
-        """``2026.09.<span>3</span>`` 뒤에서 잘려도 09-03을 만들지 않는다."""
-        html = (
-            '<div class="board_view"><p>접수기간 2026.09.01 ~ 2026.09.'
-            "<span>3</span>"
-        )
-        trimmed = complete_html_prefix(html)
-        quotes = extract_quotes(normalize_text(trimmed))
-        _start, end = period_from_quote(quotes.get(QUOTE_DEADLINE, ""), today=TODAY)
-        assert end != "2026-09-03"
-
-    def test_cut_inside_an_attribute_value_is_dropped(self):
-        """속성 **안쪽** 의 ``>`` 에서 잘려도 숨은 날짜를 인용하지 않는다."""
-        html = (
-            '<div class="board_view"><p>본문</p>'
-            '<div title="접수기간 2026.09.01~2026.09.30 >'
-        )
-        trimmed = complete_html_prefix(html)
-        assert "접수기간" not in trimmed
-        assert extract_quotes(normalize_text(trimmed)) == {}
-
-    def test_attribute_dates_are_never_extracted(self):
-        """완결된 마크업에서도 속성 값은 본문이 아니다."""
-        html = (
-            '<div class="board_view"><p>접수기간 2026.09.01 ~ 2026.09.30</p>'
-            '<div title="접수기간 2027.01.01~2027.12.31">보기</div></div>'
-        )
-        quotes = extract_quotes(normalize_text(html))
-        assert period_from_quote(quotes[QUOTE_DEADLINE], today=TODAY) == (
-            "2026-09-01", "2026-09-30"
-        )
-        assert "2027" not in quotes[QUOTE_DEADLINE]
-
-    def test_only_block_boundaries_survive(self):
-        assert complete_html_prefix("<p>a</p><span>b") == "<p>a</p>"
-        assert complete_html_prefix("<span>b</span>") == ""
-        assert complete_html_prefix("2026.09.3") == ""
-
-
 class TestFinalGateYearInference:
     """최종 게이트 #5: 회차 사이 날짜 역전을 해 넘김으로 오인했다."""
 
@@ -1077,58 +1086,3 @@ class TestFinalGateYearInference:
         assert period_from_quote(
             "모집기간 1차 2026.08.01~8.31 2차 9.01~9.30", today=TODAY
         ) == ("2026-09-01", "2026-09-30")
-
-
-class TestFinalGateEarlyCloseReset:
-    """최종 게이트 #9: 조기마감 플래그가 교체 후에도 남았다."""
-
-    def test_flag_is_cleared_when_the_quote_is_replaced(self):
-        crawler = make_stub(fetch_detail=True)
-        announcement = make_announcement()
-
-        early = (
-            '<div class="board_view"><table><tr><th>접수기간</th>'
-            "<td>2026.09.01 ~ 2026.09.30 (예산 소진 시 조기마감)</td>"
-            "</tr></table></div>"
-        )
-        plain = (
-            '<div class="board_view"><table><tr><th>접수기간</th>'
-            "<td>2026.10.01 ~ 2026.10.31</td></tr></table></div>"
-        )
-
-        with patch.object(crawler.session, "get", return_value=fake_response(early)):
-            crawler.enrich_with_quotes([announcement])
-        assert json.loads(announcement.raw_data)[EARLY_CLOSE] is True
-
-        # 같은 공고에 조건 없는 인용이 새로 도착한다
-        announcement.raw_data = json.dumps(
-            {k: v for k, v in json.loads(announcement.raw_data).items()
-             if not k.startswith("quote_")},
-            ensure_ascii=False,
-        )
-        with patch.object(crawler.session, "get", return_value=fake_response(plain)):
-            crawler._apply_quotes(
-                announcement,
-                extract_quotes(normalize_text(plain)),
-            )
-
-        payload = json.loads(announcement.raw_data)
-        assert EARLY_CLOSE not in payload
-        assert payload["quote_period_end"] == "2026-10-31"
-        assert announcement.period_end == "2026-10-31"
-
-    def test_stale_quote_periods_are_replaced(self):
-        """교체된 인용의 예전 파생 날짜가 남지 않는다."""
-        crawler = make_stub(fetch_detail=True)
-        announcement = make_announcement()
-        announcement.raw_data = json.dumps(
-            {"quote_period_start": "2026-01-01", "quote_period_end": "2026-01-31"},
-            ensure_ascii=False,
-        )
-        crawler._apply_quotes(
-            announcement, {QUOTE_DEADLINE: "접수기간 2026.10.01 ~ 2026.10.31"}
-        )
-        payload = json.loads(announcement.raw_data)
-        assert payload["quote_period_start"] == "2026-10-01"
-        assert payload["quote_period_end"] == "2026-10-31"
-

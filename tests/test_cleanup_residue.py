@@ -243,7 +243,8 @@ class TestRuleCProvableDefects:
 
         doomed, reasons, _canonical = cleanup.find_duplicates(conn, "socialenterprise")
         assert [row["id"] for row in doomed] == [bogus]
-        assert "글번호 자리 불일치" in " ".join(reasons)
+        # 같은 URL 규칙이 먼저 걸린다 (4차 게이트 #8) - 삭제 대상은 그대로다
+        assert "같은 URL" in " ".join(reasons)
 
     def test_unresolved_void_url_is_deleted(self, db):
         """#void 로 남은 행은 해소된 행에 흡수된다."""
@@ -532,3 +533,83 @@ class TestFinalGateDeadlineEvidence:
             "date": "2026-09-11 접수",
         }) == "2026-11-30"
 
+
+class TestGate4DeadlineEvidence:
+    """4차 게이트 #4: 정상 마감을 **시작일로** 교체하던 결함."""
+
+    def test_start_only_quote_never_replaces_a_deadline(self, db):
+        """"…2026.09.01부터" 는 종료 근거가 아니다."""
+        conn, _ = db
+        insert(conn, source="socialenterprise", source_id="950", title="공고",
+               url="https://www.socialenterprise.or.kr/x?bIdx=950",
+               period_start="2026-09-01", period_end="2026-09-30",
+               created_at="2026-09-01T09:00:00",
+               raw_data={"period": "2026-09-30까지",
+                         "quote_deadline": "접수기간 2026.09.01부터"})
+
+        changes, _reasons = cleanup.find_fake_deadlines(conn)
+        assert changes == []
+
+    def test_period_wording_is_not_a_posting_date(self, db):
+        """"2026-09-30까지" 를 게시일 후보로 넣지 않는다."""
+        payload = {"date": "2026-09-30까지"}
+        assert cleanup.posting_dates(payload, "") == set()
+
+    def test_plain_single_date_is_still_a_posting_date(self, db):
+        payload = {"date": "2026/09/11"}
+        assert cleanup.posting_dates(payload, "") == {"2026-09-11"}
+
+    def test_evidence_ignores_start_only_values(self):
+        assert cleanup.deadline_evidence(
+            {"quote_deadline": "접수기간 2026.09.01부터"}
+        ) is None
+        assert cleanup.deadline_evidence(
+            {"quote_deadline": "접수기간 2026.09.01부터", "period": "2026-09-30까지"}
+        ) == "2026-09-30"
+
+
+class TestGate4RegionAndSameUrl:
+    """4차 게이트 #8: 전국 와일드카드와 같은 URL 규칙."""
+
+    def test_nationwide_is_compatible_with_any_region(self):
+        from alert.crawlers.dedupe_keys import group_key, keys_compatible
+
+        seoul = group_key("공고", ["서울"], "2026-09-30")
+        nationwide = group_key("공고", ["전국"], "2026-09-30")
+        assert seoul != nationwide
+        assert keys_compatible(seoul, nationwide) is True
+
+    def test_different_real_regions_stay_incompatible(self):
+        from alert.crawlers.dedupe_keys import group_key, keys_compatible
+
+        seoul = group_key("공고", ["서울"], "2026-09-30")
+        busan = group_key("공고", ["부산"], "2026-09-30")
+        assert keys_compatible(seoul, busan) is False
+
+    def test_same_url_duplicate_is_deleted_even_with_a_valid_id(self, db):
+        """같은 URL이면 양쪽 글번호가 맞아도 하나는 중복이다."""
+        conn, _ = db
+        url = ("https://www.socialenterprise.or.kr/homepage/bbs/boardView.do"
+               "?bsIdx=10002&bIdx=252628")
+        first = insert(conn, source="socialenterprise", source_id="252628",
+                       title="인증 공고", url=url, period_end="2026-09-30")
+        second = insert(conn, source="socialenterprise", source_id="10002",
+                        title="인증 공고", url=url, period_end="2026-09-30")
+
+        doomed, reasons, _canonical = cleanup.find_duplicates(conn, "socialenterprise")
+        assert len(doomed) == 1
+        assert doomed[0]["id"] in {first, second}
+        assert "같은 URL" in " ".join(reasons)
+
+    def test_same_url_with_different_deadlines_is_kept(self, db):
+        """같은 URL이라도 실제 종료일이 다르면 건드리지 않는다."""
+        conn, _ = db
+        url = ("https://www.socialenterprise.or.kr/homepage/bbs/boardView.do"
+               "?bsIdx=10002&bIdx=252628")
+        insert(conn, source="socialenterprise", source_id="252628",
+               title="인증 공고", url=url, period_end="2026-09-30")
+        insert(conn, source="socialenterprise", source_id="10002",
+               title="인증 공고", url=url, period_end="2026-10-31")
+
+        doomed, _reasons, _canonical = cleanup.find_duplicates(conn, "socialenterprise")
+        assert doomed == []
