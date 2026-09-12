@@ -473,7 +473,7 @@ def is_always_open(quote: str) -> bool:
     """"상시 / 수시 / 연중" 처럼 무기한 접수를 말하는지 본다.
 
     주의: 이것만으로 마감을 지우지는 않는다. 명시된 날짜가 있으면 **날짜가
-    이긴다** (Codex 재검토 #9) - ``resolve_period`` 가 그렇게 판정한다.
+    이긴다** (Codex 재검토 #9) - ``resolve_quote_period`` 가 그렇게 판정한다.
     """
     return bool(quote) and bool(_ALWAYS_OPEN.search(quote))
 
@@ -699,7 +699,7 @@ def period_from_quote(
     return chosen[1], chosen[2]
 
 
-def resolve_period(
+def resolve_quote_period(
     quote: str, today: Optional[date] = None
 ) -> Tuple[Optional[str], Optional[str], bool, bool]:
     """마감 인용에서 기간과 상시/조기마감 표시를 함께 판정한다.
@@ -736,7 +736,7 @@ def apply_quote_period(
     Returns:
         ``(period_start, period_end, always_open, early_close)``
     """
-    return resolve_period(quotes.get(QUOTE_DEADLINE, ""), today=today)
+    return resolve_quote_period(quotes.get(QUOTE_DEADLINE, ""), today=today)
 
 
 def has_quote_keys(payload: Dict[str, object]) -> bool:

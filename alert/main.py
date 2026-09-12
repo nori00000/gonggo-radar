@@ -5,6 +5,7 @@ Modes: single run, daemon, bot, test
 """
 
 import argparse
+import json
 import logging
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -18,6 +19,16 @@ from .models import RawAnnouncement, AnalyzedAnnouncement
 from .notifiers.telegram_bot import TelegramNotifier
 from .notifiers.email_sender import EmailNotifier
 from .utils.logger import setup_logger
+
+try:
+    from .crawlers.period_extractors import PERIOD_EXTRACTORS
+except Exception as _exc:              # noqa: BLE001
+    # 추출기를 못 읽어도 파이프라인은 산다 - 그때는 **모든 소스가 기간
+    # 없음**이 된다(fail-closed). 없는 마감을 말하는 것보다 낫다.
+    logging.getLogger(__name__).error(
+        f"period extractors unavailable ({_exc}) - 모든 기간을 비운다"
+    )
+    PERIOD_EXTRACTORS = {}
 
 
 # ---------------------------------------------------------------------------
@@ -115,6 +126,56 @@ def _crawl_single(
     except Exception as e:
         logger.error(f"{crawler_name}: {e}")
         return crawler_name, [], "error"
+
+
+# ---------------------------------------------------------------------------
+# 기간 관문 (13차) - period_start/period_end 는 **여기서만** 정해진다
+# ---------------------------------------------------------------------------
+
+def _finalize_periods(source: str, item: RawAnnouncement) -> RawAnnouncement:
+    """DB 에 닿기 직전 기간 두 필드를 확정한다 - 저장 경로의 단일 관문.
+
+    크롤러가 무엇을 반환했든(하위 클래스 override, ``fetch()`` 가 직접
+    만든 객체, ``safe_fetch`` 경유 여부 무관) 이 함수가 두 필드를 **None
+    으로 리셋**한 뒤, 전용 추출기를 가진 소스만 ``raw_data`` 원문에서
+    다시 채운다.
+
+    열두 차례의 게이트에서 관문을 크롤러 쪽(베이스 클래스)에 두면 계속
+    우회됐다: 선언을 상속하거나 override 하거나, 근거 없이 만든 객체를
+    그대로 반환하면 통과했다. 그래서 관문을 **저장 직전 한 곳**에 둔다.
+
+    Args:
+        source: 저장될 소스 이름 (``announcement.source``)
+        item: 저장 대상 - **제자리에서** 고친다
+
+    Returns:
+        같은 객체 (호출 편의)
+    """
+    item.period_start = None
+    item.period_end = None
+
+    extractor = PERIOD_EXTRACTORS.get((source or "").strip())
+    if extractor is None:
+        return item                    # 전용 추출기가 없는 소스 = 기간 없음
+
+    try:
+        raw = json.loads(item.raw_data or "{}")
+    except (ValueError, TypeError):
+        return item
+    if not isinstance(raw, dict):
+        return item
+
+    try:
+        start, end = extractor(raw)
+    except Exception as exc:           # noqa: BLE001
+        logging.getLogger(__name__).error(
+            f"{source}: 기간 추출 실패 ({exc}) - 기간 없이 저장한다"
+        )
+        return item
+
+    item.period_start = start or None
+    item.period_end = end or None
+    return item
 
 
 # ---------------------------------------------------------------------------
@@ -258,10 +319,28 @@ def run_pipeline(test_mode: bool = False) -> None:
             new_raw: List[RawAnnouncement] = []
             duplicate_count = 0
             quote_merge_count = 0
+            period_reset_count = 0
 
             for raw_ann in raw_announcements:
+                # ── 기간 관문 ─────────────────────────────────────────
+                # 기간 두 필드는 이 호출 뒤로만 존재한다. 신규 저장은 이
+                # 객체의 복사본을 쓰고(``KeywordAnalyzer.analyze`` 가
+                # ``__dict__`` 를 그대로 복사), 기존 행은 아래
+                # ``overwrite_periods`` 가 같은 값으로 덮어쓴다. 그래서
+                # DB 에 닿는 두 경로가 모두 이 한 호출을 지난다.
+                _finalize_periods(raw_ann.source, raw_ann)
+
                 if db.is_duplicate(raw_ann.source, raw_ann.source_id):
                     duplicate_count += 1
+                    # 기존 행의 기간도 **재수집 값으로 덮어쓴다** (None
+                    # 포함) - 예전 실행이 심은 가짜 마감을 재수집이 지운다.
+                    try:
+                        if db.overwrite_periods(raw_ann):
+                            period_reset_count += 1
+                    except Exception as e:
+                        logger.debug(
+                            f"period sync failed for {raw_ann.source_id}: {e}"
+                        )
                     # 중복이라도 **새 인용은 살린다**. 상세 인용은 요청 상한
                     # 때문에 다음 실행에서 도착하기도 하는데, 그때 중복
                     # 필터가 버리면 인용이 영구히 사라진다 (최종 게이트 #6).
@@ -278,6 +357,7 @@ def run_pipeline(test_mode: bool = False) -> None:
             logger.info(
                 f"{crawler_name}: {new_count} new, {duplicate_count} duplicates"
                 f"{f', {quote_merge_count} quote merges' if quote_merge_count else ''}"
+                f"{f', {period_reset_count} period resets' if period_reset_count else ''}"
             )
 
             if new_count == 0:

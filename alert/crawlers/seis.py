@@ -6,13 +6,13 @@ from collections import OrderedDict
 from typing import List, Optional
 from .base import BaseCrawler
 from .date_labels import (
-    classify_date,
     posted_date,
     extract_date_and_label,
     header_labels,
     label_for,
 )
 from .dedupe_keys import ALWAYS_OPEN_TOKENS, group_key, normalize_title
+from .period_extractors import seis_period
 from ..models import RawAnnouncement
 
 try:
@@ -222,10 +222,11 @@ class SeisCrawler(BaseCrawler):
                 "author": "",
                 "category": category,
                 "date": self._clean(date_elem.get_text(strip=True)) if date_elem else "",
-                # 허용목록 (a): SEIS 메인 카드의 ``p.date`` 는 **구조적으로**
-                # 접수기간 필드다(D-day 배지 옆의 기간 표시). 라벨 텍스트가
-                # 없으므로 구조로 라벨을 준다 - 범위일 때만 기간이 된다.
-                "date_label": "접수기간",
+                # 13차: 구조 라벨을 **주지 않는다**. 이 자리에는 접수기간·
+                # 교육기간·무라벨 범위가 섞여 들어오므로, 값 자체가
+                # ``접수기간 …`` 이라고 말할 때만 기간이 된다
+                # (9차 게이트 HIGH ①: 무라벨 범위 14건이 모두 마감이 됐다).
+                "date_label": "",
                 "sub": self._clean(sub.get_text(strip=True)) if sub else "",
                 "info": info_values,
                 "round": round_label,
@@ -263,9 +264,9 @@ class SeisCrawler(BaseCrawler):
 
         정리 스크립트의 규칙 B도 같은 함수(``dedupe_keys.group_key``)를 쓴다.
         """
-        _, period_end, _posted = self._classify_date(
-            item.get("date", ""), item.get("date_label", "")
-        )
+        # 마감 키는 **관문과 같은 함수**로 판정한다 - 크롤러가 따로
+        # 계산하면 키와 저장값이 갈라진다.
+        _start, period_end = seis_period(item)
         # 기관(author/sub)이 다르면 절대 병합하지 않는다 (v2final7 #4):
         # table.board_list 의 같은 제목·같은 게시일 두 행이 td.author=서울센터/
         # 부산센터인데 병합되어 부산만 남았다.
@@ -274,7 +275,8 @@ class SeisCrawler(BaseCrawler):
         # 회차 후보: 카드의 round 필드 + 주체 + 분류 (제목은 group_key가 본다)
         rounds = [item.get("round", "") or ""] + candidates
         return group_key(
-            item.get("title", ""), candidates, period_end, round_candidates=rounds
+            item.get("title", ""), candidates, period_end,
+            round_candidates=rounds, date_text=item.get("date", "") or "",
         )
 
     def _dedupe_items(self, items: List[dict]) -> List[dict]:
@@ -572,24 +574,6 @@ class SeisCrawler(BaseCrawler):
         self.logger.warning(f"Unrecognized date format: {date_str}")
         return None
 
-    def _classify_date(
-        self, date_str: str, label: str = ""
-    ) -> tuple[Optional[str], Optional[str], Optional[str]]:
-        """목록의 날짜가 **접수기간**인지 **게시일**인지 가른다.
-
-        판정은 공용 규칙(``alert/crawlers/date_labels.classify_date``)에
-        위임한다 - 같은 결함이 여섯 크롤러에 있었으므로 규칙이 한 곳에
-        있어야 사본끼리 갈라지지 않는다 (6차 게이트 #1).
-
-        Args:
-            date_str: 목록에서 읽은 날짜 문자열
-            label: 그 날짜의 컬럼 라벨(표 헤더 등)
-
-        Returns:
-            ``(period_start, period_end, posted)``
-        """
-        return classify_date(date_str, label)
-
     def _parse_period(self, period_str: str) -> tuple[Optional[str], Optional[str]]:
         """기간 문자열을 시작일과 종료일로 파싱한다."""
         if not period_str:
@@ -610,45 +594,6 @@ class SeisCrawler(BaseCrawler):
             self.logger.warning(f"Failed to parse period '{period_str}': {e}")
             return None, None
 
-    # ── 허용목록 (a): 접수기간 필드 ────────────────────────────────
-    # 카드의 ``p.date`` 와 표의 접수 헤더가 **사이트 구조상** 접수기간
-    # 필드다. 그래서 seis 만 목록 단계에서 기간을 만들 수 있다.
-    PERIOD_EXTRACTOR = "_period_from_reception_field"
-
-    # 값 자체가 "접수기간 …" 으로 시작하면 그 라벨만 허용한다
-    _RECEPTION_PREFIX = re.compile(r"^\s*접수\s*기간\s*[:：]?\s*")
-    _FIRST_DIGIT = re.compile(r"\d")
-
-    def _period_from_reception_field(self, item: dict):
-        """접수기간 필드에서만 기간을 만든다. 그 밖은 ``(None, None)``.
-
-        두 겹으로 막는다:
-        1. **값의 앞머리** - 날짜 앞에 한글이 남아 있으면(``교육기간``,
-           ``행사일정`` …) 접수기간이 아니다. 카드 파서가 붙이는
-           ``date_label="접수기간"`` 은 구조 라벨이라 셀 **본문**의 라벨을
-           보지 못하므로, 본문을 따로 검사한다.
-        2. **라벨** - 공용 허용목록(``classify_date``)을 통과해야 한다.
-           표 헤더가 ``구분`` 이면 범위여도 기간이 아니다.
-        """
-        value = (item.get("date") or "").strip()
-        if not value:
-            return None, None
-
-        body = self._RECEPTION_PREFIX.sub("", value)
-        labelled_in_text = body != value
-
-        digit = self._FIRST_DIGIT.search(body)
-        if not digit:
-            return None, None
-        if re.search(r"[가-힣]", body[:digit.start()]):
-            return None, None          # 날짜 앞의 다른 라벨 = 접수기간 아님
-
-        label = "접수기간" if labelled_in_text else (
-            item.get("date_label") or ""
-        ).strip()
-        start, end, _posted = self._classify_date(body, label)
-        return start, end
-
     def _to_announcement(self, item: dict, base_url: str) -> Optional[RawAnnouncement]:
         """파싱된 공고 데이터를 RawAnnouncement로 변환한다."""
         try:
@@ -665,11 +610,10 @@ class SeisCrawler(BaseCrawler):
             author = item.get("author", "").strip()
             category = item.get("category", "").strip()
 
-            period_start, period_end = self.resolve_period(item)
-            # 기간이 안 나온 날짜는 잃지 않고 게시일로 남긴다
-            posted = None if (period_start or period_end) else posted_date(
-                item.get("date", "")
-            )
+            # 기간은 크롤러가 만들지 않는다 - DB 도달 직전 관문
+            # (``alert.main._finalize_periods`` → ``seis_period``)이 정한다.
+            # 목록 날짜는 잃지 않게 raw_data 게시일 증거로만 남긴다.
+            posted = posted_date(item.get("date", ""))
 
             payload = dict(item)
             if posted:
@@ -686,8 +630,8 @@ class SeisCrawler(BaseCrawler):
                 author=author or "한국사회적기업진흥원",
                 category=category,
                 target="",
-                period_start=period_start,
-                period_end=period_end,
+                period_start=None,
+                period_end=None,
                 raw_data=raw_data,
             )
 

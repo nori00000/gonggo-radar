@@ -439,7 +439,7 @@ class Database:
 
         row = self._conn.execute(
             _sql(
-                "SELECT id, raw_data, period_start, period_end FROM announcements"
+                "SELECT id, raw_data FROM announcements"
                 " WHERE source = ? AND source_id = ?"
             ),
             (announcement.source, announcement.source_id),
@@ -466,21 +466,66 @@ class Database:
                 stored.pop(key, None)
         stored.update(fresh)
 
-        period_start = fresh.get("quote_period_start") or row["period_start"]
-        period_end = fresh.get("quote_period_end") or row["period_end"]
-
+        # 기간은 **여기서 쓰지 않는다** (13차). 인용에서 뽑은
+        # ``quote_period_*`` 는 raw_data 증거로만 남고, 기간 두 필드는
+        # 관문(``alert.main._finalize_periods``)이 정한 값을
+        # ``overwrite_periods`` 가 쓴다. 예전에는 ``or row["period_end"]`` 가
+        # 기존 값을 보존해, 재수집해도 가짜 마감이 영구히 남았다
+        # (9차 게이트 MEDIUM).
         self._conn.execute(
             _sql(
-                "UPDATE announcements SET raw_data = ?, period_start = ?,"
-                " period_end = ?, updated_at = ? WHERE id = ?"
+                "UPDATE announcements SET raw_data = ?, updated_at = ?"
+                " WHERE id = ?"
             ),
             (
                 json.dumps(stored, ensure_ascii=False),
-                period_start,
-                period_end,
                 datetime.now().isoformat(),
                 row["id"],
             ),
+        )
+        if self._backend == "sqlite":
+            self._conn.commit()
+        return True
+
+    def overwrite_periods(self, announcement: RawAnnouncement) -> bool:
+        """저장된 행의 기간 두 필드를 **재수집 값으로 덮어쓴다** (None 포함).
+
+        재수집이 기존 오염을 지울 수 있어야 한다. 예전 구현은 새 값이
+        비어 있으면 기존 값을 지켜서, 가짜 마감이 심어진 행은 크롤러를
+        고친 뒤에도 영구히 그 마감을 말했다 (9차 게이트 MEDIUM).
+
+        값은 관문(``alert.main._finalize_periods``)이 이미 정했다 - 이
+        메서드는 그 결정을 그대로 쓴다.
+
+        Args:
+            announcement: 관문을 지난 새 수집 결과
+
+        Returns:
+            실제로 값이 바뀌었으면 True (같으면 건드리지 않는다)
+        """
+        row = self._conn.execute(
+            _sql(
+                "SELECT id, period_start, period_end FROM announcements"
+                " WHERE source = ? AND source_id = ?"
+            ),
+            (announcement.source, announcement.source_id),
+        ).fetchone()
+        if row is None:
+            return False
+
+        start = announcement.period_start or None
+        end = announcement.period_end or None
+        if (row["period_start"] or None) == start and (
+            row["period_end"] or None
+        ) == end:
+            return False               # 같은 값이면 updated_at 도 건드리지 않는다
+
+        self._conn.execute(
+            _sql(
+                "UPDATE announcements SET period_start = ?, period_end = ?,"
+                " updated_at = ? WHERE id = ?"
+            ),
+            (start, end, datetime.now().isoformat(), row["id"]),
         )
         if self._backend == "sqlite":
             self._conn.commit()

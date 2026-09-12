@@ -392,10 +392,9 @@ class NongupGgCrawler(BaseCrawler):
             author = item.get("author", "").strip()
             category = item.get("category", "").strip()
 
-            # 12차 choke point: 이 소스는 PERIOD_EXTRACTOR 를 선언하지
-            # 않는다 = 기간을 만들 수 없다. 목록 날짜는 게시일로만 남고
-            # 라벨 분류(classify_date)는 기간 경로에서 빠졌다.
-            period_start, period_end = self.resolve_period(item)
+            # 13차: 이 소스는 전용 추출기가 없다 = 기간이 없다. 목록
+            # 날짜는 게시일 증거로만 남는다 (관문이 두 필드를 None 으로
+            # 확정한다).
             posted = posted_date(item.get("date", ""))
 
             payload = dict(item)
@@ -412,8 +411,8 @@ class NongupGgCrawler(BaseCrawler):
                 author=author or "경기도농업기술원",
                 category=category,
                 target="",
-                period_start=period_start,
-                period_end=period_end,
+                period_start=None,
+                period_end=None,
                 raw_data=raw_data,
             )
 

@@ -36,7 +36,7 @@ from alert.crawlers.detail_quotes import (
     is_early_close,
     normalize_text,
     period_from_quote,
-    resolve_period,
+    resolve_quote_period,
 )
 from alert.models import RawAnnouncement
 
@@ -421,8 +421,9 @@ class TestEnrichWithQuotes:
         assert payload["quote_period_start"] == "2026-09-07"
         assert payload["quote_period_end"] == "2026-09-30"
         assert payload[QUOTES_ATTEMPTED_AT]
-        assert announcement.period_start == "2026-09-07"
-        assert announcement.period_end == "2026-09-30"
+        # 13차: 인용은 기간 **필드**를 쓰지 않는다 - raw_data 증거로만 남고,
+        # 기간은 저장 직전 관문(``alert.main._finalize_periods``)이 정한다.
+        assert (announcement.period_start, announcement.period_end) == (None, None)
 
     def test_always_open_is_flagged_without_inventing_a_deadline(self):
         crawler = make_stub(fetch_detail=True)
@@ -471,7 +472,8 @@ class TestEnrichWithQuotes:
             crawler.enrich_with_quotes([announcement])
 
         payload = json.loads(announcement.raw_data)
-        assert announcement.period_end == "2026-09-30"
+        assert payload["quote_period_end"] == "2026-09-30"
+        assert announcement.period_end is None          # 관문이 정한다 (13차)
         assert payload[EARLY_CLOSE] is True
         assert ALWAYS_OPEN not in payload
 
@@ -496,7 +498,7 @@ class TestEnrichWithQuotes:
         payload = json.loads(announcement.raw_data)
         assert EARLY_CLOSE not in payload
         assert payload["quote_period_end"] == "2026-10-31"
-        assert announcement.period_end == "2026-10-31"
+        assert announcement.period_end is None          # 관문이 정한다 (13차)
 
     def test_missing_quotes_leave_keys_absent_but_record_the_attempt(self):
         """문구가 없으면 키를 만들지 않지만 **시도는 기록한다** (게이트 #6)."""
@@ -989,7 +991,7 @@ class TestResolvePeriodPriority:
          ("2026-09-01", None, True, False)),
     ])
     def test_resolution(self, quote, expected):
-        assert resolve_period(quote, today=TODAY) == expected
+        assert resolve_quote_period(quote, today=TODAY) == expected
 
     def test_early_close_detector(self):
         assert is_early_close("예산 소진 시 조기마감") is True

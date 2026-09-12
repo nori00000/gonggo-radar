@@ -29,12 +29,12 @@ from .detail_quotes import (
 class BaseCrawler(abc.ABC):
     """All crawlers inherit from this."""
 
-    # 12차 choke point: 접수기간은 **이 이름의 메서드를 선언한 크롤러만**
-    # 만들 수 있다. 선언이 없으면 ``safe_fetch`` 가 기간을 무조건 None 으로
-    # 되돌린다 - 하위 클래스의 파서가 무엇을 계산했든 소용없다. 환각
-    # 마감은 열 번의 게이트에서 늘 "라벨을 잘못 읽었다" 로 들어왔으므로
-    # 읽기를 고치는 대신 **쓸 수 있는 소스를 선언으로 제한**한다.
-    PERIOD_EXTRACTOR: Optional[str] = None
+    # 13차: 기간은 **크롤러가 만들지 않는다**. ``period_start``/
+    # ``period_end`` 는 DB 도달 직전의 관문
+    # (``alert.main._finalize_periods``)이 단독으로 정한다 - 크롤러가
+    # 무엇을 반환하든 그 관문에서 리셋되고, 전용 추출기를 가진 소스만
+    # 다시 채워진다. 12차의 "선언한 소스만 쓸 수 있다" 는 하위 클래스
+    # override·직접 생성 객체로 우회됐다 (9차 게이트 HIGH).
 
     def __init__(self, source_name: str):
         self.source_name = source_name
@@ -318,20 +318,18 @@ class BaseCrawler(abc.ABC):
     ) -> None:
         """인용을 raw_data에 싣고, 확신할 수 있는 날짜만 기간 필드에 반영한다.
 
-        **명시된 날짜가 "상시" 보다 우선한다**. 인용에서 종료일이 잡히면 그
-        값을 쓰고, "예산 소진 시 조기마감" 은 마감이 있는 공고이므로
-        ``early_close`` 로만 표시한다. 종료일이 전혀 없고 "상시/수시/연중" 만
-        있을 때 ``always_open`` 이며, 그때도 이미 확정된 마감은 지우지 않는다.
+        **명시된 날짜가 "상시" 보다 우선한다**. 인용에서 종료일이 잡히면
+        ``quote_period_end`` 증거로 남기고, "예산 소진 시 조기마감" 은 마감이
+        있는 공고이므로 ``early_close`` 로만 표시한다. 종료일이 전혀 없고
+        "상시/수시/연중" 만 있을 때 ``always_open`` 이다.
+
+        기간 두 필드는 **여기서 쓰지 않는다** - 관문이 정한다 (13차).
 
         인용이 없어도 **시도 시각**을 남긴다 - 다음 실행이 아직 안 본 항목을
         먼저 보게 하는 근거다 (4차 게이트 #6).
         """
         result = result or {}
         start, end, always_open, early_close = apply_quote_period(quotes)
-        if start:
-            announcement.period_start = start
-        if end:
-            announcement.period_end = end
 
         payload = self._load_raw(announcement)
         payload[QUOTES_ATTEMPTED_AT] = datetime.now().isoformat()
@@ -360,53 +358,6 @@ class BaseCrawler(abc.ABC):
 
         announcement.raw_data = json.dumps(payload, ensure_ascii=False)
 
-    def declares_period_extractor(self) -> bool:
-        """이 크롤러가 기간 추출기를 선언했는가."""
-        name = type(self).PERIOD_EXTRACTOR
-        return bool(name) and callable(getattr(self, name, None))
-
-    def resolve_period(self, item: dict) -> Tuple[Optional[str], Optional[str]]:
-        """허용목록 소스만 기간을 만든다. 그 밖은 항상 ``(None, None)``.
-
-        하위 클래스의 ``_to_announcement`` 는 기간을 직접 계산하지 않고
-        이 메서드만 부른다.
-        """
-        if not self.declares_period_extractor():
-            return None, None
-        try:
-            result = getattr(self, type(self).PERIOD_EXTRACTOR)(item)
-        except Exception as exc:                       # noqa: BLE001
-            self.logger.error(f"기간 추출 실패: {exc}")
-            return None, None
-        if not result:
-            return None, None
-        start, end = result
-        return start or None, end or None
-
-    def _enforce_period_whitelist(
-        self, results: List[RawAnnouncement]
-    ) -> List[RawAnnouncement]:
-        """choke point - 선언 없는 소스가 만든 기간을 지운다.
-
-        ``_to_announcement`` 를 고쳐도 새 크롤러가 다시 기간을 채울 수 있다.
-        마지막 관문을 베이스에 두면 **선언하지 않은 소스는 구조적으로**
-        기간을 저장할 수 없다.
-        """
-        if self.declares_period_extractor():
-            return results
-        stripped = 0
-        for announcement in results:
-            if announcement.period_start or announcement.period_end:
-                announcement.period_start = None
-                announcement.period_end = None
-                stripped += 1
-        if stripped:
-            self.logger.warning(
-                f"{self.source_name}: PERIOD_EXTRACTOR 미선언 - "
-                f"기간 {stripped} 건을 지웠다"
-            )
-        return results
-
     def safe_fetch(self) -> List[RawAnnouncement]:
         """Wrapper that catches exceptions and logs them.
 
@@ -427,7 +378,7 @@ class BaseCrawler(abc.ABC):
             self.logger.info(
                 f"{self.source_name}: fetched {len(results)} announcements"
             )
-            return self._enforce_period_whitelist(results)
+            return results
         except Exception as e:
             self.logger.error(
                 f"{self.source_name} crawl failed: {e}",

@@ -142,8 +142,8 @@ class TestQuoteReCollectionReachesTheDatabase:
         assert merged_3 == 0
         assert quoted_count(db) == TOTAL_ITEMS
 
-    def test_merged_quote_lands_with_its_period(self, db):
-        """인용과 함께 파생된 기간이 저장된다."""
+    def test_merged_quote_lands_as_evidence_only(self, db):
+        """인용은 raw_data 증거로 저장되고 기간 컬럼은 건드리지 않는다 (13차)."""
         self.run_once(db)
         row = db.get_quoted_source_ids("stub")
         assert "0" in row
@@ -155,8 +155,11 @@ class TestQuoteReCollectionReachesTheDatabase:
         payload = json.loads(stored["raw_data"])
         assert payload["quote_deadline"] == "접수기간 2026.09.01 ~ 2026.09.30"
         assert payload["title"] == "공고 0"          # 목록 정보 보존
-        assert stored["period_start"] == "2026-09-01"
-        assert stored["period_end"] == "2026-09-30"
+        assert payload["quote_period_start"] == "2026-09-01"
+        assert payload["quote_period_end"] == "2026-09-30"
+        # 기간 컬럼은 관문(``alert.main._finalize_periods``)만 쓴다 - 인용
+        # 병합이 기간을 만들면 재수집으로 지울 수 없는 값이 생긴다
+        assert (stored["period_start"], stored["period_end"]) == (None, None)
 
     def test_merge_without_quotes_is_a_no_op(self, db):
         """인용이 없는 결과는 저장을 건드리지 않는다."""
@@ -187,7 +190,8 @@ class TestQuoteReCollectionReachesTheDatabase:
         payload = json.loads(stored["raw_data"])
         assert "always_open" not in payload
         assert "early_close" not in payload
-        assert stored["period_end"] == "2026-10-31"
+        assert payload["quote_period_end"] == "2026-10-31"
+        assert stored["period_end"] is None          # 관문이 정한다 (13차)
 
 
 class TestFinalGateRegionKey:
@@ -315,7 +319,8 @@ class TestNoQuotePagesStillGetCovered:
         ).fetchone()
         payload = json.loads(stored["raw_data"])
         assert payload["quote_deadline"] == "접수기간 2026.09.01 ~ 2026.09.30"
-        assert stored["period_end"] == "2026-09-30"
+        assert payload["quote_period_end"] == "2026-09-30"
+        assert stored["period_end"] is None          # 관문이 정한다 (13차)
 
     def test_empty_value_never_erases_a_quote(self, db):
         """빈 값으로는 정상 인용을 덮지 않는다 (게이트 #7)."""
@@ -358,4 +363,5 @@ class TestNoQuotePagesStillGetCovered:
         payload = json.loads(stored["raw_data"])
         assert payload["quote_deadline"].startswith("접수기간")
         assert payload["quote_eligibility"] == "지원대상 사회적기업"
-        assert stored["period_end"] == "2026-09-30"
+        assert payload["quote_period_end"] == "2026-09-30"
+        assert stored["period_end"] is None          # 관문이 정한다 (13차)

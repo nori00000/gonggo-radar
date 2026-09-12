@@ -139,6 +139,9 @@ def row_key(
     period_end = row["period_end"] or None
     if corrected is not None and row["id"] in corrected:
         period_end = corrected[row["id"]]
+    # 13차: 정리 스크립트는 **목록 날짜 슬롯을 쓰지 않는다**. 교정으로
+    # 마감이 지워진 행은 회차로 갈라야 1차·2차가 모두 살아남는다
+    # (7차 게이트 #2). 삭제하는 쪽은 항상 덜 합치는 방향을 택한다.
     return group_key(
         row["title"],
         region_candidates(row),

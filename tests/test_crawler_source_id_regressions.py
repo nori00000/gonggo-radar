@@ -152,8 +152,13 @@ class TestSocialenterprisePeriodSemantics:
         assert posted[0] == "2026-09-11"
         assert all(p for p in posted)
 
-    def test_explicit_range_in_list_is_still_honoured(self, crawler):
-        """목록 날짜가 범위 표기면 접수기간으로 받아들인다."""
+    def test_explicit_range_in_the_list_is_discarded_by_the_gate(self, crawler):
+        """13차: 이 소스는 전용 추출기가 없다 - 목록 범위도 기간이 아니다.
+
+        크롤러 파서가 무엇을 계산하든 저장 직전 관문이 두 필드를 비운다.
+        """
+        from alert.main import _finalize_periods
+
         item = {
             "title": "접수기간이 목록에 있는 공고",
             "link": "/homepage/bbs/boardView.do?bsIdx=10002&bIdx=999",
@@ -162,12 +167,13 @@ class TestSocialenterprisePeriodSemantics:
             "date": "2026-09-01 ~ 2026-09-30",
         }
         ann = crawler._to_announcement(item, "https://www.socialenterprise.or.kr")
-        assert ann.period_start == "2026-09-01"
-        assert ann.period_end == "2026-09-30"
-        assert "posted" not in json.loads(ann.raw_data)
+        gated = _finalize_periods(ann.source, ann)
+        assert (gated.period_start, gated.period_end) == (None, None)
 
-    def test_detail_quote_can_fill_the_deadline(self, crawler, announcements):
-        """상세 페이지에 접수기간 문구가 있으면 그때 마감이 채워진다."""
+    def test_detail_quote_lands_as_evidence_not_as_a_period(
+        self, crawler, announcements
+    ):
+        """상세 인용은 raw_data 증거로만 남는다 - 기간은 관문이 정한다 (13차)."""
         announcement = announcements[0]
         assert announcement.period_end is None
 
@@ -176,10 +182,10 @@ class TestSocialenterprisePeriodSemantics:
             {"quote_deadline": "접수기간 2026.09.15 ~ 2026.09.30"},
         )
 
-        assert announcement.period_start == "2026-09-15"
-        assert announcement.period_end == "2026-09-30"
+        assert (announcement.period_start, announcement.period_end) == (None, None)
         payload = json.loads(announcement.raw_data)
         assert payload["quote_deadline"] == "접수기간 2026.09.15 ~ 2026.09.30"
+        assert payload["quote_period_end"] == "2026-09-30"
         assert payload["posted"] == "2026-09-11"   # 게시일은 지워지지 않는다
 
 
