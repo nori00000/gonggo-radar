@@ -151,7 +151,25 @@ class EmailNotifier:
         html_part = MIMEText(html_body, "html", "utf-8")
         msg.attach(html_part)
 
-        # SMTP 전송
+        # SMTP 전송 (공용 경로)
+        if not self._send_via_smtp(msg):
+            return False
+
+        self.logger.info(
+            f"이메일 다이제스트 전송 성공: {len(announcements)}건, "
+            f"수신자 {len(self.recipients)}명"
+        )
+        return True
+
+    def _send_via_smtp(self, msg: MIMEMultipart) -> bool:
+        """구성된 메시지를 SMTP로 전송 (connect/starttls/login/send).
+
+        Args:
+            msg: 전송할 MIME 메시지
+
+        Returns:
+            전송 성공 여부
+        """
         try:
             with smtplib.SMTP(
                 self.email_config.smtp_server,
@@ -164,10 +182,6 @@ class EmailNotifier:
                 server.login(self.sender, self.password)
                 server.send_message(msg)
 
-            self.logger.info(
-                f"이메일 다이제스트 전송 성공: {len(announcements)}건, "
-                f"수신자 {len(self.recipients)}명"
-            )
             return True
 
         except smtplib.SMTPException as exc:
@@ -176,6 +190,37 @@ class EmailNotifier:
         except Exception as exc:
             self.logger.error(f"이메일 전송 중 예외 발생: {exc}")
             return False
+
+    def send_html(self, subject: str, html_body: str, recipients: List[str]) -> bool:
+        """임의의 HTML 본문을 지정 수신자에게 전송 (기존 SMTP 경로 재사용).
+
+        Args:
+            subject: 메일 제목
+            html_body: HTML 본문
+            recipients: 수신자 이메일 목록
+
+        Returns:
+            전송 성공 여부
+        """
+        if not self.sender or not self.password:
+            self.logger.error("이메일 인증 정보가 설정되지 않았습니다.")
+            return False
+
+        if not recipients:
+            self.logger.error("수신자가 설정되지 않았습니다.")
+            return False
+
+        msg = MIMEMultipart("alternative")
+        msg["From"] = self.sender
+        msg["To"] = ", ".join(recipients)
+        msg["Subject"] = subject
+        msg.attach(MIMEText(html_body, "html", "utf-8"))
+
+        if not self._send_via_smtp(msg):
+            return False
+
+        self.logger.info(f"HTML 메일 전송 성공: 수신자 {len(recipients)}명")
+        return True
 
     def send_test(self) -> bool:
         """테스트 이메일 전송으로 설정 확인.
