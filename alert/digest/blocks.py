@@ -72,6 +72,17 @@ EMPTY_SECTION_LINE = "*(항목 없음)*"
 # 항목 섹션 안에서 마커 없이도 허용되는 줄 (composer 가 쓰는 빈 섹션 표시)
 _ALLOWED_BARE_LINES = (EMPTY_SECTION_LINE,)
 
+# GLM 야간 요약 레인(V3)의 보강 줄 — 항목 줄·원문 줄 **다음**(선택) 4번째 줄.
+# 항목 줄은 편집 불가 영역이라 여기에 별도 줄로만 붙인다(계약: schema_version 불변,
+# `enrich_line` 은 정본의 선택 필드 — composer.items_manifest 참고).
+ENRICH_LINE_PREFIX = "  → "
+_ENRICH_LINE_RE = re.compile(r"^  → \S.*$")
+
+
+def enrich_line_text(text: str) -> str:
+    """GLM 보강 줄 렌더 (`한 줄 의미` 텍스트 → `  → 텍스트`)."""
+    return f"{ENRICH_LINE_PREFIX}{text}"
+
 class Link(NamedTuple):
     """본문에서 찾은 마크다운 링크 하나."""
 
@@ -388,13 +399,23 @@ def parse_blocks(
                 fields = parse_item_line(lines[index + 1])
                 url = origin_url(lines[index + 2]) if fields else None
                 if fields and url:
+                    item_lines = [line, lines[index + 1], lines[index + 2]]
+                    consumed = index + 3
+                    enrich_line: Optional[str] = None
+                    # V3(GLM 보강): 원문 줄 바로 다음이 보강 줄(`  → …`)이면
+                    # 같은 항목 블록에 담는다 — 그래야 prose_lines_in_item_sections
+                    # 가 산문으로 오판해 게이트를 떨어뜨리지 않는다.
+                    if consumed < total and _ENRICH_LINE_RE.match(lines[consumed]):
+                        enrich_line = lines[consumed]
+                        item_lines.append(enrich_line)
+                        consumed += 1
                     index = push({"kind": "item", "title": fields["raw"],
                                   "section": section_name,
                                   "in_item_section": True,
                                   "url": url, "fields": fields,
                                   "item_id": item_id,
-                                  "lines": [line, lines[index + 1],
-                                            lines[index + 2]]}, index + 3)
+                                  "enrich_line": enrich_line,
+                                  "lines": item_lines}, consumed)
                     continue
             index = push({"kind": "comment", "section": section_name,
                           "in_item_section": in_item_section,
@@ -420,7 +441,8 @@ def item_blocks(
     return [
         {"title": block["title"], "url": block["url"],
          "section": block["section"], "fields": block["fields"],
-         "item_id": block["item_id"]}
+         "item_id": block["item_id"],
+         "enrich_line": block.get("enrich_line")}
         for block in parse_blocks(markdown_text, item_sections)
         if block["kind"] == "item"
     ]
@@ -544,3 +566,48 @@ def link_audit(
                     commentary += 1
     return {"total": total, "items": items,
             "commentary": commentary, "stray": stray}
+
+
+def set_enrich_lines(
+    markdown_text: str,
+    enrich_by_id: Dict[str, Optional[str]],
+    item_sections: Optional[Sequence[str]] = None,
+) -> Tuple[str, List[str]]:
+    """항목 블록에 GLM 보강 줄(V3)을 붙이거나 갱신한다.
+
+    `enrich_by_id`: {항목 id(문자열): 렌더된 보강 줄 전체 텍스트(`  → …`)}.
+    값이 falsy 면 기존 보강 줄을 뗀다(멱등). id 가 이 문서에 없으면 조용히 무시한다
+    (glm_enrich 가 재조립 사이 낡은 id 를 들고 올 수 있다 — fail-closed 은 호출자 몫).
+
+    블록 구조는 이 모듈이 정본이므로 삽입도 여기서 한다 — 다른 곳에서 문자열을
+    직접 이어 붙이면 이 모듈의 파서와 다시 어긋날 수 있다.
+
+    Returns:
+        (새 markdown 텍스트, 실제로 바뀐 항목 id 목록(문서 순서)).
+    """
+    blocks = parse_blocks(markdown_text, item_sections)
+    changed: List[str] = []
+    out_lines: List[str] = []
+    for block in blocks:
+        if block["kind"] != "item":
+            out_lines.extend(block["lines"])
+            continue
+        item_id = str(block.get("item_id"))
+        current_enrich = block.get("enrich_line")
+        core_len = 4 if current_enrich else 3
+        core = block["lines"][:core_len]
+        trailing = block["lines"][core_len:]
+        new_enrich = enrich_by_id.get(item_id)
+        if item_id not in enrich_by_id:
+            out_lines.extend(block["lines"])
+            continue
+        if new_enrich and new_enrich != current_enrich:
+            out_lines.extend(core[:3] + [new_enrich])
+            changed.append(item_id)
+        elif not new_enrich and current_enrich:
+            out_lines.extend(core[:3])
+            changed.append(item_id)
+        else:
+            out_lines.extend(core)
+        out_lines.extend(trailing)
+    return "\n".join(out_lines), changed

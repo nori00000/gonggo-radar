@@ -1643,6 +1643,13 @@ def items_manifest(data: Dict, markdown_bytes: bytes = b"") -> Dict:
                 "org": item.get("org") or "",
                 "target": item.get("target") or "",
                 "region": item.get("region") or "",
+                # V3(GLM 야간 보강 레인) 선택 필드 — compose 시점엔 항상 비어 있다.
+                # glm_enrich.py 가 사후에 채우고(`set_manifest_enrich_lines`),
+                # checker 는 채워졌을 때만 md 의 보강 줄과 문자열 대조한다.
+                # 이 필드의 존재 여부는 REQUIRED_ENTRY_FIELDS 가 아니다 — 채워도
+                # 항목 줄·원문 줄의 렌더 방식은 그대로이므로 schema_version 은
+                # 올리지 않는다(옛 정본도 여전히 유효 — checker._schema_problems).
+                "enrich_line": item.get("enrich_line") or "",
             }
             for section in ITEM_SECTIONS
             for item in (data["sections"].get(section) or [])
@@ -1687,6 +1694,28 @@ def refresh_manifest_binding(markdown_path) -> Optional[Dict]:
         return manifest
     write_items_manifest(markdown_path, manifest)
     return manifest
+
+
+def set_manifest_enrich_lines(
+    markdown_path, enrich_by_id: Dict[str, str]
+) -> Optional[Dict]:
+    """정본의 `enrich_line` 필드를 갱신하고 해시를 다시 맞춘다 (V3).
+
+    호출 순서가 요점이다 — glm_enrich.py 는 **먼저** md 에 보강 줄을 써넣은
+    뒤 이 함수를 부른다. 여기서는 그 id 들의 `enrich_line` 값만 바꾸고(다른
+    항목 필드는 손대지 않는다), 마지막에 지금 md 바이트로 해시를 다시 맞춘다
+    (`refresh_manifest_binding`) — 그래야 checker 의 문자열 대조·해시 검사가
+    둘 다 새 md 를 본다.
+    """
+    manifest = load_items_manifest(markdown_path)
+    if manifest is None:
+        return None
+    for entry in manifest.get("items") or []:
+        key = str(entry.get("id"))
+        if key in enrich_by_id:
+            entry["enrich_line"] = enrich_by_id[key] or ""
+    write_items_manifest(markdown_path, manifest)
+    return refresh_manifest_binding(markdown_path)
 
 
 def item_marker(item: Dict) -> str:

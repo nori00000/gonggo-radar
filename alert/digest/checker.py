@@ -165,6 +165,16 @@ def manifest_problems(
             problems.append(
                 f"id={item_id} 원문 줄이 정본과 다름 — 재조립 필요"
             )
+        # V3(GLM 보강): 보강 줄은 선택 필드다 — 있으면 정본과 문자열이 정확히
+        # 같아야 한다. glm_enrich.py 가 md 를 쓴 직후 정본도 함께 갱신하므로
+        # (`composer.set_manifest_enrich_lines`), 어긋남은 "누가 md 만 손으로
+        # 고쳤다"는 뜻이다 — 재조립이 아니라 GLM 보강 재적용으로 고친다.
+        expected_enrich = entry.get("enrich_line") or ""
+        actual_enrich = block.get("enrich_line") or ""
+        if expected_enrich != actual_enrich:
+            problems.append(
+                f"id={item_id} 보강 줄이 정본과 다름 — GLM 보강 재적용 필요"
+            )
 
     missing = sorted(set(entries) - seen)
     if missing:

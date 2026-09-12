@@ -35,6 +35,26 @@ if [ ! -f "${MD}" ]; then
   exit 1
 fi
 
+# V3(GLM 야간 요약 레인): 항목 보강 줄(→ 한 줄 의미)을 붙인다. **실패해도 잡은
+# 계속한다** — ds 부재·타임아웃·게이트 실패는 경고일 뿐, 다이제스트 발송을
+# 막을 이유가 아니다(glm_enrich.py 자체가 fail-open, 항상 exit 0에 수렴한다).
+GLM_RC=0
+"${PY}" scripts/glm_enrich.py "${WEEK}" --db "${DB}" || GLM_RC=$?
+echo "glm_enrich exit=${GLM_RC} (실패해도 계속)"
+
+# glm_enrich 가 본문에 보강 줄을 붙였을 수 있으므로, notify 가 보기 전에
+# check.json 의 해시·항목 대조를 다시 맞춘다(recheck_digest.py — 죽은 URL도
+# 함께 재검사한다). 여기서 pass=false 면 weekly_digest 실패와 같은 이유로
+# 미리보기를 보내지 않는다(낡은 "발송 가능" 판정이 남지 않게).
+RECHECK_RC=0
+"${PY}" scripts/recheck_digest.py "${MD}" --db "${DB}" || RECHECK_RC=$?
+echo "recheck_digest exit=${RECHECK_RC}"
+
+if [ "${RECHECK_RC}" -ne 0 ]; then
+  echo "재검증 실패(exit ${RECHECK_RC}) — 미리보기 전송 생략" >&2
+  exit "${RECHECK_RC}"
+fi
+
 NOTIFY_RC=0
 # 통합 2·3: notify 도 정본 대조·URL 생존을 본다 — **생성과 같은 DB**를 넘긴다
 # (GONGGO_DB 로 경로를 바꿔 쓰는 운영에서 두 단계가 다른 DB 를 보면 안 된다).
