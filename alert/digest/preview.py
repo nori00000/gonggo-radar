@@ -209,6 +209,12 @@ def render_preview(
     ]
     if not check_pass and check.get("reason"):
         lines.append(f"검증 실패 사유: {check['reason']}")
+    # V3.1: GLM 보강 게이트가 버린 문장 수를 **상단에** 한 줄로 보여준다. 경고가
+    # `digests/<주차>.glm_warnings.json` 에만 남으면 아무도 읽지 않는다 — 발송을
+    # 막지는 않지만(본문은 이미 `원문 확인`으로 대체돼 있다) 사람이 알고 승인해야 한다.
+    glm_warnings = check.get("glm_warnings") or 0
+    if glm_warnings:
+        lines.append(f"GLM 보강 경고 {glm_warnings}건 (해당 항목은 '원문 확인'으로 대체)")
     lines.append("")
 
     # 항목 번호는 블록 파서가 정한 순서로만 붙인다 (문자열 일치 추측 금지 —
@@ -234,6 +240,11 @@ def render_preview(
                 if len(block["url"]) + 4 <= TELEGRAM_LIMIT
                 else f"   {URL_TOO_LONG_NOTICE}"
             )
+            # V3.1: GLM 보강 줄도 **미리보기에 그대로** 보인다 — 편집자가 보지 못한
+            # 문장이 메일·카톡으로 나가면 승인 게이트가 거짓이 된다(개정 v2.5 #7).
+            enrich = (block.get("enrich_line") or "").strip()
+            if enrich:
+                lines.append(f"   {enrich}")
             lines.extend(
                 "" for line in block["lines"] if not line.strip()
             )

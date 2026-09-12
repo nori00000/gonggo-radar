@@ -17,6 +17,17 @@ DB 도 고칠 수 있고, 어떤 파일 대조로도 막지 못한다.
 검증은 고쳐주지 않고 `pass=false` 로 멈춘다 — 자동 교정은 ①을 위반한다
 (Codex 5차 HIGH #2: 재검토가 불일치 항목을 지워 통과시키면서 살아 있는 공고가
 sections·holds 양쪽에서 사라졌다). 해소는 재조립뿐이다.
+
+**GLM 보강 레인의 외부 입력** (V3.1): `scripts/glm_enrich.py` 는 항목 URL 의 상세
+페이지를 직접 받아(`alert/utils/http_fetch.fetch_detail_text` — 이 파일의 생존
+프로브와 같은 UA·헤더) 앞 2,000자를 `detail_text` 로 GLM 에 넘긴다. 그 텍스트는
+**우리가 통제하지 않는 외부 입력**이고, 그것을 읽은 GLM 의 출력도 마찬가지다.
+그래서 GLM 이 낸 문장은 세 관문을 다 지난 뒤에만 md 에 들어간다: ①glm_enrich 의
+결정론 게이트(숫자·인용의 근거 부분문자열 일치, 마크다운·제어문자 형식 금지,
+n 집합 정확 일치 — 하나라도 어긋나면 그 필드는 `원문 확인`이거나 출력 전체 폐기)
+②이 파일의 정본 대조·해시 결속(보강 줄도 items.json 의 `enrich_line` 과 문자열
+동일해야 한다) ③사람의 미리보기 승인(보강 줄과 `GLM 보강 경고 N건` 이 미리보기에
+그대로 보인다). 상세 텍스트 자체는 어떤 경로로도 발송본에 실리지 않는다.
 """
 
 import hashlib
@@ -30,6 +41,7 @@ import requests
 from alert.digest import blocks as blocks_mod
 from alert.digest import prune
 from alert.digest import sections as sections_mod
+from alert.utils import http_fetch
 from alert.digest.composer import (
     HEADING_TO_SECTION,
     ITEMS_JSON_SUFFIX,
@@ -500,18 +512,36 @@ def parse_period_end(period_end_str: Optional[str]) -> bool:
     return parse_deadline(period_end_str) is not None
 
 
-# 공공기관 사이트 다수가 기본 python-requests UA를 차단하거나 HEAD를 지원하지 않는다.
-BROWSER_USER_AGENT = (
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
-)
-PROBE_HEADERS = {
-    "User-Agent": BROWSER_USER_AGENT,
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-    "Accept-Language": "ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7",
-}
+# UA·헤더 정본은 alert/utils/http_fetch 다 — 생존 프로브(여기)와 GLM 보강의 상세
+# 텍스트 수집(scripts/glm_enrich.py)이 **같은 UA** 로 같은 사이트를 친다.
+BROWSER_USER_AGENT = http_fetch.BROWSER_USER_AGENT
+PROBE_HEADERS = http_fetch.PROBE_HEADERS
 # 생존 확인에는 응답 본문이 필요 없다. 연결만 확인하고 최대 이만큼만 읽는다.
 MAX_PROBE_BYTES = 64 * 1024
+
+# V3.1: GLM 보강 레인의 게이트 경고 파일 (`digests/<주차>.glm_warnings.json`).
+# 발송을 막지는 않는다 — 미리보기 상단에 건수만 보여 사람이 알고 승인하게 한다.
+GLM_WARNINGS_SUFFIX = ".glm_warnings.json"
+
+
+def glm_warnings_path(markdown_path) -> Path:
+    """발송본 마크다운 경로 → GLM 보강 경고 파일 경로."""
+    markdown_path = Path(markdown_path)
+    name = markdown_path.name
+    stem = name[:-3] if name.endswith(".md") else name
+    return markdown_path.with_name(stem + GLM_WARNINGS_SUFFIX)
+
+
+def glm_warning_count(markdown_path) -> int:
+    """GLM 보강 게이트 경고 건수. 파일이 없거나 깨졌으면 0 (표시용, 게이트 아님)."""
+    try:
+        loaded = json.loads(
+            glm_warnings_path(markdown_path).read_text(encoding="utf-8")
+        )
+    except (OSError, json.JSONDecodeError):
+        return 0
+    warnings = loaded.get("warnings") if isinstance(loaded, dict) else None
+    return len(warnings) if isinstance(warnings, list) else 0
 
 def extract_item_urls(markdown_text: str, item_sections=None) -> List[str]:
     """항목 블록의 원문 URL을 문서 순서대로, 중복 없이 뽑는다.
@@ -824,6 +854,10 @@ def check_digest(
         "link_audit": links,
         "long_prose_urls": long_prose_urls,
         "kakao_problems": kakao_problems,
+        # V3.1: GLM 보강 게이트가 남긴 경고 건수 — 미리보기 상단에 표시만 한다
+        # (발송 차단 아님. 경고 = "GLM 이 낸 문장을 게이트가 버렸다" 이므로 본문은
+        # 이미 안전한 쪽으로 대체돼 있다. 사람은 그 사실을 알고 승인해야 한다).
+        "glm_warnings": glm_warning_count(markdown_path),
         "pass": (
             network_checked
             and alive_count > 0

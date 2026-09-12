@@ -1969,27 +1969,37 @@ def markdown_kakao_problems(markdown_text: str) -> List[str]:
         problems.append(
             f"URL 출현 불일치({source_counts[url]}→{accounted}): {url[:40]}…"
         )
+
+    # V3.1 ③ **보강 줄 유실**. md 에 있는 GLM 보강 줄이 카톡 결과물에 없으면
+    # 채널마다 다른 본문이 나간다 — 승인 게이트가 본 것과 받는 사람이 읽는 것이
+    # 갈라진다. 사람이 md 에서 읽은 문장이 카톡에서 조용히 사라지는 쪽이,
+    # 발송을 멈추는 쪽보다 나쁘다.
+    for block in blocks_mod.item_blocks(markdown_text):
+        enrich = (block.get("enrich_line") or "").strip()
+        if enrich and enrich not in joined:
+            problems.append(f"보강 줄 누락: {enrich[:40]}…")
     return problems
 
 
 def _is_item_block(block: str) -> bool:
-    """카톡 항목 블록인가 (제목 줄 + URL 줄, 딱 두 줄)."""
+    """카톡 항목 블록인가 (제목 줄 + URL 줄 [+ V3.1 보강 줄], 두세 줄)."""
     lines = block.split("\n")
-    return len(lines) == 2 and _is_url_line(lines[1])
+    return 2 <= len(lines) <= 3 and _is_url_line(lines[1])
 
 
 def _shrink_item_block(block: str, limit: int) -> str:
-    """항목 블록이 한도를 넘으면 **제목만** 줄이고 URL은 보존한다 (개정 v2.6 (5))."""
+    """항목 블록이 한도를 넘으면 **제목만** 줄이고 URL·보강 줄은 보존한다 (개정 v2.6 (5))."""
     if not _is_item_block(block):
         return block
-    head, url_line = block.split("\n")
-    room = limit - len(url_line) - 1
+    head, *tail_lines = block.split("\n")
+    tail = "\n".join(tail_lines)
+    room = limit - len(tail) - 1
     if room <= 1:
         # URL 자체가 한도를 넘는다 — 자르지 않고 그대로 둔다(링크 보존이 우선).
         return block
     if len(head) > room:
         head = head[: max(1, room - 1)] + "…"
-    return f"{head}\n{url_line}"
+    return f"{head}\n{tail}"
 
 
 URL_TOO_LONG_NOTICE = "(URL 길이 초과 — 원문 확인)"
@@ -2129,8 +2139,15 @@ def kakao_blocks_from_markdown(markdown_text: str) -> List[str]:
             seen_section = True
             continue
         if kind == "item":
-            # 항목은 제목 줄 + URL 줄이 **한 덩어리**다 (쪼개지 않는다)
-            body.append(f"{block['title']}\n  {block['url']}")
+            # 항목은 제목 줄 + URL 줄이 **한 덩어리**다 (쪼개지 않는다).
+            # V3.1: GLM 보강 줄(`  → …`)이 있으면 같은 덩어리의 셋째 줄로 싣는다 —
+            # 예전에는 카톡 렌더가 앞 두 줄만 보고 보강을 조용히 떨어뜨렸다
+            # (md·메일에는 있고 카톡에는 없는 채널 분기, Codex v3 MEDIUM).
+            chunk = f"{block['title']}\n  {block['url']}"
+            enrich = block.get("enrich_line")
+            if enrich and enrich.strip():
+                chunk += f"\n{enrich.rstrip()}"
+            body.append(chunk)
             continue
         for raw in block["lines"]:
             text = raw.strip()
