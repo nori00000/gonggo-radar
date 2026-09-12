@@ -1,5 +1,6 @@
 """다이제스트 항목 검증: URL 생존성 및 마감일 파싱."""
 
+import hashlib
 import json
 import re
 import sqlite3
@@ -7,7 +8,26 @@ from pathlib import Path
 from typing import Dict, List, Optional
 import requests
 
+from alert.digest import prune
 from alert.digest.composer import parse_deadline
+
+
+def markdown_sha256(markdown_text: str) -> str:
+    """검증한 본문의 지문 (계약 W10 크리틱 #3).
+
+    check.json 에 이 값을 남기면 "과거 검증 재사용"을 발송 게이트가 잡아낼 수 있다 —
+    본문이 한 글자라도 바뀌면 해시가 달라지므로 재검증 없이는 발송되지 않는다.
+    """
+    return hashlib.sha256((markdown_text or "").encode("utf-8")).hexdigest()
+
+
+def dead_urls(result: Dict) -> List[str]:
+    """검증 결과에서 아직 본문에 남아 있는 죽은 URL 목록."""
+    return [
+        item["url"]
+        for item in (result or {}).get("items") or []
+        if not item.get("url_alive")
+    ]
 
 
 def parse_period_end(period_end_str: Optional[str]) -> bool:
@@ -54,6 +74,10 @@ def extract_item_urls(markdown_text: str) -> List[str]:
     검사 대상으로 세면, 재조립이 원문 URL만 제외하는 사이 제목 속 죽은 링크가
     발송본에 남는다. 제목 쪽은 composer.sanitize_title이 링크 문법을 제거하고,
     weekly_digest가 "제외된 URL이 본문에 남아 있지 않은지"를 따로 확인한다.
+
+    여기서 빠진 링크(해설·산문·제목에 남은 링크)는 검사 대상에서 사라지는 것이
+    아니다 — check_digest가 body_links()로 이어 붙여 함께 확인한다(계약 W10 #2).
+    이 함수의 반환값은 "재조립이 제외할 수 있는 항목 좌표"라는 좁은 뜻이다.
     """
     urls: List[str] = []
     seen = set()
@@ -167,7 +191,9 @@ def check_digest(
             "dropped": [],
             "pass": False,
             "network_checked": False,
-            "reason": "마크다운 파일 없음"
+            "item_blocks": 0,
+            "reason": "마크다운 파일 없음",
+            "md_sha256": "",
         }
         result = _apply_warnings(result, warnings)
         write_check_result(output_path, result)
@@ -177,7 +203,17 @@ def check_digest(
     with open(markdown_path, "r", encoding="utf-8") as f:
         markdown_text = f.read()
 
-    urls = extract_item_urls(markdown_text)
+    # 검사 대상 = 항목의 "원문" 링크(개정 v2.5 #2) + 본문에 남은 나머지 링크
+    # (계약 W10 크리틱 #2). 앞쪽은 재조립이 제외할 수 있는 항목 좌표이고, 뒤쪽은
+    # 해설·산문에 사람이 써넣은 링크다 — 후자를 안 보면 `/digest 재검토` 경로에서
+    # 죽은 링크가 그대로 발송된다(재검토는 재조립을 하지 않는다).
+    item_urls = extract_item_urls(markdown_text)
+    urls = list(item_urls)
+    seen = set(item_urls)
+    for url in body_links(markdown_text):
+        if url and url not in seen:
+            seen.add(url)
+            urls.append(url)
 
     # 항목 0건은 fail-closed (검사한 URL이 0건이므로 network_checked=False)
     if not urls:
@@ -186,7 +222,9 @@ def check_digest(
             "dropped": [],
             "pass": False,
             "network_checked": False,
-            "reason": "항목 없음"
+            "item_blocks": 0,
+            "reason": "항목 없음",
+            "md_sha256": markdown_sha256(markdown_text),
         }
         result = _apply_warnings(result, warnings)
         write_check_result(output_path, result)
@@ -242,20 +280,45 @@ def check_digest(
     network_checked = network_checked_count > 0
     alive_count = len(items) - len(dropped)
 
+    # 계약 W10 크리틱 #2: items 는 **본문에 실린 URL 전부**다. 그 안에 죽은 URL이
+    # 하나라도 남아 있으면 통과시키지 않는다 — 죽은 링크를 메일로 보내는 것이
+    # "살아 있는 항목도 있으니 pass" 보다 나쁘다. 제거는 호출자(재조립·prune)가 한다.
+    #
+    # 사이클2 #6·#7: 항목 수는 **링크 수가 아니라 항목 블록 수**다(해설의 참고 링크가
+    # 항목으로 세어지면 "공고 0건인데 pass" 가 난다). 섹션 상한 초과도 fail 이다.
+    item_blocks = prune.item_block_count(markdown_text)
+    cap_violations = prune.cap_violations(markdown_text)
+
     if not network_checked:
         reason = "네트워크 미검사"
     elif alive_count == 0:
         reason = "생존 항목 없음"
+    elif len(dropped) > 0:
+        reason = f"본문에 죽은 URL {len(dropped)}건 잔존"
+    elif item_blocks == 0:
+        reason = "항목 0건"
+    elif cap_violations:
+        reason = "섹션 상한 초과: " + ", ".join(
+            f"{name} {count}>{cap}" for name, count, cap in cap_violations
+        )
     else:
         reason = ""
 
     result = {
         "items": items,
         "dropped": dropped,
-        "pass": network_checked and alive_count > 0,
+        "item_blocks": item_blocks,
+        "pass": (
+            network_checked
+            and alive_count > 0
+            and len(dropped) == 0
+            and item_blocks > 0
+            and not cap_violations
+        ),
         # 실제로 네트워크 검사한 URL이 0건이면 False
         "network_checked": network_checked,
-        "reason": reason
+        "reason": reason,
+        "md_sha256": markdown_sha256(markdown_text),
     }
     result = _apply_warnings(result, warnings)
 

@@ -18,6 +18,24 @@ from alert.digest.preview import MARKER
 
 NOOP_MESSAGE = "⚠️  마커 없음 — 변경하지 않았습니다 (이미 해설이 채워졌습니다)"
 
+# 계약 W10 크리틱 #7: 해설에 HTML 주석 구분자가 들어오면 거부한다.
+# 발송 렌더러(send_digest.markdown_to_html)는 `<!--` 로 시작하는 줄을 버리므로,
+# 주석을 품은 해설은 승인 마커까지 삼키면서 메일에서 조용히 사라진다.
+COMMENT_TOKENS = ("<!--", "-->")
+COMMENT_REJECT = (
+    "✗ 해설에 HTML 주석 구분자(<!-- 또는 -->)를 쓸 수 없습니다 — "
+    "발송 렌더러가 해당 줄을 버려 해설이 조용히 사라집니다"
+)
+
+
+def commentary_error(commentary: str) -> str:
+    """해설로 받아들일 수 없는 이유. 문제없으면 빈 문자열."""
+    if not (commentary or "").strip():
+        return "✗ 본문이 비었습니다"
+    if any(token in commentary for token in COMMENT_TOKENS):
+        return COMMENT_REJECT
+    return ""
+
 
 def apply_commentary(markdown_text: str, commentary: str):
     """(새 본문, 치환했는가). 마커가 없으면 원문을 그대로 돌려준다."""
@@ -36,8 +54,9 @@ def main(argv=None):
     args = parser.parse_args(argv)
 
     commentary = args.text.strip()
-    if not commentary:
-        print("✗ 본문이 비었습니다", file=sys.stderr)
+    error = commentary_error(commentary)
+    if error:
+        print(error, file=sys.stderr)
         return 2
 
     markdown_path = Path(args.out_dir) / f"{args.week}.md"
@@ -67,14 +86,21 @@ def main(argv=None):
         )
         print(f"✓ 카톡 평문 동기화: {kakao_path}")
 
+    # 계약 W10 사이클2 #1: 상태 쓰기는 잠금 하 read-modify-write.
+    # 발송 중(sending)·발송 완료(sent) 주차의 해설 변경은 mark_annotated 가 거부한다.
     state_path = state_mod.state_path(args.week, args.out_dir)
+    lock_path = state_mod.lock_path(args.week, args.out_dir)
     try:
-        state = state_mod.load_state(state_path, args.week)
-        state_mod.save_state(
-            state_path, state_mod.mark_annotated(state, commentary)
+        state_mod.update_state(
+            state_path, lock_path, args.week,
+            lambda current: state_mod.mark_annotated(current, commentary),
+            on_reclaim=lambda reason: print(
+                f"⚠️  잔존 잠금 회수: {reason}", file=sys.stderr
+            ),
         )
         print(f"✓ 상태 기록: {state_path} (status=annotated)")
-    except (state_mod.StateError, OSError) as exc:
+    except (state_mod.StateError, state_mod.TransitionError,
+            state_mod.LockBusy, OSError) as exc:
         print(f"⚠️  상태 기록 실패(본문은 적용됨): {exc}", file=sys.stderr)
         return 1
 

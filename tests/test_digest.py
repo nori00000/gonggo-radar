@@ -57,6 +57,7 @@ from alert.digest.checker import (
     body_links,
     check_digest,
     extract_item_urls,
+    markdown_sha256,
     parse_period_end,
     check_url_alive,
 )
@@ -896,15 +897,18 @@ class TestSendDigest:
         assert "&lt;script&gt;" in html
 
     def test_markdown_to_html_https_only(self):
-        """http/https만 허용."""
+        """앵커는 http/https 스킴일 때만 만든다."""
         md = "[test](https://example.com)"
         html = markdown_to_html(md)
         assert "https://example.com" in html
 
         md_js = "[test](javascript:alert(1))"
         html_js = markdown_to_html(md_js)
-        # javascript: URL은 제거되고 텍스트만 남음
-        assert "javascript:" not in html_js
+        # 개정: LINK_PATTERN 이 URL 스킴(http/https/www)을 요구하므로 javascript:
+        # 는 링크 문법으로 읽히지 않는다. 안전 속성은 "앵커·href 가 생기지 않는다"
+        # 이며, 남은 문자열은 이스케이프된 평문이다.
+        assert "<a " not in html_js
+        assert "href=" not in html_js
 
     def test_fail_closed_marker(self, tmp_path):
         """마커 있으면 실패."""
@@ -944,15 +948,18 @@ class TestSendDigest:
     def test_dry_run_default(self, tmp_path):
         """기본값은 dry_run (발송 안 함)."""
         md_path = tmp_path / "digest.md"
-        md_path.write_text("# 테스트\n\n완료")
+        body = "# 테스트\n\n완료"
+        md_path.write_text(body)
 
         # check.json 파일은 markdown 파일 이름으로부터 자동 파생됨
+        # 계약 W10: 검증은 그 본문의 해시를 남겨야 발송 게이트를 통과한다.
         check_path = md_path.with_suffix(".check.json")
         check_path.write_text(json.dumps({
             "items": [{"url": "https://example.com", "url_alive": True, "deadline_parsed": True, "passed": True}],
             "pass": True,
             "network_checked": True,
-            "reason": ""
+            "reason": "",
+            "md_sha256": markdown_sha256(body),
         }))
 
         # dry_run=True가 기본값이므로 발송 안 함
@@ -969,18 +976,31 @@ class TestSendDigest:
         assert html.count("<a ") == 1, html
         assert "__LINK_0__" in html
 
-    def test_markdown_to_html_javascript_no_residual_paren(self):
-        """javascript: 링크는 텍스트만 남고 잔여 ')'가 없다."""
+    def test_markdown_to_html_javascript_is_never_linked(self):
+        """javascript: 는 앵커가 되지 않는다 (링크 문법으로 읽지 않는다)."""
         html = markdown_to_html("[클릭](javascript:alert(1))")
 
-        assert "javascript:" not in html
-        assert "<p>클릭</p>" in html, html
-        assert "클릭)" not in html
+        assert "<a " not in html
+        assert "href=" not in html
+        # 링크가 아니므로 잔여 ')' 없이 원문 그대로 이스케이프되어 남는다
+        assert "[클릭](javascript:alert(1))" in html
+
+    def test_markdown_to_html_keeps_non_url_parenthesis(self):
+        """`[모집](~9.30)` 같은 비URL 괄호는 링크가 아니라 본문 그대로 남는다.
+
+        V1 사이클 5 잔여: 링크로 오인하면 발송 HTML에서 마감 표기가 조용히 사라졌다.
+        """
+        html = markdown_to_html("[모집](~9.30) 산림 공고 [원문](https://ok.example/x)")
+
+        assert "[모집](~9.30)" in html
+        assert html.count("<a ") == 1
+        assert 'href="https://ok.example/x"' in html
 
     def test_main_dry_run_with_send_never_opens_smtp(self, tmp_path, monkeypatch):
         """--dry-run --send 동시 지정 시 SMTP 연결이 생성되지 않는다."""
         md_path = tmp_path / "x.md"
-        md_path.write_text("# 테스트\n\n[원문](https://example.com)")
+        body = "# 테스트\n\n[원문](https://example.com)"
+        md_path.write_text(body)
         check_path = md_path.with_suffix(".check.json")
         check_path.write_text(json.dumps({
             "items": [{"url": "https://example.com", "url_alive": True,
@@ -988,6 +1008,7 @@ class TestSendDigest:
             "pass": True,
             "network_checked": True,
             "reason": "",
+            "md_sha256": markdown_sha256(body),
         }))
 
         smtp_mock = mock.MagicMock()
@@ -1006,7 +1027,8 @@ class TestSendDigest:
     def test_send_to_override_replaces_config_recipients(self, tmp_path, monkeypatch):
         """--to 지정 시 config 수신자 2명이 아니라 제3자에게만 발송."""
         md_path = tmp_path / "y.md"
-        md_path.write_text("# 테스트\n\n[원문](https://example.com)")
+        body = "# 테스트\n\n[원문](https://example.com)"
+        md_path.write_text(body)
         check_path = md_path.with_suffix(".check.json")
         check_path.write_text(json.dumps({
             "items": [{"url": "https://example.com", "url_alive": True,
@@ -1014,6 +1036,7 @@ class TestSendDigest:
             "pass": True,
             "network_checked": True,
             "reason": "",
+            "md_sha256": markdown_sha256(body),
         }))
 
         monkeypatch.setenv("EMAIL_SENDER", "sender@x.com")
@@ -1043,7 +1066,8 @@ class TestSendDigest:
 
         monkeypatch.setattr("alert.notifiers.email_sender.smtplib.SMTP", FakeSMTP)
 
-        rc = send_digest(md_path, to_email="third@example.com", dry_run=False)
+        rc = send_digest(md_path, to_email="third@example.com", dry_run=False,
+                         approved_sha=markdown_sha256(body)[:8])
 
         assert rc == 0
         assert sent["to"] == "third@example.com"
