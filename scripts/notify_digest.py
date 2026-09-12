@@ -6,7 +6,6 @@
 토큰은 어떤 경로로도 출력하지 않는다.
 """
 
-import argparse
 import json
 import os
 import sys
@@ -23,6 +22,10 @@ from alert.digest import sections as sections_mod
 from alert.digest import state as state_mod
 from alert.digest.checker import markdown_sha256
 from alert.utils.redact import redact
+from alert.utils.safe_argparse import (
+    RedactingArgumentParser,
+    reject_secret_argv,
+)
 
 
 def _err(message) -> None:
@@ -198,7 +201,7 @@ def _blocking_reason(markdown_path, week, check, current_sha, markdown_text):
 
 
 def main():
-    parser = argparse.ArgumentParser(
+    parser = RedactingArgumentParser(
         description="다이제스트 미리보기를 텔레그램 협의회 토픽으로 전송"
     )
     parser.add_argument("markdown", help="다이제스트 마크다운 경로")
@@ -212,6 +215,10 @@ def main():
         action="store_true",
         help="전송하지 않고 본문만 출력",
     )
+    # 사이클8 #3: argparse 는 guarded_main 보다 먼저 말한다 — argv 에 토큰 형태가
+    # 있으면 **내용을 출력하지 않고** 일반 오류로 끝낸다.
+    if reject_secret_argv(sys.argv[1:], _err):
+        return 2
     args = parser.parse_args()
 
     markdown_path = Path(args.markdown)
@@ -233,9 +240,9 @@ def main():
             _err(f"✗ 전송 대상 확인 실패: {redact(exc)}")
             return 2
 
-    # 사이클7 #1 · 사이클6 MEDIUM #6: **읽기 전에** 잠금을 쥔다.
-    # 예전에는 본문·검증을 먼저 읽고 판정한 뒤 잠금을 쥐어서, 그 사이에 본문이
-    # 바뀌면 낡은 미리보기가 화면에 남았다. 발송기가 아닌 작성자는 블로킹 대기다.
+    # ── 잠금 ①: 파일 읽기·판정·승인 초안 발급까지. 텔레그램 왕복은 하지 않는다.
+    # 사이클8 #4: 잠금 안에서는 파일 IO 만 한다 — 카드 제거·청크 전송을 잠금 안에서
+    # 하면 다른 작성자의 60초 한도를 텔레그램 지연이 잡아먹는다.
     try:
         handle = state_mod.acquire_lock(lock_path, blocking=True)
     except state_mod.LockBusy as exc:
@@ -246,9 +253,12 @@ def main():
             )
             if not ok:
                 _err(f"✗ 발송 진행 중 안내 전송 실패: {error}")
+        # 사이클8 #5: 잠금 타임아웃 종료 코드는 다섯 CLI 모두 2 다.
         _err(f"✗ 미리보기 생략: 잠금 대기 실패({redact(exc)})")
-        return 3
+        return 2
 
+    prepared = None
+    stale_card = None
     try:
         if not markdown_path.exists():
             _err(f"✗ 파일 없음: {markdown_path}")
@@ -277,15 +287,11 @@ def main():
             ).format(week, blocked)
             chunks = [body]
             item_urls = []
-            approval_sha = None
-            approval_check_sha = None
         else:
             item_sections, _ = sections_mod.resolve(check, markdown_text)
             body = preview_mod.render_preview(week, markdown_text, check)
             chunks = preview_mod.chunk_text(body)
             item_urls = preview_mod.item_urls(markdown_text, item_sections)
-            approval_sha = current_sha
-            approval_check_sha = current_check_sha
 
         if args.dry_run:
             _out(f"[DRY-RUN] {week} 미리보기 {len(chunks)}개 메시지")
@@ -294,48 +300,142 @@ def main():
                 _out(chunk)
             return 0
 
-        # 이전 승인 카드의 버튼을 먼저 지운다 (계약 W10 크리틱 #6).
         try:
-            stale_card = state_mod.card_message_id(
-                state_mod.load_state(state_path, week))
+            current = state_mod.load_state(state_path, week)
         except state_mod.StateError as exc:
-            _err(f"⚠️  상태 확인 실패(미리보기는 계속 전송): {redact(exc)}")
-            stale_card = None
-        if stale_card:
-            ok, error = clear_card(token, chat_id, stale_card)
-            if not ok:
-                _err(f"⚠️  이전 승인 카드 버튼 제거 실패: {error}")
+            _err(f"✗ 상태 확인 실패: {redact(exc)}")
+            return 2
+        # 이전 승인 카드의 message_id — 버튼 제거는 잠금 밖에서 한다.
+        stale_card = state_mod.card_message_id(current)
 
-        message_ids = []
-        for index, chunk in enumerate(chunks, start=1):
-            # 사이클5 #4: 미리보기 본문도 단일 발신 경로에서 redact 를 지난다.
-            ok, message_id, error = send_chunk(
-                token, chat_id, thread_id, redact(chunk))
-            if not ok:
-                _err(f"✗ 전송 실패 ({index}/{len(chunks)}): {error}")
+        if blocked:
+            # 차단이면 옛 승인을 **먼저 폐기한다** (사이클7 #2 규율). 못 지우면
+            # 안내조차 보내지 않는다 — 옛 카드가 살아 있는 채로 끝나면 안 된다.
+            try:
+                state_mod.update_state_locked(
+                    state_path, week, state_mod.clear_approval)
+            except (state_mod.StateError, state_mod.TransitionError,
+                    OSError) as exc:
+                _err(f"✗ 승인 폐기 실패 — 안내를 보내지 않았습니다: {redact(exc)}")
                 return 2
-            message_ids.append(message_id)
-            _out(f"✓ 전송 {index}/{len(chunks)} message_id={message_id}")
-
-        # 사이클4 #2: 사람이 **본** 본문·검증으로 새 승인 세대를 발급한다.
-        # 잠금을 이미 쥐고 있으므로 update_state_locked 로 쓴다.
-        try:
-            new_state = state_mod.update_state_locked(
-                state_path, week,
-                lambda current: state_mod.record_preview(
-                    current, message_ids, item_urls,
-                    approval_sha, approval_check_sha),
-            )
-            approval = state_mod.approval_of(new_state)
-            _out("✓ 상태 기록: {} (approval={})".format(
-                state_path, approval.get("id") or "없음(검증 필요)"))
-        except (state_mod.StateError, state_mod.TransitionError, OSError) as exc:
-            _err(f"⚠️  상태 기록 실패(미리보기는 전송됨): {redact(exc)}")
-            return 1
+        else:
+            # 사이클8 #4: 승인 초안을 **전송 전에** 잠금 안에서 발급한다.
+            # message_id 는 전송 뒤 잠금 ②에서 붙인다.
+            try:
+                drafted = state_mod.update_state_locked(
+                    state_path, week,
+                    lambda cur: state_mod.record_preview(
+                        cur, [], item_urls, current_sha, current_check_sha),
+                )
+            except (state_mod.StateError, state_mod.TransitionError,
+                    OSError) as exc:
+                _err(f"✗ 승인 세대 발급 실패: {redact(exc)}")
+                return 2
+            prepared = dict(state_mod.approval_of(drafted))
     finally:
         state_mod.release_lock(handle)
 
-    return 0
+    # ── 잠금 밖: 텔레그램 왕복 ────────────────────────────────────────────
+    if stale_card:
+        # notify 가 못 지웠으면 봇이 한 번 더 지운다. 실패는 경고만.
+        ok, error = clear_card(token, chat_id, stale_card)
+        if not ok:
+            _err(f"⚠️  이전 승인 카드 버튼 제거 실패: {error}")
+
+    message_ids = []
+    send_error = None
+    for index, chunk in enumerate(chunks, start=1):
+        # 사이클5 #4: 미리보기 본문도 단일 발신 경로에서 redact 를 지난다.
+        ok, message_id, error = send_chunk(
+            token, chat_id, thread_id, redact(chunk))
+        if not ok:
+            send_error = f"전송 실패 ({index}/{len(chunks)}): {error}"
+            break
+        message_ids.append(message_id)
+        _out(f"✓ 전송 {index}/{len(chunks)} message_id={message_id}")
+
+    # ── 잠금 ②: 준비 시점의 세대가 그대로일 때만 message_id 를 기록한다 ──
+    try:
+        handle = state_mod.acquire_lock(lock_path, blocking=True)
+    except state_mod.LockBusy as exc:
+        _err(f"✗ 상태 기록 실패(미리보기는 전송됨): 잠금 대기 실패({redact(exc)})")
+        return 1
+
+    try:
+        rc, drop_card, message = _finish_locked(
+            state_path, week, prepared, message_ids, item_urls, send_error)
+    finally:
+        state_mod.release_lock(handle)
+
+    # 카드 회수는 잠금 밖에서 (사이클8 #4)
+    if drop_card:
+        ok, error = clear_card(token, chat_id, drop_card)
+        if not ok:
+            _err(f"⚠️  폐기한 승인 카드 버튼 제거 실패: {error}")
+    if message:
+        (_out if rc == 0 else _err)(message)
+    return rc
+
+
+def _finish_locked(state_path, week, prepared, message_ids, item_urls,
+                   send_error):
+    """잠금 ② — **파일 IO 만** 한다. (종료 코드, 회수할 카드 id, 안내문).
+
+    준비 시점(잠금 ①)에 발급한 승인 세대가 그대로일 때만 message_id 를 붙인다.
+    전송이 깨졌거나 그 사이 다른 작성자가 세대를 바꿨으면 폐기하고 카드를 회수한다.
+    """
+    try:
+        current = state_mod.load_state(state_path, week)
+    except state_mod.StateError as exc:
+        return 1, None, f"⚠️  상태 기록 실패(미리보기는 전송됨): {redact(exc)}"
+
+    if prepared is None:
+        # 차단 안내만 보냈다 — 승인은 이미 폐기됐다. 그래도 안내의 message_id 는
+        # 기록한다: "최신 미리보기" 가 항목 0건이 되어 옛 번호 좌표가 무효가 된다.
+        if send_error:
+            return 2, None, f"✗ {send_error}"
+        try:
+            state_mod.update_state_locked(
+                state_path, week,
+                lambda cur: state_mod.record_preview_messages(
+                    cur, message_ids, []),
+            )
+        except (state_mod.StateError, state_mod.TransitionError,
+                OSError) as exc:
+            return 1, None, f"⚠️  상태 기록 실패(안내는 전송됨): {redact(exc)}"
+        return 0, None, "✓ 상태 기록: {} (approval=없음(검증 필요))".format(
+            state_path)
+
+    live = state_mod.approval_of(current)
+    same_generation = (
+        live.get("id") == prepared.get("id")
+        and live.get("sha") == prepared.get("sha")
+        and live.get("check_sha") == prepared.get("check_sha")
+    )
+    if send_error or not same_generation:
+        drop_card = live.get("card_message_id")
+        try:
+            state_mod.update_state_locked(
+                state_path, week, state_mod.clear_approval)
+        except (state_mod.StateError, state_mod.TransitionError,
+                OSError) as exc:
+            return (2 if send_error else 1), drop_card, \
+                f"⚠️  승인 폐기 실패: {redact(exc)}"
+        if send_error:
+            return 2, drop_card, f"✗ {send_error} — 승인 세대를 폐기했습니다"
+        return 1, drop_card, (
+            "✗ 전송 중 본문·검증이 바뀌었습니다 — 승인 세대를 폐기했습니다"
+            " (`/digest 재검토`)")
+    try:
+        state_mod.update_state_locked(
+            state_path, week,
+            lambda cur: state_mod.record_preview_messages(
+                cur, message_ids, item_urls),
+        )
+    except (state_mod.StateError, state_mod.TransitionError, OSError) as exc:
+        return 1, None, f"⚠️  상태 기록 실패(미리보기는 전송됨): {redact(exc)}"
+    return 0, None, "✓ 상태 기록: {} (approval={})".format(
+        state_path, prepared.get("id"))
 
 
 def guarded_main():

@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 """주간 정책브리핑 다이제스트 발송 스크립트."""
 
-import argparse
 import html as html_module
 import hmac
 import json
@@ -23,6 +22,10 @@ from alert.digest import state as state_mod
 from alert.digest.preview import MARKER
 from alert.digest.checker import markdown_sha256
 from alert.utils.redact import redact
+from alert.utils.safe_argparse import (
+    RedactingArgumentParser,
+    reject_secret_argv,
+)
 
 # 상태 기록(status=sent) 저장 재시도 — 여기서 실패하면 "발송했는데 기록이 없는" 창이 열린다.
 STATE_SAVE_ATTEMPTS = 3
@@ -114,7 +117,8 @@ def markdown_to_html(markdown_text: str) -> str:
             continue
 
         # 링크는 이스케이프 전에 처리해야 하므로, 원문에 등장할 수 없는
-        # sentinel(\x00LINK{n}\x00)로 먼저 치환한다.
+        # sentinel(\x00LINK{n}\x00)로 먼저 치환한다. sentinel 에는 `*`·`_` 가
+        # 없다 — 굵게 정규식이 sentinel 을 씹으면 앵커가 깨진다 (사이클8 #2).
         link_placeholders = {}
         modified_line = line
         for i, match in enumerate(prune.link_matches(line)):
@@ -133,19 +137,23 @@ def markdown_to_html(markdown_text: str) -> str:
                 # (뒤에서 라인 전체를 이스케이프하므로 여기서는 원문 그대로)
                 modified_line = modified_line.replace(match.group(0), text, 1)
 
-        # 이제 라인 전체 이스케이프 (sentinel은 이스케이프 영향 없음)
+        # 순서가 곧 안전이다 (사이클8 #2): 이스케이프 → 굵게(**텍스트만**) →
+        # 앵커 복원. 예전에는 앵커를 먼저 복원하고 HTML 전체에 굵게를 걸어서,
+        # href 안의 `**report**` 가 `<strong>report</strong>` 로 바뀌었다 —
+        # 검사한 URL 과 실제 목적지가 갈리는 경로였다.
         escaped_line = html_module.escape(modified_line)
 
-        # sentinel을 실제 링크로 복원
-        for placeholder, link_html in link_placeholders.items():
-            escaped_line = escaped_line.replace(placeholder, link_html)
-
-        # **굵은텍스트** 처리 (이스케이프 후: \*\*...\*\*)
+        # **굵은텍스트** 처리 (이스케이프 후: \*\*...\*\*).
+        # sentinel(\x00)을 넘지 못하게 한다 — 링크를 걸친 굵게는 렌더하지 않는다.
         escaped_line = re.sub(
-            r"\*\*([^*]+)\*\*",
+            r"\*\*([^*\x00]+)\*\*",
             r"<strong>\1</strong>",
             escaped_line
         )
+
+        # 마지막에 sentinel을 실제 링크로 복원 — href 는 어떤 치환도 지나지 않는다.
+        for placeholder, link_html in link_placeholders.items():
+            escaped_line = escaped_line.replace(placeholder, link_html)
 
         html_body += f"<p>{escaped_line}</p>"
 
@@ -550,7 +558,7 @@ def _keep_sending_notice(state_path: Path, week: str) -> None:
 
 
 def main():
-    parser = argparse.ArgumentParser(
+    parser = RedactingArgumentParser(
         description="협의회 주간 정책브리핑 다이제스트 발송"
     )
     parser.add_argument(
@@ -581,6 +589,10 @@ def main():
         help=f"승인 카드의 세대 id(16진수 {state_mod.APPROVAL_ID_LEN}자). --send 에 필수",
         )
 
+    # 사이클8 #3: argparse 는 guarded_main 보다 먼저 말한다 — argv 에 토큰 형태가
+    # 있으면 **내용을 출력하지 않고** 일반 오류로 끝낸다.
+    if reject_secret_argv(sys.argv[1:], _err):
+        return 2
     args = parser.parse_args()
 
     # --dry-run이 --send보다 우선 (명시적 안전 플래그)

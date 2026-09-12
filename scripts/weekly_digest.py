@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 """주간 정책브리핑 다이제스트 생성 스크립트."""
 
-import argparse
 import sys
 from datetime import datetime
 from pathlib import Path
@@ -13,6 +12,10 @@ from alert.digest.composer import compose_digest
 from alert.digest.checker import check_digest, write_check_result
 from alert.digest import state as state_mod
 from alert.utils.redact import redact
+from alert.utils.safe_argparse import (
+    RedactingArgumentParser,
+    reject_secret_argv,
+)
 
 # 죽은 URL 제외 → 재조립을 반복하는 최대 횟수 (무한 루프 방지)
 MAX_RECOMPOSE_ROUNDS = 3
@@ -28,7 +31,7 @@ def _out(message) -> None:
 
 
 def main():
-    parser = argparse.ArgumentParser(
+    parser = RedactingArgumentParser(
         description="협의회 주간 정책브리핑 다이제스트 생성"
     )
     parser.add_argument(
@@ -55,6 +58,10 @@ def main():
         help="상태 파일(YYYY-Www.state.json)의 excluded_urls를 조회 단계에서 제외",
     )
 
+    # 사이클8 #3: argparse 는 guarded_main 보다 먼저 말한다 — argv 에 토큰 형태가
+    # 있으면 **내용을 출력하지 않고** 일반 오류로 끝낸다.
+    if reject_secret_argv(sys.argv[1:], _err):
+        return 2
     args = parser.parse_args()
 
     # 현재 주 결정

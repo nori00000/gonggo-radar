@@ -12,7 +12,6 @@ CLI 는 **플래그 인터페이스만** 받는다 (사이클6 #8, V1 브랜치 
 잠금을 먼저 쥐고 상태를 확인한 뒤에만 파일을 쓴다 (사이클3 #6).
 """
 
-import argparse
 import sys
 from pathlib import Path
 
@@ -23,6 +22,10 @@ from alert.digest import prune
 from alert.digest import state as state_mod
 from alert.digest.preview import MARKER
 from alert.utils.redact import redact
+from alert.utils.safe_argparse import (
+    RedactingArgumentParser,
+    reject_secret_argv,
+)
 
 NOOP_MESSAGE = "⚠️  마커 없음 — 변경하지 않았습니다 (이미 채워졌습니다)"
 
@@ -91,7 +94,7 @@ def apply_commentary(markdown_text: str, commentary: str):
 
 
 def main():
-    parser = argparse.ArgumentParser(
+    parser = RedactingArgumentParser(
         description="협의회 의견·이번 주 한 줄 확정 마커 치환")
     parser.add_argument("week", help="주차 (예: 2026-W37)")
     parser.add_argument("--commentary", help="협의회 의견 본문")
@@ -99,6 +102,10 @@ def main():
     parser.add_argument(
         "--out-dir", default="digests", help="다이제스트 디렉토리 (기본: digests)"
     )
+    # 사이클8 #3: argparse 는 guarded_main 보다 먼저 말한다 — argv 에 토큰 형태가
+    # 있으면 **내용을 출력하지 않고** 일반 오류로 끝낸다.
+    if reject_secret_argv(sys.argv[1:], _err):
+        return 2
     args = parser.parse_args()
 
     if not state_mod.valid_week(args.week):

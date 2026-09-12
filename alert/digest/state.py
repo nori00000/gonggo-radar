@@ -471,6 +471,28 @@ def new_approval_id() -> str:
     return uuid.uuid4().hex[:APPROVAL_ID_LEN]
 
 
+def record_preview_messages(state: Dict, message_ids, item_urls=None) -> Dict:
+    """이미 발급된 승인 세대에 **미리보기 message_id 만** 붙인다 (사이클8 #4).
+
+    approval 은 건드리지 않는다 — 세대는 텔레그램 전송 **전에** 잠금 안에서 발급하고
+    (record_preview), 전송 뒤 다시 잠금을 쥐고 "그 세대가 그대로인지" 확인한 다음
+    이 함수로 message_id 를 기록한다. 그래서 잠금이 텔레그램 왕복을 기다리지 않는다.
+    """
+    updated = dict(state)
+    ids = [int(mid) for mid in message_ids]
+    updated["preview_message_ids"] = ids
+    items = dict(updated.get("preview_items") or {})
+    urls = list(item_urls or [])
+    for mid in ids:
+        items.pop(str(mid), None)     # 재기록 시 순서를 최신으로
+        items[str(mid)] = urls
+    if len(items) > PREVIEW_ITEMS_MAX:
+        for key in list(items)[: len(items) - PREVIEW_ITEMS_MAX]:
+            items.pop(key)
+    updated["preview_items"] = items
+    return updated
+
+
 def record_preview(state: Dict, message_ids, item_urls=None,
                    approval_sha: Optional[str] = None,
                    check_sha: Optional[str] = None) -> Dict:
@@ -487,18 +509,7 @@ def record_preview(state: Dict, message_ids, item_urls=None,
     싣는다. 본문 SHA 가 같아도 렌더에 쓴 검증이 바뀌면(분류 개편으로 0건 → 수정 후
     pass) 세대가 무효가 된다.
     """
-    updated = dict(state)
-    ids = [int(mid) for mid in message_ids]
-    updated["preview_message_ids"] = ids
-    items = dict(updated.get("preview_items") or {})
-    urls = list(item_urls or [])
-    for mid in ids:
-        items.pop(str(mid), None)     # 재기록 시 순서를 최신으로
-        items[str(mid)] = urls
-    if len(items) > PREVIEW_ITEMS_MAX:
-        for key in list(items)[: len(items) - PREVIEW_ITEMS_MAX]:
-            items.pop(key)
-    updated["preview_items"] = items
+    updated = record_preview_messages(state, message_ids, item_urls)
     updated["approval"] = (
         {
             "id": new_approval_id(),

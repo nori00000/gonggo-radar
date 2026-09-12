@@ -4,6 +4,7 @@ import hashlib
 import json
 import sqlite3
 import sys
+from html.parser import HTMLParser
 from pathlib import Path
 
 import pytest
@@ -2011,7 +2012,8 @@ def test_notify_skips_preview_while_send_holds_lock(tmp_path, monkeypatch):
     )
     monkeypatch.setattr("sys.argv", ["notify_digest.py", str(md)])
     try:
-        assert notify_digest.main() == 3
+        # 사이클8 #5: 잠금 타임아웃 종료 코드는 다섯 CLI 모두 2 다.
+        assert notify_digest.main() == 2
     finally:
         state_mod.release_lock(holder)
     assert len(sent) == 1
@@ -2642,3 +2644,362 @@ def test_recheck_cli_guarded_main_redacts_traceback(tmp_path, monkeypatch,
     captured = capsys.readouterr()
     assert LEAK_TOKEN not in captured.err
     assert "<redacted>" in captured.err
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# 사이클8 — Codex w10fix7 크리틱 재현을 테스트로
+# ══════════════════════════════════════════════════════════════════════════
+
+# ══ #2 HTML 렌더 순서: 이스케이프 → 굵게(텍스트만) → 앵커 복원 ══════════
+class _HrefProbe(HTMLParser):
+    """실제 HTML 파서가 읽는 href·strong (렌더러 자체 문자열 검사 금지)."""
+
+    def __init__(self):
+        super().__init__()
+        self.hrefs = []
+        self.strong_text = []
+        self._in_strong = False
+
+    def handle_starttag(self, tag, attrs):
+        if tag == "a":
+            self.hrefs.append(dict(attrs).get("href"))
+        elif tag == "strong":
+            self._in_strong = True
+
+    def handle_endtag(self, tag):
+        if tag == "strong":
+            self._in_strong = False
+
+    def handle_data(self, data):
+        if self._in_strong:
+            self.strong_text.append(data)
+
+
+def _rendered(line):
+    from scripts.send_digest import markdown_to_html
+
+    probe = _HrefProbe()
+    probe.feed(markdown_to_html(line))
+    return probe
+
+
+def test_renderer_does_not_rewrite_asterisks_inside_href():
+    """사이클7 크리틱 #2 재현: 앵커 복원 뒤 굵게를 걸어 href 가 바뀌었다.
+
+    `[자료](https://example.com/**report**)` 의 실제 목적지가
+    `https://example.com/<strong>report</strong>` 가 되어, 검사한 URL 과
+    발송되는 URL 이 갈렸다 (checker pass · sender rc=0 · SMTP 1회).
+    """
+    line = "[자료](https://example.com/**report**)"
+    probe = _rendered(line)
+    assert probe.hrefs == ["https://example.com/**report**"]
+    assert "<strong>" not in (probe.hrefs[0] or "")
+    assert probe.strong_text == []          # 굵게는 href 를 건드리지 않았다
+
+
+def test_renderer_applies_bold_to_text_only():
+    probe = _rendered("**원문:** [자료](https://example.com/**report**)")
+    assert probe.hrefs == ["https://example.com/**report**"]
+    assert probe.strong_text == ["원문:"]   # 텍스트에만 <strong>
+
+
+@pytest.mark.parametrize("line", [
+    "[자료](https://example.com/**report**)",
+    "**원문:** [자료](https://example.com/**report**)",
+    "[자료](https://example.com/report(1))",
+    "[자료](https://example.com/report!)",
+    "[https://example.com/hidden](https://example.com/ok)",
+    "**원문:** [https://x/**h**](https://x/**o**)",
+])
+def test_rendered_href_is_always_a_checked_url(line):
+    """실제 파서가 읽은 href 는 **반드시** body_urls 안에 있다."""
+    probe = _rendered(line)
+    checked = prune_mod.body_urls(line)
+    for href in probe.hrefs:
+        assert href in checked
+
+
+@pytest.mark.parametrize("hidden,injected", [
+    ("https://example.com/**report**",
+     "확정 의견 — [자료](https://example.com/**report**)"),
+    ("https://example.com/a**b",
+     "확정 의견 — [자료](https://example.com/a**b)"),
+])
+def test_send_digest_refuses_excluded_url_with_asterisks(
+    tmp_path, monkeypatch, hidden, injected
+):
+    """`**` 를 품은 URL 도 제외 검사를 피하지 못한다 (렌더·검사 동일 문자열)."""
+    md = _write_digest(tmp_path, SAMPLE_MD.replace(preview_mod.MARKER, injected))
+    _seed_preview(md)
+    state_path = state_mod.state_path_for_markdown(md)
+    state_mod.save_state(state_path, dict(
+        state_mod.load_state(state_path, "2026-W37"), excluded_urls=[hidden]))
+    _forbid_notifier(monkeypatch, f"제외 URL({hidden})이 남았는데 발송했다")
+    assert _send(md) == 2
+
+
+# ══ #3 argparse 출력도 redact 를 지난다 ═════════════════════════════════
+_CLI_SCRIPTS = [
+    "scripts/send_digest.py",
+    "scripts/notify_digest.py",
+    "scripts/recheck_digest.py",
+    "scripts/weekly_digest.py",
+    "scripts/apply_commentary.py",
+]
+
+
+def _run_cli(*args):
+    import subprocess
+
+    return subprocess.run(
+        [sys.executable, *args],
+        capture_output=True, text=True,
+        cwd=str(Path(__file__).resolve().parent.parent),
+    )
+
+
+@pytest.mark.parametrize("script", _CLI_SCRIPTS)
+def test_cli_argparse_does_not_leak_token_on_unknown_flag(script):
+    """사이클7 크리틱 #3 재현: argparse 가 guarded_main 보다 먼저 원문을 찍었다."""
+    proc = _run_cli(script, f"--invalid={LEAK_TOKEN}")
+    assert proc.returncode == 2, proc.stderr
+    assert LEAK_TOKEN not in proc.stderr
+    assert LEAK_TOKEN not in proc.stdout
+
+
+@pytest.mark.parametrize("script", _CLI_SCRIPTS)
+def test_cli_rejects_token_shaped_argv_before_parsing(script):
+    """토큰 형태 인자는 **내용을 출력하지 않고** 일반 오류로 끝낸다."""
+    proc = _run_cli(script, LEAK_TOKEN)
+    assert proc.returncode == 2
+    assert LEAK_TOKEN not in proc.stderr + proc.stdout
+    assert "토큰 형태" in proc.stderr
+
+
+@pytest.mark.parametrize("script", _CLI_SCRIPTS)
+def test_cli_usage_output_has_no_token(script):
+    """--help 경로도 같은 파서를 쓴다 (usage 출력 자체는 정상)."""
+    proc = _run_cli(script, "--help")
+    assert proc.returncode == 0
+    assert LEAK_TOKEN not in proc.stdout
+
+
+def test_safe_argparse_detects_token_shaped_argv():
+    from alert.utils.safe_argparse import argv_has_secret
+
+    assert argv_has_secret([f"--token={LEAK_TOKEN}"]) is True
+    assert argv_has_secret([f"https://api.telegram.org/bot{LEAK_TOKEN}/x"]) is True
+    assert argv_has_secret(["--week", "2026-W37", "--db", "a.db"]) is False
+
+
+# ══ #4 잠금 범위 최소화 — 텔레그램 왕복은 잠금 밖 ═══════════════════════
+def _lock_free(md):
+    """지금 그 주차의 잠금이 비어 있는가 (별 fd 로 즉시 획득 시도)."""
+    try:
+        handle = state_mod.acquire_lock(
+            state_mod.lock_path_for_markdown(md), blocking=False)
+    except state_mod.LockBusy:
+        return False
+    state_mod.release_lock(handle)
+    return True
+
+
+def _notify_stubs(monkeypatch, notify_digest, send_chunk):
+    monkeypatch.setattr(
+        notify_digest, "resolve_target", lambda topic_key="council": (-100, 2011)
+    )
+    monkeypatch.setattr(notify_digest, "resolve_token", lambda: "123:FAKE")
+    monkeypatch.setattr(notify_digest, "send_chunk", send_chunk)
+    monkeypatch.setattr(
+        notify_digest, "clear_card", lambda token, chat, mid: (True, ""))
+
+
+def test_notify_releases_lock_during_telegram_roundtrip(tmp_path, monkeypatch):
+    """사이클7 크리틱 #4 재현: 카드 제거·청크 전송 내내 flock 을 쥐고 있었다."""
+    from scripts import notify_digest
+
+    annotated, _ = apply_commentary(SAMPLE_MD, "확정 의견")
+    md = _write_digest(tmp_path, annotated)
+    _seed_preview(md)
+    observed = []
+
+    def send_chunk(token, chat, thread, text):
+        observed.append(_lock_free(md))
+        return True, 2013 + len(observed), ""
+
+    _notify_stubs(monkeypatch, notify_digest, send_chunk)
+    monkeypatch.setattr("sys.argv", ["notify_digest.py", str(md)])
+    assert notify_digest.main() == 0
+    assert observed and all(observed)        # 전송 중 잠금은 비어 있었다
+    state = state_mod.load_state(
+        state_mod.state_path_for_markdown(md), "2026-W37")
+    assert state["preview_message_ids"] == [2014]
+    assert state_mod.approval_of(state)["sha"] == markdown_sha256(
+        md.read_bytes())
+
+
+def test_notify_issues_approval_before_sending(tmp_path, monkeypatch):
+    """승인 초안은 전송 **전에** 잠금 안에서 발급된다 (사이클8 #4)."""
+    from scripts import notify_digest
+
+    annotated, _ = apply_commentary(SAMPLE_MD, "확정 의견")
+    md = _write_digest(tmp_path, annotated)
+    state_path = state_mod.state_path_for_markdown(md)
+    seen = {}
+
+    def send_chunk(token, chat, thread, text):
+        state = state_mod.load_state(state_path, "2026-W37")
+        seen["approval_during_send"] = state_mod.approval_of(state).get("id")
+        seen["ids_during_send"] = list(state.get("preview_message_ids") or [])
+        return True, 2014, ""
+
+    _notify_stubs(monkeypatch, notify_digest, send_chunk)
+    monkeypatch.setattr("sys.argv", ["notify_digest.py", str(md)])
+    assert notify_digest.main() == 0
+    assert seen["approval_during_send"]              # 이미 발급돼 있다
+    assert seen["ids_during_send"] == []             # message_id 는 아직 없다
+    state = state_mod.load_state(state_path, "2026-W37")
+    assert state_mod.approval_of(state)["id"] == seen["approval_during_send"]
+    assert state["preview_message_ids"] == [2014]
+
+
+def test_notify_drops_approval_when_generation_changes_mid_send(
+    tmp_path, monkeypatch
+):
+    """전송 중 다른 작성자가 세대를 바꿨으면 message_id 를 붙이지 않고 폐기한다."""
+    from scripts import notify_digest
+
+    annotated, _ = apply_commentary(SAMPLE_MD, "확정 의견")
+    md = _write_digest(tmp_path, annotated)
+    state_path = state_mod.state_path_for_markdown(md)
+    dropped_cards = []
+
+    def send_chunk(token, chat, thread, text):
+        # 전송 왕복 중 recheck 가 승인을 폐기했다 (잠금이 비어 있으니 가능하다)
+        state_mod.save_state(state_path, state_mod.clear_approval(
+            state_mod.load_state(state_path, "2026-W37")))
+        return True, 2014, ""
+
+    _notify_stubs(monkeypatch, notify_digest, send_chunk)
+    monkeypatch.setattr(
+        notify_digest, "clear_card",
+        lambda token, chat, mid: (dropped_cards.append(mid), (True, ""))[1])
+    monkeypatch.setattr("sys.argv", ["notify_digest.py", str(md)])
+    assert notify_digest.main() == 1
+
+    state = state_mod.load_state(state_path, "2026-W37")
+    assert state_mod.approval_of(state) == {}        # 세대는 폐기됐다
+    assert state["preview_message_ids"] == []        # 기록하지 않았다
+
+
+def test_notify_drops_approval_when_send_fails(tmp_path, monkeypatch):
+    """전송이 깨지면 발급해 둔 초안 승인을 폐기한다 (카드 없는 승인 방지)."""
+    from scripts import notify_digest
+
+    annotated, _ = apply_commentary(SAMPLE_MD, "확정 의견")
+    md = _write_digest(tmp_path, annotated)
+    state_path = state_mod.state_path_for_markdown(md)
+
+    _notify_stubs(monkeypatch, notify_digest,
+                  lambda token, chat, thread, text: (False, None, "API 실패"))
+    monkeypatch.setattr("sys.argv", ["notify_digest.py", str(md)])
+    assert notify_digest.main() == 2
+    state = state_mod.load_state(state_path, "2026-W37")
+    assert state_mod.approval_of(state) == {}
+
+
+def test_notify_blocked_notice_drops_old_approval(tmp_path, monkeypatch):
+    """차단 안내 경로도 옛 승인을 폐기하고, 안내 message_id 를 최신으로 남긴다."""
+    from scripts import notify_digest
+
+    annotated, _ = apply_commentary(SAMPLE_MD, "확정 의견")
+    md = _write_digest(tmp_path, annotated)
+    _seed_preview(md)
+    md.write_text(annotated + "\n사후 변경", encoding="utf-8")   # 검증과 불일치
+    state_path = state_mod.state_path_for_markdown(md)
+    assert state_mod.approval_of(
+        state_mod.load_state(state_path, "2026-W37")).get("id")
+
+    sent = []
+    _notify_stubs(
+        monkeypatch, notify_digest,
+        lambda token, chat, thread, text: (
+            sent.append(text), (True, 3014, ""))[1])
+    monkeypatch.setattr("sys.argv", ["notify_digest.py", str(md)])
+    assert notify_digest.main() == 0
+
+    state = state_mod.load_state(state_path, "2026-W37")
+    assert state_mod.approval_of(state) == {}            # 옛 승인 폐기
+    assert state["preview_message_ids"] == [3014]         # 최신은 안내(항목 0건)
+    assert state_mod.preview_urls(state) == []
+    assert any("재검증 필요" in text or "검증" in text for text in sent)
+
+
+def test_notify_aborts_when_blocked_and_approval_drop_fails(
+    tmp_path, monkeypatch
+):
+    """차단인데 승인을 못 지우면 안내조차 보내지 않는다 (사이클7 #2 규율)."""
+    from scripts import notify_digest
+
+    annotated, _ = apply_commentary(SAMPLE_MD, "확정 의견")
+    md = _write_digest(tmp_path, annotated)
+    _seed_preview(md)
+    md.write_text(annotated + "\n사후 변경", encoding="utf-8")
+
+    def boom(*args, **kwargs):
+        raise OSError("상태 저장 실패")
+
+    sent = []
+    _notify_stubs(
+        monkeypatch, notify_digest,
+        lambda token, chat, thread, text: (
+            sent.append(text), (True, 3014, ""))[1])
+    monkeypatch.setattr(
+        "scripts.notify_digest.state_mod.update_state_locked", boom)
+    monkeypatch.setattr("sys.argv", ["notify_digest.py", str(md)])
+    assert notify_digest.main() == 2
+    assert sent == []
+
+
+# ══ #5 잠금 타임아웃 종료 코드 2 로 통일 ════════════════════════════════
+def test_notify_lock_timeout_exit_code_is_two(tmp_path, monkeypatch):
+    from scripts import notify_digest
+
+    annotated, _ = apply_commentary(SAMPLE_MD, "확정 의견")
+    md = _write_digest(tmp_path, annotated)
+    _seed_preview(md)
+    holder = state_mod.acquire_lock(state_mod.lock_path_for_markdown(md))
+    monkeypatch.setenv(state_mod.LOCK_TIMEOUT_ENV, "0.2")
+    _notify_stubs(monkeypatch, notify_digest,
+                  lambda token, chat, thread, text: (True, 2014, ""))
+    monkeypatch.setattr("sys.argv", ["notify_digest.py", str(md)])
+    try:
+        assert notify_digest.main() == 2
+    finally:
+        state_mod.release_lock(holder)
+
+
+def test_all_cli_lock_timeouts_exit_two(tmp_path, monkeypatch):
+    """recheck·weekly·apply·notify 가 같은 종료 코드(2)로 실패한다."""
+    from scripts import notify_digest, recheck_digest, weekly_digest
+
+    annotated, _ = apply_commentary(SAMPLE_MD, "확정 의견")
+    md = _write_digest(tmp_path, annotated)
+    holder = state_mod.acquire_lock(state_mod.lock_path_for_markdown(md))
+    monkeypatch.setenv(state_mod.LOCK_TIMEOUT_ENV, "0.2")
+    _notify_stubs(monkeypatch, notify_digest,
+                  lambda token, chat, thread, text: (True, 2014, ""))
+    try:
+        monkeypatch.setattr(
+            "sys.argv",
+            ["recheck_digest.py", str(md), "--db", str(tmp_path / "x.db")])
+        assert recheck_digest.main() == 2
+        monkeypatch.setattr("sys.argv", [
+            "weekly_digest.py", "--week", "2026-W37",
+            "--out-dir", str(tmp_path), "--db", str(tmp_path / "x.db")])
+        assert weekly_digest.main() == 2
+        monkeypatch.setattr("sys.argv", ["notify_digest.py", str(md)])
+        assert notify_digest.main() == 2
+        assert _run_apply(tmp_path, "--commentary", "의견").returncode == 2
+    finally:
+        state_mod.release_lock(holder)

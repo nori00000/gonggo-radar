@@ -10,7 +10,6 @@ apply_commentary.py 로 협의회 의견을 채운 뒤, 그 파일 기준으로 
 check.json 을 pass=false 로 덮어쓴다(크리틱 #3) — 과거의 pass 가 재사용되지 않게.
 """
 
-import argparse
 import sys
 from pathlib import Path
 
@@ -27,6 +26,10 @@ from alert.digest.checker import (
     write_check_result,
 )
 from alert.utils.redact import redact
+from alert.utils.safe_argparse import (
+    RedactingArgumentParser,
+    reject_secret_argv,
+)
 
 # 죽은 URL 제거 → 재검증을 반복하는 최대 횟수 (무한 루프 방지)
 MAX_PRUNE_ROUNDS = 3
@@ -119,13 +122,17 @@ def write_failure(check_path: Path, markdown_path: Path, reason: str) -> None:
 
 
 def main():
-    parser = argparse.ArgumentParser(description="다이제스트 팩트 게이트 재검증")
+    parser = RedactingArgumentParser(description="다이제스트 팩트 게이트 재검증")
     parser.add_argument("markdown", help="다이제스트 마크다운 경로")
     parser.add_argument(
         "--db",
         default="alert/data/announcements.db",
         help="announcements.db 경로 (기본: alert/data/announcements.db)",
     )
+    # 사이클8 #3: argparse 는 guarded_main 보다 먼저 말한다 — argv 에 토큰 형태가
+    # 있으면 **내용을 출력하지 않고** 일반 오류로 끝낸다.
+    if reject_secret_argv(sys.argv[1:], _err):
+        return 2
     args = parser.parse_args()
 
     markdown_path = Path(args.markdown)
