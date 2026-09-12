@@ -250,16 +250,14 @@ def run_pipeline(test_mode: bool = False) -> None:
     # Initialize components
     db = Database()
 
-    # 예전 source_id 를 **행 식별자**로 이관한다 (멱등, 삭제 없음).
-    # 인용 보유 목록(``get_quoted_source_ids``)도 식별자 기준이므로
-    # 크롤 시작 전에 끝나 있어야 한다.
+    # 옛 규칙으로 저장된 행은 **표시만** 한다 (멱등, 삭제 없음).
+    # 새 식별자로 재수집되면 그 새 행이 정본이 되고, 옛 행은 기간·알림에서
+    # 빠진 채 조용히 남는다 - 추측 이관이 남의 기간을 덮어쓰는 것보다 안전하다.
     try:
-        migrated, conflicts = db.migrate_identity_keys()
-        logger.info(
-            f"식별자 이관: {migrated} 행 이관, {conflicts} 행 충돌 보존"
-        )
+        marked = db.mark_legacy_rows(EVIDENCE_KEYS)
+        logger.info(f"레거시 식별자 행: {marked} 건 표시 (기간·알림 제외)")
     except Exception as e:
-        logger.error(f"식별자 이관 실패: {e}")
+        logger.error(f"레거시 표시 실패: {e}")
 
     # 기존 오염 정규화 (멱등) - 허용목록 **여집합 전체**의 기간을 지운다.
     # 12차 게이트: 대상을 몇 개 소스로 좁혔더니 bizinfo 같은 소스의 오염이

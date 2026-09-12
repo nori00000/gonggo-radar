@@ -11,14 +11,15 @@
 ``exists``, ``overwrite_periods``, ``merge_quote_fields``)는 전부 여기서
 나온 키만 쓴다.
 
-규칙 (우선순위):
+규칙 (우선순위) - **URL 우선**:
 
-1. 소스가 **식별 필드를 선언**했고 그 필드가 **전부** 있으면 그 조합이
-   식별자다. API 가 주는 자기 ID 는 URL 보다 권위 있고, URL 이 없을 때
-   만들어 내는 상세 링크(템플릿)가 식별자가 되는 것을 막는다.
-   하나라도 없으면 URL 로 넘어간다 - 반쪽 키는 다른 공고와 겹친다.
-2. 아니면 **정규화 URL** 이 곧 식별자다 (쿼리 정렬·세션 파라미터 제거).
-3. URL 도 식별 필드도 없으면 크롤러가 만든 ``source_id`` 를 그대로 쓴다.
+1. **정규화 URL** 이 있으면 그것이 곧 식별자다 (쿼리 정렬·알려진 세션·추적
+   파라미터만 제거). API 소스(bizinfo·g2b)도 마찬가지다 - 상세 URL 은
+   안정적이고, 키를 두 갈래로 두면 같은 공고가 **URL 키 행과 필드 키
+   행으로 갈려** 한쪽에 철회된 기간이 남는다 (15차 게이트 HIGH).
+2. URL 이 없을 때만 소스가 선언한 식별 필드가 **전부** 있으면 그 조합.
+   하나라도 없으면 다음으로 넘어간다 - 반쪽 키는 다른 공고와 겹친다.
+3. 둘 다 없으면 크롤러가 만든 ``source_id``.
 """
 import hashlib
 import json
@@ -28,6 +29,7 @@ from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 # 소스가 선언한 식별 필드 (``raw_data`` 키). 하나라도 빠지면 다른 공고가
 # 같은 행이 된다 - G2B 차수(``bidNtceOrd``)가 그 사례다.
+# URL 이 **전혀 없을 때**만 쓰는 대체 식별 필드.
 IDENTITY_FIELDS: Dict[str, Tuple[str, ...]] = {
     "g2b": ("bidNtceNo", "bidNtceOrd"),
     "bizinfo": ("pblancId",),
@@ -100,6 +102,17 @@ def normalize_url(url: Any) -> Optional[str]:
     ))
 
 
+# ``identity_key`` 가 만드는 키의 접두사. 이 형식이 아닌 ``source_id`` 는
+# 옛 규칙으로 저장된 행이다 (15차 게이트: 휴리스틱 이관 대신 **표시**한다).
+IDENTITY_PREFIXES = ("url:", "fld:", "raw:")
+
+
+def is_identity_key(value: Any) -> bool:
+    """이 ``source_id`` 가 현재 식별 규칙으로 만들어진 값인가."""
+    text = clean_text(value)
+    return bool(text) and text.startswith(IDENTITY_PREFIXES)
+
+
 def _url_and_raw(item: Any) -> Tuple[Optional[str], Dict[str, Any], str]:
     """``(url, raw_data 딕셔너리, 크롤러 source_id)`` 를 꺼낸다."""
     if isinstance(item, Mapping):
@@ -129,22 +142,22 @@ def identity_key(source: str, item: Any) -> str:
         item: ``RawAnnouncement`` 또는 ``{"url":…, "raw_data":…}`` 매핑
 
     Returns:
-        ``fld:…`` / ``url:…`` / 크롤러 ``source_id`` / ``raw:…``
+        ``url:…`` / ``fld:…`` / 크롤러 ``source_id`` / ``raw:…``
     """
     url, raw, source_id = _url_and_raw(item)
-
-    fields = IDENTITY_FIELDS.get((source or "").strip(), ())
-    if fields:
-        values = [clean_text(raw.get(name)) for name in fields]
-        # **전부** 있을 때만 필드 키다. 하나라도 비면 그 키는 다른 공고와
-        # 같아질 수 있으므로(``fld:번호|``) URL 로 넘어간다 (14차 게이트).
-        if all(values):
-            return "fld:" + "|".join(values)
 
     normalized = normalize_url(url)
     if normalized:
         digest = hashlib.sha1(normalized.encode("utf-8")).hexdigest()[:16]
         return f"url:{digest}"
+
+    fields = IDENTITY_FIELDS.get((source or "").strip(), ())
+    if fields:
+        values = [clean_text(raw.get(name)) for name in fields]
+        # **전부** 있을 때만 필드 키다. 하나라도 비면 그 키는 다른 공고와
+        # 같아질 수 있으므로(``fld:번호|``) 다음으로 넘어간다 (14차 게이트).
+        if all(values):
+            return "fld:" + "|".join(values)
 
     if source_id:
         return source_id           # 레거시·수동 입력: 크롤러가 만든 값 유지

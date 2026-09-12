@@ -215,19 +215,21 @@ class TestTheGateSitsBeforeEveryWrite:
             assert gate < source.index(call), f"{call} 이 관문보다 앞에 있다"
 
     def test_only_known_statements_write_period_columns(self):
-        """기간 컬럼을 쓰는 SQL 은 **세 자리**뿐이다.
+        """기간 컬럼을 쓰는 SQL 은 **네 자리**뿐이다.
 
+        ``mark_legacy_rows``(옛 식별자 행 비우기),
         ``revalidate_periods``(기존 행 근거 재검증),
-        ``clear_periods_for_sources``(추출기 없는 소스 정규화),
+        ``clear_periods_except``(추출기 없는 소스 정규화),
         ``overwrite_periods``(관문 값 기록). 다른 자리가 생기면 이 테스트가
         먼저 깨진다.
         """
         db_source = (REPO / "alert" / "db.py").read_text(encoding="utf-8")
         writes = [
             line.strip() for line in db_source.splitlines()
-            if "UPDATE announcements SET period_start" in line
+            if "period_start = " in line
         ]
         assert writes == [
+            '"UPDATE announcements SET legacy = 1, period_start = NULL,"',
             '"UPDATE announcements SET period_start = ?, period_end = ?,"',
             '"UPDATE announcements SET period_start = NULL,"',
             '"UPDATE announcements SET period_start = ?, period_end = ?,"',
@@ -254,6 +256,14 @@ class TestTheGateSitsBeforeEveryWrite:
         assert source.count("clear_periods_except(") == 1
         assert source.index("clear_periods_except(") < source.index(
             "db.get_unnotified("
+        )
+
+    def test_legacy_rows_are_marked_before_anything_else(self):
+        """레거시 표시는 정규화·재검증보다 먼저 한 번 돈다."""
+        source = self.pipeline_source()
+        assert source.count("mark_legacy_rows(") == 1
+        assert source.index("mark_legacy_rows(") < source.index(
+            "clear_periods_except("
         )
 
     def test_keyword_analysis_preserves_the_gate(self):

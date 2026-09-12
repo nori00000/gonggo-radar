@@ -109,6 +109,14 @@ MIGRATIONS: List[Tuple[int, str, List[str]]] = [
             " ON announcements(duplicate_of);",
         ]
     ),
+    (
+        6,
+        "Add legacy flag to announcements (rows stored under old id rules)",
+        [
+            "ALTER TABLE announcements ADD COLUMN legacy INTEGER DEFAULT 0;",
+            "CREATE INDEX IF NOT EXISTS idx_ann_legacy ON announcements(legacy);",
+        ]
+    ),
 ]
 
 

@@ -8,9 +8,9 @@ import os
 import sqlite3
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence
 
-from .crawlers.identity import identity_key
+from .crawlers.identity import identity_key, is_identity_key
 from .models import (
     AnalyzedAnnouncement,
     ApplicationRecord,
@@ -346,14 +346,16 @@ class Database:
     def get_unnotified(self) -> List[AnalyzedAnnouncement]:
         """Return all announcements that have not been notified yet.
 
-        이관 충돌로 보존된 중복 행(``duplicate_of``)은 **알리지 않는다** -
-        같은 공고를 두 번 말하게 된다 (14차 게이트).
+        보존된 중복 행(``duplicate_of``)은 같은 공고를 두 번 말하게 되므로,
+        옛 규칙으로 저장된 행(``legacy``)은 아무 것도 주장할 수 없으므로
+        제외한다 (14·15차 게이트).
         """
         rows = self._conn.execute(
             """
             SELECT * FROM announcements
              WHERE is_notified = 0
                AND duplicate_of IS NULL
+               AND legacy = 0
                AND (period_end IS NULL OR period_end = '' OR period_end >= date('now'))
              ORDER BY relevance_score DESC, created_at DESC
             """
@@ -521,99 +523,62 @@ class Database:
         """이 공고가 이미 저장돼 있는가 (행 식별자 기준)."""
         return self._find_row("id", announcement) is not None
 
-    def migrate_identity_keys(self) -> Tuple[int, int]:
-        """예전 ``source_id`` 를 **행 식별자**로 1회 이관한다 (멱등).
+    def mark_legacy_rows(
+        self, evidence_keys: Optional[Dict[str, Sequence[str]]] = None
+    ) -> int:
+        """옛 규칙으로 저장된 행을 **어둡게** 둔다 (멱등, 삭제 없음).
 
-        숫자 ID·접두형 ID 로 저장된 기존 행은 새 식별자와 달라서, 재수집이
-        같은 행을 찾지 못하고 새 행을 만든다. 그러면 예전 행의 기간은
-        영원히 정리되지 않는다.
+        15차 게이트: 예전 ``source_id`` 를 새 식별자로 **추측해 이관**하려
+        했더니, 서로 다른 공고가 같은 키로 수렴해 중복으로 묶이고 남의
+        기간이 덮어써졌다. 추측이 아니라 **표시**한다:
 
-        **충돌(이미 그 식별자를 쓰는 행이 있음)은 삭제하지 않는다** - 중복을
-        남기고 로그로만 알린다. 삭제는 되돌릴 수 없다.
+        - ``legacy = 1`` 로 표시하고
+        - 기간 두 필드를 NULL 로, 추출 근거를 raw_data 에서 지운다
+        - 알림·기간 조회 후보에서 제외한다
+
+        재수집되면 새 식별자로 **새 행**이 생기고 그것이 정본이 된다.
+        옛 행은 남아 있지만 아무 것도 주장하지 않는다 - 되돌릴 수 없는
+        삭제 대신 조용히 두는 쪽이 안전하다(fail-safe).
+
+        Args:
+            evidence_keys: 소스별 추출 근거 키 (``EVIDENCE_KEYS``)
 
         Returns:
-            ``(이관한 행 수, 충돌로 남긴 행 수)``
+            이번 실행에서 새로 표시한 행 수
         """
         rows = self._conn.execute(
             _sql(
-                "SELECT id, source, source_id, url, raw_data, duplicate_of"
-                " FROM announcements ORDER BY id"
+                "SELECT id, source, source_id, raw_data FROM announcements"
+                " WHERE legacy = 0"
             )
         ).fetchall()
 
         now = datetime.now().isoformat()
-        representatives: Dict[Tuple[str, str], int] = {}
-        migrated = conflicts = 0
-
+        marked = 0
         for row in rows:
-            current = str(row["source_id"] or "")
-            fresh = identity_key(row["source"], {
-                "url": row["url"],
-                "raw_data": row["raw_data"],
-                "source_id": current,
-            })
-            if not fresh:
+            if is_identity_key(row["source_id"]):
                 continue
-            slot = (row["source"], fresh)
+            payload = self._load_json(row["raw_data"])
+            for key in (evidence_keys or {}).get(row["source"], ()):
+                payload.pop(key, None)
+            self._conn.execute(
+                _sql(
+                    "UPDATE announcements SET legacy = 1, period_start = NULL,"
+                    " period_end = NULL, raw_data = ?, updated_at = ?"
+                    " WHERE id = ?"
+                ),
+                (json.dumps(payload, ensure_ascii=False), now, row["id"]),
+            )
+            marked += 1
 
-            if fresh == current:
-                representatives.setdefault(slot, row["id"])
-                continue
-
-            if slot in representatives:
-                # 같은 공고를 가리키는 레거시 행이 이미 있다. **삭제하지
-                # 않는다** - 대표를 가리키게 묶어 두고(`duplicate_of`),
-                # 기간 갱신·정규화는 그룹 전체에 적용한다 (14차 게이트).
-                self._link_duplicate(row["id"], representatives[slot], now)
-                conflicts += 1
-                logging.getLogger(__name__).warning(
-                    "identity 이관 충돌: %s/%s -> %s (대표 %s 에 묶었다)",
-                    row["source"], current, fresh, representatives[slot],
-                )
-                continue
-
-            try:
-                self._conn.execute(
-                    _sql(
-                        "UPDATE announcements SET source_id = ?, updated_at = ?"
-                        " WHERE id = ?"
-                    ),
-                    (fresh, now, row["id"]),
-                )
-            except _IntegrityError:
-                # 이번 실행에서 보지 못한 행이 이미 그 키를 쓰고 있다
-                existing = self._conn.execute(
-                    _sql(
-                        "SELECT id FROM announcements"
-                        " WHERE source = ? AND source_id = ?"
-                    ),
-                    (row["source"], fresh),
-                ).fetchone()
-                if existing is not None:
-                    self._link_duplicate(row["id"], existing["id"], now)
-                conflicts += 1
-                logging.getLogger(__name__).warning(
-                    "identity 이관 충돌: %s/%s -> %s (중복을 보존한다)",
-                    row["source"], current, fresh,
-                )
-                continue
-
-            representatives[slot] = row["id"]
-            migrated += 1
-
-        if self._backend == "sqlite":
+        if marked and self._backend == "sqlite":
             self._conn.commit()
-        return migrated, conflicts
-
-    def _link_duplicate(self, row_id: int, representative: int, now: str) -> None:
-        """충돌로 남긴 행을 대표 행에 묶는다 (삭제하지 않는다)."""
-        self._conn.execute(
-            _sql(
-                "UPDATE announcements SET duplicate_of = ?, updated_at = ?"
-                " WHERE id = ?"
-            ),
-            (representative, now, row_id),
-        )
+        if marked:
+            logging.getLogger(__name__).warning(
+                "레거시 식별자 행 %s 건을 표시했다 - 기간·알림에서 제외한다"
+                " (재수집되면 새 행이 정본)", marked,
+            )
+        return marked
 
     def revalidate_periods(self, source: str, recompute) -> int:
         """저장된 행의 기간을 **raw_data 근거로 다시 산출**한다 (멱등).
@@ -744,7 +709,16 @@ class Database:
                 stored[key] = fresh
                 evidence_changed = True
 
-        if not period_changed and not evidence_changed:
+        # 대표가 이미 최신이어도 **묶인 중복 행**은 옛 값을 들고 있을 수
+        # 있다. 조기 반환하면 그 행의 기간이 기간별 조회에 남는다
+        # (15차 게이트 MEDIUM). 중복이 있으면 항상 그룹을 다시 쓴다.
+        has_duplicates = self._conn.execute(
+            _sql(
+                "SELECT 1 FROM announcements WHERE duplicate_of = ? LIMIT 1"
+            ),
+            (row["id"],),
+        ).fetchone() is not None
+        if not period_changed and not evidence_changed and not has_duplicates:
             return False               # 같으면 updated_at 도 건드리지 않는다
 
         # 이관 충돌로 보존된 중복 행도 **같은 값**으로 갱신한다. 대표만
@@ -1211,11 +1185,16 @@ class Database:
     # ------------------------------------------------------------------
 
     def get_announcements_by_period(self, start: str, end: str) -> List[AnalyzedAnnouncement]:
-        """Get announcements created within a date range."""
+        """Get announcements created within a date range.
+
+        다이제스트 후보에서도 레거시·중복 행은 뺀다 (15차 게이트).
+        """
         rows = self._conn.execute(
             _sql("""
             SELECT * FROM announcements
              WHERE created_at >= ? AND created_at <= ?
+               AND legacy = 0
+               AND duplicate_of IS NULL
              ORDER BY relevance_score DESC, created_at DESC
             """),
             (start, end),

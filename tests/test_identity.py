@@ -27,7 +27,7 @@ from alert.crawlers.identity import (
     identity_key,
     normalize_url,
 )
-from alert.crawlers.period_extractors import g2b_period
+from alert.crawlers.period_extractors import EVIDENCE_KEYS, g2b_period
 from alert.db import Database
 from alert.main import _finalize_periods, _periods_from_raw
 from alert.models import AnalyzedAnnouncement, RawAnnouncement
@@ -125,14 +125,24 @@ class TestIdentityKey:
             "seis", "https://www.seis.or.kr/v.do?b=2&a=1&jsessionid=Q"))
         assert first == second
 
-    def test_declared_fields_win_over_the_url(self):
-        """API ID 가 URL 보다 권위 있다 - 템플릿 링크가 식별자가 되면 안 된다."""
+    def test_the_url_wins_even_for_api_sources(self):
+        """15차 게이트: 키를 두 갈래로 두면 같은 공고가 갈린다.
+
+        같은 URL 을 ①ID 없이 ②ID 와 함께 수집하면 예전에는 URL 키 행과
+        필드 키 행으로 갈려, 한쪽에 철회된 기간이 남았다.
+        """
         assert IDENTITY_FIELDS["bizinfo"] == ("pblancId",)
-        first = identity_key("bizinfo", announcement(
-            "bizinfo", "https://www.bizinfo.go.kr/x", {"pblancId": "B1"}))
-        second = identity_key("bizinfo", announcement(
-            "bizinfo", "https://www.bizinfo.go.kr/y", {"pblancId": "B1"}))
-        assert first == second == "fld:B1"
+        url = "https://www.bizinfo.go.kr/view.do?pblancId=B1"
+        without_id = identity_key("bizinfo", announcement("bizinfo", url))
+        with_id = identity_key("bizinfo", announcement(
+            "bizinfo", url, {"pblancId": "B1"}))
+        assert without_id == with_id
+        assert with_id.startswith("url:")
+
+    def test_declared_fields_are_the_fallback_when_no_url(self):
+        """URL 이 **전혀 없을 때만** 선언 필드를 쓴다."""
+        assert identity_key("bizinfo", announcement(
+            "bizinfo", None, {"pblancId": "B1"})) == "fld:B1"
 
     def test_g2b_order_is_part_of_the_identity(self):
         """차수가 다르면 마감이 다른 별개 공고다."""
@@ -185,7 +195,7 @@ class TestEveryDbPathUsesTheSameKey:
         남아 있고 생산 경로에서는 쓰지 않는다 - 아래 테스트가 고정한다.
         """
         assert self.methods_matching("AND source_id = ?") == {
-            "_find_row", "is_duplicate", "migrate_identity_keys",
+            "_find_row", "is_duplicate",
         }
 
     def test_production_code_never_calls_is_duplicate(self):
@@ -274,9 +284,9 @@ class TestRowsNeverOverwriteEachOther:
         assert [(r["title"], r["period_end"]) for r in rows] == [
             ("용역 입찰 00차", "2026-10-31"), ("용역 입찰 01차", "2026-11-30"),
         ]
-        assert {r["source_id"] for r in rows} == {
-            "fld:20260900123|00", "fld:20260900123|01",
-        }
+        # URL(템플릿)이 차수를 담으므로 키는 URL 키다 (15차: URL 우선)
+        keys = {r["source_id"] for r in rows}
+        assert len(keys) == 2 and all(k.startswith("url:") for k in keys)
 
     def test_g2b_template_url_carries_the_order(self, db):
         crawler = make(G2bCrawler, "g2b")
@@ -314,7 +324,8 @@ class TestRowsNeverOverwriteEachOther:
         assert [(r["title"], r["period_end"]) for r in rows] == [
             ("10월 공고", "2026-10-31"), ("11월 공고", "2026-11-30"),
         ]
-        assert {r["source_id"] for r in rows} == {"fld:B1", "fld:B2"}
+        keys = {r["source_id"] for r in rows}
+        assert len(keys) == 2 and all(k.startswith("url:") for k in keys)
 
 
 class TestPartialIdentifiersKeepTheAnnouncement:
@@ -393,47 +404,43 @@ class TestPartialIdentifiersKeepTheAnnouncement:
 
 
 class TestDuplicateGroupsMoveTogether:
-    """이관 충돌로 보존한 행은 **그룹 전체**가 함께 갱신된다 (14차 HIGH)."""
+    """``duplicate_of`` 로 묶인 행은 **그룹 전체**가 함께 갱신된다."""
 
     URL = "https://www.seis.or.kr/subPage.do?fncPbofrSn=1"
+    EVIDENCE = ("date", "date_field", "dday")
 
     @pytest.fixture
     def db(self, tmp_path):
         yield Database(db_path=tmp_path / "announcements.db")
 
-    def seed(self, db, source_id, url, period_end):
+    def grouped(self, db):
+        """대표 1행 + 묶인 중복 1행 (옛 10월 기간을 들고 있다)."""
+        raw = json.dumps(
+            {"date": "2026.10.01 ~ 2026.10.31",
+             "date_field": "li.swiper-slide p.date"},
+            ensure_ascii=False,
+        )
+        representative = AnalyzedAnnouncement(
+            source="seis", source_id="ignored", title="지원사업 공고",
+            url=self.URL, raw_data=raw, period_start="2026-10-01",
+            period_end="2026-10-31", relevance_score=0.9,
+            fetched_at=datetime.now().isoformat(),
+        )
+        rep_id = db.insert_announcement(representative)
         db._conn.execute(
             "INSERT INTO announcements (source, source_id, title, url,"
             " raw_data, period_start, period_end, relevance_score,"
-            " created_at, updated_at)"
-            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            ("seis", source_id, "지원사업 공고", url,
-             json.dumps({"date": "2026.10.01 ~ 2026.10.31",
-                         "date_field": "li.swiper-slide p.date"},
-                        ensure_ascii=False),
-             "2026-10-01", period_end, 0.9,
+            " duplicate_of, created_at, updated_at)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            ("seis", "legacy-b", "지원사업 공고", self.URL + "&jsessionid=ZZ",
+             raw, "2026-10-01", "2026-10-31", 0.9, rep_id,
              datetime.now().isoformat(), datetime.now().isoformat()),
         )
         db._conn.commit()
-
-    def grouped(self, db):
-        self.seed(db, "legacy-a", self.URL, "2026-10-31")
-        self.seed(db, "legacy-b", self.URL + "&jsessionid=ZZ", "2026-10-31")
-        migrated, conflicts = db.migrate_identity_keys()
-        assert (migrated, conflicts) == (1, 1)
-        return db
-
-    def test_conflict_rows_are_linked_not_deleted(self, db):
-        self.grouped(db)
-        rows = db._conn.execute(
-            "SELECT id, source_id, duplicate_of FROM announcements ORDER BY id"
-        ).fetchall()
-        assert len(rows) == 2                       # 어느 행도 사라지지 않았다
-        assert rows[0]["duplicate_of"] is None      # 대표
-        assert rows[1]["duplicate_of"] == rows[0]["id"]
+        return rep_id
 
     def test_retraction_clears_the_whole_group(self, db):
-        """철회된 기간이 보존 행에 남아 알림으로 나가지 않는다."""
+        """철회된 기간이 묶인 행에 남아 기간 조회에 나오지 않는다."""
         self.grouped(db)
         retracted = RawAnnouncement(
             source="seis", source_id="ignored", title="지원사업 공고",
@@ -445,7 +452,7 @@ class TestDuplicateGroupsMoveTogether:
             ),
         )
         gated = _finalize_periods("seis", retracted)
-        assert db.overwrite_periods(gated, ("date", "date_field", "dday")) is True
+        assert db.overwrite_periods(gated, self.EVIDENCE) is True
 
         rows = db._conn.execute(
             "SELECT period_start, period_end FROM announcements"
@@ -454,7 +461,6 @@ class TestDuplicateGroupsMoveTogether:
             (None, None), (None, None),
         ]
 
-        # 다음 실행(빈 수집)의 재검증도 근거가 바뀌었으므로 부활시키지 않는다
         assert db.revalidate_periods(
             "seis", lambda raw: _periods_from_raw("seis", raw)
         ) == 0
@@ -462,8 +468,32 @@ class TestDuplicateGroupsMoveTogether:
         assert len(notified) == 1                   # 알림은 대표만
         assert notified[0].period_end is None
 
+    def test_group_is_rewritten_even_when_the_leader_is_current(self, db):
+        """15차 MEDIUM: 대표가 이미 최신이어도 묶인 행을 갱신한다."""
+        rep_id = self.grouped(db)
+        # 대표만 먼저 비운다 (묶인 행은 10월을 그대로 들고 있다)
+        db._conn.execute(
+            "UPDATE announcements SET period_start = NULL, period_end = NULL,"
+            " raw_data = '{}' WHERE id = ?",
+            (rep_id,),
+        )
+        db._conn.commit()
+
+        empty = RawAnnouncement(
+            source="seis", source_id="ignored", title="지원사업 공고",
+            url=self.URL, raw_data="{}",
+        )
+        gated = _finalize_periods("seis", empty)
+        assert db.overwrite_periods(gated, self.EVIDENCE) is True
+
+        ends = [
+            row["period_end"] for row in db._conn.execute(
+                "SELECT period_end FROM announcements"
+            ).fetchall()
+        ]
+        assert ends == [None, None]
+
     def test_duplicates_are_never_notified(self, db):
-        """보존 행은 알림 목록에 들어가지 않는다 (같은 공고를 두 번 말한다)."""
         self.grouped(db)
         assert len(db.get_unnotified()) == 1
 
@@ -484,64 +514,154 @@ class TestG2bDeadlineValidation:
         assert g2b_period({"bidClseDt": value})[1] == expected
 
 
-class TestLegacyIdentityMigration:
-    """예전 source_id 는 1회 이관한다 - 삭제는 하지 않는다."""
+class TestLegacyRowsGoDark:
+    """옛 규칙으로 저장된 행은 **표시만** 한다 - 이관도 삭제도 없다.
+
+    15차 게이트: 예전 ``source_id`` 를 새 식별자로 **추측해 이관**했더니
+    서로 다른 공고가 같은 키로 수렴해 중복으로 묶이고, 남의 기간이
+    덮어써졌다. 추측하지 않고 어둡게 둔다(fail-safe).
+    """
 
     @pytest.fixture
     def db(self, tmp_path):
         yield Database(db_path=tmp_path / "announcements.db")
 
-    def seed_legacy(self, db, source, source_id, url, raw=None, title="공고"):
+    def seed_legacy(self, db, source, source_id, url, raw=None,
+                    title="공고", period_end="2026-10-31"):
         db._conn.execute(
             "INSERT INTO announcements (source, source_id, title, url,"
-            " raw_data, created_at, updated_at)"
-            " VALUES (?, ?, ?, ?, ?, ?, ?)",
+            " raw_data, period_start, period_end, relevance_score,"
+            " created_at, updated_at)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (source, source_id, title, url,
              json.dumps(raw or {}, ensure_ascii=False),
+             "2026-10-01", period_end, 0.9,
              datetime.now().isoformat(), datetime.now().isoformat()),
         )
         db._conn.commit()
 
-    def test_legacy_ids_are_migrated_once(self, db):
-        url = "https://www.seis.or.kr/subPage.do?fncPbofrSn=42"
-        self.seed_legacy(db, "seis", "42", url)
-        self.seed_legacy(db, "bizinfo", "B1", "", {"pblancId": "B1"})
+    def test_legacy_rows_are_marked_and_silenced(self, db):
+        """기간·근거를 지우고 알림·다이제스트에서 뺀다 (삭제는 없다)."""
+        self.seed_legacy(
+            db, "seis", "ntt:42",
+            "https://www.seis.or.kr/boardView.do?nttId=42",
+            {"date": "2026.10.01 ~ 2026.10.31",
+             "date_field": "li.swiper-slide p.date"},
+            title="레거시 B",
+        )
+        assert len(db.get_unnotified()) == 1
 
-        migrated, conflicts = db.migrate_identity_keys()
-        assert (migrated, conflicts) == (2, 0)
+        assert db.mark_legacy_rows(EVIDENCE_KEYS) == 1
 
-        stored = {
-            row["source"]: row["source_id"]
-            for row in db._conn.execute(
-                "SELECT source, source_id FROM announcements"
-            ).fetchall()
-        }
-        assert stored["seis"] == identity_key("seis", {"url": url, "raw_data": "{}"})
-        assert stored["bizinfo"] == "fld:B1"
+        row = db._conn.execute(
+            "SELECT legacy, period_start, period_end, raw_data, title"
+            " FROM announcements"
+        ).fetchone()
+        assert row["legacy"] == 1
+        assert (row["period_start"], row["period_end"]) == (None, None)
+        assert json.loads(row["raw_data"]) == {}          # 근거 삭제
+        assert row["title"] == "레거시 B"                  # 행은 남아 있다
+        assert db.get_unnotified() == []                  # 알림 제외
+        assert db.get_announcements_by_period("2000", "2100") == []
 
-        # 멱등
-        assert db.migrate_identity_keys() == (0, 0)
+        assert db.mark_legacy_rows(EVIDENCE_KEYS) == 0    # 멱등
 
-    def test_migrated_row_is_found_by_the_new_key(self, db):
-        url = "https://www.seis.or.kr/subPage.do?fncPbofrSn=42"
-        self.seed_legacy(db, "seis", "42", url)
-        db.migrate_identity_keys()
+    def test_new_rows_are_untouched(self, db):
+        db.insert_announcement(AnalyzedAnnouncement(
+            source="seis", source_id="ignored", title="새 A",
+            url="https://www.seis.or.kr/boardView.do?sid=A&nttId=42",
+            raw_data="{}", period_end="2026-11-30", relevance_score=0.9,
+            fetched_at=datetime.now().isoformat(),
+        ))
+        assert db.mark_legacy_rows(EVIDENCE_KEYS) == 0
+        row = db._conn.execute(
+            "SELECT legacy, period_end FROM announcements"
+        ).fetchone()
+        assert (row["legacy"], row["period_end"]) == (0, "2026-11-30")
 
-        fresh = announcement("seis", url, {"date": "2026.09.01 ~ 2026.09.30"})
-        assert db.exists(fresh) is True
-        rows = db._conn.execute("SELECT COUNT(*) AS n FROM announcements").fetchone()
-        assert rows["n"] == 1
+    def test_legacy_and_fresh_rows_coexist(self, db):
+        """재현: 레거시 B 와 새 A 는 **별개 행**이고 A 만 살아 있다."""
+        self.seed_legacy(
+            db, "seis", "ntt:42",
+            "https://www.seis.or.kr/boardView.do?nttId=42",
+            title="레거시 B",
+        )
+        db.insert_announcement(AnalyzedAnnouncement(
+            source="seis", source_id="ignored", title="새 A",
+            url="https://www.seis.or.kr/boardView.do?sid=A&nttId=42",
+            raw_data="{}", period_end="2026-11-30", relevance_score=0.9,
+            fetched_at=datetime.now().isoformat(),
+        ))
 
-    def test_conflicts_keep_both_rows(self, db):
-        """같은 식별자로 몰리면 **중복을 보존**한다 (삭제 금지)."""
-        url = "https://www.seis.or.kr/v.do?id=1"
-        self.seed_legacy(db, "seis", "legacy-a", url, title="A")
-        self.seed_legacy(db, "seis", "legacy-b", url + "&jsessionid=ZZ", title="B")
-
-        migrated, conflicts = db.migrate_identity_keys()
-        assert (migrated, conflicts) == (1, 1)
+        assert db.mark_legacy_rows(EVIDENCE_KEYS) == 1
         rows = db._conn.execute(
-            "SELECT source_id, title FROM announcements ORDER BY title"
+            "SELECT title, legacy, period_end FROM announcements ORDER BY title"
         ).fetchall()
-        assert len(rows) == 2                      # 어느 행도 사라지지 않았다
-        assert rows[1]["source_id"] == "legacy-b"  # 충돌한 쪽은 그대로 남는다
+        assert [(r["title"], r["legacy"], r["period_end"]) for r in rows] == [
+            ("레거시 B", 1, None), ("새 A", 0, "2026-11-30"),
+        ]
+        assert [a.title for a in db.get_unnotified()] == ["새 A"]
+
+    def test_recollected_row_becomes_the_truth(self, db):
+        """레거시 행이 있어도 재수집은 **새 행**을 만들고 그것이 정본이다."""
+        url = "https://www.seis.or.kr/subPage.do?fncPbofrSn=42"
+        self.seed_legacy(db, "seis", "42", url, title="옛 행")
+        db.mark_legacy_rows(EVIDENCE_KEYS)
+
+        fresh = announcement(
+            "seis", url, {"date": "접수기간 2026.09.01 ~ 2026.09.30"}
+        )
+        assert db.exists(fresh) is False               # 레거시 키와 만나지 않는다
+        db.insert_announcement(AnalyzedAnnouncement(
+            **_finalize_periods("seis", fresh).__dict__, relevance_score=0.9,
+        ))
+        rows = db._conn.execute(
+            "SELECT legacy, period_end FROM announcements ORDER BY legacy"
+        ).fetchall()
+        assert [(r["legacy"], r["period_end"]) for r in rows] == [
+            (0, "2026-09-30"), (1, None),
+        ]
+        assert len(db.get_unnotified()) == 1
+
+
+class TestBizinfoUrlConvergence:
+    """같은 URL 의 ①ID 없음 ②ID 있음 수집은 **한 행**으로 수렴한다."""
+
+    URL = "https://www.bizinfo.go.kr/view.do?pblancId=B1"
+
+    @pytest.fixture
+    def db(self, tmp_path):
+        yield Database(db_path=tmp_path / "announcements.db")
+
+    def collect(self, db, crawler, item):
+        built = crawler._parse_item(item)
+        assert built is not None
+        gated = _finalize_periods("bizinfo", built)
+        if db.exists(gated):
+            db.overwrite_periods(gated, EVIDENCE_KEYS["bizinfo"])
+        else:
+            db.insert_announcement(
+                AnalyzedAnnouncement(**gated.__dict__, relevance_score=0.9)
+            )
+        return gated
+
+    def test_same_url_converges_and_retraction_applies(self, db):
+        crawler = make(BizinfoCrawler, "bizinfo")
+        self.collect(db, crawler, {
+            "pblancNm": "지원 공고", "detailUrl": self.URL,
+            "reqstBeginEndDe": "20261001~20261031",
+        })
+        assert db._conn.execute(
+            "SELECT period_end FROM announcements"
+        ).fetchone()["period_end"] == "2026-10-31"
+
+        self.collect(db, crawler, {
+            "pblancId": "B1", "pblancNm": "지원 공고", "detailUrl": self.URL,
+            "reqstBeginEndDe": "",
+        })
+        rows = db._conn.execute(
+            "SELECT period_end FROM announcements"
+        ).fetchall()
+        assert len(rows) == 1                       # 한 행으로 수렴
+        assert rows[0]["period_end"] is None        # 철회가 반영된다
+        assert [a.period_end for a in db.get_unnotified()] == [None]
