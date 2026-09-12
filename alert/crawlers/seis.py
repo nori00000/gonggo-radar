@@ -5,8 +5,13 @@ import re
 from collections import OrderedDict
 from typing import List, Optional
 from .base import BaseCrawler
-from .date_labels import classify_date, header_labels, label_before, label_for
-from .dedupe_keys import group_key, normalize_title
+from .date_labels import (
+    classify_date,
+    extract_date_and_label,
+    header_labels,
+    label_for,
+)
+from .dedupe_keys import ALWAYS_OPEN_TOKENS, group_key, normalize_title
 from ..models import RawAnnouncement
 
 try:
@@ -51,8 +56,11 @@ class SeisCrawler(BaseCrawler):
         re.compile(r"detail", re.I),
     ]
 
-    # 목록 카드의 D-day 배지 (지역/회차와 구분하기 위해 걸러낸다)
-    _DDAY_RE = re.compile(r"^D-\s*(\d+|DAY|day)$|^마감$|^상시$")
+    # 목록 카드의 D-day 배지 (지역/회차와 구분하기 위해 걸러낸다).
+    # **"상시" 는 걸러내지 않는다** (7차 게이트 #4): 상시는 D-day 자리에
+    # 나오지만 회차·상시접수를 뜻하는 정보라, 버리면 같은 카드의
+    # ``[교육,1차,상시]`` 와 ``[교육,1차]`` 가 구별되지 않는다.
+    _DDAY_RE = re.compile(r"^D-\s*(\d+|DAY|day)$|^마감$")
     _ROUND_RE = re.compile(r"(\d+)\s*차")
 
     def __init__(self):
@@ -207,7 +215,7 @@ class SeisCrawler(BaseCrawler):
                     continue
                 info_values.append(value)
 
-            items.append({
+            item = {
                 "title": title,
                 "link": href,
                 "author": "",
@@ -216,7 +224,12 @@ class SeisCrawler(BaseCrawler):
                 "sub": self._clean(sub.get_text(strip=True)) if sub else "",
                 "info": info_values,
                 "round": round_label,
-            })
+            }
+            # 상시 표기는 키에도 쓰고 raw_data 에도 남긴다 (7차 게이트 #4)
+            if any(ALWAYS_OPEN_TOKENS.search(value) for value in
+                   [title, item["sub"], *info_values, round_label]):
+                item["always_open"] = True
+            items.append(item)
 
         return items
 
@@ -447,22 +460,10 @@ class SeisCrawler(BaseCrawler):
             if cat_elem:
                 category = cat_elem.get_text(strip=True)
 
-            date_str = ""
-            date_label = ""
-            date_elem = item_elem.find(
-                ["span", "em", "div"],
-                class_=re.compile(r"date|period|term|time", re.I)
-            )
-            if date_elem:
-                date_str = date_elem.get_text(strip=True)
-                date_label = " ".join(date_elem.get("class", []) or [])
-            else:
-                text = item_elem.get_text(" ", strip=True)
-                date_match = re.search(r"\d{4}[-./]\d{1,2}[-./]\d{1,2}", text)
-                if date_match:
-                    date_str = date_match.group()
-                    # 날짜 앞에 붙은 말을 라벨로 본다 ("게시일 2026.09.11")
-                    date_label = label_before(text, date_match.start())
+            # 날짜와 라벨은 **날짜가 든 가장 작은 요소** 안에서만 읽는다.
+            # 항목 전체 텍스트에서 앞말을 자르면 제목이 라벨로 새어 들어와
+            # 게시일이 접수기간이 된다 (7차 게이트 #3).
+            date_str, date_label = extract_date_and_label(item_elem)
 
             items.append({
                 "title": title_text,

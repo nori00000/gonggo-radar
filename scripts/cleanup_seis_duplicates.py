@@ -55,9 +55,23 @@ from alert.crawlers.dedupe_keys import (  # noqa: E402
     keys_compatible,
     normalize_title,
 )
+from alert.crawlers.date_labels import (  # noqa: E402
+    DEADLINE_ONLY_LABELS,
+    PERIOD_LABELS,
+    POSTED_LABELS,
+)
 from alert.crawlers.detail_quotes import period_from_quote  # noqa: E402
 
 DEFAULT_DB = "alert/data/announcements.db"
+
+# 마감 교정 대상 = **협의회 8소스** (7차 게이트 #1).
+# 전 소스로 넓혔더니 g2b 처럼 목록이 실제 마감(``bidClseDt``)을 주는 소스에서
+# 적재일과 마감일이 같은 날이면 **정상 마감을 지웠다**. 브리핑이 쓰는 소스만
+# 손댄다.
+DEADLINE_FIX_SOURCES = (
+    "seis", "socialenterprise", "fowi", "forest_service", "forest_press",
+    "kofpi", "coop", "lawmaking",
+)
 
 # 규칙 B(제목·주체·종료일 병합)는 회차별 링크를 뿌리는 seis 에만 쓴다
 RULE_B_SOURCE = "seis"
@@ -114,7 +128,9 @@ def row_region(row: sqlite3.Row) -> str:
     return extract_region(region_candidates(row))
 
 
-def row_key(row: sqlite3.Row) -> Tuple[str, Tuple[str, ...], str, str]:
+def row_key(
+    row: sqlite3.Row, corrected: Optional[Dict[int, Optional[str]]] = None
+) -> Tuple[str, Tuple[str, ...], str, str]:
     """행의 중복 판별 키 - 크롤러와 같은 ``group_key`` 를 쓴다.
 
     접수 종료일이 없으면 **적재 월**로 갈라 회차가 다른 공고가 합쳐지지
@@ -123,10 +139,15 @@ def row_key(row: sqlite3.Row) -> Tuple[str, Tuple[str, ...], str, str]:
     created = str(row["created_at"] or "")
     payload = load_raw(row["raw_data"])
     rounds = [str(payload.get("round") or "")] + region_candidates(row)
+    # **교정된 마감**을 쓴다 (7차 게이트 #2). 교정될 가짜 마감을 확정 마감처럼
+    # 쓰면 회차 키가 비워져 별도 회차(1차/2차)가 삭제 대상이 된다.
+    period_end = row["period_end"] or None
+    if corrected is not None and row["id"] in corrected:
+        period_end = corrected[row["id"]]
     return group_key(
         row["title"],
         region_candidates(row),
-        row["period_end"] or None,
+        period_end,
         ingested_month=created[:7],
         round_candidates=rounds,
     )
@@ -184,7 +205,9 @@ def _fetch_rows(conn: sqlite3.Connection, source: str) -> List[sqlite3.Row]:
 
 
 def find_duplicates(
-    conn: sqlite3.Connection, source: str
+    conn: sqlite3.Connection,
+    source: str,
+    corrected: Optional[Dict[int, Optional[str]]] = None,
 ) -> Tuple[List[sqlite3.Row], List[str], Set[int]]:
     """한 소스에서 삭제할 중복 행과 근거, canonical 집합을 낸다.
 
@@ -213,13 +236,13 @@ def find_duplicates(
         merged = load_raw(row["raw_data"]).get("merged_source_ids") or []
         if not merged:
             continue
-        keeper_key = row_key(row)
+        keeper_key = row_key(row, corrected)
         honoured = False
         for merged_id in merged:
             victim = by_source_id.get(str(merged_id))
             if victim is None or victim["id"] == row["id"]:
                 continue
-            victim_key = row_key(victim)
+            victim_key = row_key(victim, corrected)
             same_url = (victim["url"] or "") == (row["url"] or "") and bool(row["url"])
             if not keys_compatible(victim_key, keeper_key, ignore_deadline=same_url):
                 reasons.append(
@@ -254,7 +277,7 @@ def find_duplicates(
     if source == RULE_B_SOURCE:
         groups: Dict[Tuple[str, Tuple[str, ...], str, str], List[sqlite3.Row]] = {}
         for row in survivors:
-            groups.setdefault(row_key(row), []).append(row)
+            groups.setdefault(row_key(row, corrected), []).append(row)
 
         for (_title, region, deadline, round_key), group in groups.items():
             if len(group) < 2:
@@ -302,7 +325,7 @@ def find_duplicates(
                         and (row["url"] or "")
                         and (row["url"] or "") == (keeper["url"] or "")
                         and keys_compatible(
-                            row_key(row), row_key(keeper), ignore_deadline=True
+                            row_key(row, corrected), row_key(keeper, corrected), ignore_deadline=True
                         )
                     ),
                     None,
@@ -328,13 +351,13 @@ def find_duplicates(
                     if same_url:
                         # 같은 URL은 적재월이 달라도 같은 글이다
                         if keys_compatible(
-                            row_key(row), row_key(keeper), ignore_deadline=True
+                            row_key(row, corrected), row_key(keeper, corrected), ignore_deadline=True
                         ):
                             matched, cause = keeper, "같은 URL + 글번호 자리 불일치"
                             break
                         continue
                     if url_is_unresolved(source, row["url"] or "") and keys_compatible(
-                        row_key(row), row_key(keeper)
+                        row_key(row, corrected), row_key(keeper, corrected)
                     ):
                         matched, cause = keeper, "URL 미해소(#void)"
                         break
@@ -503,7 +526,11 @@ def deadline_evidence(payload: dict) -> Optional[str]:
 def find_fake_deadlines(
     conn: sqlite3.Connection, skip_ids: Optional[Set[int]] = None
 ) -> Tuple[List[Tuple[sqlite3.Row, Optional[str]]], List[str]]:
-    """**모든 소스**의 마감을 근거와 대조해 고친다 (6차 게이트 #1).
+    """**협의회 8소스**의 마감을 근거와 대조해 고친다.
+
+    라벨이 접수 일정(접수/신청/모집/마감/기한)을 말하면 건드리지 않는다
+    (7차 게이트 #1) - 게시일과 같은 날이어도 진짜 마감이다. g2b 처럼 목록이
+    실제 마감을 주는 소스는 대상에서 아예 빼 두었다.
 
     판정 (최종 게이트 #8) - 저장된 마감이 **게시일과 같을 때만** 손댄다:
 
@@ -526,7 +553,9 @@ def find_fake_deadlines(
         "SELECT id, source, source_id, title, period_start, period_end, raw_data,"
         "       date(created_at) AS created_date"
         " FROM announcements"
-        " WHERE period_end IS NOT NULL AND period_end != ''"
+        f" WHERE source IN ({', '.join('?' for _ in DEADLINE_FIX_SOURCES)})"
+        "   AND period_end IS NOT NULL AND period_end != ''",
+        DEADLINE_FIX_SOURCES,
     ).fetchall()
 
     skip_ids = skip_ids or set()
@@ -536,6 +565,17 @@ def find_fake_deadlines(
         if row["id"] in skip_ids:
             continue
         payload = load_raw(row["raw_data"])
+
+        # **라벨이 접수 일정을 말하면 손대지 않는다** (7차 게이트 #1).
+        # "접수마감/신청기한" 라벨이 붙은 날짜는 게시일과 같은 날이어도
+        # 진짜 마감이다. 게시일 라벨이거나 라벨이 없을 때만 교정한다.
+        label = str(payload.get("date_label") or "")
+        if label and not POSTED_LABELS.search(label):
+            if PERIOD_LABELS.search(label) or DEADLINE_ONLY_LABELS.search(label):
+                continue
+
+        if payload.get("quote_period_end"):
+            continue  # 상세 인용에서 온 진짜 마감
         if row["period_end"] not in posting_dates(payload, row["created_date"]):
             continue  # 게시일과 다른 마감 - 근거 없이 건드리지 않는다
 
@@ -680,11 +720,25 @@ def main() -> int:
     before = counts(conn)
     print_counts("before", before)
 
+    # **순서가 중요하다** (7차 게이트 #2): 마감 교정 -> 키 재계산 -> 규칙 A/B/C.
+    # 교정될 가짜 마감을 확정 마감처럼 쓰면 회차 키가 비워져 별도 회차가
+    # 삭제 대상이 된다.
+    deadline_changes, deadline_reasons = find_fake_deadlines(conn)
+    corrected: Dict[int, Optional[str]] = {
+        row["id"]: new_end for row, new_end in deadline_changes
+    }
+    print(
+        f"\n[a] 마감 교정 (협의회 {len(DEADLINE_FIX_SOURCES)}소스, 키 계산 전): "
+        f"{len(deadline_changes)} 행"
+    )
+    for line in deadline_reasons:
+        print(line)
+
     duplicates: Dict[str, List[sqlite3.Row]] = {}
-    print("\n[b] 중복 삭제 대상")
+    print("\n[b] 중복 삭제 대상 (교정된 마감으로 키 계산)")
     try:
         for source in CLEANUP_SOURCES:
-            rows, reasons, canonical = find_duplicates(conn, source)
+            rows, reasons, canonical = find_duplicates(conn, source, corrected)
             duplicates[source] = rows
             locked = f", canonical {len(canonical)}건 잠금" if canonical else ""
             print(f"  {source}: {len(rows)} 행{locked}")
@@ -699,15 +753,17 @@ def main() -> int:
 
     doomed_ids = {row["id"] for rows in duplicates.values() for row in rows}
 
-    deadline_changes, deadline_reasons = find_fake_deadlines(conn, doomed_ids)
+    # 중복으로 삭제되는 행의 교정은 무의미하므로 제외한다
+    deadline_changes = [
+        (row, new_end) for row, new_end in deadline_changes
+        if row["id"] not in doomed_ids
+    ]
     replaced = [c for c in deadline_changes if c[1]]
     nulled = [c for c in deadline_changes if not c[1]]
     print(
-        f"\n[c] 마감 교정 (전 소스): 교체 {len(replaced)} 행 / "
-        f"NULL {len(nulled)} 행"
+        f"\n[c] 실제 적용할 마감 교정: 교체 {len(replaced)} 행 / "
+        f"NULL {len(nulled)} 행 (중복 삭제분 제외)"
     )
-    for line in deadline_reasons:
-        print(line)
 
     fake_starts, start_reasons = find_fake_starts(conn, doomed_ids)
     print(f"\n[c+] coop period_start -> NULL: {len(fake_starts)} 행")

@@ -24,12 +24,18 @@ from typing import List, Optional, Sequence, Tuple
 # 게시 시각을 말하는 라벨 - 절대 기간이 아니다
 POSTED_LABELS = re.compile(r"게시일|작성일|등록일|등록날짜|작성날짜|공고일|게시날짜|작성자")
 # 접수 일정을 말하는 라벨
-PERIOD_LABELS = re.compile(r"접수|신청|모집|마감|공모|기간|일정")
-# "마감" 만 말하는 라벨 - 종료일만 준다
-DEADLINE_ONLY_LABELS = re.compile(r"마감")
+PERIOD_LABELS = re.compile(r"접수|신청|모집|마감|공모|기간|일정|기한")
+# **종료일만** 주는 라벨 (7차 게이트 #3): "신청기한 2026.09.30" 처럼
+# 단일 날짜 하나가 마감인 표현들.
+DEADLINE_ONLY_LABELS = re.compile(r"마감|기한|종료|까지")
 
 _RANGE_MARK = re.compile(r"[~∼〜]")
 _FULL_DATE = re.compile(r"(\d{4})\s*[-./년]\s*(\d{1,2})\s*[-./월]\s*(\d{1,2})")
+# 날짜 하나 / 범위 - 범위를 **먼저** 찾는다. 첫 날짜만 집으면
+# "접수 기간 2026.09.01 ~ 2026.09.30" 의 종료일이 09-01이 된다 (7차 게이트 #3).
+_DATE_TEXT = r"\d{4}\s*[-./년]\s*\d{1,2}\s*[-./월]\s*\d{1,2}\s*일?\.?"
+_RANGE_TEXT = re.compile(rf"({_DATE_TEXT})\s*[~∼〜]\s*({_DATE_TEXT})")
+_SINGLE_TEXT = re.compile(_DATE_TEXT)
 
 
 def normalize_date(text: str) -> Optional[str]:
@@ -102,7 +108,7 @@ def classify_date(
     if label and PERIOD_LABELS.search(label):
         start, end = parse_period(value)
         if DEADLINE_ONLY_LABELS.search(label) and start == end:
-            # "접수마감 2026.09.30" 은 마감일 하나다 (시작일 아님)
+            # "접수마감/신청기한 2026.09.30" 은 마감일 하나다 (시작일 아님)
             return None, end, None
         return start, end, None
 
@@ -145,6 +151,48 @@ def label_for(cell, cells: Sequence, headers: Sequence[str], css_class: str = ""
     return css_class or ""
 
 
-def label_before(text: str, position: int, width: int = 12) -> str:
-    """날짜 앞에 붙은 말을 라벨로 본다 ("게시일 2026.09.11")."""
-    return text[max(0, position - width):position]
+def extract_date_and_label(container) -> Tuple[str, str]:
+    """컨테이너에서 **날짜와 그 날짜의 라벨**을 뽑는다 (7차 게이트 #3).
+
+    라벨은 **날짜가 들어 있는 가장 작은 요소** 안에서만 읽는다. 컨테이너
+    전체 텍스트에서 날짜 앞말을 잘라 쓰면 제목이 라벨로 새어 들어온다 -
+    ``<a>참여기업 모집 공고</a><span>2026.09.11</span>`` 에서 제목의 "모집"
+    을 라벨로 오인해 게시일이 접수기간이 됐다.
+
+    범위 표기를 **먼저** 찾는다. 첫 날짜만 집으면
+    ``접수 기간 2026.09.01 ~ 2026.09.30`` 의 종료일이 09-01이 된다.
+
+    Args:
+        container: 목록 항목 요소 (BeautifulSoup Tag)
+
+    Returns:
+        ``(날짜 문자열, 라벨)`` - 날짜가 없으면 ``("", "")``
+    """
+    if container is None:
+        return "", ""
+
+    # 날짜를 담은 **가장 작은** 요소를 찾는다
+    best = None
+    best_length = None
+    for element in container.find_all(True):
+        text = re.sub(r"\s+", " ", element.get_text(" ", strip=True))
+        if not _SINGLE_TEXT.search(text):
+            continue
+        if best_length is None or len(text) < best_length:
+            best, best_length = element, len(text)
+
+    if best is None:
+        text = re.sub(r"\s+", " ", container.get_text(" ", strip=True))
+        if not _SINGLE_TEXT.search(text):
+            return "", ""
+        best, best_length = container, len(text)
+
+    text = re.sub(r"\s+", " ", best.get_text(" ", strip=True))
+    match = _RANGE_TEXT.search(text) or _SINGLE_TEXT.search(text)
+    value = match.group(0).strip()
+
+    # 라벨: 날짜 앞의 말 + 클래스 이름 (그 요소 안에서만)
+    prefix = text[:match.start()].strip(" :：·-–—()[]")
+    classes = " ".join(best.get("class", []) or [])
+    label = " ".join(part for part in (prefix, classes) if part).strip()
+    return value, label

@@ -4,7 +4,12 @@ import json
 import re
 from typing import List, Optional
 from .base import BaseCrawler
-from .date_labels import classify_date, header_labels, label_before, label_for
+from .date_labels import (
+    classify_date,
+    extract_date_and_label,
+    header_labels,
+    label_for,
+)
 from ..models import RawAnnouncement
 
 try:
@@ -252,21 +257,10 @@ class IpetCrawler(BaseCrawler):
             if cat_elem:
                 category = cat_elem.get_text(strip=True)
 
-            date_str = ""
-            date_label = ""
-            date_elem = item_elem.find(
-                ["span", "em", "div"],
-                class_=re.compile(r"date|period|term|time", re.I)
-            )
-            if date_elem:
-                date_str = date_elem.get_text(strip=True)
-                date_label = " ".join(date_elem.get("class", []) or [])
-            else:
-                text = item_elem.get_text(" ", strip=True)
-                date_match = re.search(r"\d{4}[-./]\d{1,2}[-./]\d{1,2}", text)
-                if date_match:
-                    date_str = date_match.group()
-                    date_label = label_before(text, date_match.start())
+            # 날짜와 라벨은 **날짜가 든 가장 작은 요소** 안에서만 읽는다.
+            # 항목 전체 텍스트에서 앞말을 자르면 제목이 라벨로 새어 들어와
+            # 게시일이 접수기간이 된다 (7차 게이트 #3).
+            date_str, date_label = extract_date_and_label(item_elem)
 
             items.append({
                 "title": title_text,

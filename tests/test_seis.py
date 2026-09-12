@@ -661,3 +661,116 @@ class TestGate6RoundInKey:
         unknown = group_key("공고", ["서울"], None, "2026-09", round_candidates=["9차"])
         assert known[3] == ""          # 마감을 알면 회차는 키에서 빠진다
         assert unknown[3] == "9차"
+
+
+class TestGate7AlwaysOpenToken:
+    """7차 게이트 #4: `상시` 토큰이 키에 닿기 전에 사라지던 결함.
+
+    ``_DDAY_RE`` 가 D-day 배지를 걸러낼 때 ``^상시$`` 까지 버렸다. 그래서
+    같은 카드의 ``[교육,1차,상시]`` 와 ``[교육,1차]`` 가 둘 다
+    ``round=1차, info=[교육]`` 이 되어 2건이 1건으로 병합됐다.
+    """
+
+    CARD = """
+    <li class="swiper-slide" data-type="사업공고">
+      <span class="badge cate">사업공고</span>
+      <span class="sub">서울센터</span>
+      <p class="tit"><a href="subPage.do?menuId=30400&tabId=view&itgrdAplyPbancSn={sid}">
+         상주기업 모집 공고</a></p>
+      <ul class="info">{info}</ul>
+      <p class="date">{period}</p>
+    </li>
+    """
+
+    @pytest.fixture
+    def crawler(self):
+        config = MagicMock()
+        config.crawler.timeout = 10
+        config.crawler.retry_count = 1
+        config.crawler.retry_delay = 0
+        config.crawler.user_agent = "test-agent"
+        source = MagicMock()
+        source.enabled = True
+        source.base_url = "https://www.seis.or.kr"
+        source.fetch_detail = False
+        config.crawler.sources = {"seis": source}
+        with patch("alert.crawlers.base.get_config", return_value=config):
+            yield SeisCrawler()
+
+    def build(self, crawler, cards):
+        soup = BeautifulSoup("<ul>" + "".join(cards) + "</ul>", "html.parser")
+        items = crawler._parse_main_cards(soup)
+        return items, crawler._dedupe_items(items)
+
+    def test_always_open_card_stays_separate(self, crawler):
+        """``[교육,1차,상시]`` 와 ``[교육,1차]`` 는 별개 공고다."""
+        items, deduped = self.build(crawler, [
+            self.CARD.format(
+                sid="100", info="<li>교육</li><li>1차</li><li>상시</li>", period=""
+            ),
+            self.CARD.format(sid="101", info="<li>교육</li><li>1차</li>", period=""),
+        ])
+        assert len(items) == 2
+        assert len(deduped) == 2
+
+    def test_always_open_survives_parsing(self, crawler):
+        """상시가 info 에서 버려지지 않는다."""
+        items, _deduped = self.build(crawler, [
+            self.CARD.format(
+                sid="100", info="<li>교육</li><li>1차</li><li>상시</li>", period=""
+            ),
+        ])
+        assert "상시" in items[0]["info"]
+
+    def test_always_open_lands_in_raw_data(self, crawler):
+        """상시 표기는 raw_data.always_open 으로도 남는다."""
+        items, _deduped = self.build(crawler, [
+            self.CARD.format(sid="100", info="<li>교육</li><li>상시</li>", period=""),
+        ])
+        announcement = crawler._to_announcement(items[0], "https://www.seis.or.kr")
+        assert json.loads(announcement.raw_data)["always_open"] is True
+
+    def test_no_always_open_flag_when_absent(self, crawler):
+        items, _deduped = self.build(crawler, [
+            self.CARD.format(sid="101", info="<li>교육</li><li>1차</li>", period=""),
+        ])
+        announcement = crawler._to_announcement(items[0], "https://www.seis.or.kr")
+        assert "always_open" not in json.loads(announcement.raw_data)
+
+    def test_dday_badges_are_still_filtered(self, crawler):
+        """D-day·마감 배지는 여전히 걸러낸다 - 지역·회차가 아니다."""
+        items, _deduped = self.build(crawler, [
+            self.CARD.format(
+                sid="102", info="<li>경기도</li><li>D-109</li><li>마감</li>", period=""
+            ),
+        ])
+        assert items[0]["info"] == ["경기도"]
+
+
+class TestGate7RoundTokenBoundaries:
+    """7차 게이트 #5: 기관명 부분 문자열이 회차로 잡히던 결함."""
+
+    def test_org_name_substring_is_not_a_round(self):
+        """"여수시청" 안의 "수시" 를 회차로 보지 않는다."""
+        from alert.crawlers.dedupe_keys import extract_round, group_key
+
+        assert extract_round(["여수시청 지원사업"]) == ""
+        assert extract_round(["여수 시청 지원사업"]) == ""
+        assert group_key("여수시청 지원사업", ["교육"], None, "2026-09") == \
+            group_key("여수 시청 지원사업", ["교육"], None, "2026-09")
+
+    @pytest.mark.parametrize("text,expected", [
+        ("2026년도 (9차)", "9차"),
+        ("1차 모집", "1차"),
+        ("상시", "상시"),
+        ("상시모집", "상시"),
+        ("추가모집", "추가"),
+        ("연장 공고", "연장"),
+        ("제1차수 배정", ""),       # 차수는 회차 표기가 아니다
+        ("여수시청", ""),
+        ("교육", ""),
+    ])
+    def test_round_token_extraction(self, text, expected):
+        from alert.crawlers.dedupe_keys import extract_round
+
+        assert extract_round([text]) == expected

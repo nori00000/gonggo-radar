@@ -754,3 +754,120 @@ class TestGate6RoundAndAllSources:
 
         changes, _reasons = cleanup.find_fake_deadlines(conn)
         assert [(row["id"], new_end) for row, new_end in changes] == [(row_id, None)]
+
+
+class TestGate7DeadlineLabelAware:
+    """7차 게이트 #1: 정리가 **정상 마감**을 NULL로 만들던 결함."""
+
+    def test_reception_label_is_never_touched(self, db):
+        """``date_label=접수마감`` 이면 게시일과 같은 날이어도 진짜 마감이다."""
+        conn, _ = db
+        insert(conn, source_id="10", period_end="2026-09-30",
+               created_at="2026-09-30T09:00:00",
+               raw_data={"date": "2026.09.30", "date_label": "접수마감"})
+
+        changes, _reasons = cleanup.find_fake_deadlines(conn)
+        assert changes == []
+
+    @pytest.mark.parametrize("label", ["접수마감", "신청기한", "접수기간", "모집기간", "제출기한"])
+    def test_every_reception_label_is_protected(self, db, label):
+        conn, _ = db
+        insert(conn, source_id="11", period_end="2026-09-11",
+               created_at="2026-09-11T09:00:00",
+               raw_data={"date": "2026.09.11", "date_label": label})
+
+        changes, _reasons = cleanup.find_fake_deadlines(conn)
+        assert changes == []
+
+    @pytest.mark.parametrize("label", ["게시일", "작성일", "등록일", ""])
+    def test_posting_labels_are_still_corrected(self, db, label):
+        conn, _ = db
+        row_id = insert(conn, source_id="12", period_end="2026-09-11",
+                        created_at="2026-09-11T09:00:00",
+                        raw_data={"date": "2026.09.11", "date_label": label})
+
+        changes, _reasons = cleanup.find_fake_deadlines(conn)
+        assert [(row["id"], new_end) for row, new_end in changes] == [(row_id, None)]
+
+    def test_only_the_eight_consultation_sources_are_corrected(self, db):
+        """g2b 처럼 목록이 실제 마감을 주는 소스는 손대지 않는다."""
+        conn, _ = db
+        insert(conn, source="g2b", source_id="20", period_end="2026-09-11",
+               created_at="2026-09-11T09:00:00",
+               raw_data={"date": "2026-09-11 18:00:00"})
+        insert(conn, source="smartfarm", source_id="21", period_end="2026-09-11",
+               created_at="2026-09-11T09:00:00",
+               raw_data={"date": "2026.09.11"})
+
+        changes, _reasons = cleanup.find_fake_deadlines(conn)
+        assert changes == []
+
+    def test_consultation_sources_are_in_scope(self, db):
+        conn, _ = db
+        expected = set()
+        for index, source in enumerate(cleanup.DEADLINE_FIX_SOURCES):
+            expected.add(insert(
+                conn, source=source, source_id=f"3{index}",
+                url=f"https://example.com/{source}", period_end="2026-09-11",
+                created_at="2026-09-11T09:00:00",
+                raw_data={"date": "2026.09.11", "date_label": "게시일"},
+            ))
+
+        changes, _reasons = cleanup.find_fake_deadlines(conn)
+        assert {row["id"] for row, _new in changes} == expected
+
+
+class TestGate7CorrectionOrder:
+    """7차 게이트 #2: 교정 전 마감으로 회차 키를 만들던 결함.
+
+    교정 -> 키 재계산 -> 규칙 A/B/C 순서를 지켜야 한다.
+    """
+
+    @pytest.fixture
+    def rounds_with_a_fake_deadline(self, db):
+        """같은 제목·서울센터·1차/2차, 둘 다 기존 오류 마감 09-11."""
+        conn, _ = db
+        first = insert(
+            conn, source_id="40", title="상주기업 모집 공고",
+            url=SEIS_URL.format(sid="40"), period_end="2026-09-11",
+            created_at="2026-09-11T00:00:00",
+            raw_data={"sub": "서울센터", "info": ["교육"], "round": "1차",
+                      "date": "2026.09.11", "date_label": "게시일"},
+        )
+        second = insert(
+            conn, source_id="41", title="상주기업 모집 공고",
+            url=SEIS_URL.format(sid="41"), period_end="2026-09-11",
+            created_at="2026-09-11T00:00:00",
+            raw_data={"sub": "서울센터", "info": ["교육"], "round": "2차",
+                      "date": "2026.09.11", "date_label": "게시일"},
+        )
+        return conn, first, second
+
+    def test_corrected_keys_keep_both_rounds(self, rounds_with_a_fake_deadline):
+        """교정된 마감으로 키를 만들면 1차·2차가 모두 남는다."""
+        conn, first, second = rounds_with_a_fake_deadline
+        changes, _reasons = cleanup.find_fake_deadlines(conn)
+        corrected = {row["id"]: new_end for row, new_end in changes}
+        assert corrected == {first: None, second: None}
+
+        doomed, _reasons, _canonical = cleanup.find_duplicates(
+            conn, "seis", corrected
+        )
+        assert doomed == []
+
+    def test_without_correction_a_round_would_be_deleted(
+        self, rounds_with_a_fake_deadline
+    ):
+        """교정을 건너뛰면 1차가 삭제 대상이 된다 - 순서가 필요한 이유."""
+        conn, _first, _second = rounds_with_a_fake_deadline
+        doomed, _reasons, _canonical = cleanup.find_duplicates(conn, "seis")
+        assert len(doomed) == 1
+
+    def test_row_key_uses_the_corrected_deadline(self, rounds_with_a_fake_deadline):
+        """``row_key`` 가 교정 맵을 받으면 회차가 키에 들어간다."""
+        conn, first, _second = rounds_with_a_fake_deadline
+        rows = {r["id"]: r for r in cleanup._fetch_rows(conn, "seis")}
+        raw_key = cleanup.row_key(rows[first])
+        fixed_key = cleanup.row_key(rows[first], {first: None})
+        assert raw_key[3] == ""          # 마감이 있다고 보면 회차가 비워진다
+        assert fixed_key[3] == "1차"     # 교정 후에는 회차가 키에 들어간다

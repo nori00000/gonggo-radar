@@ -190,3 +190,76 @@ class TestSharedRuleContract:
 
     def test_unparseable_date_yields_nothing(self):
         assert classify_date("별도 공지", "접수기간") == (None, None, None)
+
+
+class TestGate7ListFallbackLabels:
+    """7차 게이트 #3: 목록 폴백에서 게시일 재유입·접수기간 손실."""
+
+    @staticmethod
+    def extract(html):
+        from alert.crawlers.date_labels import extract_date_and_label
+
+        item = BeautifulSoup(html, "html.parser").find("li")
+        return extract_date_and_label(item)
+
+    def test_title_text_is_not_a_label(self):
+        """제목의 "모집" 을 라벨로 오인하지 않는다 - 게시일로 남는다."""
+        value, label = self.extract(
+            "<li><a>참여기업 모집 공고</a><span>2026.09.11</span></li>"
+        )
+        assert value == "2026.09.11"
+        assert "모집" not in label
+        assert classify_date(value, label) == (None, None, "2026-09-11")
+
+    def test_deadline_label_inside_the_date_element(self):
+        """``신청기한 2026.09.30`` 은 종료일이다."""
+        value, label = self.extract(
+            '<li><a>공고</a><span class="date">신청기한 2026.09.30</span></li>'
+        )
+        assert classify_date(value, label) == (None, "2026-09-30", None)
+
+    def test_range_is_captured_whole(self):
+        """첫 날짜만 집으면 종료일이 09-01이 된다 - 범위를 통째로 읽는다."""
+        value, label = self.extract(
+            "<li><a>공고</a><span>접수 기간 2026.09.01 ~ 2026.09.30</span></li>"
+        )
+        assert value == "2026.09.01 ~ 2026.09.30"
+        assert classify_date(value, label) == ("2026-09-01", "2026-09-30", None)
+
+    @pytest.mark.parametrize("label_text,expected_end", [
+        ("신청기한", "2026-09-30"),
+        ("접수기한", "2026-09-30"),
+        ("마감일", "2026-09-30"),
+        ("제출기한", "2026-09-30"),
+    ])
+    def test_new_deadline_labels(self, label_text, expected_end):
+        start, end, posted = classify_date("2026.09.30", label_text)
+        assert (start, end, posted) == (None, expected_end, None)
+
+    def test_no_date_returns_empty(self):
+        assert self.extract("<li><a>날짜 없는 공고</a></li>") == ("", "")
+
+
+class TestGate7ForestPressHasNoPeriodRemnant:
+    """7차 게이트 #3: forest_press 에 period_start 게시일이 남던 결함."""
+
+    def test_press_item_has_no_period_at_all(self):
+        from alert.crawlers.forest_press import ForestPressCrawler
+
+        crawler = make_crawler(
+            "forest_press", ForestPressCrawler, "https://www.forest.go.kr"
+        )
+        item = {
+            "title": "산림청 보도자료",
+            "link": "/kfsweb/cop/bbs/selectBoardArticle.do?nttId=1",
+            "author": "산림청",
+            "category": "정책/보도",
+            "date": "2026.09.11",
+            "date_label": "게시일",
+            "summary": "요약",
+        }
+        announcement = crawler._to_announcement(item, "https://www.forest.go.kr")
+        assert announcement.period_start is None
+        assert announcement.period_end is None
+        assert json.loads(announcement.raw_data)["posted"] == "2026-09-11"
+        assert announcement.summary == "요약"

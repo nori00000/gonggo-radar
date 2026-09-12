@@ -147,13 +147,16 @@ class ForestPressCrawler(ForestServiceCrawler):
     def _to_announcement(self, item: dict, base_url: str):
         """상속받은 변환 로직에 보도자료 요약문을 덧붙인다.
 
-        보도자료에는 접수 마감일이 없으므로, 게시일을 마감일로 오인하지 않도록
-        period_end는 비운다(상속 로직은 단일 날짜를 시작=종료로 채운다).
+        기간 처리는 **상속 로직에 맡긴다**. 예전에는 여기서 ``period_end``
+        만 비웠는데, 상속 로직이 단일 날짜를 시작=종료로 채우던 시절의
+        임시 조치였다. 그 결과 ``period_start`` 에 게시일이 남았다
+        (7차 게이트 #3). 이제 공용 라벨 규칙이 게시일을 기간으로 만들지
+        않으므로 여기서 손댈 것이 없다 - 손대면 진짜 접수기간이 오는 날
+        그것까지 지운다.
         """
         announcement = super()._to_announcement(item, base_url)
         if announcement is not None:
             announcement.summary = item.get("summary", "").strip()
-            announcement.period_end = None
         return announcement
 
     @staticmethod
