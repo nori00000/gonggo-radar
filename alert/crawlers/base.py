@@ -8,6 +8,7 @@ import requests
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Tuple
+from .identity import identity_key
 from ..models import RawAnnouncement
 from ..config import get_config
 from ..utils.logger import setup_logger
@@ -238,14 +239,24 @@ class BaseCrawler(abc.ABC):
             url = announcement.url or ""
             if not url or url.endswith("#void"):
                 continue
-            if str(announcement.source_id) in skip:
+            # DB 가 알려 준 목록은 **행 식별자**(identity_key) 기준이고,
+            # 크롤러가 만든 source_id 와 다를 수 있다 - 둘 다 본다.
+            keys = (
+                str(announcement.source_id),
+                identity_key(self.source_name, announcement),
+            )
+            if any(key in skip for key in keys):
                 continue
             payload = self._load_raw(announcement)
             if has_quote_keys(payload):
                 continue
             attempted = str(
                 payload.get(QUOTES_ATTEMPTED_AT)
-                or self._quote_attempts.get(str(announcement.source_id), "")
+                or next(
+                    (self._quote_attempts[key] for key in keys
+                     if key in self._quote_attempts),
+                    "",
+                )
             )
             candidates.append((attempted, announcement))
 

@@ -180,7 +180,9 @@ def lawmaking_period(raw: Dict[str, object]) -> Period:
 _BIZINFO_RANGE = re.compile(
     r"^\s*(\d{4})-?(\d{2})-?(\d{2})\s*~\s*(\d{4})-?(\d{2})-?(\d{2})\s*$"
 )
-_G2B_DATETIME = re.compile(r"^\s*(\d{4})(\d{2})(\d{2})(?:\d{4})?\s*$")
+# ``YYYYMMDDHHMM`` 또는 ``YYYYMMDD``. **시·분까지** 달력 검증한다 -
+# ``202609309999`` 를 09-30 으로 잘라 저장하던 자리다 (13차 게이트 MEDIUM).
+_G2B_DATETIME = re.compile(r"^\s*(\d{8}|\d{12})\s*$")
 
 
 def bizinfo_period(raw: Dict[str, object]) -> Period:
@@ -230,7 +232,12 @@ def _g2b_date(value: object) -> Optional[str]:
     match = _G2B_DATETIME.match(_normalize(value))
     if not match:
         return None
-    return _calendar_date(*(int(part) for part in match.groups()))
+    digits = match.group(1)
+    fmt = "%Y%m%d" if len(digits) == 8 else "%Y%m%d%H%M"
+    try:
+        return datetime.strptime(digits, fmt).strftime("%Y-%m-%d")
+    except ValueError:
+        return None
 
 
 # 기간을 만들 수 있는 소스 **전부**. 여기 없는 소스는 항상 None 이다.

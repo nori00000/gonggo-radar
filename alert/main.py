@@ -250,6 +250,17 @@ def run_pipeline(test_mode: bool = False) -> None:
     # Initialize components
     db = Database()
 
+    # 예전 source_id 를 **행 식별자**로 이관한다 (멱등, 삭제 없음).
+    # 인용 보유 목록(``get_quoted_source_ids``)도 식별자 기준이므로
+    # 크롤 시작 전에 끝나 있어야 한다.
+    try:
+        migrated, conflicts = db.migrate_identity_keys()
+        logger.info(
+            f"식별자 이관: {migrated} 행 이관, {conflicts} 행 충돌 보존"
+        )
+    except Exception as e:
+        logger.error(f"식별자 이관 실패: {e}")
+
     # 기존 오염 정규화 (멱등) - 허용목록 **여집합 전체**의 기간을 지운다.
     # 12차 게이트: 대상을 몇 개 소스로 좁혔더니 bizinfo 같은 소스의 오염이
     # 살아남아 알림까지 갔다.

@@ -15,6 +15,7 @@ import pytest
 from alert.crawlers.base import BaseCrawler
 from alert.crawlers.dedupe_keys import group_key, keys_compatible, subject_signature
 from alert.crawlers.detail_quotes import MAX_DETAIL_REQUESTS
+from alert.crawlers.identity import identity_key
 from alert.db import Database
 from alert.models import AnalyzedAnnouncement, RawAnnouncement
 
@@ -95,6 +96,11 @@ def db(tmp_path):
     database.close() if hasattr(database, "close") else None
 
 
+# 저장 행의 키는 **행 식별자**다 (13차 게이트) - 크롤러가 만든
+# source_id 가 아니라 이 값으로 조회한다.
+FIRST_ID = identity_key("stub", raw_items()[0])
+
+
 def quoted_count(database: Database) -> int:
     return len(database.get_quoted_source_ids("stub"))
 
@@ -118,7 +124,7 @@ class TestQuoteReCollectionReachesTheDatabase:
             crawler.enrich_with_quotes(items)
         merged = 0
         for item in items:
-            if database.is_duplicate(item.source, item.source_id):
+            if database.exists(item):
                 if database.merge_quote_fields(item):
                     merged += 1
         return len(sent), merged
@@ -146,11 +152,11 @@ class TestQuoteReCollectionReachesTheDatabase:
         """인용은 raw_data 증거로 저장되고 기간 컬럼은 건드리지 않는다 (13차)."""
         self.run_once(db)
         row = db.get_quoted_source_ids("stub")
-        assert "0" in row
+        assert FIRST_ID in row          # 행 식별자로 돌아온다 (13차 게이트)
 
         stored = db._conn.execute(
             "SELECT raw_data, period_start, period_end FROM announcements"
-            " WHERE source = 'stub' AND source_id = '0'"
+            f" WHERE source = 'stub' AND source_id = '{FIRST_ID}'"
         ).fetchone()
         payload = json.loads(stored["raw_data"])
         assert payload["quote_deadline"] == "접수기간 2026.09.01 ~ 2026.09.30"
@@ -185,7 +191,7 @@ class TestQuoteReCollectionReachesTheDatabase:
 
         stored = db._conn.execute(
             "SELECT raw_data, period_end FROM announcements"
-            " WHERE source = 'stub' AND source_id = '0'"
+            f" WHERE source = 'stub' AND source_id = '{FIRST_ID}'"
         ).fetchone()
         payload = json.loads(stored["raw_data"])
         assert "always_open" not in payload
@@ -264,7 +270,7 @@ class TestNoQuotePagesStillGetCovered:
         with patch.object(crawler, "run_detail_worker", run):
             crawler.enrich_with_quotes(items)
         for item in items:
-            if database.is_duplicate(item.source, item.source_id):
+            if database.exists(item):
                 database.merge_quote_fields(item)
         return [entry["source_id"] for entry in sent]
 
@@ -315,7 +321,7 @@ class TestNoQuotePagesStillGetCovered:
 
         stored = db._conn.execute(
             "SELECT raw_data, period_end FROM announcements"
-            " WHERE source = 'stub' AND source_id = '0'"
+            f" WHERE source = 'stub' AND source_id = '{FIRST_ID}'"
         ).fetchone()
         payload = json.loads(stored["raw_data"])
         assert payload["quote_deadline"] == "접수기간 2026.09.01 ~ 2026.09.30"
@@ -336,7 +342,7 @@ class TestNoQuotePagesStillGetCovered:
 
         stored = db._conn.execute(
             "SELECT raw_data FROM announcements"
-            " WHERE source = 'stub' AND source_id = '0'"
+            f" WHERE source = 'stub' AND source_id = '{FIRST_ID}'"
         ).fetchone()
         assert json.loads(stored["raw_data"])["quote_deadline"].startswith("접수기간")
 
@@ -358,7 +364,7 @@ class TestNoQuotePagesStillGetCovered:
 
         stored = db._conn.execute(
             "SELECT raw_data, period_end FROM announcements"
-            " WHERE source = 'stub' AND source_id = '0'"
+            f" WHERE source = 'stub' AND source_id = '{FIRST_ID}'"
         ).fetchone()
         payload = json.loads(stored["raw_data"])
         assert payload["quote_deadline"].startswith("접수기간")

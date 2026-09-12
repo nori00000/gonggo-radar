@@ -808,14 +808,17 @@ class TestGate11Reproductions:
             )
             saved.append(announcement)
 
-        assert {a.source_id for a in saved} == {"fnc:42", "dsgn:42"}
+        # 저장 키는 **행 식별자**다 - 두 공고가 서로 다른 키를 받는다
+        assert len({a.source_id for a in saved}) == 2
         rows = db._conn.execute(
-            "SELECT source_id, period_start, period_end FROM announcements"
-            " ORDER BY source_id"
+            "SELECT source_id, url, period_end FROM announcements"
         ).fetchall()
         assert len(rows) == 2
-        assert {(r["source_id"], r["period_end"]) for r in rows} == {
-            ("dsgn:42", "2026-11-30"), ("fnc:42", "2026-09-30"),
+        assert len({r["source_id"] for r in rows}) == 2
+        by_url = {r["url"]: r["period_end"] for r in rows}
+        assert by_url == {
+            "https://www.seis.or.kr/subPage.do?fncPbofrSn=42": "2026-09-30",
+            "https://www.seis.or.kr/subPage.do?dsgnPbofrSn=42": "2026-11-30",
         }
 
     def test_legacy_row_is_matched_by_url(self, db):
@@ -944,11 +947,14 @@ class TestGate12Reproductions:
             )
 
         rows = db._conn.execute(
-            "SELECT source_id, period_end FROM announcements ORDER BY source_id"
+            "SELECT source_id, url, period_end FROM announcements"
         ).fetchall()
-        assert [(r["source_id"], r["period_end"]) for r in rows] == [
-            ("epsd:2026:4", "2026-09-30"), ("epsd:2027:4", "2027-11-30"),
-        ]
+        assert len(rows) == 2
+        assert len({r["source_id"] for r in rows}) == 2      # 행이 갈린다
+        assert {(r["url"].split("statsYr=")[1][:4], r["period_end"])
+                for r in rows} == {
+            ("2026", "2026-09-30"), ("2027", "2027-11-30"),
+        }
 
     def test_same_id_with_a_different_url_is_a_different_row(self, db):
         """ID 가 같아도 URL 이 다르면 남의 행을 덮어쓰지 않는다."""
@@ -1110,17 +1116,20 @@ class TestStructuredApiSources:
             "bizinfo", lambda raw: _periods_from_raw("bizinfo", raw)
         ) == 2
         rows = db._conn.execute(
-            "SELECT source_id, period_start, period_end FROM announcements"
-            " ORDER BY source_id"
+            "SELECT url, period_start, period_end FROM announcements"
         ).fetchall()
-        assert [(r["source_id"], r["period_start"], r["period_end"]) for r in rows] == [
-            ("with-field", "2026-09-01", "2026-12-31"),
-            ("without-field", None, None),
-        ]
-        notified = {a.source_id: a.period_end for a in db.get_unnotified()}
-        assert notified == {
-            "with-field": "2026-12-31", "without-field": None,
+        stored = {
+            r["url"].rsplit("/", 1)[-1]: (r["period_start"], r["period_end"])
+            for r in rows
         }
+        assert stored == {
+            "with-field": ("2026-09-01", "2026-12-31"),
+            "without-field": (None, None),
+        }
+        notified = {
+            a.url.rsplit("/", 1)[-1]: a.period_end for a in db.get_unnotified()
+        }
+        assert notified == {"with-field": "2026-12-31", "without-field": None}
 
 
 class TestStaleRowsAreOverwritten:
@@ -1131,11 +1140,12 @@ class TestStaleRowsAreOverwritten:
         database = Database(db_path=tmp_path / "announcements.db")
         yield database
 
-    def stored(self, database, source, source_id):
+    def stored(self, database, source, _source_id="1"):
+        """행은 **행 식별자**로 저장된다 - URL 로 찾는다 (13차 게이트)."""
         row = database._conn.execute(
             "SELECT period_start, period_end FROM announcements"
-            " WHERE source = ? AND source_id = ?",
-            (source, source_id),
+            " WHERE source = ? AND url = ?",
+            (source, "https://example.test/1"),
         ).fetchone()
         return (row["period_start"] or None, row["period_end"] or None)
 

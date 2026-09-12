@@ -8,8 +8,9 @@ import os
 import sqlite3
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
+from .crawlers.identity import identity_key
 from .models import (
     AnalyzedAnnouncement,
     ApplicationRecord,
@@ -283,6 +284,10 @@ class Database:
             Backward-compatible: ``bool(int)`` is ``True``, ``bool(None)`` is ``False``.
         """
         now = datetime.now().isoformat()
+        # 저장도 **조회와 같은 키**로 한다. 크롤러가 만든 source_id 를 그대로
+        # 넣으면, 서로 다른 공고가 같은 키로 들어가 UNIQUE 제약에 걸려
+        # 한 건이 사라지거나 남의 행을 덮어쓴다 (13차 게이트 HIGH).
+        ann.source_id = self.identity_of(ann)
         try:
             sql = _sql("""
                 INSERT INTO announcements
@@ -309,7 +314,12 @@ class Database:
                 self._conn.commit()
                 return cur.lastrowid
         except _IntegrityError:
-            # Duplicate (source, source_id) -- update score/reason and return existing ID.
+            # 같은 **행 식별자**가 이미 있다 = 같은 공고다. 점수·사유만
+            # 갱신한다. 행은 ``_find_row`` 로만 찾는다 - 저장 경로에도
+            # 식별 우회가 없어야 한다 (13차 게이트).
+            row = self._find_row("id", ann)
+            if row is None:
+                return None
             self._conn.execute(
                 _sql("""
                 UPDATE announcements
@@ -317,27 +327,20 @@ class Database:
                        relevance_reason = ?,
                        matched_keywords = ?,
                        updated_at       = ?
-                 WHERE source = ? AND source_id = ?
+                 WHERE id = ?
                 """),
                 (
                     ann.relevance_score,
                     ann.relevance_reason,
                     json.dumps(ann.matched_keywords, ensure_ascii=False),
                     now,
-                    ann.source,
-                    ann.source_id,
+                    row["id"],
                 ),
             )
             if self._backend == "sqlite":
                 self._conn.commit()
             if return_existing:
-                row = self._conn.execute(
-                    _sql("SELECT id FROM announcements WHERE source = ? AND source_id = ?"),
-                    (ann.source, ann.source_id),
-                ).fetchone()
-                if row:
-                    return row["id"] if isinstance(row, dict) else row[0]
-                return None
+                return row["id"]
             return None
 
     def get_unnotified(self) -> List[AnalyzedAnnouncement]:
@@ -481,12 +484,18 @@ class Database:
             self._conn.commit()
         return True
 
-    def _find_row(self, columns: str, announcement: RawAnnouncement) -> Optional[Any]:
-        """``(source, source_id)`` 로 찾고, 없으면 **같은 URL** 로 찾는다.
+    @staticmethod
+    def identity_of(announcement: RawAnnouncement) -> str:
+        """이 공고가 가리키는 **행 식별자** (저장·조회의 유일한 키).
 
-        source_id 체계가 바뀌어도(예: seis 가 ``42`` -> ``fnc:42``) 예전에
-        저장된 행을 같은 공고로 인식해야 한다 - 그러지 않으면 같은 공고가
-        두 행이 되고, 예전 행의 기간은 영원히 정리되지 않는다 (11차 게이트).
+        13차 게이트: 조회는 식별자로, 저장은 크롤러 ``source_id`` 로 하던
+        불일치 때문에 서로 다른 공고가 한 행을 덮어썼다. 이제 두 경로가
+        같은 함수를 쓴다.
+        """
+        return identity_key(announcement.source, announcement)
+
+    def _find_row(self, columns: str, announcement: RawAnnouncement) -> Optional[Any]:
+        """**행 식별자**로만 찾는다 - 다른 키의 행은 절대 건드리지 않는다.
 
         Args:
             columns: 읽을 컬럼 목록 (내부 상수만 넘긴다)
@@ -495,34 +504,65 @@ class Database:
         Returns:
             찾은 행 또는 None
         """
-        url = (announcement.url or "").strip()
-        row = self._conn.execute(
+        return self._conn.execute(
             _sql(
                 f"SELECT {columns}, url FROM announcements"
                 " WHERE source = ? AND source_id = ?"
             ),
-            (announcement.source, announcement.source_id),
-        ).fetchone()
-        if row is not None:
-            stored_url = (row["url"] or "").strip()
-            # 같은 ID 인데 URL 이 다르면 **다른 공고**다 - ID 체계가 특정에
-            # 실패한 경우이므로 남의 행을 덮어쓰지 않는다 (12차 게이트).
-            if not url or not stored_url or stored_url == url:
-                return row
-
-        if not url:
-            return None
-        return self._conn.execute(
-            _sql(
-                f"SELECT {columns}, url FROM announcements"
-                " WHERE source = ? AND url = ?"
-            ),
-            (announcement.source, url),
+            (announcement.source, self.identity_of(announcement)),
         ).fetchone()
 
     def exists(self, announcement: RawAnnouncement) -> bool:
-        """이 공고가 이미 저장돼 있는가 (source_id 또는 같은 URL)."""
+        """이 공고가 이미 저장돼 있는가 (행 식별자 기준)."""
         return self._find_row("id", announcement) is not None
+
+    def migrate_identity_keys(self) -> Tuple[int, int]:
+        """예전 ``source_id`` 를 **행 식별자**로 1회 이관한다 (멱등).
+
+        숫자 ID·접두형 ID 로 저장된 기존 행은 새 식별자와 달라서, 재수집이
+        같은 행을 찾지 못하고 새 행을 만든다. 그러면 예전 행의 기간은
+        영원히 정리되지 않는다.
+
+        **충돌(이미 그 식별자를 쓰는 행이 있음)은 삭제하지 않는다** - 중복을
+        남기고 로그로만 알린다. 삭제는 되돌릴 수 없다.
+
+        Returns:
+            ``(이관한 행 수, 충돌로 남긴 행 수)``
+        """
+        rows = self._conn.execute(
+            _sql("SELECT id, source, source_id, url, raw_data FROM announcements")
+        ).fetchall()
+
+        migrated = conflicts = 0
+        for row in rows:
+            current = str(row["source_id"] or "")
+            fresh = identity_key(row["source"], {
+                "url": row["url"],
+                "raw_data": row["raw_data"],
+                "source_id": current,
+            })
+            if not fresh or fresh == current:
+                continue
+            try:
+                self._conn.execute(
+                    _sql(
+                        "UPDATE announcements SET source_id = ?, updated_at = ?"
+                        " WHERE id = ?"
+                    ),
+                    (fresh, datetime.now().isoformat(), row["id"]),
+                )
+            except _IntegrityError:
+                conflicts += 1
+                logging.getLogger(__name__).warning(
+                    "identity 이관 충돌: %s/%s -> %s (중복을 보존한다)",
+                    row["source"], current, fresh,
+                )
+                continue
+            migrated += 1
+
+        if migrated and self._backend == "sqlite":
+            self._conn.commit()
+        return migrated, conflicts
 
     def revalidate_periods(self, source: str, recompute) -> int:
         """저장된 행의 기간을 **raw_data 근거로 다시 산출**한다 (멱등).
