@@ -36,18 +36,22 @@ from alert.digest.composer import (
     infer_target_tags,
     hold_comment,
     jaccard,
+    kakao_blocks,
     kakao_file_text,
+    kst_date,
     normalize_title,
     parse_deadline,
     refresh_kakao_headline,
     render_kakao_chunks,
     render_kakao,
     render_markdown,
+    prefix_bracket,
     sanitize_title,
     source_display_name,
     target_display,
     title_ngrams,
     week_bounds,
+    window_prefilter_bounds,
 )
 from alert.digest.checker import (
     body_links,
@@ -2440,14 +2444,14 @@ class TestFixCycle4:
         )
         assert result.verdict == VERDICT_NOTICE
 
-    def test_bare_plan_keyword_needs_forest_context(self):
+    def test_bare_plan_keyword_needs_relevance_context(self):
+        """개정 v2.6 (6): 단독 `계획`은 산림 업종 **또는** 사회적경제 정체성 동반 시 인정."""
         assert classify_item("산림 탄소중립 추진계획", "", "forest_service").verdict == (
             VERDICT_NOTICE
         )
-        # 산림 업종 키워드가 없으면 단독 `계획`은 제도 신호로 인정하지 않는다
-        assert classify_item(
-            "사회적기업 성장 추진계획", "", "seis"
-        ).verdict == VERDICT_HOLD
+        assert classify_item("사회적기업 성장 추진계획", "", "seis").verdict == (
+            VERDICT_NOTICE
+        )
 
     # ─── #11 지역 접두사 ────────────────────────────────────────────────
     def test_region_prefix_prevents_merge(self, tmp_path):
@@ -2590,3 +2594,390 @@ class TestFixCycle4:
         detail = " ".join(str(row[-1]) for row in plan)
         assert "SEARCH" in detail
         assert "SCAN announcements" not in detail
+
+
+class TestFixCycle5:
+    """개정 v2.6 — Codex 재검토 신규 발견(1·2·7·8·9·10)과 검증 공백."""
+
+    # ─── (1) 연장 공고 병합 만료 ────────────────────────────────────────
+    def test_extension_round_survives_expired_original(self, tmp_path):
+        db_path = tmp_path / "c5_1.db"
+        _create_announcements_table(db_path)
+        _insert_one(
+            db_path,
+            source="kofpi",
+            source_id="orig",
+            title="산림 지원사업 참여기업 모집 공고",
+            url="https://example.com/orig",
+            period_start="2026-09-08",
+            period_end="2026-09-12",
+            created_at=W37_CREATED_AT,
+        )
+        _insert_one(
+            db_path,
+            source="kofpi",
+            source_id="ext",
+            title="산림 지원사업 참여기업 모집 공고(연장 ~9.30)",
+            url="https://example.com/ext",
+            period_start="2026-09-08",
+            period_end=None,
+            raw_data=(
+                '{"title": "산림 지원사업 참여기업 모집 공고(연장 ~9.30)"}'
+            ),
+            created_at=W37_CREATED_AT,
+        )
+
+        data = compose_digest_data(
+            str(db_path), week_str=W37, today=W37_TODAY
+        )
+        published = [item["url"] for item in data["sections"][VERDICT_APPLY]]
+        excluded = [
+            (item["url"], item["reason"]) for item in data["excluded"]
+        ]
+
+        assert published == ["https://example.com/ext"]
+        assert ("https://example.com/orig", "마감 경과") in excluded
+        assert data["merged_ids"] == []
+
+    def test_renewal_without_deadline_is_not_merged(self):
+        result = classify_item(
+            "산림 지원사업 참여기업 추가모집 공고", "", "kofpi"
+        )
+        assert result.verdict == VERDICT_APPLY
+
+    # ─── (2) 지역 소실 병합 ─────────────────────────────────────────────
+    def test_prefix_region_wins_over_venue(self):
+        result = classify_item(
+            "[경기] 사회적기업 지원사업 모집 (설명회 장소: 서울)", "", "seis"
+        )
+        assert result.region == "경기"
+
+    def test_prefix_region_difference_blocks_merge(self, tmp_path):
+        db_path = tmp_path / "c5_2.db"
+        _create_announcements_table(db_path)
+        for index, title in enumerate(
+            [
+                "[경기] 사회적기업 지원사업 모집 (설명회 장소: 서울)",
+                "[강원] 사회적기업 지원사업 모집",
+            ]
+        ):
+            _insert_one(
+                db_path,
+                source="seis",
+                source_id=f"reg_{index}",
+                title=title,
+                url=f"https://example.com/reg-{index}",
+                period_start="2026-09-08",
+                period_end="2026-09-30",
+                created_at=W37_CREATED_AT,
+            )
+
+        data = compose_digest_data(
+            str(db_path), week_str=W37, today=W37_TODAY
+        )
+        published = data["sections"][VERDICT_APPLY]
+        assert len(published) == 2
+        assert {item["region"] for item in published} == {"경기", "강원"}
+        assert data["merged_ids"] == []
+
+    def test_venue_context_is_ignored_without_prefix(self):
+        result = classify_item(
+            "사회적기업 지원사업 모집 (설명회 장소: 서울)", "", "seis"
+        )
+        assert result.region is None
+
+    # ─── (3) sanitize_title: URL만 링크 ────────────────────────────────
+    @pytest.mark.parametrize(
+        "title",
+        [
+            "[모집](~9.30) 산림 지원사업",
+            "[모집](산림사업자) 지원사업",
+            "「2026년 산림 공고」(~9.30)",
+        ],
+    )
+    def test_sanitize_title_preserves_non_url_parens(self, title):
+        assert sanitize_title(title) == title
+
+    def test_sanitize_title_still_strips_real_links(self):
+        assert sanitize_title("산림 [신청](https://example.com/dead) 모집") == (
+            "산림 신청 모집"
+        )
+        assert sanitize_title("산림 [자료](www.example.com/x) 모집") == (
+            "산림 자료 모집"
+        )
+
+    def test_non_url_paren_survives_to_markdown(self, tmp_path):
+        db_path = tmp_path / "c5_3.db"
+        _create_announcements_table(db_path)
+        _insert_one(
+            db_path,
+            source="kofpi",
+            source_id="paren",
+            title="[모집](~9.30) 산림 지원사업 참여기업",
+            url="https://example.com/paren",
+            period_end="2026-12-31",
+        )
+        markdown = compose_digest(
+            db_path=str(db_path), week_str=W13, today=W13_TODAY
+        )
+        assert "[모집](~9.30) 산림 지원사업 참여기업" in markdown
+
+    # ─── (4) 지역 오탐 ──────────────────────────────────────────────────
+    @pytest.mark.parametrize(
+        "title",
+        [
+            "경기침체 대응 사회적기업 지원사업 모집",
+            "대구목재 사회적기업 판로 지원사업 모집",
+            "사회적기업 모집 (대전 [교육장] 안내)",
+        ],
+    )
+    def test_region_substring_false_positives(self, title):
+        assert classify_item(title, "", "seis").region is None
+
+    def test_fullwidth_and_ascii_prefix_agree(self):
+        ascii_region = classify_item(
+            "[경기센터] 강원 사회적기업 지원사업 모집", "", "seis"
+        ).region
+        fullwidth_region = classify_item(
+            "［경기센터］ 강원 사회적기업 지원사업 모집", "", "seis"
+        ).region
+        assert ascii_region == fullwidth_region == "경기"
+
+    def test_prefix_bracket_helper(self):
+        assert prefix_bracket("[경기] 모집") == "경기"
+        assert prefix_bracket("［세종대전충청센터］ 모집") == "세종대전충청센터"
+        assert prefix_bracket("2026년 경기도 모집") == ""
+
+    # ─── (5) 카톡 항목·URL 보존 ─────────────────────────────────────────
+    def test_kakao_never_splits_url_or_starts_with_it(self, tmp_path):
+        db_path = tmp_path / "c5_5.db"
+        _create_announcements_table(db_path)
+        _insert_one(
+            db_path,
+            source="kofpi",
+            source_id="long",
+            title="산림 지원사업 참여기업 모집 공고 " + "가" * 3947,
+            url="https://example.com/long-item",
+            period_end="2026-12-31",
+        )
+        data = compose_digest_data(
+            str(db_path), week_str=W13, today=W13_TODAY
+        )
+        chunks = render_kakao_chunks(data)
+
+        assert all(len(chunk) <= 4096 for chunk in chunks)
+        for chunk in chunks:
+            assert not chunk.lstrip().startswith("https://")
+        # URL은 한 조각 안에 온전히 남는다
+        assert sum(
+            chunk.count("https://example.com/long-item") for chunk in chunks
+        ) == 1
+        # 항목 블록은 통째로 한 조각에 들어간다 (URL이 다음 메시지로 밀리지 않는다)
+        assert any(
+            "https://example.com/long-item" in chunk and "가" in chunk
+            for chunk in chunks
+        )
+
+    def test_kakao_shrinks_title_to_fit_and_keeps_url(self, tmp_path):
+        db_path = tmp_path / "c5_5d.db"
+        _create_announcements_table(db_path)
+        _insert_one(
+            db_path,
+            source="kofpi",
+            source_id="huge",
+            title="산림 지원사업 참여기업 모집 공고 " + "가" * 4200,
+            url="https://example.com/huge-item",
+            period_end="2026-12-31",
+        )
+        data = compose_digest_data(
+            str(db_path), week_str=W13, today=W13_TODAY
+        )
+        chunks = render_kakao_chunks(data)
+
+        assert all(len(chunk) <= 4096 for chunk in chunks)
+        assert any("…" in chunk for chunk in chunks)
+        holder = [c for c in chunks if "https://example.com/huge-item" in c]
+        assert len(holder) == 1
+        assert holder[0].rstrip().endswith("https://example.com/huge-item")
+
+    def test_kakao_keeps_oversized_url_intact(self, tmp_path):
+        db_path = tmp_path / "c5_5b.db"
+        _create_announcements_table(db_path)
+        long_url = "https://example.com/" + "a" * 4120
+        _insert_one(
+            db_path,
+            source="kofpi",
+            source_id="longurl",
+            title="산림 지원사업 참여기업 모집 공고",
+            url=long_url,
+            period_end="2026-12-31",
+        )
+        data = compose_digest_data(
+            str(db_path), week_str=W13, today=W13_TODAY
+        )
+        chunks = render_kakao_chunks(data)
+        assert any(long_url in chunk for chunk in chunks)
+
+    def test_kakao_blocks_keep_item_with_its_url(self, tmp_path):
+        db_path = tmp_path / "c5_5c.db"
+        _create_announcements_table(db_path)
+        _insert_one(
+            db_path,
+            source="kofpi",
+            source_id="pair",
+            title="산림 지원사업 참여기업 모집 공고",
+            url="https://example.com/pair",
+            period_end="2026-12-31",
+        )
+        data = compose_digest_data(
+            str(db_path), week_str=W13, today=W13_TODAY
+        )
+        item_blocks = [
+            block
+            for block in kakao_blocks(data)
+            if "https://example.com/pair" in block
+        ]
+        assert len(item_blocks) == 1
+        assert item_blocks[0].count("\n") == 1
+
+    # ─── (8) 시간대 ─────────────────────────────────────────────────────
+    @pytest.mark.parametrize(
+        "value,expected",
+        [
+            ("2026-09-06T15:30:00+00:00", date(2026, 9, 7)),
+            ("2026-09-13T15:30:00Z", date(2026, 9, 14)),
+            ("2026-09-12T09:46:29.074620", date(2026, 9, 12)),
+            ("2026-09-07T00:30:00+09:00", date(2026, 9, 7)),
+        ],
+    )
+    def test_kst_date(self, value, expected):
+        assert kst_date(value) == expected
+
+    def test_window_prefilter_is_wider_than_window(self):
+        assert week_bounds(W37) == ("2026-09-07", "2026-09-14")
+        assert window_prefilter_bounds(W37) == ("2026-09-06", "2026-09-15")
+
+    def test_utc_offsets_are_judged_in_kst(self, tmp_path):
+        db_path = tmp_path / "c5_8.db"
+        _create_announcements_table(db_path)
+        _insert_one(
+            db_path,
+            source="kofpi",
+            source_id="utc_in",
+            title="산림 지원사업 참여기업 모집 공고",
+            url="https://example.com/utc-in",
+            period_end="2026-12-31",
+            created_at="2026-09-06T15:30:00+00:00",
+        )
+        _insert_one(
+            db_path,
+            source="fowi",
+            source_id="utc_out",
+            title="임업 경영 컨설팅 참여기업 모집",
+            url="https://example.com/utc-out",
+            period_end="2026-12-31",
+            created_at="2026-09-13T15:30:00Z",
+        )
+        data = compose_digest_data(
+            str(db_path), week_str=W37, today=W37_TODAY
+        )
+        urls = [item["url"] for item in data["sections"][VERDICT_APPLY]]
+        assert urls == ["https://example.com/utc-in"]
+
+    # ─── (7) 분할 불변식 강화 ───────────────────────────────────────────
+    RICH_ROWS = (
+        # (source, title, period_start, period_end, raw_data)
+        ("kofpi", "산림분야 오픈이노베이션 참여기업 모집 공고", "2026-09-08", "2026-09-30", ""),
+        ("kofpi", "임산물 가공유통 지원사업 참여업체 모집", "2026-09-08", "2026-10-01", ""),
+        ("kofpi", "목재산업 시설 개선 지원 참여기업 모집", "2026-09-08", "2026-10-02", ""),
+        # 만료 + 연장 회차 (병합 금지, 살아 있는 쪽이 남는다)
+        ("fowi", "산림복지 지원사업 참여기업 모집 공고", "2026-09-08", "2026-09-11", ""),
+        (
+            "fowi",
+            "산림복지 지원사업 참여기업 모집 공고(연장 ~9.30)",
+            "2026-09-08",
+            None,
+            '{"title": "산림복지 지원사업 참여기업 모집 공고(연장 ~9.30)"}',
+        ),
+        # 대표 교체 (괄호를 지우면 같은 제목 — 사업자 신호 있는 쪽이 대표)
+        (
+            "forest_service",
+            "산림 탄소 흡수량 산정 지원 모집 안내",
+            "2026-09-08",
+            "2026-09-25",
+            "",
+        ),
+        (
+            "forest_service",
+            "산림 탄소 흡수량 산정 지원 모집 안내(참여기업)",
+            "2026-09-08",
+            "2026-09-25",
+            "",
+        ),
+        # 지역 접두 2건 (병합 금지)
+        ("seis", "[경기] 사회적기업 사업개발비 지원사업 모집", "2026-09-08", "2026-09-28", ""),
+        ("seis", "[강원] 사회적기업 사업개발비 지원사업 모집", "2026-09-08", "2026-09-28", ""),
+        # 배제 (소스 풀 외) / 보류 (B2C) / 알아두세요
+        ("smartfarm", "스마트팜 실증단지 입주 모집 공고", "2026-09-08", None, ""),
+        ("fowi", "나눔의 숲 캠프 모집 공고", "2026-09-08", None, ""),
+        ("lawmaking", "산지관리법 시행령 일부개정령안 입법예고", "2026-09-08", "2026-10-19", ""),
+        ("forest_press", "산림청, 국제산림협력 해법 모색", "2026-09-08", None, ""),
+    )
+
+    def test_partition_invariant_with_independent_oracle(self, tmp_path):
+        """창 내 모든 후보가 섹션∪보류∪배제∪병합됨에 **정확히 한 번** 나타난다."""
+        db_path = tmp_path / "c5_7.db"
+        _create_announcements_table(db_path)
+        for index, (source, title, start, end, raw) in enumerate(
+            self.RICH_ROWS
+        ):
+            _insert_one(
+                db_path,
+                source=source,
+                source_id=f"rich_{index}",
+                title=title,
+                url=f"https://example.com/rich-{index}",
+                period_start=start,
+                period_end=end,
+                raw_data=raw,
+                created_at=W37_CREATED_AT,
+            )
+
+        # 오라클: 컴포저와 무관한 별도 SQL + 테스트가 직접 계산한 KST 창
+        conn = sqlite3.connect(str(db_path))
+        rows = conn.execute(
+            "SELECT id, created_at FROM announcements"
+        ).fetchall()
+        conn.close()
+        first, last = date(2026, 9, 7), date(2026, 9, 13)
+        oracle = {
+            row_id
+            for row_id, created in rows
+            if first <= kst_date(created) <= last
+        }
+        assert len(oracle) == len(self.RICH_ROWS)
+
+        data = compose_digest_data(
+            str(db_path), week_str=W37, today=W37_TODAY
+        )
+        buckets = [
+            [item["id"] for item in data["sections"][VERDICT_APPLY]],
+            [item["id"] for item in data["sections"][VERDICT_NOTICE]],
+            [item["id"] for item in data["holds"]],
+            [item["id"] for item in data["excluded"]],
+            list(data["merged_ids"]),
+        ]
+        placed = [item_id for bucket in buckets for item_id in bucket]
+
+        assert len(placed) == len(set(placed)), "두 곳에 배치된 항목이 있다"
+        assert set(placed) == oracle, "섹션∪보류∪배제∪병합됨 밖의 항목이 있다"
+
+        # 픽스처가 의도한 사례들이 실제로 등장했는지 (테스트가 비어 돌지 않게)
+        reasons = {item["reason"] for item in data["excluded"]}
+        assert "마감 경과" in reasons
+        assert "협의회 소스 풀 외" in reasons
+        hold_reasons = {item["reason"] for item in data["holds"]}
+        assert any(r.startswith("참가자 모집(B2C)") for r in hold_reasons)
+        assert HOLD_REASON_SECTION_CAP in hold_reasons
+        assert len(data["merged_ids"]) == 1
+        assert len(data["sections"][VERDICT_NOTICE]) == 1

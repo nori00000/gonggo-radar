@@ -16,7 +16,7 @@ import re
 import sqlite3
 import sys
 from collections import Counter
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Dict, List, NamedTuple, Optional, Sequence, Set, Tuple
 
@@ -294,6 +294,15 @@ QUOTE_FALLBACK = "원문 확인"
 DEDUP_JACCARD = 0.6
 NGRAM_SIZE = 3
 
+# 개정 v2.6 (8): created_at에 오프셋이 있으면 KST로 환산해 주간 창을 판정한다.
+KST = timezone(timedelta(hours=9))
+# SQL 문자열 범위는 인덱스용 1차 필터라 앞뒤로 하루 넓힌다(오프셋 최대 ±14h 흡수).
+WINDOW_PREFILTER_SLACK_DAYS = 1
+
+# 연장·재공고 표지 (개정 v2.6 (1)). 마감이 비어 있는데 이 말이 붙어 있으면
+# 앞 회차의 만료된 마감을 상속시키지 않는다.
+RENEWAL_KEYWORDS = ("연장", "재공고", "추가모집", "재모집", "2차")
+
 # 카톡 평문 분할 (개정 v2.5 #12). 카카오톡 한 메시지 한도와 같은 4096자.
 KAKAO_CHUNK_LIMIT = 4096
 KAKAO_CHUNK_SEPARATOR = "---8<---"
@@ -311,7 +320,17 @@ _RAW_SKIP_KEYS = ("link", "url", "href")
 # 들어간 공공기관 제목이 흔하고, 바깥 괄호만 지우면 " 14:00, 대전)"이 본문에 남아
 # 지역 태그가 엉뚱하게 붙는다.
 _BRACKET_RE = re.compile(
-    r"[(\[{（【<](?:[^()\[\]{}（）【】<>]|\([^()]*\))*[)\]}）】>]"
+    r"[(\[{（【［<]"
+    r"(?:[^()\[\]{}（）【】［］<>]|\([^()]*\)|\[[^\[\]]*\]|［[^［］]*］)*"
+    r"[)\]}）】］>]"
+)
+# 접두 괄호 — 자격 지역은 여기서 확정한다 (개정 v2.6 (2)). 전각 대괄호도 인식.
+_PREFIX_BRACKET_RE = re.compile(
+    r"^\s*[(\[（【［]([^()\[\]（）【】［］]*)[)\]）】］]"
+)
+# 행사 장소 문맥 — 자격 지역이 아니다 (개정 v2.6 (2)).
+_VENUE_CONTEXT_RE = re.compile(
+    r"(?:개최\s*)?장소\s*[:：][^)\]]*|[가-힣]{2,5}에서|개최지\s*[:：][^)\]]*"
 )
 # 괄호 내용을 지우고 남은 알맹이가 이보다 짧으면 부호만 지우는 쪽으로 되돌린다.
 _MIN_DEDUP_KEY_CHARS = 8
@@ -391,25 +410,26 @@ def normalize_title(title: str) -> str:
 
 
 # 개정 v2.5 (#2): 제목은 링크·HTML을 렌더하지 않는다. 링크는 "원문" 필드로만 나간다.
-_MD_LINK_IN_TITLE_RE = re.compile(r"\[([^\]]*)\]\((?:[^()\s]|\([^()]*\))*\)")
-_AUTOLINK_RE = re.compile(r"<(\s*https?://[^>]*)>")
+# 개정 v2.6 (3): 괄호 내용이 **URL일 때만** 링크로 본다. `[모집](~9.30)`,
+# `[모집](산림사업자)` 같은 정상 표기는 원문 그대로 보존한다.
+_MD_LINK_IN_TITLE_RE = re.compile(
+    r"\[([^\]]*)\]\(\s*(?:https?://|www\.)(?:[^()\s]|\([^()]*\))*\)"
+)
+_AUTOLINK_RE = re.compile(r"<(\s*(?:https?://|www\.)[^>]*)>")
 
 
 def sanitize_title(title: str) -> str:
     """제목에서 링크 문법과 HTML 태그 형성 가능성을 제거한다.
 
-    - `[텍스트](URL)` → `텍스트` (URL은 버린다 — 링크는 "원문" 필드의 몫)
+    - `[텍스트](http…)` → `텍스트` (URL은 버린다 — 링크는 "원문" 필드의 몫)
     - `<https://…>` → `https://…` (꺾쇠 제거)
     - 남은 `<`·`>`는 전각으로 바꿔 태그가 만들어지지 못하게 한다
-    - 남은 `](` 는 `] (` 로 끊어 링크 문법이 재조립되지 못하게 한다
-
-    `[모집]`·`(~9.30)` 같은 정상 표기는 그대로 읽히도록 대괄호·괄호 자체는 남긴다.
+    - 괄호 내용이 URL이 아니면 손대지 않는다 (`[모집](~9.30)` 유지)
     """
     text = normalize_title(title)
     text = _MD_LINK_IN_TITLE_RE.sub(lambda m: m.group(1), text)
     text = _AUTOLINK_RE.sub(lambda m: m.group(1).strip(), text)
     text = text.replace("<", "＜").replace(">", "＞")
-    text = text.replace("](", "] (")
     return " ".join(text.split())
 
 
@@ -456,18 +476,55 @@ def strip_brackets(text: str) -> str:
     return " ".join(_BRACKET_RE.sub(" ", normalize_title(text)).split())
 
 
+_REGION_SUFFIXES = ("센터", "권역", "광역", "특별", "지역", "도", "시", "권")
+
+
+def _region_boundary_ok(text: str, pattern: str, pos: int) -> bool:
+    """지역 토큰 경계 규칙 (개정 v2.6 (4)).
+
+    `경기침체`·`대구목재`처럼 다른 낱말에 묻힌 토큰은 지역으로 인정하지 않는다.
+    허용: 문자열 끝 / 공백 / 구두점 / {센터·도·시·권·권역·지역·광역·특별} /
+    바로 다음에 또 다른 지역·권역 토큰(센터명 연쇄: `세종대전충청센터`).
+    """
+    rest = text[pos + len(pattern):]
+    if not rest:
+        return True
+    head = rest[0]
+    if head.isspace():
+        return True
+    if not (head.isalnum() or "가" <= head <= "힣"):
+        return True
+    if any(rest.startswith(suffix) for suffix in _REGION_SUFFIXES):
+        return True
+    if any(rest.startswith(other) for other, _ in REGION_PATTERNS):
+        return True
+    if any(rest.startswith(other) for other, _ in REGION_BROAD_PATTERNS):
+        return True
+    return False
+
+
 def _scan_regions(text: str) -> List[str]:
-    """텍스트에 등장하는 시·도명 (표시명 기준 중복 제거)."""
+    """텍스트에 등장하는 시·도명 (표시명 기준 중복 제거, 경계 규칙 적용)."""
     found: List[str] = []
     for pattern, display in REGION_PATTERNS:
-        if pattern in text and display not in found:
-            found.append(display)
+        if display in found:
+            continue
+        start = 0
+        while True:
+            pos = text.find(pattern, start)
+            if pos < 0:
+                break
+            if _region_boundary_ok(text, pattern, pos):
+                found.append(display)
+                break
+            start = pos + 1
     return found
 
 
 def _scan_broad_region(text: str) -> Optional[str]:
     for pattern, display in REGION_BROAD_PATTERNS:
-        if pattern in text:
+        pos = text.find(pattern)
+        if pos >= 0 and _region_boundary_ok(text, pattern, pos):
             return display
     return None
 
@@ -483,21 +540,36 @@ def _region_from(text: str) -> Optional[str]:
     return None
 
 
-def infer_region(title: str) -> Optional[str]:
-    """제목에서 지역 한정 도·광역·권역명을 추론 (개정 v2.4 (b)).
+def prefix_bracket(title: str) -> str:
+    """제목 맨 앞 괄호의 내용 (없으면 빈 문자열)."""
+    matched = _PREFIX_BRACKET_RE.match(normalize_title(title))
+    return matched.group(1).strip() if matched else ""
 
-    ① 먼저 괄호 밖 본문을 본다 (`경기도 …`, `강원(춘천 권역) …`).
-    ② 본문에서 못 찾으면 `[세종대전충청센터]` 같은 접두 괄호까지 포함해서 본다.
-    여러 시·도가 섞여 있으면 권역명을 쓰고, 권역명도 없으면 붙이지 않는다(여러 지역 = 판정 불가).
+
+def _drop_venue_context(text: str) -> str:
+    """행사 장소 문맥을 지운다 — 자격 지역이 아니다."""
+    return " ".join(_VENUE_CONTEXT_RE.sub(" ", text).split())
+
+
+def infer_region(title: str) -> Optional[str]:
+    """제목에서 **신청 자격 지역**을 추론 (개정 v2.4 (b) + v2.6 (2)(4)).
+
+    ① 접두 괄호(`[경기]`·`［경기센터］`)에 지역이 있으면 **거기서 확정하고 끝낸다**.
+       2차 탐색을 하면 행사 장소(`(설명회 장소: 서울)`)가 섞여 자격 지역이 사라진다.
+    ② 접두 괄호에 지역이 없으면 괄호 밖 본문을 본다(장소 문맥 제거 후).
+    여러 시·도가 섞여 있으면 권역명을 쓰고, 권역명도 없으면 붙이지 않는다.
 
     주의: announcements 스키마에는 소스별 지역 필드가 없다(스키마 변경 금지). 그래서
     판정 근거는 제목뿐이다 — 소스 지역 필드가 생기면 여기에 합친다.
     """
-    body = strip_brackets(title)
-    region = _region_from(body)
-    if region:
-        return region
-    return _region_from(normalize_title(title))
+    prefix = prefix_bracket(title)
+    if prefix:
+        region = _region_from(prefix)
+        if region:
+            return region
+
+    body = _drop_venue_context(strip_brackets(title))
+    return _region_from(body)
 
 
 def infer_target_tags(text: str) -> Tuple[str, ...]:
@@ -522,15 +594,21 @@ def infer_target_tags(text: str) -> Tuple[str, ...]:
     return tuple(tag for tag in TAG_ORDER if tag in tags)
 
 
-def _institution_hits(title: str, forest: Tuple[str, ...]) -> Tuple[str, ...]:
-    """제목의 제도 키워드. 단독 `계획`·`발표`는 산림 업종 키워드 동반 시에만 인정 (#10)."""
+def _institution_hits(
+    title: str, relevance: Tuple[str, ...]
+) -> Tuple[str, ...]:
+    """제목의 제도 키워드.
+
+    개정 v2.6 (6): 단독 `계획`·`발표`는 **산림 업종 또는 사회적경제 정체성** 키워드를
+    동반할 때 인정한다(`사회적기업 성장 추진계획` → 알아두세요). 계약에 없던 산림
+    한정 조건을 걷어냈다.
+    """
     hits = _hits(title, INSTITUTION_KEYWORDS)
     if not hits:
         return ()
-    if forest:
+    if relevance:
         return hits
-    strong = tuple(kw for kw in hits if kw not in BARE_INSTITUTION_KEYWORDS)
-    return strong
+    return tuple(kw for kw in hits if kw not in BARE_INSTITUTION_KEYWORDS)
 
 
 def classify_item(title: str, summary: str, source: str) -> Classification:
@@ -567,7 +645,7 @@ def classify_item(title: str, summary: str, source: str) -> Classification:
     # 근거(W37 실측): forest_press 보도자료 요약에는 "모집"·"정책"·"시행" 같은 상용구가
     # 늘 들어 있어서 본문까지 보면 관리소 활동 기사가 신청/제도 섹션으로 올라온다.
     opportunity = _hits(title, OPPORTUNITY_KEYWORDS)
-    institution = _institution_hits(title, forest)
+    institution = _institution_hits(title, relevance)
 
     # ③ 노이즈 사전 — 개정 v2.5 (#6): **제목에만** 적용한다. 요약의 "통합정보시스템에서
     # 접수" 같은 접수 안내 상용구로 유효 공고를 영구 배제하던 결함을 막는다.
@@ -868,7 +946,7 @@ def _build_item(row: Sequence, classification: Classification, today: date) -> D
     # "새 소식" 판정에는 쓰지 않는다 — 크롤 날짜를 게시일로 믿으면 게시일이 없는 소스
     # (seis·coop 실측: period_start NULL)가 전부 "새 소식"이 되어 최신 슬롯을 독식한다.
     posted_known = _parse_created_date(period_start)
-    posted = posted_known or _parse_created_date(created_at)
+    posted = posted_known or kst_date(created_at)
     quotes = extract_quotes(summary, raw_data)
     quoted = quotes["quote_deadline"]
     quoted_tail = quoted if quoted != QUOTE_FALLBACK else None
@@ -898,6 +976,12 @@ def _build_item(row: Sequence, classification: Classification, today: date) -> D
         ) else 1,
         # 개정 v2.5 (#5): 병합 대표는 사업자 신호가 있는 쪽이 먼저다
         "has_b2b": bool(_hits(clean_title, B2B_SIGNAL_KEYWORDS)),
+        # 개정 v2.6 (1): 마감이 비어 있는데 연장·재공고 표지나 새 마감 인용이 있으면
+        # 앞 회차와 병합하지 않는다 — 만료된 마감을 상속받아 함께 배제됐다.
+        "is_renewal": bool(
+            deadline is None
+            and (_hits(clean_title, RENEWAL_KEYWORDS) or quoted_tail)
+        ),
         "merged_ids": [],
         "similar_count": 0,
     }
@@ -919,6 +1003,11 @@ def _refresh_deadline(item: Dict, deadline: Optional[date], today: date) -> None
     )
 
 
+def _is_new_round(item: Dict) -> bool:
+    """마감 없는 연장·재공고 — 새 회차로 취급해 병합하지 않는다 (개정 v2.6 (1))."""
+    return bool(item.get("is_renewal"))
+
+
 def _mergeable(left: Dict, right: Dict) -> bool:
     """병합해도 되는 짝인가 (개정 v2.5 #5·#11).
 
@@ -931,6 +1020,8 @@ def _mergeable(left: Dict, right: Dict) -> bool:
     if tuple(left["tags"]) != tuple(right["tags"]):
         return False
     if (left["region"] or "") != (right["region"] or ""):
+        return False
+    if _is_new_round(left) or _is_new_round(right):
         return False
     return True
 
@@ -1032,6 +1123,41 @@ def _sort_notice(items: List[Dict]) -> List[Dict]:
     return sorted(items, key=lambda item: -_posted_ordinal(item))
 
 
+def kst_date(value: Optional[str]) -> Optional[date]:
+    """타임스탬프 문자열을 **KST 날짜**로 (개정 v2.6 (8)).
+
+    오프셋이 붙어 있으면 KST로 환산한다(`2026-09-06T15:30:00+00:00` → 9/7).
+    naive 값은 KST로 저장된 것으로 본다(실측: `2026-09-12T09:46:29.074620`).
+    ISO로 못 읽으면 앞쪽 날짜만이라도 건진다.
+    """
+    if not value:
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+    candidate = text[:-1] + "+00:00" if text.endswith("Z") else text
+    try:
+        parsed = datetime.fromisoformat(candidate)
+    except ValueError:
+        return parse_deadline(text)
+    if parsed.tzinfo is None:
+        return parsed.date()
+    return parsed.astimezone(KST).date()
+
+
+def window_prefilter_bounds(week_str: str) -> Tuple[str, str]:
+    """SQL 1차 필터용 문자열 범위 — 인덱스를 쓰되 오프셋 경계를 놓치지 않게 넓힌다."""
+    week_start, end_exclusive = week_bounds(week_str)
+    slack = timedelta(days=WINDOW_PREFILTER_SLACK_DAYS)
+    start = (datetime.strptime(week_start, "%Y-%m-%d") - slack).strftime(
+        "%Y-%m-%d"
+    )
+    end = (datetime.strptime(end_exclusive, "%Y-%m-%d") + slack).strftime(
+        "%Y-%m-%d"
+    )
+    return start, end
+
+
 def week_bounds(week_str: str) -> Tuple[str, str]:
     """주간 창을 KST 날짜 문자열 범위로 (개정 v2.5 #9).
 
@@ -1072,7 +1198,9 @@ def compose_digest_data(
         today = date.today()
 
     week_start, week_end = get_week_date_range(week_str)
-    range_start, range_end = week_bounds(week_str)
+    range_start, range_end = window_prefilter_bounds(week_str)
+    window_first = parse_deadline(week_start)
+    window_last = parse_deadline(week_end)
 
     conn = sqlite3.connect(db_path)
     cursor = conn.cursor()
@@ -1106,6 +1234,14 @@ def compose_digest_data(
     for row in rows:
         source, title, summary, url = row[1], row[2], row[3], row[4]
         if exclude_urls and url in exclude_urls:
+            continue
+        # 개정 v2.6 (8): 정확한 창 판정은 KST 날짜로 한다 (SQL 범위는 1차 필터).
+        created_kst = kst_date(row[7])
+        if created_kst is None:
+            continue
+        if window_first and created_kst < window_first:
+            continue
+        if window_last and created_kst > window_last:
             continue
         candidate_ids.append(row[0])
         # 개정 v2.5 (#8): 값이 있는데 못 읽은 날짜를 센다(조용한 실패 가시화)
@@ -1329,14 +1465,12 @@ def render_markdown(data: Dict) -> str:
 
 
 def chunk_plaintext(text: str, limit: int = KAKAO_CHUNK_LIMIT) -> List[str]:
-    """평문을 한도 이하 조각으로 분할. 줄 경계를 지키고, 한 줄이 한도를 넘으면 자른다."""
+    """평문을 한도 이하 조각으로 분할. 줄 경계를 지키고, URL 줄은 쪼개지 않는다."""
     chunks: List[str] = []
     current: List[str] = []
     size = 0
     for line in text.split("\n"):
-        pieces = [line] if len(line) <= limit else [
-            line[i:i + limit] for i in range(0, len(line), limit)
-        ]
+        pieces = _split_line(line, limit)
         for piece in pieces:
             extra = len(piece) + (1 if current else 0)
             if size + extra > limit and current:
@@ -1351,11 +1485,106 @@ def chunk_plaintext(text: str, limit: int = KAKAO_CHUNK_LIMIT) -> List[str]:
     return chunks or [""]
 
 
+def _split_line(line: str, limit: int) -> List[str]:
+    """한 줄을 한도로 자른다. **URL 줄은 자르지 않는다** (개정 v2.6 (5))."""
+    if len(line) <= limit:
+        return [line]
+    if _is_url_line(line):
+        # 쪼개면 링크가 죽는다. 한도를 넘겨도 통째로 보낸다.
+        return [line]
+    return [line[i:i + limit] for i in range(0, len(line), limit)]
+
+
+def _is_url_line(line: str) -> bool:
+    stripped = line.strip()
+    return stripped.startswith("http://") or stripped.startswith("https://")
+
+
+def _shrink_item_block(block: str, limit: int) -> str:
+    """항목 블록이 한도를 넘으면 **제목만** 줄이고 URL은 보존한다 (개정 v2.6 (5))."""
+    lines = block.split("\n")
+    if len(lines) != 2 or not _is_url_line(lines[1]):
+        return block
+    head, url_line = lines
+    room = limit - len(url_line) - 1
+    if room <= 1:
+        # URL 자체가 한도를 넘는다 — 자르지 않고 그대로 둔다(링크 보존이 우선).
+        return block
+    if len(head) > room:
+        head = head[: max(1, room - 1)] + "…"
+    return f"{head}\n{url_line}"
+
+
+def _pack_blocks(blocks: Sequence[str], limit: int) -> List[str]:
+    """블록(항목·머리글·메모)을 쪼개지 않고 한도 이하로 묶는다 (개정 v2.6 (5))."""
+    chunks: List[str] = []
+    current: List[str] = []
+
+    def flush() -> None:
+        if current:
+            text = "\n".join(current).strip("\n")
+            if text:
+                chunks.append(text)
+            current.clear()
+
+    for block in blocks:
+        block = _shrink_item_block(block, limit)
+        if len(block) > limit:
+            flush()
+            chunks.extend(chunk_plaintext(block, limit))
+            continue
+        candidate = len("\n".join(current + [block]))
+        if current and candidate > limit:
+            flush()
+            if not block.strip():
+                continue
+        current.append(block)
+    flush()
+    return chunks or [""]
+
+
+def kakao_blocks(data: Dict, headline: Optional[str] = None) -> List[str]:
+    """카톡 평문을 블록 단위로 (항목은 `제목 줄 + URL 줄` 한 덩어리)."""
+    blocks: List[str] = [
+        "{} ({})\n{}{}".format(
+            f"📋 협의회 주간 정책브리핑 {data['week']}",
+            data["period_label"],
+            KAKAO_HEADLINE_PREFIX,
+            headline.strip() if headline else KAKAO_HEADLINE_PLACEHOLDER,
+        ),
+        "",
+    ]
+
+    for section in ITEM_SECTIONS:
+        blocks.append(SECTION_HEADINGS[section])
+        items = data["sections"].get(section) or []
+        if not items:
+            blocks.append("  (항목 없음)")
+        for item in items:
+            blocks.append(f"{item_line(item)}\n  {item['url']}")
+        blocks.append("")
+
+    if data.get("council_notes"):
+        blocks.append(SECTION_HEADINGS[SECTION_COUNCIL])
+        for note in data["council_notes"]:
+            blocks.append(f"· {note}")
+        blocks.append("")
+
+    if data.get("member_news"):
+        blocks.append(SECTION_HEADINGS[SECTION_MEMBER])
+        for company, contents in sorted(data["member_news"].items()):
+            for content in contents:
+                blocks.append(f"· {company}: {content}")
+        blocks.append("")
+
+    return blocks
+
+
 def render_kakao_chunks(
     data: Dict, headline: Optional[str] = None
 ) -> List[str]:
-    """카톡 평문을 메시지 한도(4096자) 조각 리스트로 (개정 v2.5 #12)."""
-    return chunk_plaintext(render_kakao(data, headline))
+    """카톡 평문을 메시지 한도(4096자) 조각 리스트로 (개정 v2.5 #12 + v2.6 (5))."""
+    return _pack_blocks(kakao_blocks(data, headline), KAKAO_CHUNK_LIMIT)
 
 
 def kakao_file_text(data: Dict, headline: Optional[str] = None) -> str:
@@ -1366,14 +1595,14 @@ def kakao_file_text(data: Dict, headline: Optional[str] = None) -> str:
 
 def refresh_kakao_headline(text: str, headline: str) -> str:
     """`.kakao.txt`의 "이번 주 한 줄" 자리를 확정 문구로 바꾸고 다시 분할 (#12)."""
-    body = "\n".join(
+    body = [
         line
         for line in text.splitlines()
         if line.strip() != KAKAO_CHUNK_SEPARATOR
-    )
+    ]
     replaced = []
     done = False
-    for line in body.splitlines():
+    for line in body:
         if not done and line.startswith(KAKAO_HEADLINE_PREFIX):
             replaced.append(f"{KAKAO_HEADLINE_PREFIX}{headline.strip()}")
             done = True
@@ -1385,37 +1614,7 @@ def refresh_kakao_headline(text: str, headline: str) -> str:
 
 def render_kakao(data: Dict, headline: Optional[str] = None) -> str:
     """카톡 평문 렌더 (같은 틀, 마크다운 장식·보류 주석 없음)."""
-    lines = [
-        f"📋 협의회 주간 정책브리핑 {data['week']} ({data['period_label']})",
-        KAKAO_HEADLINE_PREFIX
-        + (headline.strip() if headline else KAKAO_HEADLINE_PLACEHOLDER),
-        "",
-    ]
-
-    for section in ITEM_SECTIONS:
-        lines.append(SECTION_HEADINGS[section])
-        items = data["sections"].get(section) or []
-        if not items:
-            lines.append("  (항목 없음)")
-        for item in items:
-            lines.append(item_line(item))
-            lines.append(f"  {item['url']}")
-        lines.append("")
-
-    if data.get("council_notes"):
-        lines.append(SECTION_HEADINGS[SECTION_COUNCIL])
-        for note in data["council_notes"]:
-            lines.append(f"· {note}")
-        lines.append("")
-
-    if data.get("member_news"):
-        lines.append(SECTION_HEADINGS[SECTION_MEMBER])
-        for company, contents in sorted(data["member_news"].items()):
-            for content in contents:
-                lines.append(f"· {company}: {content}")
-        lines.append("")
-
-    return "\n".join(lines).rstrip() + "\n"
+    return "\n".join(kakao_blocks(data, headline)).rstrip() + "\n"
 
 
 def compose_digest(
