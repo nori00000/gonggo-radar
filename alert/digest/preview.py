@@ -82,6 +82,8 @@ def parse_digest(markdown_text: str, item_sections=None) -> Dict:
     commentary_lines: List[str] = []
     section_by_heading: Dict[str, Dict] = {}
 
+    # 계약 W10 사이클6 #2(splitlines 금지)는 blocks.py 가 이미 충족한다 —
+    # 파서는 split("\n") 하나뿐이고, 제어 문자는 checker 가 fail-closed 로 막는다.
     for block in blocks_mod.parse_blocks(markdown_text, item_sections):
         if block["kind"] == "comment":
             matched = _HOLD_RE.match(block["lines"][0].strip())

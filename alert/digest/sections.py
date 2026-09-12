@@ -64,7 +64,17 @@ def from_composer() -> Optional[Tuple[Tuple[str, ...], Tuple[str, ...]]]:
 
 
 def declared() -> Tuple[Tuple[str, ...], Tuple[str, ...]]:
-    """composer 상수 → 없으면 선언 목록(v1.2 + v2 합집합)."""
+    """항목·산문 헤딩의 선언 목록 — **composer 상수가 정본**이다.
+
+    합집합(계약 W10 사이클5)은 "디스크에 남은 v1.2 본문이 항목 0건이 되지 않게"
+    하려던 것이었다. 병합 3회차에서 그 목적은 사라졌다 — 항목 판정은 이제
+    구조 마커(blocks.py, 사이클 6 #1)가 하고, composer 가 만들지 않는 형식은
+    섹션 이름과 무관하게 산문으로 보고 fail-closed 한다. 남은 효과는 **삭제된
+    이름이 계속 항목 섹션으로 인정되는 것**뿐이어서, 섹션 이름을 바꿔도 옛 이름의
+    본문이 조용히 통과한다(조용한 오분류). 그래서 composer 목록만 쓴다.
+
+    composer 를 읽을 수 없을 때만 선언 목록(v1.2 ∪ v2)으로 물러선다.
+    """
     from_mod = from_composer()
     if from_mod is not None:
         return from_mod

@@ -443,9 +443,26 @@ def get_week_date_range(week_str: str) -> Tuple[str, str]:
     return week_start.strftime("%Y-%m-%d"), week_end.strftime("%Y-%m-%d")
 
 
+def strip_controls(text: str) -> str:
+    """허용되지 않은 제어 문자를 제거 (계약 W10 사이클6 #2).
+
+    DB·폼에서 들어온 제목·요약·의견에 `\v`·`\r` 같은 문자가 섞이면 파서마다
+    줄 수가 달라져 "같은 본문, 다른 항목 수" 가 된다. 저장 시점에 없앤다.
+    (검증 단계에도 fail-closed 게이트가 있다 — 여기는 애초에 만들지 않는 쪽.)
+    """
+    from alert.digest.prune import strip_control_chars
+
+    return strip_control_chars(text)
+
+
 def normalize_title(title: str) -> str:
-    """제목 정규화: 공백 정규화 (개행·탭 제거)."""
-    return " ".join((title or "").split())
+    """제목 정규화: 공백 정규화(개행·탭 제거) + 제어 문자 제거.
+
+    제어 문자 제거는 계약 W10 사이클6 #2 다 — DB·폼에서 들어온 제목에 `\v` 같은
+    문자가 섞이면 파서마다 줄 수가 달라져 "같은 본문, 다른 항목 수" 가 된다.
+    여기는 애초에 만들지 않는 쪽이고, checker 에 fail-closed 게이트가 또 있다.
+    """
+    return " ".join(strip_controls(title or "").split())
 
 
 # 개정 v2.5 (#2): 제목은 링크·HTML을 렌더하지 않는다. 링크는 "원문" 필드로만 나간다.
@@ -2184,7 +2201,7 @@ def compose_digest(
             f"# 협의회 의견 {data['week']}",
             "",
         ]
-        for opinion in data["opinions"]:
+        for opinion in (strip_controls(text) for text in data["opinions"]):
             opinions_lines.append(f"- {opinion}")
             opinions_lines.append("")
 

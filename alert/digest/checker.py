@@ -27,6 +27,7 @@ from typing import Dict, List, Optional
 import requests
 
 from alert.digest import blocks as blocks_mod
+from alert.digest import prune
 from alert.digest import sections as sections_mod
 from alert.digest.composer import (
     HEADING_TO_SECTION,
@@ -48,7 +49,7 @@ def markdown_sha256(markdown_bytes: bytes) -> str:
 
     정본은 파일 바이트다 — CRLF 만 바뀐 본문도 해시가 달라져 재검증을 요구한다.
     check.json 의 키는 `markdown_sha256` 하나이고, 텍스트 정규화 해시는 쓰지 않는다.
-    미리보기 지문(state.preview_sha)·승인 카드 지문·`--approved-sha` 도 모두 이 값이다.
+    state 의 approval.sha(승인 세대 지문)도 이 값이다 — 승인 카드는 세대 id 를 싣는다.
     """
     return hashlib.sha256(markdown_bytes).hexdigest()
 
@@ -165,6 +166,18 @@ def manifest_problems(
     missing = sorted(set(entries) - seen)
     if missing:
         problems.append("본문에 없는 정본 항목 id=" + ", ".join(missing))
+
+    # 병합 3회차: **번호 좌표의 근거는 정본 순서**다 (봇의 `제외 2,5` 가 가리키는
+    # 그 번호). 순서가 본문과 다르면 사람이 승인한 번호와 실제 항목이 어긋나므로
+    # 고치지 않고 멈춘다 — 해소는 재조립이다.
+    manifest_order = [
+        str(entry.get("id")) for entry in (manifest.get("items") or [])
+        if isinstance(entry, dict) and entry.get("id") is not None
+    ]
+    body_order = [str(block.get("item_id")) for block in blocks]
+    if (sorted(manifest_order) == sorted(body_order)
+            and manifest_order != body_order):
+        problems.append("정본 항목 순서가 본문과 다름 — 재조립 필요")
 
     problems.extend(_db_problems(entries, db_path))
     return problems
@@ -471,6 +484,27 @@ def check_digest(
     markdown_bytes = markdown_path.read_bytes()
     markdown_text = markdown_bytes.decode("utf-8")
     content_hash = markdown_sha256(markdown_bytes)
+
+    # 계약 W10 사이클6 #2: 허용되지 않은 제어 문자는 그 자체로 fail-closed —
+    # 파서마다(split vs splitlines) 줄 수가 달라져 "같은 본문, 다른 항목 수" 가 된다.
+    # 이 검사는 **가장 먼저** 한다: 아래 판정들이 모두 같은 줄 나눔을 전제한다.
+    if prune.control_chars(markdown_text):
+        result = {
+            "items": [],
+            "dropped": [],
+            "item_blocks": 0,
+            "item_sections": [],
+            "commentary_sections": [],
+            "manifest_problems": [],
+            "pass": False,
+            "network_checked": False,
+            "reason": "제어 문자 포함 ({})".format(
+                prune.control_chars_label(markdown_text)),
+            "markdown_sha256": content_hash,
+        }
+        result = _apply_warnings(result, warnings)
+        write_check_result(output_path, result)
+        return result
 
     # 사이클3 #7: 섹션 정본을 여기서 확정해 check.json 에 남긴다 — prune·preview·
     # 봇은 이 목록과 **정확 일치**로 판정한다(부분 일치 금지).

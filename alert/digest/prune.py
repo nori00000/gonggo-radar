@@ -19,9 +19,15 @@ weekly_digest 는 재조립(compose)으로 죽은 항목을 빼지만, `/digest 
 **제목 중복 병합은 하지 않는다** (사이클 6 #3 / Codex 신규 #5). 병합 판정은 compose
 단계의 몫이고, 소스 간 비병합 계약(같은 제목이라도 forest_service·forest_press 는
 각자 게시)을 재검토가 뒤집으면 안 된다. 여기서 지우는 중복은 **동일 URL** 뿐이다.
+
+제어 문자 게이트(계약 W10 사이클7 #4)와 **파서 API 이름**도 여기 있다. 후자는
+전부 `alert.digest.blocks` 로의 위임이다 — 링크 파서·URL 추출은 저장소에 하나뿐이고
+(발송기의 렌더와 검사기가 같은 함수를 봐야 한다), 이 모듈은 그 이름을 계약 W10 의
+호출자들에게 그대로 내어줄 뿐이다.
 """
 
 import re
+import unicodedata
 from typing import Dict, List, Optional, Sequence, Tuple
 
 from alert.digest import blocks as blocks_mod
@@ -167,3 +173,94 @@ def drop_from_manifest(manifest: Dict, removed: Sequence[Dict]) -> Dict:
         and entry.get("url") not in dead_urls_only
     ]
     return updated
+
+
+# ─── 제어 문자 게이트 (계약 W10 사이클7 #4) ──────────────────────────────
+# 허용은 `\n`·`\t` 뿐. 그 밖에 category 가 Cc(제어)·Cf(포맷: BOM·ZWSP·LRM·RLO·LRI…)
+# ·Zl·Zp 인 코드포인트가 하나라도 있으면 fail-closed 다 — 블랙리스트로는
+# U+0080~U+009F·양방향 제어를 계속 놓쳤다. 줄 나눔이 파서마다 달라지면
+# "같은 본문, 다른 항목 수" 가 되고, 그 틈으로 항목이 숨는다.
+_ALLOWED_CONTROLS = ("\n", "\t")
+_BANNED_CATEGORIES = ("Cc", "Cf", "Zl", "Zp")
+
+
+def _is_banned(char: str) -> bool:
+    return (char not in _ALLOWED_CONTROLS
+            and unicodedata.category(char) in _BANNED_CATEGORIES)
+
+
+def control_chars(text) -> List[str]:
+    """허용 목록 밖의 문자 (등장 순서, 중복 제거)."""
+    found: List[str] = []
+    for char in text or "":
+        if _is_banned(char) and char not in found:
+            found.append(char)
+    return found
+
+
+def control_chars_label(text) -> str:
+    """사람이 읽을 표기 (예: `\x0b, \ufeff`)."""
+    return ", ".join(repr(char).strip("'") for char in control_chars(text))
+
+
+def strip_control_chars(text) -> str:
+    """허용 목록 밖의 문자를 제거 (composer 가 저장 시 쓴다)."""
+    return "".join(char for char in (text or "") if not _is_banned(char))
+
+
+# ─── 파서 API (전부 blocks.py 로의 위임, 사이클 6 #1 · 계약 W10 사이클7 #3) ──
+# 계약 W10 의 호출자(checker·notify·발송기·봇 guard)는 이 이름들을 쓴다. 구현은
+# **하나**여야 한다 — 렌더러가 만드는 href 와 검사기가 보는 URL 이 갈리면
+# "검사한 곳과 다른 데로 보내는" 링크가 생긴다.
+def markdown_links(text) -> List[Tuple[str, str]]:
+    """`[표시](href)` 쌍 목록 — href 는 **그대로**(끝 구두점 포함) 돌려준다."""
+    return [
+        (link.text, link.url)
+        for line in (text or "").split("\n")
+        for link in blocks_mod.find_links(line)
+    ]
+
+
+def link_matches(line) -> List[blocks_mod.Link]:
+    """한 줄의 링크 목록 (렌더러가 치환 좌표까지 쓴다 — `start`·`end`·`raw`)."""
+    return blocks_mod.find_links(line or "")
+
+
+def body_urls(text) -> List[str]:
+    """본문에 실린 **모든** URL — 링크 href + 표시문 안의 URL + 산문 베어."""
+    return blocks_mod.body_urls(text)
+
+
+def body_links(markdown_text: str) -> List[str]:
+    """본문의 마크다운 링크 href 목록."""
+    return blocks_mod.body_link_urls(markdown_text)
+
+
+def parse_blocks(
+    markdown_text: str, item_sections: Optional[Sequence[str]] = None
+) -> List[Dict]:
+    return blocks_mod.parse_blocks(markdown_text, item_sections)
+
+
+def item_blocks(
+    markdown_text: str, item_sections: Optional[Sequence[str]] = None
+) -> List[Dict]:
+    return blocks_mod.item_blocks(markdown_text, item_sections)
+
+
+def item_block_count(
+    markdown_text: str, item_sections: Optional[Sequence[str]] = None
+) -> int:
+    return blocks_mod.item_block_count(markdown_text, item_sections)
+
+
+def section_block_counts(
+    markdown_text: str, item_sections: Optional[Sequence[str]] = None
+) -> Dict[str, int]:
+    return blocks_mod.section_block_counts(markdown_text, item_sections)
+
+
+def cap_violations(
+    markdown_text: str, item_sections: Optional[Sequence[str]] = None
+) -> List[Tuple[str, int, int]]:
+    return blocks_mod.cap_violations(markdown_text, item_sections)
