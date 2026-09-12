@@ -320,8 +320,8 @@ class TestCritiqueSameDayReception:
                created_at="2026-09-12T09:00:00",
                raw_data={"date": "2026-09-15 ~ 2026-09-15"})
 
-        doomed, _reasons = cleanup.find_fake_deadlines(conn)
-        assert doomed == []
+        changes, _reasons = cleanup.find_fake_deadlines(conn)
+        assert changes == []
 
     def test_two_dates_in_raw_data_is_kept(self, db):
         """날짜가 둘 있으면 원문이 기간을 말한 것이다."""
@@ -332,8 +332,8 @@ class TestCritiqueSameDayReception:
                created_at="2026-09-12T09:00:00",
                raw_data={"date": "2026.09.15 2026.09.15"})
 
-        doomed, _reasons = cleanup.find_fake_deadlines(conn)
-        assert doomed == []
+        changes, _reasons = cleanup.find_fake_deadlines(conn)
+        assert changes == []
 
     def test_single_posting_date_is_nulled(self, db):
         """게시일 하나가 기간으로 해석된 행은 마감을 비운다."""
@@ -344,8 +344,8 @@ class TestCritiqueSameDayReception:
                         created_at="2026-09-12T09:00:00",
                         raw_data={"date": "2026/09/11"})
 
-        doomed, reasons = cleanup.find_fake_deadlines(conn)
-        assert [row["id"] for row in doomed] == [row_id]
+        changes, reasons = cleanup.find_fake_deadlines(conn)
+        assert [(row["id"], new_end) for row, new_end in changes] == [(row_id, None)]
         assert "단일 게시일" in " ".join(reasons)
 
     def test_quote_backed_deadline_is_kept(self, db):
@@ -358,8 +358,8 @@ class TestCritiqueSameDayReception:
                raw_data={"date": "2026/09/11",
                          "quote_deadline": "접수기간 2026.09.11까지"})
 
-        doomed, _reasons = cleanup.find_fake_deadlines(conn)
-        assert doomed == []
+        changes, _reasons = cleanup.find_fake_deadlines(conn)
+        assert changes == []
 
     def test_coop_same_day_range_is_kept(self, db):
         """coop 도 원문이 기간을 말하면 period_start 를 남긴다."""
@@ -374,268 +374,161 @@ class TestCritiqueSameDayReception:
 
 
 class TestInvariantGuard:
-    """불변식이 깨지는 계획이면 아무것도 지우지 않는다."""
+    """불변식: **삭제되는 행마다 살아남는 대표가 있어야 한다**.
 
-    def test_wipeout_plan_raises(self, db, monkeypatch):
-        """묶음 전멸 계획이 나오면 RuntimeError 로 막는다."""
+    키 묶음 단위 생존 검사는 정상 병합(적재월·메타데이터가 대표와 다른
+    구행)을 전멸로 오판했다. 흡수 관계를 직접 검사한다.
+    """
+
+    @staticmethod
+    def _rows(conn):
+        return {r["id"]: r for r in cleanup._fetch_rows(conn, "seis")}
+
+    @pytest.fixture
+    def rows(self, db):
         conn, _ = db
-        insert(conn, source_id="500", title="같은 제목", url=SEIS_URL.format(sid="500"),
-               raw_data={"sub": "같음"})
-        insert(conn, source_id="501", title="같은 제목", url=SEIS_URL.format(sid="501"),
-               raw_data={"sub": "같음"})
+        first = insert(conn, source_id="700", title="A", url=SEIS_URL.format(sid="700"))
+        second = insert(conn, source_id="701", title="A", url=SEIS_URL.format(sid="701"))
+        return conn, first, second
 
-        # 대표 선정을 고장 내 모든 행이 삭제 대상이 되는 상황을 강제한다
-        monkeypatch.setattr(
-            cleanup, "canonical_rank", lambda row: (0, "", -1, -1)
+    def test_valid_plan_passes(self, rows):
+        conn, keeper, victim = rows
+        table = self._rows(conn)
+        cleanup._assert_invariants(
+            "seis", {victim: table[victim]}, {victim: keeper}, {keeper}
         )
-        real_max = max
 
-        def broken_max(iterable, key=None):
-            group = list(iterable)
-            keeper = real_max(group, key=key) if key else real_max(group)
-            # 대표를 묶음 밖의 행으로 바꿔치기해 전멸 계획을 만든다
-            return {**dict(keeper), "id": -1}
+    def test_deleting_a_canonical_row_raises(self, rows):
+        conn, keeper, victim = rows
+        table = self._rows(conn)
+        with pytest.raises(RuntimeError, match="canonical"):
+            cleanup._assert_invariants(
+                "seis", {keeper: table[keeper]}, {keeper: victim}, {keeper}
+            )
 
-        monkeypatch.setattr(cleanup, "max", broken_max, raising=False)
-        with pytest.raises(RuntimeError, match="전멸"):
-            cleanup.find_duplicates(conn, "seis")
+    def test_deleting_without_a_keeper_raises(self, rows):
+        conn, _keeper, victim = rows
+        table = self._rows(conn)
+        with pytest.raises(RuntimeError, match="대표 없이"):
+            cleanup._assert_invariants("seis", {victim: table[victim]}, {}, set())
+
+    def test_keeper_also_deleted_raises(self, rows):
+        """대표까지 삭제되는 계획은 막는다 (묶음 전멸)."""
+        conn, keeper, victim = rows
+        table = self._rows(conn)
+        plan = {victim: table[victim], keeper: table[keeper]}
+        absorbed = {victim: keeper, keeper: victim}
+        with pytest.raises(RuntimeError, match="대표까지"):
+            cleanup._assert_invariants("seis", plan, absorbed, set())
 
 
-class TestCodexReviewRuleAVerification:
-    """재검토 #5: A가 잘못된 병합 기록을 검증 없이 확정하던 결함."""
+class TestFinalGateRuleAAndC:
+    """최종 게이트 #7: A/C 정리의 누락."""
 
-    def test_merge_record_across_regions_is_ignored(self, db):
-        """서울 100 이 부산 101 을 병합했다고 기록해도 부산을 지우지 않는다."""
+    def test_same_url_merges_across_ingestion_months(self, db):
+        """같은 URL·마감 NULL은 적재월이 달라도 같은 글이다."""
         conn, _ = db
-        seoul = insert(
-            conn, source_id="100", title="상주기업 모집 공고",
-            url=SEIS_URL.format(sid="100"), period_end="2026-09-30",
-            raw_data={"sub": "성장지원센터", "info": ["서울"],
-                      "merged_source_ids": ["101"]},
-        )
-        busan = insert(
-            conn, source_id="101", title="상주기업 모집 공고",
-            url=SEIS_URL.format(sid="101"), period_end="2026-09-30",
-            raw_data={"sub": "성장지원센터", "info": ["부산"]},
-        )
-        doomed, reasons, canonical = cleanup.find_duplicates(conn, "seis")
-
-        assert doomed == []
-        assert canonical == set()          # 기록이 무시되면 잠금도 없다
-        assert "병합 기록 무시" in " ".join(reasons)
-        remaining = {r["id"] for r in conn.execute("SELECT id FROM announcements")}
-        assert remaining == {seoul, busan}
-
-    def test_merge_record_across_periods_is_ignored(self, db):
-        """기간이 다른 행을 병합했다는 기록도 믿지 않는다."""
-        conn, _ = db
-        insert(conn, source_id="200", title="같은 제목",
-               url=SEIS_URL.format(sid="200"), period_end="2026-09-30",
-               raw_data={"info": ["서울"], "merged_source_ids": ["201"]})
-        insert(conn, source_id="201", title="같은 제목",
-               url=SEIS_URL.format(sid="201"), period_end="2026-10-31",
-               raw_data={"info": ["서울"]})
-
-        doomed, _reasons, _canonical = cleanup.find_duplicates(conn, "seis")
-        assert doomed == []
-
-    def test_verified_merge_record_is_honoured(self, db):
-        """키가 같은 병합 기록은 그대로 믿는다."""
-        conn, _ = db
-        keeper = insert(conn, source_id="8371", title="사회보험료 지원사업 모집",
-                        url=SEIS_URL.format(sid="8371"), period_end="2026-12-31",
-                        raw_data={"sub": "사회보험료 지원 사업", "info": ["경기도"],
-                                  "merged_source_ids": ["8370"]})
-        victim = insert(conn, source_id="8370", title="사회보험료 지원사업 모집",
-                        url=SEIS_URL.format(sid="8370"), period_end="2026-12-31",
-                        raw_data={"sub": "사회보험료 지원 사업", "info": ["경기도"]})
+        url = SEIS_URL.format(sid="900")
+        keeper = insert(conn, source_id="900", title="같은 공고", url=url,
+                        created_at="2026-09-10T00:00:00",
+                        raw_data={"merged_source_ids": ["901"]})
+        victim = insert(conn, source_id="901", title="같은 공고", url=url,
+                        created_at="2026-08-10T00:00:00")
 
         doomed, _reasons, canonical = cleanup.find_duplicates(conn, "seis")
         assert [row["id"] for row in doomed] == [victim]
         assert canonical == {keeper}
 
-    def test_invariant_checks_key_groups_not_titles(self, db):
-        """불변식은 제목이 아니라 (제목·지역·기간) 묶음 단위로 본다."""
+    def test_merge_record_honoured_when_victim_lacks_metadata(self, db):
+        """구행에 지역 메타데이터가 없고 대표에만 있어도 병합을 인정한다."""
         conn, _ = db
-        insert(conn, source_id="300", title="같은 제목",
-               url=SEIS_URL.format(sid="300"), period_end="2026-09-30",
-               raw_data={"info": ["서울"]})
-        insert(conn, source_id="301", title="같은 제목",
-               url=SEIS_URL.format(sid="301"), period_end="2026-09-30",
-               raw_data={"info": ["부산"]})
+        keeper = insert(conn, source_id="910", title="같은 공고",
+                        url=SEIS_URL.format(sid="910"), period_end="2026-12-31",
+                        raw_data={"sub": "사회보험료 지원 사업", "info": ["경기도"],
+                                  "merged_source_ids": ["911"]})
+        victim = insert(conn, source_id="911", title="같은 공고",
+                        url=SEIS_URL.format(sid="911"), period_end="2026-12-31",
+                        raw_data={})
 
-        doomed, _reasons, _canonical = cleanup.find_duplicates(conn, "seis")
-        assert doomed == []
-        # 서로 다른 키 묶음이므로 각각 1행씩 살아 있다
-        keys = {cleanup.row_key(r) for r in cleanup._fetch_rows(conn, "seis")}
-        assert len(keys) == 2
+        doomed, _reasons, canonical = cleanup.find_duplicates(conn, "seis")
+        assert [row["id"] for row in doomed] == [victim]
+        assert canonical == {keeper}
 
-
-class TestCodexReviewRuleCGuards:
-    """재검토 #6: 규칙 C가 URL 미해소만 보고 별개 공고를 지우던 결함."""
-
-    def test_unresolved_url_with_different_period_is_kept(self):
-        """서울(#void, 09-30)과 부산(정상 URL, 10-31)은 별개 공고다."""
-        import sqlite3 as sq
-        conn = sq.connect(":memory:")
-        conn.row_factory = sq.Row
-        conn.execute("PRAGMA journal_mode=WAL")
-        conn.execute(SCHEMA)
+    def test_rule_c_compares_every_canonical_row(self, db):
+        """정상 대표가 여러 개면 **모두** 와 대조한다."""
+        conn, _ = db
         base = "https://www.smartfarmkorea.net/board/view.do?searchNttId={sid}"
-        seoul = insert(conn, source="smartfarm", source_id="hash-seoul",
-                       title="실증단지 입주대상 모집",
-                       url="https://www.smartfarmkorea.net/#void",
-                       period_end="2026-09-30", raw_data={"info": ["서울"]})
-        busan = insert(conn, source="smartfarm", source_id="101",
-                       title="실증단지 입주대상 모집", url=base.format(sid="101"),
-                       period_end="2026-10-31", raw_data={"info": ["부산"]})
-
-        doomed, _reasons, _canonical = cleanup.find_duplicates(conn, "smartfarm")
-        try:
-            assert doomed == []
-            remaining = {r["id"] for r in conn.execute("SELECT id FROM announcements")}
-            assert remaining == {seoul, busan}
-        finally:
-            conn.close()
-
-    def test_unresolved_url_same_key_is_deleted(self, db):
-        """제목·지역·기간이 같으면 미해소 행은 흡수한다."""
-        conn, _ = db
-        void_row = insert(conn, source="smartfarm", source_id="30a490b686668023",
-                          title="실증단지 입주대상 모집",
+        # 대표 둘: 4529(경기), 4600(강원). 미해소 행은 강원 쪽 중복이다.
+        insert(conn, source="smartfarm", source_id="4529", title="실증단지 모집",
+               url=base.format(sid="4529"), period_end="2026-09-22",
+               raw_data={"info": ["경기도"]})
+        insert(conn, source="smartfarm", source_id="4600", title="실증단지 모집",
+               url=base.format(sid="4600"), period_end="2026-10-31",
+               raw_data={"info": ["강원도"]})
+        void_row = insert(conn, source="smartfarm", source_id="hash-gw",
+                          title="실증단지 모집",
                           url="https://www.smartfarmkorea.net/#void",
-                          period_end="2026-09-22")
-        insert(conn, source="smartfarm", source_id="4529",
-               title="실증단지 입주대상 모집",
-               url="https://www.smartfarmkorea.net/board/view.do?searchNttId=4529",
-               period_end="2026-09-22")
+                          period_end="2026-10-31", raw_data={"info": ["강원도"]})
 
         doomed, reasons, _canonical = cleanup.find_duplicates(conn, "smartfarm")
         assert [row["id"] for row in doomed] == [void_row]
-        assert "키 일치" in " ".join(reasons)
+        assert "4600" in " ".join(reasons)      # 최대 순위가 아닌 대표와 짝지어야 한다
 
-    def test_different_period_never_deletes(self, db):
-        """기간이 다르면 같은 URL이라도 지우지 않는다."""
+
+class TestFinalGateDeadlineEvidence:
+    """최종 게이트 #8: 혼합 raw 필드의 근거 판정."""
+
+    def test_evidence_in_another_field_keeps_the_deadline(self, db):
+        """``date=09-01`` 이고 ``period="2026-09-15까지"`` 면 09-15는 정상이다."""
         conn, _ = db
-        url = ("https://www.socialenterprise.or.kr/homepage/bbs/boardView.do"
-               "?bsIdx=10002&bIdx=252628")
-        insert(conn, source="socialenterprise", source_id="10002",
-               title="인증 공고", url=url, period_end="2026-09-30")
-        insert(conn, source="socialenterprise", source_id="252628",
-               title="인증 공고", url=url, period_end="2026-10-31")
+        insert(conn, source="socialenterprise", source_id="800", title="공고",
+               url="https://www.socialenterprise.or.kr/x?bIdx=800",
+               period_start="2026-09-01", period_end="2026-09-15",
+               created_at="2026-09-01T09:00:00",
+               raw_data={"date": "2026-09-01", "period": "2026-09-15까지"})
 
-        doomed, _reasons, _canonical = cleanup.find_duplicates(conn, "socialenterprise")
-        assert doomed == []
+        changes, _reasons = cleanup.find_fake_deadlines(conn)
+        assert changes == []
 
-
-class TestCodexReviewRegionKey:
-    """재검토 #4: 지역이 ul.info 에 있을 때 놓치던 결함."""
-
-    def test_region_from_info_separates_rows(self, db):
-        """sub 이 같고 info 지역만 다르면 별개 공고다."""
+    def test_evidence_replaces_a_posting_date_deadline(self, db):
+        """게시일 마감인데 근거가 다른 기간을 말하면 **교체**한다."""
         conn, _ = db
-        insert(conn, source_id="400", title="사회보험료 지원사업 모집",
-               url=SEIS_URL.format(sid="400"), period_end="2026-12-31",
-               raw_data={"sub": "사회보험료 지원 사업", "info": ["서울"]})
-        insert(conn, source_id="401", title="사회보험료 지원사업 모집",
-               url=SEIS_URL.format(sid="401"), period_end="2026-12-31",
-               raw_data={"sub": "사회보험료 지원 사업", "info": ["부산"]})
+        row_id = insert(
+            conn, source="socialenterprise", source_id="801", title="공고",
+            url="https://www.socialenterprise.or.kr/x?bIdx=801",
+            period_start="2026-09-11", period_end="2026-09-11",
+            created_at="2026-09-11T09:00:00",
+            raw_data={"date": "2026/09/11", "period": "2026-10-01~2026-10-31"},
+        )
+        changes, reasons = cleanup.find_fake_deadlines(conn)
+        assert [(row["id"], new_end) for row, new_end in changes] == [
+            (row_id, "2026-10-31")
+        ]
+        assert "교체" in " ".join(reasons)
 
-        doomed, _reasons, _canonical = cleanup.find_duplicates(conn, "seis")
-        assert doomed == []
-
-    def test_null_deadline_rounds_split_by_ingestion_month(self, db):
-        """마감이 없는 1·2차는 적재 월이 다르면 합치지 않는다."""
+    def test_matching_evidence_is_left_alone(self, db):
+        """근거가 저장값과 같으면 그대로 둔다 (당일 접수)."""
         conn, _ = db
-        insert(conn, source_id="500", title="같은 제목",
-               url=SEIS_URL.format(sid="500"), created_at="2026-08-10T00:00:00",
-               raw_data={"info": ["경기도"]})
-        insert(conn, source_id="501", title="같은 제목",
-               url=SEIS_URL.format(sid="501"), created_at="2026-09-10T00:00:00",
-               raw_data={"info": ["경기도"]})
-
-        doomed, _reasons, _canonical = cleanup.find_duplicates(conn, "seis")
-        assert doomed == []
-
-    def test_null_deadline_same_month_merges(self, db):
-        """같은 달에 적재된 마감 없는 중복은 합친다."""
-        conn, _ = db
-        insert(conn, source_id="600", title="같은 제목",
-               url=SEIS_URL.format(sid="600"), created_at="2026-09-10T00:00:00",
-               raw_data={"info": ["경기도"]})
-        older = insert(conn, source_id="601", title="같은 제목",
-                       url=SEIS_URL.format(sid="601"),
-                       created_at="2026-09-11T00:00:00",
-                       raw_data={"info": ["경기도"]})
-
-        doomed, _reasons, _canonical = cleanup.find_duplicates(conn, "seis")
-        assert len(doomed) == 1
-        assert doomed[0]["id"] in {600, older} or doomed[0]["source_id"] in {"600", "601"}
-
-
-class TestCodexReviewFakeDeadlineRule:
-    """재검토 #10: 가짜 마감 판정의 오탐·누락."""
-
-    def test_same_day_reception_wording_is_kept(self, db):
-        """``date="2026-09-15 당일 접수"`` 는 원문 근거이므로 남긴다."""
-        conn, _ = db
-        insert(conn, source="socialenterprise", source_id="700", title="공고",
-               url="https://www.socialenterprise.or.kr/x?bIdx=700",
+        insert(conn, source="socialenterprise", source_id="802", title="공고",
+               url="https://www.socialenterprise.or.kr/x?bIdx=802",
                period_start="2026-09-15", period_end="2026-09-15",
                created_at="2026-09-12T09:00:00",
                raw_data={"date": "2026-09-15 당일 접수"})
 
-        doomed, _reasons = cleanup.find_fake_deadlines(conn)
-        assert doomed == []
+        changes, _reasons = cleanup.find_fake_deadlines(conn)
+        assert changes == []
 
-    def test_same_day_reception_with_other_list_date_is_kept(self, db):
-        """목록 날짜가 09-01이어도 당일 접수 문구가 있으면 남긴다."""
-        conn, _ = db
-        insert(conn, source="socialenterprise", source_id="701", title="공고",
-               url="https://www.socialenterprise.or.kr/x?bIdx=701",
-               period_start="2026-09-15", period_end="2026-09-15",
-               created_at="2026-09-01T09:00:00",
-               raw_data={"date": "2026-09-01", "period": "2026-09-15 당일 접수"})
-
-        doomed, _reasons = cleanup.find_fake_deadlines(conn)
-        assert doomed == []
-
-    def test_quote_without_a_date_is_nulled(self, db):
-        """``quote_deadline="접수기간 별도 공지"`` 는 근거가 아니다 - 비운다."""
-        conn, _ = db
-        row_id = insert(
-            conn, source="socialenterprise", source_id="702", title="공고",
-            url="https://www.socialenterprise.or.kr/x?bIdx=702",
-            period_start="2026-09-11", period_end="2026-09-11",
-            created_at="2026-09-11T09:00:00",
-            raw_data={"date": "2026/09/11", "quote_deadline": "접수기간 별도 공지"},
-        )
-        doomed, reasons = cleanup.find_fake_deadlines(conn)
-        assert [row["id"] for row in doomed] == [row_id]
-        assert "인용에 날짜 없음" in " ".join(reasons)
-
-    def test_deadline_unrelated_to_posting_is_kept(self, db):
-        """게시일과 무관한 마감은 건드리지 않는다."""
-        conn, _ = db
-        insert(conn, source="socialenterprise", source_id="703", title="공고",
-               url="https://www.socialenterprise.or.kr/x?bIdx=703",
-               period_start="2026-09-11", period_end="2026-10-31",
-               created_at="2026-09-12T09:00:00",
-               raw_data={"date": "2026/09/11"})
-
-        doomed, _reasons = cleanup.find_fake_deadlines(conn)
-        assert doomed == []
-
-    def test_quote_backed_deadline_is_kept(self, db):
-        conn, _ = db
-        insert(conn, source="socialenterprise", source_id="704", title="공고",
-               url="https://www.socialenterprise.or.kr/x?bIdx=704",
-               period_start="2026-09-11", period_end="2026-09-11",
-               created_at="2026-09-11T09:00:00",
-               raw_data={"date": "2026/09/11",
-                         "quote_period_end": "2026-09-11",
-                         "quote_deadline": "접수기간 2026.09.11까지"})
-
-        doomed, _reasons = cleanup.find_fake_deadlines(conn)
-        assert doomed == []
+    def test_deadline_evidence_helper(self):
+        assert cleanup.deadline_evidence({"period": "2026-09-15까지"}) == "2026-09-15"
+        assert cleanup.deadline_evidence(
+            {"period": "2026-10-01~2026-10-31"}
+        ) == "2026-10-31"
+        assert cleanup.deadline_evidence({"date": "2026-09-15 당일 접수"}) == "2026-09-15"
+        assert cleanup.deadline_evidence({"date": "2026/09/11"}) is None
+        assert cleanup.deadline_evidence({"quote_deadline": "접수기간 별도 공지"}) is None
+        # 강한 근거(인용)가 약한 근거(목록 날짜)를 이긴다
+        assert cleanup.deadline_evidence({
+            "quote_deadline": "접수기간 2026.11.01 ~ 2026.11.30",
+            "date": "2026-09-11 접수",
+        }) == "2026-11-30"
 

@@ -257,16 +257,28 @@ def run_pipeline(test_mode: bool = False) -> None:
             # Filter out duplicates
             new_raw: List[RawAnnouncement] = []
             duplicate_count = 0
+            quote_merge_count = 0
 
             for raw_ann in raw_announcements:
                 if db.is_duplicate(raw_ann.source, raw_ann.source_id):
                     duplicate_count += 1
+                    # 중복이라도 **새 인용은 살린다**. 상세 인용은 요청 상한
+                    # 때문에 다음 실행에서 도착하기도 하는데, 그때 중복
+                    # 필터가 버리면 인용이 영구히 사라진다 (최종 게이트 #6).
+                    try:
+                        if db.merge_quote_fields(raw_ann):
+                            quote_merge_count += 1
+                    except Exception as e:
+                        logger.debug(f"quote merge failed for {raw_ann.source_id}: {e}")
                     logger.debug(f"Duplicate: {raw_ann.title}")
                 else:
                     new_raw.append(raw_ann)
 
             new_count = len(new_raw)
-            logger.info(f"{crawler_name}: {new_count} new, {duplicate_count} duplicates")
+            logger.info(
+                f"{crawler_name}: {new_count} new, {duplicate_count} duplicates"
+                f"{f', {quote_merge_count} quote merges' if quote_merge_count else ''}"
+            )
 
             if new_count == 0:
                 run_stats[crawler_name] = {

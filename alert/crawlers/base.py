@@ -1,6 +1,7 @@
 """크롤러 추상 베이스 클래스"""
 import abc
 import json
+import threading
 import time
 import requests
 from typing import Dict, Iterable, List, Optional
@@ -135,6 +136,28 @@ class BaseCrawler(abc.ABC):
                 continue
         return body.decode("utf-8", errors="replace")
 
+    def _read_body(self, response, holder: Dict[str, object]) -> None:
+        """응답 본문을 상한까지 읽어 ``holder`` 에 담는다 (작업 스레드용)."""
+        try:
+            chunks = []
+            total = 0
+            truncated = False
+            for chunk in response.iter_content(chunk_size=8192):
+                if not chunk:
+                    continue
+                remaining = MAX_DETAIL_BYTES - total
+                if len(chunk) >= remaining:
+                    chunks.append(chunk[:remaining])
+                    truncated = True
+                    break
+                chunks.append(chunk)
+                total += len(chunk)
+            holder["body"] = b"".join(chunks)
+            holder["truncated"] = truncated
+            holder["encoding"] = response.encoding
+        except Exception as exc:  # 네트워크·소켓 종료 등
+            holder["error"] = exc
+
     def fetch_detail_quotes(
         self, detail_url: str, deadline: Optional[float] = None
     ) -> Dict[str, str]:
@@ -166,12 +189,15 @@ class BaseCrawler(abc.ABC):
             return {}
 
         started = time.monotonic()
-        hard_deadline = started + DETAIL_REQUEST_DEADLINE
+        limit = DETAIL_REQUEST_DEADLINE
         if deadline is not None:
-            hard_deadline = min(hard_deadline, deadline)
+            limit = min(limit, max(0.0, deadline - started))
+        if limit <= 0:
+            self.logger.warning(
+                f"{self.source_name}: no time left for detail {detail_url}"
+            )
+            return {}
 
-        response = None
-        truncated = False
         try:
             response = self.session.get(
                 detail_url,
@@ -180,42 +206,59 @@ class BaseCrawler(abc.ABC):
                 stream=True,
             )
             response.raise_for_status()
-
-            declared = response.headers.get("Content-Length")
-            if declared and declared.isdigit() and int(declared) > MAX_DETAIL_BYTES:
-                self.logger.info(
-                    f"Detail body declared {declared} bytes, reading first "
-                    f"{MAX_DETAIL_BYTES} for {detail_url}"
-                )
-
-            chunks = []
-            total = 0
-            for chunk in response.iter_content(chunk_size=8192):
-                if time.monotonic() > hard_deadline:
-                    self.logger.warning(
-                        f"Detail read exceeded its wall-clock limit after "
-                        f"{time.monotonic() - started:.1f}s, giving up on {detail_url}"
-                    )
-                    truncated = True
-                    break
-                if not chunk:
-                    continue
-                remaining = MAX_DETAIL_BYTES - total
-                if len(chunk) >= remaining:
-                    chunks.append(chunk[:remaining])
-                    truncated = True
-                    break
-                chunks.append(chunk)
-                total += len(chunk)
-            body = b"".join(chunks)
         except requests.RequestException as exc:
             self.logger.warning(f"Detail fetch failed for {detail_url}: {exc}")
             return {}
-        finally:
-            if response is not None:
-                response.close()
 
-        html = self._decode(body, response.encoding)
+        declared = response.headers.get("Content-Length")
+        if declared and declared.isdigit() and int(declared) > MAX_DETAIL_BYTES:
+            self.logger.info(
+                f"Detail body declared {declared} bytes, reading first "
+                f"{MAX_DETAIL_BYTES} for {detail_url}"
+            )
+
+        # 본문 읽기는 **작업 스레드**에서 한다. requests/urllib3 의 iterator는
+        # chunk_size 만큼 모일 때까지 반환하지 않으므로, 1바이트를 9초마다
+        # 보내는 서버에서는 첫 청크까지 73,728초가 걸린다 - 청크마다 시간을
+        # 재는 것으로는 막을 수 없었다(최종 게이트 #2). join(timeout) 으로
+        # 벽시계 상한을 **바깥에서** 강제한다.
+        holder: Dict[str, object] = {}
+        worker = threading.Thread(
+            target=self._read_body,
+            args=(response, holder),
+            name=f"detail-{self.source_name}",
+            daemon=True,
+        )
+        worker.start()
+        worker.join(timeout=limit)
+
+        if worker.is_alive():
+            # 소켓을 닫아 읽기를 풀어 주고 (데몬 스레드라) 뒤는 돌아보지 않는다
+            try:
+                response.close()
+            except Exception:  # pragma: no cover - 닫기 실패는 무해하다
+                pass
+            self.logger.warning(
+                f"Detail read hit its wall-clock limit ({limit:.1f}s), "
+                f"abandoning {detail_url}"
+            )
+            return {}
+
+        try:
+            response.close()
+        except Exception:  # pragma: no cover
+            pass
+
+        if holder.get("error") is not None:
+            self.logger.warning(
+                f"Detail read failed for {detail_url}: {holder['error']}"
+            )
+            return {}
+
+        body = holder.get("body") or b""
+        truncated = bool(holder.get("truncated"))
+        encoding = holder.get("encoding")
+        html = self._decode(body, encoding)
         if truncated:
             html = complete_html_prefix(html)
             self.logger.warning(
@@ -333,6 +376,9 @@ class BaseCrawler(abc.ABC):
 
         payload = self._load_raw(announcement)
         payload.update(quotes)
+        # 인용이 교체되면 예전 파생값을 남기지 않는다 (최종 게이트 #9)
+        payload.pop("quote_period_start", None)
+        payload.pop("quote_period_end", None)
         if start:
             payload["quote_period_start"] = start
         if end:
@@ -341,8 +387,12 @@ class BaseCrawler(abc.ABC):
             payload[ALWAYS_OPEN] = True
         else:
             payload.pop(ALWAYS_OPEN, None)
+        # 조기마감도 **매번 다시 계산**한다. 조건 없는 인용으로 교체되면
+        # 플래그가 남아 브리핑이 없는 조건을 말하게 된다 (최종 게이트 #9).
         if early_close:
             payload[EARLY_CLOSE] = True
+        else:
+            payload.pop(EARLY_CLOSE, None)
         if truncated:
             payload[DETAIL_TRUNCATED] = True
 

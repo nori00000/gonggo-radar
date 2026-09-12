@@ -52,7 +52,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from alert.crawlers.dedupe_keys import (  # noqa: E402
     extract_region,
     group_key,
+    keys_compatible,
+    normalize_title,
 )
+from alert.crawlers.detail_quotes import period_from_quote  # noqa: E402
 
 DEFAULT_DB = "alert/data/announcements.db"
 
@@ -190,6 +193,7 @@ def find_duplicates(
     rows = _fetch_rows(conn, source)
     by_source_id: Dict[str, sqlite3.Row] = {r["source_id"]: r for r in rows}
     doomed: Dict[int, sqlite3.Row] = {}
+    absorbed: Dict[int, int] = {}      # 삭제되는 행 -> 대표 행 (불변식 검사용)
     reasons: List[str] = []
 
     # ---------- 규칙 A (먼저, canonical 잠금) ----------
@@ -208,7 +212,8 @@ def find_duplicates(
             if victim is None or victim["id"] == row["id"]:
                 continue
             victim_key = row_key(victim)
-            if victim_key != keeper_key:
+            same_url = (victim["url"] or "") == (row["url"] or "") and bool(row["url"])
+            if not keys_compatible(victim_key, keeper_key, ignore_deadline=same_url):
                 reasons.append(
                     f"  [A?] id={victim['id']} source_id={victim['source_id']} "
                     f"병합 기록 무시 - 대표 source_id={row['source_id']} 와 "
@@ -218,6 +223,7 @@ def find_duplicates(
                 )
                 continue
             doomed[victim["id"]] = victim
+            absorbed[victim["id"]] = row["id"]
             honoured = True
             reasons.append(
                 f"  [A] id={victim['id']} source_id={victim['source_id']} "
@@ -251,17 +257,19 @@ def find_duplicates(
                 if row["id"] == keeper["id"] or row["id"] in canonical:
                     continue
                 doomed[row["id"]] = row
+                absorbed[row["id"]] = keeper["id"]
                 reasons.append(
                     f"  [B] id={row['id']} source_id={row['source_id']} -> 대표 "
                     f"source_id={keeper['source_id']} (제목·지역"
                     f"{region or '(없음)'}·마감키{deadline or '(없음)'} 동일)"
                 )
     else:
-        groups_by_key: Dict[Tuple[str, str, str], List[sqlite3.Row]] = {}
+        # 규칙 C는 제목으로 모으고, 키 비교는 행 대 행으로 한다
+        groups_by_title: Dict[str, List[sqlite3.Row]] = {}
         for row in survivors:
-            groups_by_key.setdefault(row_key(row), []).append(row)
+            groups_by_title.setdefault(normalize_title(row["title"]), []).append(row)
 
-        for group in groups_by_key.values():
+        for group in groups_by_title.values():
             if len(group) < 2:
                 continue
             # 규칙 C는 "글번호가 자기 URL에 없다" 는 증명 가능한 결함만 지운다.
@@ -273,25 +281,43 @@ def find_duplicates(
             ]
             if not provable:
                 continue  # 근거가 없으면 손대지 않는다
-            keeper = max(provable, key=canonical_rank)
             for row in group:
-                if row["id"] == keeper["id"] or row["id"] in canonical:
+                if row["id"] in canonical:
                     continue
                 if id_matches_url(source, row["source_id"], row["url"] or ""):
                     continue  # 제 글번호를 가진 행은 별개 공고로 본다
-                same_url = (row["url"] or "") == (keeper["url"] or "")
-                unresolved = url_is_unresolved(source, row["url"] or "")
-                if not (same_url or unresolved):
+                # **모든** 정상 대표와 대조한다 - 최대 순위 하나만 보면 다른
+                # 대표의 중복을 놓친다 (최종 게이트 #7).
+                matched = None
+                cause = ""
+                for keeper in provable:
+                    if keeper["id"] == row["id"]:
+                        continue
+                    same_url = (row["url"] or "") == (keeper["url"] or "")
+                    if same_url:
+                        # 같은 URL은 적재월이 달라도 같은 글이다
+                        if keys_compatible(
+                            row_key(row), row_key(keeper), ignore_deadline=True
+                        ):
+                            matched, cause = keeper, "같은 URL + 글번호 자리 불일치"
+                            break
+                        continue
+                    if url_is_unresolved(source, row["url"] or "") and keys_compatible(
+                        row_key(row), row_key(keeper)
+                    ):
+                        matched, cause = keeper, "URL 미해소(#void)"
+                        break
+                if matched is None:
                     continue
-                cause = "같은 URL + 글번호 자리 불일치" if same_url else "URL 미해소(#void)"
                 doomed[row["id"]] = row
+                absorbed[row["id"]] = matched["id"]
                 reasons.append(
                     f"  [C] id={row['id']} source_id={row['source_id']} -> 대표 "
-                    f"source_id={keeper['source_id']} ({cause}, 키 일치)"
+                    f"source_id={matched['source_id']} ({cause}, 키 일치)"
                 )
 
     # ---------- 불변식 ----------
-    _assert_invariants(source, rows, doomed, canonical)
+    _assert_invariants(source, doomed, absorbed, canonical)
 
     ordered = sorted(doomed.values(), key=lambda r: r["id"])
     return ordered, reasons, canonical
@@ -299,14 +325,19 @@ def find_duplicates(
 
 def _assert_invariants(
     source: str,
-    rows: List[sqlite3.Row],
     doomed: Dict[int, sqlite3.Row],
+    absorbed: Dict[int, int],
     canonical: Set[int],
 ) -> None:
-    """canonical 생존 + **키 묶음당** 최소 1행 생존을 확인한다.
+    """**삭제되는 행마다 살아남는 대표가 있는지** 확인한다.
 
-    제목만으로 검사하면 지역·기간이 다른 공고가 한 묶음으로 묶여 전멸을
-    못 잡는다 (Codex 재검토 #5).
+    이것이 진짜 불변식이다 (최종 게이트 #7 수정): 키 묶음 단위로 "1행 이상
+    생존" 을 보면, 대표에 흡수된 행이 자기 키 묶음을 비우는 정상 병합까지
+    전멸로 오판한다(적재월·메타데이터가 대표와 다를 수 있다). 흡수 관계를
+    직접 검사하면 "대표 없이 사라지는 공고" 만 정확히 막는다.
+
+    Raises:
+        RuntimeError: canonical이 삭제되거나, 대표 없이 삭제되는 행이 있으면
     """
     killed_canonical = canonical & set(doomed)
     if killed_canonical:
@@ -314,18 +345,21 @@ def _assert_invariants(
             f"{source}: canonical 행이 삭제 목록에 있다 (id={sorted(killed_canonical)})"
         )
 
-    by_key: Dict[Tuple[str, str, str], List[sqlite3.Row]] = {}
-    for row in rows:
-        by_key.setdefault(row_key(row), []).append(row)
-    for key, group in by_key.items():
-        remaining = [r for r in group if r["id"] not in doomed]
-        if not remaining:
-            title, region, deadline = key
-            raise RuntimeError(
-                f"{source}: 키 묶음이 전멸한다 (제목={title[:30]!r}, "
-                f"지역={region or '(없음)'}, 마감키={deadline or '(없음)'}, "
-                f"{len(group)}행 전부 삭제 대상)"
-            )
+    orphans = [row_id for row_id in doomed if row_id not in absorbed]
+    if orphans:
+        raise RuntimeError(
+            f"{source}: 대표 없이 삭제되는 행이 있다 (id={sorted(orphans)})"
+        )
+
+    cannibals = {
+        row_id: keeper
+        for row_id, keeper in absorbed.items()
+        if keeper in doomed
+    }
+    if cannibals:
+        raise RuntimeError(
+            f"{source}: 대표까지 삭제된다 (행->대표 {cannibals})"
+        )
 
 
 def _raw_date_fields(payload: dict) -> List[str]:
@@ -381,28 +415,56 @@ def posting_dates(payload: dict, created_date: str) -> Set[str]:
     return found
 
 
+def deadline_evidence(payload: dict) -> Optional[str]:
+    """raw 필드 **전체**에서 접수 종료일 근거를 찾는다 (최종 게이트 #8).
+
+    강한 근거부터 본다: ``quote_deadline`` → ``period`` → ``date``.
+    범위·"까지" 같은 표현은 인용 파서에 맡기고, 날짜 하나 + 접수 관련 말
+    ("2026-09-15 당일 접수")은 그 날짜를 종료일 근거로 인정한다.
+
+    Args:
+        payload: raw_data 딕셔너리
+
+    Returns:
+        근거가 되는 종료일 (ISO). 없으면 None
+    """
+    for key in ("quote_deadline", "period", "date", "WRITE_DATE"):
+        value = str(payload.get(key) or "")
+        if not value:
+            continue
+        _start, end = period_from_quote(value)
+        if end:
+            return end
+        dates = _DATE_TOKEN.findall(value)
+        if len(dates) == 1 and _RECEPTION_WORDS.search(value):
+            match = re.search(
+                r"(\d{4})\s*[.\-/년]\s*(\d{1,2})\s*[.\-/월]\s*(\d{1,2})", value
+            )
+            if match:
+                year, month, day = (int(g) for g in match.groups())
+                return f"{year:04d}-{month:02d}-{day:02d}"
+    return None
+
+
 def find_fake_deadlines(
     conn: sqlite3.Connection, skip_ids: Optional[Set[int]] = None
-) -> Tuple[List[sqlite3.Row], List[str]]:
-    """socialenterprise 의 게시일=마감 행을 찾는다.
+) -> Tuple[List[Tuple[sqlite3.Row, Optional[str]]], List[str]]:
+    """socialenterprise 의 마감을 근거와 대조해 고친다.
 
-    비우는 조건 (Codex 재검토 #10):
+    판정 (최종 게이트 #8) - 저장된 마감이 **게시일과 같을 때만** 손댄다:
 
-    1. ``period_end`` 가 **게시일**(단일 날짜 필드 또는 적재일)과 같다
-    2. 그러면서 원문이 접수 기간을 스스로 말하지 않았다
-       (``states_reception_period`` 가 False)
-    3. 상세 인용에서 온 마감(``quote_period_end``)이 없다
+    - raw 필드의 근거가 **다른 종료일**을 말한다 → 그 값으로 **교체**
+    - 근거가 아예 없다 → **NULL**
+    - 근거가 저장값과 같다 → **그대로**
 
-    그래서 ``date="2026-09-15 당일 접수"`` 나 ``"09-15 ~ 09-15"`` 같은 정상
-    당일 접수는 남고, ``quote_deadline="접수기간 별도 공지"`` 처럼 날짜가
-    없는 인용만 붙어 있는 가짜 마감은 비워진다.
+    저장된 마감이 게시일과 다르면 근거 없이 건드리지 않는다.
 
     Args:
         conn: 열린 DB 커넥션
-        skip_ids: (b)에서 이미 삭제되는 행 id - 이중 계상을 막는다
+        skip_ids: (b)에서 이미 삭제되는 행 id
 
     Returns:
-        (period_end 를 비울 행 리스트, 근거 문장 리스트)
+        ``([(행, 새 마감 또는 None)], 근거 문장)``
     """
     rows = conn.execute(
         "SELECT id, source_id, title, period_start, period_end, raw_data,"
@@ -413,30 +475,33 @@ def find_fake_deadlines(
     ).fetchall()
 
     skip_ids = skip_ids or set()
-    doomed: List[sqlite3.Row] = []
+    changes: List[Tuple[sqlite3.Row, Optional[str]]] = []
     reasons: List[str] = []
     for row in rows:
         if row["id"] in skip_ids:
             continue
         payload = load_raw(row["raw_data"])
-        if payload.get("quote_period_end"):
-            continue  # 상세 인용에서 온 진짜 마감
-        if states_reception_period(payload):
-            continue  # 원문이 접수기간/당일 접수를 명시한 행
         if row["period_end"] not in posting_dates(payload, row["created_date"]):
             continue  # 게시일과 다른 마감 - 근거 없이 건드리지 않는다
 
+        evidence = deadline_evidence(payload)
+        if evidence == row["period_end"]:
+            continue  # 근거가 저장값을 뒷받침한다
+        if evidence:
+            changes.append((row, evidence))
+            reasons.append(
+                f"  [교체] id={row['id']} period_end={row['period_end']} "
+                f"(게시일) -> {evidence} (raw 근거)"
+            )
+            continue
+        changes.append((row, None))
         quote = str(payload.get("quote_deadline") or "")
-        if quote:
-            note = f"인용에 날짜 없음({quote[:24]})"
-        else:
-            note = "목록 날짜가 단일 게시일"
-        doomed.append(row)
+        note = f"인용에 날짜 없음({quote[:24]})" if quote else "목록 날짜가 단일 게시일"
         reasons.append(
             f"  [게시일] id={row['id']} period_end={row['period_end']} "
-            f"== 게시일, {note}"
+            f"== 게시일, {note} -> NULL"
         )
-    return doomed, reasons
+    return changes, reasons
 
 
 def find_fake_starts(
@@ -577,8 +642,13 @@ def main() -> int:
 
     doomed_ids = {row["id"] for rows in duplicates.values() for row in rows}
 
-    fake_deadlines, deadline_reasons = find_fake_deadlines(conn, doomed_ids)
-    print(f"\n[c] socialenterprise period_end -> NULL: {len(fake_deadlines)} 행")
+    deadline_changes, deadline_reasons = find_fake_deadlines(conn, doomed_ids)
+    replaced = [c for c in deadline_changes if c[1]]
+    nulled = [c for c in deadline_changes if not c[1]]
+    print(
+        f"\n[c] socialenterprise 마감 교정: 교체 {len(replaced)} 행 / "
+        f"NULL {len(nulled)} 행"
+    )
     for line in deadline_reasons:
         print(line)
 
@@ -599,11 +669,14 @@ def main() -> int:
                     "DELETE FROM announcements WHERE id = ?",
                     [(row_id,) for row_id in sorted(doomed_ids)],
                 )
-            if fake_deadlines:
+            if deadline_changes:
                 conn.executemany(
-                    "UPDATE announcements SET period_end = NULL,"
+                    "UPDATE announcements SET period_end = ?,"
                     " updated_at = ? WHERE id = ?",
-                    [(datetime.now().isoformat(), row["id"]) for row in fake_deadlines],
+                    [
+                        (new_end, datetime.now().isoformat(), row["id"])
+                        for row, new_end in deadline_changes
+                    ],
                 )
             if fake_starts:
                 conn.executemany(
@@ -620,7 +693,7 @@ def main() -> int:
         deleted_se_with_deadline = sum(
             1 for row in duplicates.get("socialenterprise", []) if row["period_end"]
         )
-        projected["se_rows_with_deadline"] -= len(fake_deadlines) + deleted_se_with_deadline
+        projected["se_rows_with_deadline"] -= len(nulled) + deleted_se_with_deadline
         projected["coop_rows_with_start"] -= len(fake_starts)
         projected["total_rows"] -= total_duplicates
         print_counts("after (예상)", projected)

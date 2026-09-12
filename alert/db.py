@@ -10,7 +10,13 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from .models import AnalyzedAnnouncement, ApplicationRecord, Keyword, ResearchDocument
+from .models import (
+    AnalyzedAnnouncement,
+    ApplicationRecord,
+    Keyword,
+    RawAnnouncement,
+    ResearchDocument,
+)
 
 # ---------------------------------------------------------------------------
 # Backend detection
@@ -387,6 +393,83 @@ class Database:
             (source,),
         ).fetchall()
         return {str(row["source_id"]) for row in rows}
+
+    def merge_quote_fields(self, announcement: RawAnnouncement) -> bool:
+        """이미 저장된 공고에 **새로 얻은 인용**을 합쳐 넣는다.
+
+        상세 인용은 목록보다 늦게 도착한다(요청 상한 때문에 다음 실행에서
+        오기도 한다). 중복 필터가 그 공고를 걸러 버리면 인용이 영구히
+        버려진다(최종 게이트 #6). 그래서 인용 관련 필드만 upsert 한다.
+
+        기존 ``raw_data`` 는 보존하고 인용 키만 덮어쓰며, 기간 필드는
+        인용 근거(``quote_period_*``)가 있을 때만 갱신한다.
+
+        Args:
+            announcement: 인용을 담은 새 수집 결과
+
+        Returns:
+            실제로 갱신했으면 True
+        """
+        quote_keys = (
+            "quote_deadline", "quote_eligibility", "quote_amount",
+            "quote_period_start", "quote_period_end",
+            "always_open", "early_close", "detail_truncated",
+        )
+        try:
+            incoming = json.loads(announcement.raw_data or "{}")
+        except (ValueError, TypeError):
+            return False
+        if not isinstance(incoming, dict):
+            return False
+        fresh = {key: incoming[key] for key in quote_keys if key in incoming}
+        if not any(
+            key in fresh
+            for key in ("quote_deadline", "quote_eligibility", "quote_amount")
+        ):
+            return False
+
+        row = self._conn.execute(
+            _sql(
+                "SELECT id, raw_data, period_start, period_end FROM announcements"
+                " WHERE source = ? AND source_id = ?"
+            ),
+            (announcement.source, announcement.source_id),
+        ).fetchone()
+        if row is None:
+            return False
+
+        try:
+            stored = json.loads(row["raw_data"] or "{}")
+        except (ValueError, TypeError):
+            stored = {}
+        if not isinstance(stored, dict):
+            stored = {}
+        # 인용이 교체되면 예전 파생 플래그를 남기지 않는다
+        for key in quote_keys:
+            stored.pop(key, None)
+        stored.update(fresh)
+
+        period_start = fresh.get("quote_period_start") or row["period_start"]
+        period_end = fresh.get("quote_period_end") or row["period_end"]
+        if fresh.get("always_open") and not fresh.get("quote_period_end"):
+            period_end = row["period_end"]
+
+        self._conn.execute(
+            _sql(
+                "UPDATE announcements SET raw_data = ?, period_start = ?,"
+                " period_end = ?, updated_at = ? WHERE id = ?"
+            ),
+            (
+                json.dumps(stored, ensure_ascii=False),
+                period_start,
+                period_end,
+                datetime.now().isoformat(),
+                row["id"],
+            ),
+        )
+        if self._backend == "sqlite":
+            self._conn.commit()
+        return True
 
     def search_announcements(self, query: str, limit: int = 20) -> List[AnalyzedAnnouncement]:
         """Full-text search across title and summary.

@@ -19,9 +19,10 @@ from datetime import date
 from typing import Dict, List, Optional, Sequence, Tuple
 
 try:
-    from bs4 import BeautifulSoup
+    from bs4 import BeautifulSoup, NavigableString
 except ImportError:  # pragma: no cover - bs4 없는 환경
     BeautifulSoup = None  # type: ignore
+    NavigableString = None  # type: ignore
 
 # 상세 페이지 요청 규약 (계약 v2.1 V2 + Codex 크리틱 #8)
 BROWSER_USER_AGENT = (
@@ -55,23 +56,34 @@ CONTENT_SELECTORS = [
     "td.content", "div#content", "div#contents",
 ]
 
-# 경계는 세 등급이다 (Codex 재검토 #7).
-#   ROW  (\n): 표의 행이 끝났다 - 값이 없으면 그 라벨은 값이 없는 것이다
-#   CELL (\r): 셀이 끝났다 - 라벨과 값이 <th>/<td> 로 갈린 경우를 위해
-#              값을 만나기 전 **한 번만** 건너뛴다
-#   INNER(\v): 셀 **안쪽** 의 div/p/br/li - 값의 일부이므로 끊지 않는다
-#              (한 셀에 1차·2차 회차가 div 로 나열되는 경우)
-_ROW_END = re.compile(r"</(?:tr|table|tbody|thead)\s*>", re.I)
-_CELL_END = re.compile(r"</(?:td|th)\s*>", re.I)
-_INNER_END = re.compile(
-    r"(</(?:div|p|li|h[1-6]|dl|dd|dt|section|article)\s*>|<br\s*/?>)", re.I
-)
-# 사용자 영역 문자를 쓴다 - 원문 HTML의 자연 공백(\n, \r\n, 탭)과 절대
-# 겹치지 않아야 경계 등급을 신뢰할 수 있다.
+# 경계는 세 등급이다 (Codex 재검토 #7 + 최종 게이트 #4).
+#   ROW  : 표의 행 / 셀 밖의 문단이 끝났다 - 값이 없으면 그 라벨은 값이 없다
+#   CELL : 셀이 끝났다 - 라벨과 값이 <th>/<td> 로 갈린 경우를 위해
+#          값을 만나기 전 **한 번만** 건너뛴다
+#   INNER: 셀 **안쪽** 의 div/p/br - 한 셀에 1·2차가 나열된 경우이므로 끊지
+#          않는다. 셀 밖의 div/p/br 은 ROW 로 취급한다 (문단이 다르면 다른
+#          이야기다 - `<p>접수기간 …</p><p>교육기간 …</p>` 누출 방지)
+_ROW_TAGS = frozenset({"tr", "table", "tbody", "thead", "tfoot", "caption"})
+_CELL_TAGS = frozenset({"td", "th"})
+_INNER_TAGS = frozenset({
+    "div", "p", "li", "br", "dl", "dd", "dt", "section", "article",
+    "h1", "h2", "h3", "h4", "h5", "h6", "ul", "ol", "blockquote",
+})
+_SKIP_TAGS = frozenset({"script", "style", "noscript"})
+
+# 경계 표시는 사용자 영역 문자를 쓴다 - 원문 HTML의 자연 공백(\n, \r\n, 탭)과
+# 절대 겹치지 않아야 경계 등급을 신뢰할 수 있다.
 _ROW_MARK, _CELL_MARK, _INNER_MARK = "\uE000", "\uE001", "\uE002"
 _MARKS = _ROW_MARK + _CELL_MARK + _INNER_MARK
 # 공백과 경계 표시를 한데 묶어 "낱말 사이" 를 뜻하는 패턴
 _GAP = r"[\s\uE000-\uE002]"
+
+# 절단 복구용 - 여기까지는 "블록이 닫혔다" 고 말할 수 있다
+_BLOCK_CLOSE = re.compile(
+    r"</(?:p|div|tr|td|th|li|table|tbody|thead|tfoot|ul|ol|dl|dd|dt"
+    r"|section|article|h[1-6]|blockquote)\s*>",
+    re.I,
+)
 
 # 글머리표 - 인용의 끝 경계. ※/* 는 보충설명이라 경계로 쓰지 않는다.
 _BULLET_BOUNDARY = "ㅁ□ㅇ○◦▶■●◆"
@@ -83,6 +95,17 @@ _REPEATED_TOKEN = re.compile(
 )
 # 본문 텍스트에 이스케이프된 HTML이 그대로 실려 나오는 경우
 _LEAKED_MARKUP = re.compile(r"<\s*/?\s*[A-Za-z]")
+
+# 인용을 **끝내야 하는** 다른 라벨들 (최종 게이트 #4).
+# "접수기간 …부터 교육기간 2026.09.20~09.30" 에서 교육기간의 날짜가 접수
+# 마감으로 새어 들어오던 원인이다. 라벨의 값은 **그 라벨의 블록 안**에서만
+# 찾는다 - 다른 라벨이 시작되면 거기서 끝난다.
+_FOREIGN_LABEL_WORDS = (
+    "교육기간", "운영기간", "사업기간", "협약기간", "수행기간", "활동기간",
+    "심사기간", "발표", "선정", "문의처", "문의", "담당부서", "담당자",
+    "작성일", "등록일", "게시일", "조회수", "첨부파일", "첨부",
+    "추진 일정", "추진일정", "신청방법", "제출방법", "제출서류", "유의사항",
+)
 
 # (label, strict) - strict=True 는 글머리표/콜론/라벨중복 문맥에서만 인정한다.
 _LABELS: Dict[str, List[Tuple[str, bool]]] = {
@@ -121,48 +144,80 @@ def _collapse_boundaries(match: "re.Match") -> str:
 
 
 def complete_html_prefix(html: str) -> str:
-    """절단된 HTML에서 **완결되지 않은 꼬리**를 버린다 (Codex 재검토 #8).
+    """절단된 HTML에서 **마지막 완결 블록**까지만 남긴다 (최종 게이트 #3).
 
-    1MB 상한에서 자르면 태그나 텍스트가 중간에서 끊긴다. 그대로 파싱하면
-    ``2026.09.30`` 이 ``2026.09.3`` 으로 잘려 **09-03** 이 되거나,
-    ``<div title="접수기간 …`` 처럼 속성 중간에서 끊긴 조각이 본문 텍스트로
-    새어 들어온다. 그래서 마지막 ``>`` 까지만 남긴다 - 그 뒤는 완결되지
-    않은 태그이거나 완결되지 않은 텍스트다.
+    마지막 ``>`` 까지만 남기는 것으로는 부족했다:
+
+    - ``2026.09.<span>3</span>`` 뒤에서 자르면 ``</span>`` 가 완결 태그이므로
+      살아남아 ``2026.09.3`` → **09-03** 이 만들어졌다.
+    - ``<div title="접수기간 …09.30 >`` 처럼 속성 **안쪽** 의 ``>`` 에서 자르면
+      끊긴 태그가 텍스트로 읽혀 숨은 날짜가 인용됐다.
+
+    그래서 문단·행·셀이 **닫힌 자리**까지만 남긴다. 블록이 닫힌 뒤의 조각은
+    값의 일부일 수 없으므로 버려도 정보를 잃지 않는다. 닫힌 블록이 없으면
+    아무것도 돌려주지 않는다 - 지어내지 않는 쪽을 고른다.
 
     Args:
         html: 절단된 HTML 문자열
 
     Returns:
-        마지막 완결 태그까지의 접두사. ``>`` 가 없으면 빈 문자열
+        마지막 완결 블록까지의 접두사. 없으면 빈 문자열
     """
     if not html:
         return ""
-    last_close = html.rfind(">")
-    if last_close == -1:
+    last = None
+    for match in _BLOCK_CLOSE.finditer(html):
+        last = match
+    if last is None:
         return ""
-    return html[:last_close + 1]
+    return html[:last.end()]
+
+def _walk(node, in_cell: bool, out: list) -> None:
+    """트리를 훑어 텍스트와 경계 표시를 순서대로 모은다.
+
+    셀 안쪽인지(``in_cell``)에 따라 div/p/br 의 등급이 달라진다 - 한 셀
+    안의 나열은 값의 일부이고, 셀 밖의 문단은 다른 이야기다.
+    """
+    for child in node.children:
+        if NavigableString is not None and isinstance(child, NavigableString):
+            out.append(str(child))
+            continue
+        name = (getattr(child, "name", "") or "").lower()
+        if not name or name in _SKIP_TAGS:
+            continue
+        cell = in_cell or name in _CELL_TAGS
+        _walk(child, cell, out)
+        # **셀 안쪽의 표는 값의 일부다** (최종 게이트 #4). 중첩 표의 행·셀
+        # 경계를 단단하게 끊으면 1·2차가 첫 내부 셀에서 잘려 지난 회차가
+        # 선택된다. 그래서 이미 셀 안이면 모든 경계를 INNER로 낮춘다.
+        if name in _ROW_TAGS:
+            out.append(_INNER_MARK if in_cell else _ROW_MARK)
+        elif name in _CELL_TAGS:
+            out.append(_INNER_MARK if in_cell else _CELL_MARK)
+        elif name in _INNER_TAGS:
+            out.append(_INNER_MARK if cell else _ROW_MARK)
 
 
 def normalize_text(html: str) -> str:
     """상세 페이지 HTML에서 본문 텍스트를 뽑아 정규화한다.
 
-    셀·행·블록이 끝나는 자리에는 줄바꿈을 남긴다 - 표의 다음 행 값이
-    앞 라벨의 인용으로 새어 들어오는 것을 막기 위한 경계다.
+    셀·행·문단이 끝나는 자리에 등급별 경계 표시를 남긴다. 표시는 사용자
+    영역 문자(U+E000~E002)라 원문의 자연 공백과 겹치지 않는다.
+
+    **속성 값은 절대 텍스트가 되지 않는다** - BeautifulSoup 트리를 직접
+    훑으므로 태그 속성은 순회 대상이 아니다(최종 게이트 #3).
 
     Args:
         html: 상세 페이지 HTML 문자열
 
     Returns:
-        줄 단위로 끊긴 본문 텍스트. 파싱 불가 시 빈 문자열
+        경계 표시가 들어간 본문 텍스트. 파싱 불가 시 빈 문자열
     """
     if BeautifulSoup is None or not html:
         return ""
 
-    marked = _ROW_END.sub(lambda m: m.group(0) + _ROW_MARK, html)
-    marked = _CELL_END.sub(lambda m: m.group(0) + _CELL_MARK, marked)
-    marked = _INNER_END.sub(lambda m: m.group(0) + _INNER_MARK, marked)
-    soup = BeautifulSoup(marked, "html.parser")
-    for tag in soup(["script", "style", "noscript"]):
+    soup = BeautifulSoup(html, "html.parser")
+    for tag in soup(list(_SKIP_TAGS)):
         tag.decompose()
 
     element = None
@@ -173,9 +228,11 @@ def normalize_text(html: str) -> str:
     if element is None:
         element = soup.body or soup
 
-    text = element.get_text(" ", strip=False).replace("\xa0", " ")
-    text = re.sub(r"\s+", " ", text)          # 원문의 자연 공백을 먼저 없앤다
-    # 이어진 경계는 가장 강한 등급 하나로 (주변 공백까지 흡수)
+    pieces: list = []
+    in_cell = bool(getattr(element, "name", "") in _CELL_TAGS)
+    _walk(element, in_cell, pieces)
+    text = "".join(pieces).replace("\xa0", " ")
+    text = re.sub(r"\s+", " ", text)
     text = re.sub(rf" ?([{_MARKS}][{_MARKS} ]*)", _collapse_boundaries, text)
     return text.strip(" " + _MARKS)
 
@@ -207,7 +264,52 @@ def _find_label(text: str, label: str, strict: bool) -> Optional[int]:
     return match.start() if match else None
 
 
-def _cut_quote(text: str, start: int, label: str) -> str:
+def _foreign_words_for(key: str) -> Tuple[str, ...]:
+    """이 인용을 **끝내야 하는** 다른 라벨 낱말들.
+
+    같은 항목의 라벨끼리는 서로를 끊지 않는다 - "접수기간 … 예산 소진 시
+    **마감**" 에서 "마감" 은 값의 일부이지 다음 라벨이 아니다.
+    """
+    words = set(_FOREIGN_LABEL_WORDS)
+    for other_key, labels in _LABELS.items():
+        if other_key == key:
+            continue
+        for label, _strict in labels:
+            words.add(label)
+    return tuple(sorted(words, key=len, reverse=True))
+
+
+def _foreign_label_start(window: str, key: str, own_label: str) -> Optional[int]:
+    """값 구간에서 **다른 라벨이 새 조각을 시작하는** 위치를 찾는다.
+
+    라벨이 문장 중간에 우연히 나온 경우는 경계가 아니다 - 예를 들어
+    "(**제출서류** 완비 기준) 선착순 접수" 의 제출서류는 값의 일부다.
+    그래서 경계 표시(셀·행·문단)나 글머리표 바로 뒤에 오는 라벨만 인정한다.
+
+    Args:
+        window: 라벨 뒤의 값 구간
+        key: 지금 뽑고 있는 인용 종류
+        own_label: 지금 뽑고 있는 라벨
+
+    Returns:
+        다른 라벨이 조각을 시작하는 인덱스. 없으면 None
+    """
+    best: Optional[int] = None
+    for word in _foreign_words_for(key):
+        if word == own_label or word in own_label or own_label in word:
+            continue
+        for match in re.finditer(re.escape(word), window):
+            index = match.start()
+            prefix = window[:index].rstrip(" ")
+            if prefix and prefix[-1] not in _MARKS + _BULLET_BOUNDARY:
+                continue  # 문장 중간에 우연히 나온 낱말
+            if best is None or index < best:
+                best = index
+            break
+    return best
+
+
+def _cut_quote(text: str, start: int, label: str, key: str = "") -> str:
     """라벨부터 값이 끝나는 자리까지 잘라낸다.
 
     경계 등급별 처리 (Codex 재검토 #7):
@@ -250,6 +352,14 @@ def _cut_quote(text: str, start: int, label: str) -> str:
 
     window = text[scan_from:end]
 
+    # **다른 라벨이 시작되면 거기서 끝난다** (최종 게이트 #4).
+    # 값은 그 라벨의 것만이다 - "접수기간 …부터 교육기간 09.20~09.30" 에서
+    # 교육기간의 날짜가 접수 마감으로 새어 들어오던 원인.
+    foreign = _foreign_label_start(window, key, label)
+    if foreign is not None:
+        end = scan_from + foreign
+        window = text[scan_from:end]
+
     # 표에서 같은 낱말이 잇달아 나오면(다음 라벨) 그 앞에서 끊는다
     repeat = _REPEATED_TOKEN.search(window)
     if repeat:
@@ -282,7 +392,7 @@ def extract_quotes(text: str) -> Dict[str, str]:
             start = _find_label(text, label, strict)
             if start is None:
                 continue
-            quote = _cut_quote(text, start, label)
+            quote = _cut_quote(text, start, label, key)
             # 라벨만 남은 조각은 인용이 아니다
             if len(quote) > len(label) + 2:
                 quotes[key] = quote
@@ -315,6 +425,11 @@ _ALWAYS_OPEN = re.compile(r"상시|수시|연중|별도\s*공지\s*시")
 # 예산 소진 시 조기마감 - 마감일이 **있으면서** 앞당겨질 수 있다는 뜻이다.
 # 무기한 접수(상시)와 구분해야 한다 (Codex 재검토 #9).
 _EARLY_CLOSE = re.compile(r"예산\s*소진|소진\s*시|조기\s*마감|선착순")
+
+# 회차 표기 - 있으면 날짜 역전을 해 넘김으로 보지 않는다 (최종 게이트 #5)
+_ROUND_LABEL = re.compile(r"\d+\s*차")
+# 뒤쪽 날짜에 연도가 **명시**되어 있으면 해 넘김을 추정하지 않는다
+_EXPLICIT_YEAR = re.compile(r"\d{4}")
 
 _RANGE_GAP_MAX = 12    # 두 날짜 사이 간격 상한 (넘으면 범위로 보지 않는다)
 _UNTIL_WINDOW = 15     # 날짜 뒤에서 "까지/이내" 를 찾는 창
@@ -412,26 +527,23 @@ def _resolve_years(
     """
     resolved = list(dates)
 
-    # 앞 -> 뒤
+    # 앞 -> 뒤: **해 넘김을 추정하지 않는다** (최종 게이트 #5).
+    # 회차가 여러 개면 날짜가 뒤로 갔다 앞으로 오는 것이 정상이므로
+    # ("2차 2.01~2.28 / 1차 1.01~1.31") 이를 해 넘김으로 보면 지난 공고가
+    # 미래 공고로 바뀐다. 해 넘김은 **한 범위 안에서만** 따진다(_candidates).
     year: Optional[int] = None
-    previous: Optional[Tuple[int, int]] = None
     for index, (begin, finish, iso, month, day) in enumerate(resolved):
         if iso:
             year = int(iso[:4])
-            previous = (month, day)
             continue
         if year is None:
             continue
-        candidate_year = year
-        if previous and (month, day) < previous:
-            candidate_year += 1
-        new_iso = _safe_iso(candidate_year, month, day)
+        new_iso = _safe_iso(year, month, day)
         if new_iso:
             resolved[index] = (begin, finish, new_iso, month, day)
-            year = candidate_year
-            previous = (month, day)
 
-    # 뒤 -> 앞 (첫 명시 연도보다 앞에 있는 날짜들)
+    # 뒤 -> 앞: 첫 명시 연도보다 **앞에** 있는 날짜들만 되돌려 받는다.
+    # "12.20~2027.1.10" 의 12.20 은 2026년이다 (뒤 날짜보다 월이 크므로).
     year = None
     following: Optional[Tuple[int, int]] = None
     for index in range(len(resolved) - 1, -1, -1):
@@ -448,8 +560,6 @@ def _resolve_years(
         new_iso = _safe_iso(candidate_year, month, day)
         if new_iso:
             resolved[index] = (begin, finish, new_iso, month, day)
-            year = candidate_year
-            following = (month, day)
 
     return resolved
 
@@ -462,6 +572,7 @@ def _candidates(quote: str) -> List[Tuple[int, Optional[str], Optional[str]]]:
     dates = _resolve_years(_scan_dates(quote))
     candidates: List[Tuple[int, Optional[str], Optional[str]]] = []
     paired: set = set()
+    has_round_labels = bool(_ROUND_LABEL.search(quote))
 
     # 1) "~" 로 이어진 두 날짜
     for index in range(len(dates) - 1):
@@ -471,7 +582,19 @@ def _candidates(quote: str) -> List[Tuple[int, Optional[str], Optional[str]]]:
             continue
         if not _RANGE_SEP.search(between):
             continue
-        candidates.append((first[0], first[2], second[2]))
+        start_iso, end_iso = first[2], second[2]
+        # 해 넘김은 **한 범위 안에서만**, 그리고 회차 표기가 없을 때만 따진다
+        if (
+            start_iso
+            and end_iso
+            and end_iso < start_iso
+            and not has_round_labels
+            and not _EXPLICIT_YEAR.search(quote[second[0]:second[1]])
+        ):
+            rolled = _safe_iso(int(start_iso[:4]) + 1, second[3], second[4])
+            if rolled:
+                end_iso = rolled
+        candidates.append((first[0], start_iso, end_iso))
         paired.add(index)
         paired.add(index + 1)
 
@@ -583,3 +706,4 @@ def has_quote_keys(payload: Dict[str, object]) -> bool:
     """이미 인용이 채워진 항목인지 본다 (재요청 방지, 크리틱 #8)."""
     keys: Sequence[str] = (QUOTE_DEADLINE, QUOTE_ELIGIBILITY, QUOTE_AMOUNT)
     return any(payload.get(key) for key in keys)
+

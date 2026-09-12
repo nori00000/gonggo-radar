@@ -46,19 +46,41 @@ def has_region_token(value: str) -> bool:
 
 
 def extract_region(candidates: Iterable[str]) -> str:
-    """후보 문자열 중 지역 토큰을 담은 첫 값을 지역으로 본다.
+    """후보 중 지역을 말하는 첫 값 (표시·로그용).
 
-    Args:
-        candidates: ``span.sub`` 와 ``ul.info`` 값들 (순서대로)
-
-    Returns:
-        지역을 말하는 값 그대로. 없으면 빈 문자열
+    **그룹 키에는 쓰지 않는다** - 첫 값만 쓰면 다른 필드의 지역 차이를
+    놓친다(최종 게이트 #1). 키는 ``subject_signature`` 를 쓴다.
     """
     for value in candidates:
         text = (value or "").strip()
         if has_region_token(text):
             return text
     return ""
+
+
+def subject_signature(candidates: Iterable[str]) -> Tuple[str, ...]:
+    """주체·지역 메타데이터 **전체**를 키로 쓸 형태로 만든다.
+
+    최종 게이트 #1: 첫 후보만 지역으로 삼으면
+    ``sub="서울 본부"`` 가 같고 ``info=서울/부산`` 만 다른 공고가 합쳐지고,
+    지역 토큰 목록에 없는 시설명(``수원센터``/``성남센터``)도 구분되지
+    않았다. 그래서 **두 필드의 값을 모두** 서명에 넣는다.
+
+    값 전체를 쓰므로 갈라질 때는 최악의 경우 병합을 놓치고, 합쳐질 때는
+    메타데이터가 완전히 같을 때뿐이다 - 안전한 방향이다.
+
+    Args:
+        candidates: ``span.sub`` 와 ``ul.info`` 값들
+
+    Returns:
+        정렬·중복제거된 값 튜플. 메타데이터가 없으면 빈 튜플
+    """
+    cleaned = {
+        re.sub(r"\s+", " ", (value or "").strip())
+        for value in candidates
+        if (value or "").strip()
+    }
+    return tuple(sorted(cleaned))
 
 
 def deadline_key(period_end: Optional[str], ingested_month: str = "") -> str:
@@ -83,20 +105,60 @@ def group_key(
     region_candidates: Sequence[str],
     period_end: Optional[str],
     ingested_month: str = "",
-) -> Tuple[str, str, str]:
+) -> Tuple[str, Tuple[str, ...], str]:
     """중복 판별 키를 만든다.
 
     Args:
         title: 공고 제목
-        region_candidates: 지역 후보 문자열들 (sub, info…)
+        region_candidates: 주체·지역 후보 문자열들 (sub, info…)
         period_end: 접수 종료일 (ISO) 또는 None
         ingested_month: ``YYYY-MM`` 적재 월 (종료일 없을 때 회차 구분용)
 
     Returns:
-        ``(정규화 제목, 지역, 마감 키)``
+        ``(정규화 제목, 주체 서명, 마감 키)``
     """
     return (
         normalize_title(title),
-        extract_region(region_candidates),
+        subject_signature(region_candidates),
         deadline_key(period_end, ingested_month),
     )
+
+
+def keys_compatible(
+    first: Tuple[str, Tuple[str, ...], str],
+    second: Tuple[str, Tuple[str, ...], str],
+    ignore_deadline: bool = False,
+) -> bool:
+    """두 키가 **같은 공고**를 가리킬 수 있는지 본다.
+
+    그룹핑에는 완전 일치를 쓰지만, 이미 기록된 병합(규칙 A)이나 같은 URL을
+    확인할 때는 조금 느슨해야 한다 (최종 게이트 #7):
+
+    - 한쪽에 주체 메타데이터가 **없으면**(구 파서가 남기지 않았다) 주체는
+      비교하지 않는다 - 대표에만 메타데이터가 추가된 정상 병합을 거부하면
+      안 된다.
+    - ``ignore_deadline`` 이면 마감 키를 보지 않는다 (같은 URL은 적재월이
+      달라도 같은 글이다).
+
+    Args:
+        first: 키 하나
+        second: 키 둘
+        ignore_deadline: 마감 키 비교를 건너뛴다
+
+    Returns:
+        같은 공고로 볼 수 있으면 True
+    """
+    if first[0] != second[0]:
+        return False
+    if first[1] and second[1] and first[1] != second[1]:
+        return False
+    if first[2] == second[2]:
+        return True
+    # 마감 키가 다르다 - 완화는 **마감을 모르는 경우**(month: 대체값)에만
+    # 허용한다. 실제 종료일이 서로 다르면 같은 공고가 아니다 (같은 URL이라도).
+    if ignore_deadline and (
+        first[2].startswith("month:") or second[2].startswith("month:")
+        or not first[2] or not second[2]
+    ):
+        return True
+    return False
