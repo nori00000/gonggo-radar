@@ -33,6 +33,9 @@ DETAIL_TIMEOUT = 10
 MAX_DETAIL_BYTES = 512 * 1024
 MAX_REDIRECTS = 3
 DETAIL_TEXT_CHARS = 2000
+# 앵커(제목)를 통째로 못 찾을 때 다시 시도하는 앞부분 길이. 목록 페이지의 제목이
+# 말줄임(`…`)·괄호 정리로 정본 제목과 달라지는 경우가 흔하다.
+ANCHOR_PARTIAL_CHARS = 20
 
 _COMMENT_RE = re.compile(r"(?s)<!--.*?-->")
 _DROP_ELEMENT_RE = re.compile(
@@ -44,8 +47,41 @@ _TAG_RE = re.compile(r"(?s)<[^>]*>")
 _INVISIBLE_RE = re.compile("[\u200b\u200c\u200d\u2060\ufeff]")
 
 
-def visible_text(html_text: str, limit: int = DETAIL_TEXT_CHARS) -> str:
-    """HTML → 보이는 텍스트 (script/style/nav 제거 · 공백 정규화 · 앞 limit 자)."""
+def normalize_space(text: str) -> str:
+    """공백 정규화 — 앵커 대조는 본문과 제목이 **같은 규칙**을 지나야 맞는다."""
+    return " ".join((text or "").split())
+
+
+def anchored_window(
+    text: str, anchor: str = "", limit: int = DETAIL_TEXT_CHARS
+) -> str:
+    """본문에서 `anchor`(제목)가 **마지막으로** 나오는 자리부터 limit 자.
+
+    앞에서부터 자르면 창이 전부 메뉴·바로가기·로그인 문구다(W37 n=1 실측:
+    2,000자가 "공지사항 주메뉴 바로가기 … 로그인 회원가입 …" 로 끝나 기사 본문에
+    도달하지 못했다). 목록·빵부스러기·`<title>` 에도 제목이 박혀 있으므로
+    **마지막** 출현을 고른다 — 본문 제목이 대개 그 뒤에 본문을 달고 온다.
+
+    제목 전체를 못 찾으면 앞 `ANCHOR_PARTIAL_CHARS` 자로 한 번 더 찾고, 그래도
+    없으면 예전처럼 문서 앞에서부터 자른다(fail-open — 창이 없느니 낫다).
+    """
+    if not text:
+        return ""
+    needle = normalize_space(anchor)
+    if needle:
+        index = text.rfind(needle)
+        if index < 0:
+            partial = needle[:ANCHOR_PARTIAL_CHARS]
+            index = text.rfind(partial) if partial else -1
+        if index >= 0:
+            return text[index:index + limit]
+    return text[:limit]
+
+
+def visible_text(
+    html_text: str, limit: int = DETAIL_TEXT_CHARS, anchor: str = ""
+) -> str:
+    """HTML → 보이는 텍스트 (script/style/nav 제거 · 공백 정규화 · 앵커 기준 limit 자)."""
     if not html_text:
         return ""
     text = _COMMENT_RE.sub(" ", html_text)
@@ -53,8 +89,7 @@ def visible_text(html_text: str, limit: int = DETAIL_TEXT_CHARS) -> str:
     text = _TAG_RE.sub(" ", text)
     text = html.unescape(text)
     text = _INVISIBLE_RE.sub("", text)
-    text = " ".join(text.split())
-    return text[:limit]
+    return anchored_window(normalize_space(text), anchor, limit)
 
 
 def _charset_of(content_type: str):
@@ -79,14 +114,16 @@ def _decode(raw: bytes, content_type: str) -> str:
 
 def fetch_detail_text(
     url,
+    anchor: str = "",
     timeout: int = DETAIL_TIMEOUT,
     max_bytes: int = MAX_DETAIL_BYTES,
     limit: int = DETAIL_TEXT_CHARS,
 ) -> str:
-    """URL 의 보이는 본문 앞부분. **실패는 전부 빈 문자열**(fail-open).
+    """URL 의 보이는 본문 중 `anchor`(항목 제목) 기준 한 창. **실패는 빈 문자열**.
 
     실패로 보는 것: URL 아님·요청 예외·4xx/5xx·비 HTML(Content-Type)·빈 본문.
     리다이렉트는 MAX_REDIRECTS 까지, 본문은 max_bytes 까지만 읽는다.
+    창을 어디서 시작할지는 `anchored_window` 가 정한다.
     """
     if not url or not str(url).lower().startswith(("http://", "https://")):
         return ""
@@ -120,7 +157,7 @@ def fetch_detail_text(
         raw = b"".join(chunks)[:max_bytes]
         if not raw:
             return ""
-        return visible_text(_decode(raw, content_type), limit)
+        return visible_text(_decode(raw, content_type), limit, anchor)
     except Exception:  # noqa: BLE001 — 항목 단위 fail-open
         return ""
     finally:

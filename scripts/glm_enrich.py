@@ -210,8 +210,11 @@ def build_input_items(manifest_items: List[Dict], db_path: str) -> List[Dict]:
         summary, raw_data = db_rows.get(entry.get("id"), ("", ""))
         quotes = extract_quotes(summary, raw_data)
         url = entry.get("url") or ""
+        title = entry.get("title") or ""
         try:
-            detail_text = fetch_detail_text(url) if url else ""
+            # 창은 **제목을 앵커로** 잡는다 — 앞에서부터 2,000자를 뜨면 공공기관
+            # 사이트에서는 창 전체가 메뉴·바로가기·로그인 문구다(W37 n=1 실측).
+            detail_text = fetch_detail_text(url, anchor=title) if url else ""
         except Exception:  # noqa: BLE001 — 수집 실패는 항목 단위로만 흡수한다
             detail_text = ""
         items.append({

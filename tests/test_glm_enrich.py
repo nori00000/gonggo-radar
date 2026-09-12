@@ -1015,3 +1015,95 @@ def test_recheck_refreshes_the_manifest_hash_after_enrichment(digest_fixture, tm
         output_path=None, skip_network=False,
     )
     assert result["manifest_problems"] == []
+
+
+# ─── V3.1a. 창을 기사 본문에 앵커한다 (제목 마지막 출현 기준) ──────────────
+_NAV = "공지사항 주메뉴 바로가기 본문 바로가기 로그인 회원가입 정보공개 "
+_TITLE = "2026 산림분야 오픈이노베이션 참여기업 모집"
+_BODY = " 접수기간 9월 22일까지, 지원금 300만원 규모로 임업 기업을 모집합니다."
+
+
+def test_anchored_window_starts_at_the_title_when_found_once():
+    text = _NAV + _TITLE + _BODY
+    window = http_fetch.anchored_window(text, _TITLE, limit=50)
+    assert window.startswith(_TITLE)
+    assert "주메뉴 바로가기" not in window
+
+
+def test_anchored_window_starts_at_the_last_occurrence_of_the_title():
+    """목록·빵부스러기에도 제목이 박혀 있다 — 본문 제목은 대개 **마지막**이다."""
+    text = _NAV + _TITLE + " 목록으로 " + _NAV + _TITLE + _BODY
+    window = http_fetch.anchored_window(text, _TITLE, limit=200)
+    assert window.startswith(_TITLE + _BODY)
+    assert window.count(_TITLE) == 1
+
+
+def test_anchored_window_falls_back_to_the_start_when_the_title_is_absent():
+    text = _NAV + "전혀 다른 기사 본문입니다."
+    window = http_fetch.anchored_window(text, "레포에 없는 제목 문자열", limit=30)
+    assert window == text[:30]
+
+
+def test_anchored_window_falls_back_to_the_first_20_chars_of_the_title():
+    """목록 제목이 말줄임·괄호 정리로 정본과 달라도 앞 20자로 붙잡는다."""
+    text = _NAV + _TITLE + _BODY
+    manifest_title = _TITLE + " (2차 연장, ~9.30)"
+    assert manifest_title not in text
+    window = http_fetch.anchored_window(text, manifest_title, limit=200)
+    assert window.startswith(_TITLE[:http_fetch.ANCHOR_PARTIAL_CHARS])
+    assert "주메뉴 바로가기" not in window
+
+
+def test_anchored_window_normalizes_whitespace_on_both_sides():
+    text = http_fetch.normalize_space(_NAV + "공고\n제목   여기" + _BODY)
+    window = http_fetch.anchored_window(text, "  공고\t제목\n여기  ", limit=40)
+    assert window.startswith("공고 제목 여기")
+
+
+def test_anchored_window_with_no_anchor_keeps_the_old_start_window():
+    text = _NAV + _TITLE + _BODY
+    assert http_fetch.anchored_window(text, "", limit=25) == text[:25]
+
+
+def test_fetch_detail_text_anchors_the_window_at_the_article_title(monkeypatch):
+    html_body = (
+        "<html><body><ul><li>" + _TITLE + "</li></ul>"
+        "<div class='view'><h2>" + _TITLE + "</h2><p>" + _BODY + "</p></div>"
+        "</body></html>"
+    )
+    _use_session(monkeypatch, _FakeSession(_FakeResponse(
+        headers={"Content-Type": "text/html; charset=utf-8"},
+        chunks=[html_body.encode("utf-8")],
+    )))
+    text = http_fetch.fetch_detail_text("https://example.test/a", anchor=_TITLE)
+    assert text.startswith(_TITLE)
+    assert text.count(_TITLE) == 1
+    assert "접수기간 9월 22일까지" in text
+
+
+def test_build_input_items_passes_the_item_title_as_the_anchor(
+    digest_fixture, monkeypatch
+):
+    seen = {}
+
+    def _stub(url, anchor="", **kwargs):
+        seen[url] = anchor
+        return f"{anchor} 본문"
+
+    monkeypatch.setattr(glm_mod, "fetch_detail_text", _stub)
+
+    class Args:
+        week = W13
+        db = digest_fixture["db_path"]
+        out_dir = str(digest_fixture["out_dir"])
+        dry_run = True
+        apply_json = None
+
+    assert glm_mod.run(Args()) == 0
+    payload = json.loads(
+        (digest_fixture["out_dir"] / f"{W13}.glm_input.json").read_text(encoding="utf-8")
+    )
+    assert seen
+    for entry in payload["items"]:
+        assert seen[entry["url"]] == entry["title"]
+        assert entry["detail_text"] == f"{entry['title']} 본문"
