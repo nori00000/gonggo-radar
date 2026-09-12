@@ -18,6 +18,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from alert.digest import prune
+from alert.digest import sections as sections_mod
 from alert.digest.checker import (
     check_digest,
     dead_urls,
@@ -56,12 +57,14 @@ def recheck(markdown_path: Path, db_path: str, check_path: Path):
             break
 
         text = markdown_path.read_text(encoding="utf-8")
-        pruned, removed, unlinked = prune.strip_dead_urls(text, dead)
+        # 사이클3 #7: 섹션 판정은 방금 쓴 check.json 의 목록과 정확 일치로 한다.
+        item_sections, _ = sections_mod.resolve(result, text)
+        pruned, removed, unlinked = prune.strip_dead_urls(text, dead, item_sections)
         if pruned == text:
             # 제거 대상을 본문에서 찾지 못했다 → 더 돌려도 같다. 아래에서 pass=false.
             break
         # 사이클2 #7: 링크를 떼어내면 제목이 겹칠 수 있다 → 중복 재검사.
-        pruned, duplicates = prune.dedupe_titles(pruned)
+        pruned, duplicates = prune.dedupe_titles(pruned, item_sections)
         markdown_path.write_text(pruned, encoding="utf-8")
         dropped.extend(removed)
         dropped.extend(duplicates)
@@ -92,6 +95,8 @@ def write_failure(check_path: Path, markdown_path: Path, reason: str) -> None:
         "pass": False,
         "network_checked": False,
         "item_blocks": 0,
+        "item_sections": [],
+        "commentary_sections": [],
         "reason": f"재검증 실패: {reason}",
         "md_sha256": md_sha,
     })

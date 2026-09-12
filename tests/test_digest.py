@@ -889,6 +889,15 @@ class TestSendDigest:
 
         monkeypatch.setattr("alert.notifiers.email_sender.smtplib.SMTP", FakeSMTP)
 
+        # 계약 W10 사이클3 #3: 실발송에는 "사람이 본 미리보기"의 지문이 필요하다.
+        from alert.digest import state as state_mod
+
+        state_path = state_mod.state_path_for_markdown(md_path)
+        state_mod.save_state(state_path, state_mod.record_preview(
+            state_mod.default_state(state_mod.week_from_markdown(md_path)),
+            [2014], [], markdown_sha256(body),
+        ))
+
         rc = send_digest(md_path, to_email="third@example.com", dry_run=False,
                          approved_sha=markdown_sha256(body)[:8])
 

@@ -23,6 +23,10 @@ from alert.digest.checker import markdown_sha256
 STATE_SAVE_ATTEMPTS = 3
 STATE_SAVE_BACKOFF = 0.5
 
+# 승인 지문은 8자 이상 64자 이하의 16진수만 받는다 (사이클3 #4).
+# 빈 문자열·공백·1자를 받으면 startswith("") 가 언제나 참이 되어 게이트가 뚫린다.
+APPROVED_SHA_RE = re.compile(r"^[0-9a-f]{8,64}$")
+
 # [텍스트](URL) — URL 안의 괄호 한 단계까지 균형 있게 소비 (javascript:alert(1) 대응)
 LINK_PATTERN = r"\[([^\]]+)\]\(([^()\s]*(?:\([^()]*\)[^()\s]*)*)\)"
 
@@ -247,16 +251,18 @@ def send_digest(
         )
         return 0
 
-    # 사이클2 #2: 승인 지문 없는 실발송은 없다. 봇이 카드에서 전달하고, 사람이
-    # CLI로 보낼 때도 "지금 이 본문을 승인한다"는 선언을 요구한다.
-    if not approved_sha:
+    # 사이클2 #2·사이클3 #4: 승인 지문 없는 실발송은 없다. 형식도 검증한다 —
+    # 공백·1자를 허용하면 startswith 가 언제나 참이 되어 게이트가 통째로 뚫린다.
+    approved = (approved_sha or "").strip().lower()
+    if not APPROVED_SHA_RE.match(approved):
         try:
             current = markdown_sha256(markdown_path.read_text(encoding="utf-8"))
         except OSError:
             current = "?"
+        problem = "없습니다" if not approved else f"형식이 아닙니다: {approved!r}"
         print(
-            "✗ 발송 거부: --approved-sha 가 없습니다 "
-            f"(현재 본문 지문: {current[:8]})",
+            f"✗ 발송 거부: --approved-sha 가 {problem} "
+            f"(8자 이상 16진수 · 현재 본문 지문: {current[:8]})",
             file=sys.stderr,
         )
         return 2
@@ -269,7 +275,10 @@ def send_digest(
         print(f"⚠️  잔존 잠금 회수: {reason}", file=sys.stderr)
 
     try:
-        lock_fd = state_mod.acquire_lock(lock_path, on_reclaim=_reclaimed)
+        lock_handle = state_mod.acquire_lock(
+            lock_path, on_reclaim=_reclaimed,
+            on_warn=lambda why: print(f"⚠️  {why}", file=sys.stderr),
+        )
     except state_mod.LockBusy as exc:
         print(f"✗ 발송 거부: {exc}", file=sys.stderr)
         return 2
@@ -283,12 +292,13 @@ def send_digest(
             check_json_path=check_json_path,
             to_email=to_email,
             approved_by=approved_by,
-            approved_sha=approved_sha,
+            approved_sha=approved,
             week=week,
             state_path=state_path,
         )
     finally:
-        state_mod.release_lock(lock_path, lock_fd)
+        if not state_mod.release_lock(lock_handle):
+            print("⚠️  잠금 해제 생략(내 잠금이 아님)", file=sys.stderr)
 
 
 def _subject(markdown_text: str) -> str:
@@ -322,7 +332,7 @@ def _send_locked(
     if not current_sha.startswith(approved):
         print(
             "✗ 발송 거부: 승인된 본문이 아닙니다 "
-            f"(승인 {approved} ≠ 현재 {current_sha[:len(approved) or 8]})",
+            f"(승인 {approved} ≠ 현재 {current_sha[:len(approved)]})",
             file=sys.stderr,
         )
         return 2
@@ -338,6 +348,7 @@ def _send_locked(
     except state_mod.StateError as exc:
         print(f"✗ 발송 거부: {exc}", file=sys.stderr)
         return 2
+
     allowed, reason = state_mod.can_send(state)
     if not allowed:
         print(f"✗ 발송 거부: {reason}", file=sys.stderr)
@@ -347,6 +358,23 @@ def _send_locked(
                 f"`/digest 해제 {week}` 로 풀어주세요(자동 재발송 안 함).",
                 file=sys.stderr,
             )
+        return 2
+
+    # 사이클3 #3: 사람이 **본** 본문(최신 미리보기)과 지금 발송할 본문이 같아야 한다.
+    #   approved-sha == 현재 본문 해시 == 최신 preview_sha — 셋이 일치할 때만 발송.
+    preview_sha = state.get("preview_sha")
+    if not preview_sha:
+        print(
+            "✗ 발송 거부: 미리보기 기록이 없습니다 — 미리보기를 먼저 보내세요",
+            file=sys.stderr,
+        )
+        return 2
+    if preview_sha != current_sha:
+        print(
+            "✗ 발송 거부: 미리보기와 본문이 다릅니다 "
+            f"(미리보기 {str(preview_sha)[:8]} ≠ 현재 {current_sha[:8]}) — 재검토 필요",
+            file=sys.stderr,
+        )
         return 2
 
     # SMTP 앞의 모든 준비는 sending 표시 **전**에 끝낸다 — 설정 실수로 sending 이
@@ -481,7 +509,7 @@ def main():
     )
     parser.add_argument(
         "--approved-sha",
-        help="승인 카드가 본 본문 해시(접두 8자 이상). --send 에 필수",
+        help="승인 카드가 본 본문 해시(16진수 8~64자). --send 에 필수",
     )
 
     args = parser.parse_args()

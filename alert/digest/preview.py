@@ -11,6 +11,7 @@ import re
 from typing import Dict, List, Optional
 
 from alert.digest import prune
+from alert.digest import sections as sections_mod
 
 MARKER = "<!-- 상민 확정 필요 -->"
 TELEGRAM_LIMIT = 4096
@@ -23,16 +24,18 @@ _PERIOD_RE = re.compile(r"^\*\*기간:\*\*\s*(.+)$")
 _TITLE_RE = re.compile(r"^#\s+(.+)$")
 
 
-def item_urls(markdown_text: str) -> List[str]:
+def item_urls(markdown_text: str, item_sections=None) -> List[str]:
     """문서 순서대로 항목 URL만 뽑는다 (번호 → URL 좌표의 정본).
 
     항목 섹션 안의 블록만 센다 (사이클2 #5·#6) — 해설의 참고 링크가 번호를
-    차지하면 `제외 N` 이 엉뚱한 항목을 지운다.
+    차지하면 `제외 N` 이 엉뚱한 항목을 지운다. 섹션 판정은 정확 일치다(사이클3 #7).
     """
-    return [block["url"] for block in prune.item_blocks(markdown_text)]
+    return [
+        block["url"] for block in prune.item_blocks(markdown_text, item_sections)
+    ]
 
 
-def parse_digest(markdown_text: str) -> Dict:
+def parse_digest(markdown_text: str, item_sections=None) -> Dict:
     """미리보기에 필요한 만큼만 파싱.
 
     Returns:
@@ -40,6 +43,10 @@ def parse_digest(markdown_text: str) -> Dict:
          "items": [{"number", "section", "title", "author", "deadline", "url"}],
          "has_marker": bool, "commentary": str}
     """
+    if item_sections is None:
+        item_sections, _ = sections_mod.resolve(None, markdown_text)
+    known = tuple(item_sections)
+
     title = ""
     period = ""
     sections: List[Dict] = []
@@ -54,9 +61,10 @@ def parse_digest(markdown_text: str) -> Dict:
 
         if line.startswith("## "):
             name = line[3:].strip()
-            in_commentary = name == "협의회 의견"
+            # 사이클3 #7: "협의회 의견"·"협의회에서" 등을 정확 일치로 인식한다.
+            in_commentary = sections_mod.is_opinion_section(name)
             current_item = None
-            if prune.section_key(name) is not None:
+            if name in known:
                 current_section = {"name": name, "items": []}
                 sections.append(current_section)
             else:
@@ -149,8 +157,9 @@ def render_preview(
     check: Optional[Dict] = None,
 ) -> str:
     """미리보기 본문 전체 (분할 전)."""
-    parsed = parse_digest(markdown_text)
     check = check or {}
+    item_sections, _ = sections_mod.resolve(check, markdown_text)
+    parsed = parse_digest(markdown_text, item_sections)
     check_pass = bool(check.get("pass"))
     dropped = check.get("dropped") or []
 

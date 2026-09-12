@@ -9,6 +9,7 @@ from typing import Dict, List, Optional
 import requests
 
 from alert.digest import prune
+from alert.digest import sections as sections_mod
 
 
 def markdown_sha256(markdown_text: str) -> str:
@@ -156,6 +157,8 @@ def check_digest(
             "pass": False,
             "network_checked": False,
             "item_blocks": 0,
+            "item_sections": [],
+            "commentary_sections": [],
             "reason": "마크다운 파일 없음",
             "md_sha256": "",
         }
@@ -179,6 +182,8 @@ def check_digest(
             "pass": False,
             "network_checked": False,
             "item_blocks": 0,
+            "item_sections": list(sections_mod.classify(markdown_text)[0]),
+            "commentary_sections": list(sections_mod.classify(markdown_text)[1]),
             "reason": "항목 없음",
             "md_sha256": markdown_sha256(markdown_text),
         }
@@ -242,8 +247,11 @@ def check_digest(
     #
     # 사이클2 #6·#7: 항목 수는 **링크 수가 아니라 항목 블록 수**다(해설의 참고 링크가
     # 항목으로 세어지면 "공고 0건인데 pass" 가 난다). 섹션 상한 초과도 fail 이다.
-    item_blocks = prune.item_block_count(markdown_text)
-    cap_violations = prune.cap_violations(markdown_text)
+    # 사이클3 #7: 섹션 정본을 여기서 확정해 check.json 에 남긴다 — prune·preview·
+    # 봇은 이 목록과 **정확 일치**로 판정한다(부분 일치 금지).
+    item_sections, commentary_sections = sections_mod.classify(markdown_text)
+    item_blocks = prune.item_block_count(markdown_text, item_sections)
+    cap_violations = prune.cap_violations(markdown_text, item_sections)
 
     if not network_checked:
         reason = "네트워크 미검사"
@@ -264,6 +272,8 @@ def check_digest(
         "items": items,
         "dropped": dropped,
         "item_blocks": item_blocks,
+        "item_sections": list(item_sections),
+        "commentary_sections": list(commentary_sections),
         "pass": (
             network_checked
             and alive_count > 0
