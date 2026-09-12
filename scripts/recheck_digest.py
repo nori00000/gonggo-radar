@@ -18,6 +18,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from alert.digest import prune
+from alert.digest import sections as sections_mod
 from alert.digest.composer import kakao_file_text_from_markdown
 from alert.digest.checker import (
     check_digest,
@@ -57,14 +58,17 @@ def recheck(markdown_path: Path, db_path: str, check_path: Path):
             break
 
         text = markdown_path.read_text(encoding="utf-8")
-        pruned, removed, unlinked = prune.strip_dead_urls(text, dead)
+        # 사이클3 #7: 섹션 판정은 방금 쓴 check.json 의 목록과 정확 일치로 한다.
+        item_sections, _ = sections_mod.resolve(result, text)
+        pruned, removed, unlinked = prune.strip_dead_urls(text, dead, item_sections)
         if pruned == text:
             # 제거 대상을 본문에서 찾지 못했다 → 더 돌려도 같다. 아래에서 pass=false.
             break
         # 사이클 6 #3: 같은 URL 을 가리키는 블록만 접는다. 제목이 같아도 URL 이
         # 다르면 남긴다 — 소스 간 비병합 계약(같은 사안을 forest_service·
         # forest_press 가 각자 게시)을 재검토가 뒤집으면 안 된다.
-        pruned, duplicates = prune.dedupe_urls(pruned)
+        # 섹션 판정은 방금 쓴 check.json 의 목록과 정확 일치다 (사이클3 #7).
+        pruned, duplicates = prune.dedupe_urls(pruned, item_sections)
         markdown_path.write_text(pruned, encoding="utf-8")
         dropped.extend(removed)
         dropped.extend(duplicates)
@@ -103,7 +107,7 @@ def _refresh_kakao(markdown_path: Path) -> None:
 def write_failure(check_path: Path, markdown_path: Path, reason: str) -> None:
     """재검증 실패를 check.json 에 착지 (과거 pass 를 남겨두지 않는다)."""
     try:
-        md_sha = markdown_sha256(markdown_path.read_text(encoding="utf-8"))
+        md_sha = markdown_sha256(markdown_path.read_bytes())
     except OSError:
         md_sha = ""
     write_check_result(check_path, {
@@ -112,8 +116,10 @@ def write_failure(check_path: Path, markdown_path: Path, reason: str) -> None:
         "pass": False,
         "network_checked": False,
         "item_blocks": 0,
+        "item_sections": [],
+        "commentary_sections": [],
         "reason": f"재검증 실패: {reason}",
-        "md_sha256": md_sha,
+        "markdown_sha256": md_sha,
     })
 
 

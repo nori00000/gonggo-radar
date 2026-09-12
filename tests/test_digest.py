@@ -961,7 +961,7 @@ class TestSendDigest:
             "pass": True,
             "network_checked": True,
             "reason": "",
-            "md_sha256": markdown_sha256(body),
+            "markdown_sha256": markdown_sha256(md_path.read_bytes()),
         }))
 
         # dry_run=True가 기본값이므로 발송 안 함
@@ -1028,7 +1028,7 @@ class TestSendDigest:
             "pass": True,
             "network_checked": True,
             "reason": "",
-            "md_sha256": markdown_sha256(body),
+            "markdown_sha256": markdown_sha256(md_path.read_bytes()),
         }))
 
         smtp_mock = mock.MagicMock()
@@ -1056,7 +1056,7 @@ class TestSendDigest:
             "pass": True,
             "network_checked": True,
             "reason": "",
-            "md_sha256": markdown_sha256(body),
+            "markdown_sha256": markdown_sha256(md_path.read_bytes()),
         }))
 
         monkeypatch.setenv("EMAIL_SENDER", "sender@x.com")
@@ -1086,8 +1086,17 @@ class TestSendDigest:
 
         monkeypatch.setattr("alert.notifiers.email_sender.smtplib.SMTP", FakeSMTP)
 
+        # 계약 W10 사이클3 #3: 실발송에는 "사람이 본 미리보기"의 지문이 필요하다.
+        from alert.digest import state as state_mod
+
+        state_path = state_mod.state_path_for_markdown(md_path)
+        state_mod.save_state(state_path, state_mod.record_preview(
+            state_mod.default_state(state_mod.week_from_markdown(md_path)),
+            [2014], [], markdown_sha256(md_path.read_bytes()),
+        ))
+
         rc = send_digest(md_path, to_email="third@example.com", dry_run=False,
-                         approved_sha=markdown_sha256(body)[:8])
+                         approved_sha=markdown_sha256(md_path.read_bytes())[:8])
 
         assert rc == 0
         assert sent["to"] == "third@example.com"
@@ -2194,7 +2203,7 @@ class TestFixCycle4:
         )
         monkeypatch.setattr(
             "alert.digest.checker.extract_item_urls",
-            lambda text: [
+            lambda text, item_sections=None: [
                 "https://example.com/live",
                 "https://example.com/dead",
             ],

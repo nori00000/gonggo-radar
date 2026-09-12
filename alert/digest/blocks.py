@@ -6,6 +6,13 @@
 불일치")가 모두 그 불일치의 증상이다. 그래서 **파서는 하나다** — 이 모듈을 우회해
 항목을 세거나 URL을 뽑는 코드는 그 자체가 결함이다.
 
+역할 분담 (병합 2회차):
+- **어떤 섹션이 항목 섹션인가** = `alert/digest/sections.py`. check.json 의
+  `item_sections` 가 정본이고, 판정은 언제나 **정확한 헤딩 문자열 완전 일치**다
+  (계약 W10 사이클3 #7 — 부분 일치로 하면 `## 협의회에서 — 지원사업 의견` 이
+  공고 섹션으로 오분류돼 사람이 쓴 해설이 항목으로 세어지고 삭제된다).
+- **그 섹션 안에서 무엇이 항목인가** = 이 모듈.
+
 항목 블록의 정의 (두 조건을 **모두** 만족해야 항목이다):
 
 1. 항목 줄이 composer 가 만드는 형식이다 (`composer.ITEM_LINE_RE` 가 정본)
@@ -13,9 +20,8 @@
    - 알아두세요: `제목 — 기관 · 대상: … · 의견 …까지`
 2. **바로 다음 줄이 `  [원문](URL)`** 이다.
 
-산문 줄 + 링크 줄은 항목이 아니다. 항목 섹션(`composer.SECTION_LIMITS` 의 키) 안에서만
-항목을 센다. 구형 형식 v1.2(`### 제목` + `**원문:** [x](url)`)는 더 이상 생성되지
-않으므로 지원하지 않는다 — 지원하는 척하면 두 형식의 계수가 또 갈라진다.
+산문 줄 + 링크 줄은 항목이 아니다. 구형 형식 v1.2(`### 제목` + `**원문:** [x](url)`)는
+더 이상 생성되지 않으므로 지원하지 않는다 — 지원하는 척하면 두 형식의 계수가 또 갈라진다.
 
 블록 경계 (사이클 6 #2): 항목 블록은 **제목 줄 + 원문 줄(+ 뒤따르는 빈 줄)** 뿐이다.
 다음 항목 줄·헤딩·주석은 각자 새 블록을 연다. 그래서 죽은 항목을 지워도 이어지는
@@ -23,7 +29,9 @@
 """
 
 import re
-from typing import Dict, List, NamedTuple, Optional, Tuple
+from typing import Dict, List, NamedTuple, Optional, Sequence, Tuple
+
+from alert.digest import sections as sections_mod
 
 # 링크 후보로 인정하는 스킴 (사이클 6 #4). `~9.30`·`산림사업자` 같은 괄호는 URL이 아니다.
 _SCHEME_RE = re.compile(r"^(?:https?://|www\.)", re.IGNORECASE)
@@ -35,9 +43,6 @@ ORIGIN_LINK_TEXT = "원문"
 _NOT_ITEM_PREFIXES = ("#", "<!--", "*", "·", "-", ">", "|")
 
 EMPTY_SECTION_LINE = "*(항목 없음)*"
-
-# composer 를 못 읽을 때의 항목 섹션 키 폴백 (계약 v2)
-FALLBACK_ITEM_SECTION_KEYS = ("신청하세요", "알아두세요")
 
 
 class Link(NamedTuple):
@@ -51,45 +56,23 @@ class Link(NamedTuple):
 
 def _composer():
     """composer 모듈 (없거나 깨지면 None). 지연 로딩 — import 순환을 피한다."""
-    try:
-        from alert.digest import composer
-    except Exception:       # noqa: BLE001 — composer 가 개편 중이어도 파서는 산다
-        return None
-    return composer
+    return sections_mod._composer()
 
 
-# ─── 섹션 ────────────────────────────────────────────────────────────────
-def item_section_keys() -> Tuple[str, ...]:
-    """항목 섹션 판정 키 (composer.SECTION_LIMITS 가 정본)."""
-    composer = _composer()
-    limits = getattr(composer, "SECTION_LIMITS", None) if composer else None
-    if isinstance(limits, dict) and limits:
-        return tuple(str(key) for key in limits)
-    return FALLBACK_ITEM_SECTION_KEYS
+# ─── 섹션 (정본은 sections.py) ───────────────────────────────────────────
+def item_section_headings(
+    markdown_text: str, item_sections: Optional[Sequence[str]] = None
+) -> Tuple[str, ...]:
+    """판정에 쓸 항목 섹션 헤딩 목록 (정확 일치용).
 
-
-def section_caps() -> Dict[str, int]:
-    """섹션 키 → 상한 (composer.SECTION_LIMITS). 없으면 빈 dict."""
-    composer = _composer()
-    limits = getattr(composer, "SECTION_LIMITS", None) if composer else None
-    if not isinstance(limits, dict):
-        return {}
-    return {str(key): int(value) for key, value in limits.items()}
-
-
-def section_key(section_name: Optional[str]) -> Optional[str]:
-    """섹션 헤딩 → 항목 섹션 키. 산문 섹션·미지의 섹션이면 None.
-
-    미지의 섹션을 산문으로 보는 것은 의도적이다 — 모르는 섹션의 블록을 지우는 것보다
-    죽은 URL 을 남겨 pass=false 로 크게 실패하는 편이 안전하다(fail-closed).
+    호출자가 check.json 의 목록을 주면 그것이 정본이다. 없으면 sections.resolve 가
+    composer 상수 → 선언 목록 순으로 찾고, 본문에 실제로 등장한 헤딩만 남긴다
+    (미지의 헤딩은 산문 취급 = fail-closed).
     """
-    name = (section_name or "").strip()
-    if not name:
-        return None
-    for key in item_section_keys():
-        if key and key in name:
-            return key
-    return None
+    if item_sections is not None:
+        return tuple(item_sections)
+    resolved, _ = sections_mod.resolve(None, markdown_text)
+    return resolved
 
 
 # ─── 링크·URL 추출 ───────────────────────────────────────────────────────
@@ -121,11 +104,8 @@ def find_links(text: str) -> List[Link]:
             index = open_bracket + 1
             continue
         url, after = _balanced(text, close_bracket + 2)
-        if url is None:
-            index = open_bracket + 1
-            continue
-        if not has_url_scheme(url):
-            # 링크가 아니다. 여는 괄호 뒤부터 다시 찾는다.
+        if url is None or not has_url_scheme(url):
+            # 링크가 아니다. 여는 대괄호 뒤부터 다시 찾는다.
             index = open_bracket + 1
             continue
         links.append(
@@ -181,19 +161,13 @@ def body_link_urls(markdown_text: str) -> List[str]:
 
 
 # ─── 항목 줄 판정 ────────────────────────────────────────────────────────
-def _item_line_re():
-    """항목 줄 정규식 (composer.ITEM_LINE_RE 가 정본)."""
-    composer = _composer()
-    pattern = getattr(composer, "ITEM_LINE_RE", None) if composer else None
-    return pattern
-
-
 def parse_item_line(line: str) -> Optional[Dict]:
     """항목 줄을 라벨·제목·기관·대상·마감으로 분해. 항목 줄이 아니면 None."""
     stripped = line.strip()
     if not stripped or stripped.startswith(_NOT_ITEM_PREFIXES):
         return None
-    pattern = _item_line_re()
+    composer = _composer()
+    pattern = getattr(composer, "ITEM_LINE_RE", None) if composer else None
     if pattern is None:
         return None
     matched = pattern.match(stripped)
@@ -231,15 +205,20 @@ def _is_comment(line: str) -> bool:
 #   item    — 항목 (제목 줄 + 원문 줄)
 #   comment — HTML 주석 줄 (보류 목록·레인 표기). **절대 항목과 묶이지 않는다**
 #   prose   — 그 밖의 줄 (협의회에서·회원사 소식·해설)
-def parse_blocks(markdown_text: str) -> List[Dict]:
+def parse_blocks(
+    markdown_text: str, item_sections: Optional[Sequence[str]] = None
+) -> List[Dict]:
     """본문을 블록으로 쪼갠다. 블록들의 lines 를 이으면 원문과 **정확히 같다**.
 
-    각 블록: {kind, lines, section, key, name?(section), title?/url?/fields?(item)}
+    각 블록: {kind, lines, section, is_item, name?(section),
+              title?/url?/fields?(item)}
+    `is_item` = 그 블록이 속한 섹션이 **항목 섹션 목록과 정확히 일치**하는가.
     """
+    known = item_section_headings(markdown_text, item_sections)
     lines = (markdown_text or "").split("\n")
     blocks: List[Dict] = []
     section_name = ""
-    key: Optional[str] = None
+    in_item_section = False
     index = 0
     total = len(lines)
 
@@ -258,18 +237,19 @@ def parse_blocks(markdown_text: str) -> List[Dict]:
 
         if stripped.startswith("## "):
             section_name = stripped[3:].strip()
-            key = section_key(section_name)
+            in_item_section = section_name in known        # 정확 일치
             index = push({"kind": "section", "name": section_name,
-                          "section": section_name, "key": key,
+                          "section": section_name,
+                          "is_item": in_item_section,
                           "lines": [line]}, index + 1)
             continue
 
         if _is_comment(line):
             index = push({"kind": "comment", "section": section_name,
-                          "key": key, "lines": [line]}, index + 1)
+                          "is_item": False, "lines": [line]}, index + 1)
             continue
 
-        if key and not stripped.startswith("#"):
+        if in_item_section and not stripped.startswith("#"):
             fields = parse_item_line(line)
             url = (
                 origin_url(lines[index + 1]) if fields and index + 1 < total
@@ -277,19 +257,21 @@ def parse_blocks(markdown_text: str) -> List[Dict]:
             )
             if fields and url:
                 index = push({"kind": "item", "title": fields["raw"],
-                              "section": section_name, "key": key,
+                              "section": section_name, "is_item": True,
                               "url": url, "fields": fields,
                               "lines": [line, lines[index + 1]]}, index + 2)
                 continue
 
         kind = "head" if not section_name else "prose"
-        index = push({"kind": kind, "section": section_name, "key": key,
-                      "lines": [line]}, index + 1)
+        index = push({"kind": kind, "section": section_name,
+                      "is_item": False, "lines": [line]}, index + 1)
 
     return blocks
 
 
-def item_blocks(markdown_text: str) -> List[Dict]:
+def item_blocks(
+    markdown_text: str, item_sections: Optional[Sequence[str]] = None
+) -> List[Dict]:
     """항목 섹션 안의 항목 블록만 (문서 순서).
 
     미리보기 번호 N = 이 리스트의 N번째(1-based). checker 의 항목 수, prune 의 삭제
@@ -297,44 +279,53 @@ def item_blocks(markdown_text: str) -> List[Dict]:
     """
     return [
         {"title": block["title"], "url": block["url"],
-         "section": block["section"], "key": block["key"],
-         "fields": block["fields"]}
-        for block in parse_blocks(markdown_text)
+         "section": block["section"], "fields": block["fields"]}
+        for block in parse_blocks(markdown_text, item_sections)
         if block["kind"] == "item"
     ]
 
 
-def item_block_count(markdown_text: str) -> int:
+def item_block_count(
+    markdown_text: str, item_sections: Optional[Sequence[str]] = None
+) -> int:
     """항목 블록 수."""
-    return len(item_blocks(markdown_text))
+    return len(item_blocks(markdown_text, item_sections))
 
 
-def item_urls(markdown_text: str) -> List[str]:
+def item_urls(
+    markdown_text: str, item_sections: Optional[Sequence[str]] = None
+) -> List[str]:
     """항목 URL만 (문서 순서). 번호 → URL 좌표의 정본."""
-    return [block["url"] for block in item_blocks(markdown_text)]
+    return [
+        block["url"] for block in item_blocks(markdown_text, item_sections)
+    ]
 
 
-def section_block_counts(markdown_text: str) -> Dict[str, int]:
+def section_block_counts(
+    markdown_text: str, item_sections: Optional[Sequence[str]] = None
+) -> Dict[str, int]:
     """항목 섹션 헤딩 → 그 섹션의 항목 블록 수."""
     counts: Dict[str, int] = {}
-    for block in parse_blocks(markdown_text):
-        if block["kind"] == "section" and block["key"]:
+    for block in parse_blocks(markdown_text, item_sections):
+        if block["kind"] == "section" and block["is_item"]:
             counts.setdefault(block["name"], 0)
         elif block["kind"] == "item":
             counts[block["section"]] = counts.get(block["section"], 0) + 1
     return counts
 
 
-def cap_violations(markdown_text: str) -> List[Tuple[str, int, int]]:
+def cap_violations(
+    markdown_text: str, item_sections: Optional[Sequence[str]] = None
+) -> List[Tuple[str, int, int]]:
     """상한을 넘은 (섹션 헤딩, 실제 수, 상한) 목록.
 
     상한을 **재적용하지는 않는다** — 넘으면 pass=false 로 알린다.
+    상한 표는 sections.caps_by_heading(composer.SECTION_LIMITS)가 정본이다.
     """
-    caps = section_caps()
-    violations = []
-    for name, count in section_block_counts(markdown_text).items():
-        key = section_key(name)
-        cap = caps.get(key) if key else None
-        if cap is not None and count > cap:
-            violations.append((name, count, cap))
-    return violations
+    counts = section_block_counts(markdown_text, item_sections)
+    caps = sections_mod.caps_by_heading(tuple(counts))
+    return [
+        (name, count, caps[name])
+        for name, count in counts.items()
+        if name in caps and count > caps[name]
+    ]

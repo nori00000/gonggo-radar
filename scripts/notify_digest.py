@@ -18,7 +18,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import requests
 
 from alert.digest import preview as preview_mod
+from alert.digest import sections as sections_mod
 from alert.digest import state as state_mod
+from alert.digest.checker import markdown_sha256
 from alert.utils.redact import redact
 
 TOPIC_GROUP_FILE = os.path.expanduser(
@@ -154,7 +156,14 @@ def main():
         return 2
 
     week = state_mod.week_from_markdown(markdown_path)
-    markdown_text = markdown_path.read_text(encoding="utf-8")
+    # 미리보기 지문(preview_sha)은 발송 게이트와 같은 **원시 바이트** 해시다.
+    # 렌더에 쓰는 텍스트도 같은 읽기에서 나와야 지문과 화면이 어긋나지 않는다.
+    try:
+        markdown_bytes = markdown_path.read_bytes()
+        markdown_text = markdown_bytes.decode("utf-8")
+    except (OSError, UnicodeDecodeError) as exc:
+        print(f"✗ 마크다운 읽기 실패: {exc}", file=sys.stderr)
+        return 2
     check = load_check(markdown_path)
 
     body = preview_mod.render_preview(week, markdown_text, check)
@@ -204,18 +213,23 @@ def main():
     # 계약 W10 사이클2 #1: 상태 쓰기는 **잠금 하 read-modify-write** 다.
     # 텔레그램 왕복 동안 다른 발송이 sent 를 썼을 수 있으므로, 여기서 다시 읽고
     # message_id 만 더한다(record_preview 는 status 를 건드리지 않는다).
-    item_urls = preview_mod.item_urls(markdown_text)
+    #
+    # 사이클3 #3: 사람이 **본** 본문의 지문(preview_sha)을 같이 남긴다. 승인 카드는
+    # 이 값으로 발급되고, 발송 게이트가 approved-sha·현재 해시·이 값의 일치를 본다.
+    item_sections, _ = sections_mod.resolve(check, markdown_text)
+    item_urls = preview_mod.item_urls(markdown_text, item_sections)
+    preview_sha = markdown_sha256(markdown_bytes)
     try:
         state_mod.update_state(
             state_path, lock_path, week,
             lambda current: state_mod.record_preview(
-                current, message_ids, item_urls
+                current, message_ids, item_urls, preview_sha
             ),
             on_reclaim=lambda reason: print(
                 f"⚠️  잔존 잠금 회수: {reason}", file=sys.stderr
             ),
         )
-        print(f"✓ 상태 기록: {state_path}")
+        print(f"✓ 상태 기록: {state_path} (preview_sha={preview_sha[:8]})")
     except (state_mod.StateError, state_mod.TransitionError,
             state_mod.LockBusy, OSError) as exc:
         print(f"⚠️  상태 기록 실패(미리보기는 전송됨): {redact(exc)}",

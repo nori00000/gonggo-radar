@@ -4,8 +4,10 @@ weekly_digest 는 재조립(compose)으로 죽은 항목을 빼지만, `/digest 
 재조립을 하지 않는다(손으로 고친 본문과 해설이 마커로 되돌아가기 때문이다).
 그래서 재검증은 **본문을 직접 편집**한다.
 
-이 모듈은 **편집만** 한다. 항목 판정·URL 추출·섹션 판정은 전부 `alert.digest.blocks`
-가 정본이다 (사이클 6 #1: 파서 단일화).
+이 모듈은 **편집만** 한다:
+- 어떤 섹션이 항목 섹션인가 → `alert.digest.sections` (check.json 의 `item_sections`
+  와 **정확 일치**, 계약 W10 사이클3 #7)
+- 그 섹션 안에서 무엇이 항목 블록인가 → `alert.digest.blocks` (사이클 6 #1)
 
 삭제 범위:
 - 죽은 URL을 가진 **항목 블록만** 지운다 (제목 줄 + 원문 줄). 블록 경계는 blocks 가
@@ -20,7 +22,7 @@ weekly_digest 는 재조립(compose)으로 죽은 항목을 빼지만, `/digest 
 """
 
 import re
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 from alert.digest import blocks as blocks_mod
 
@@ -47,7 +49,9 @@ def _strip_dead_links(line: str, dead_set, stripped: List[str]) -> str:
     return line
 
 
-def _render(kept: List[Dict], original: str, dead_set=frozenset()) -> Tuple[str, List[str]]:
+def _render(
+    kept: List[Dict], original: str, dead_set=frozenset()
+) -> Tuple[str, List[str]]:
     """남은 블록을 본문으로. dead_set 의 링크는 텍스트만 남긴다."""
     stripped: List[str] = []
     lines = [
@@ -63,7 +67,7 @@ def _render(kept: List[Dict], original: str, dead_set=frozenset()) -> Tuple[str,
 def _mark_empty_sections(kept: List[Dict]) -> None:
     """항목이 전부 빠진 항목 섹션에 composer 와 같은 빈 표시를 남긴다."""
     for index, block in enumerate(kept):
-        if block["kind"] != "section" or not block["key"]:
+        if block["kind"] != "section" or not block["is_item"]:
             continue
         following = kept[index + 1:]
         end = next(
@@ -79,7 +83,8 @@ def _mark_empty_sections(kept: List[Dict]) -> None:
 
 
 def strip_dead_urls(
-    markdown_text: str, dead: List[str]
+    markdown_text: str, dead: List[str],
+    item_sections: Optional[Sequence[str]] = None,
 ) -> Tuple[str, List[Dict], List[str]]:
     """(새 본문, 제거된 항목 [{title, url}], 링크만 떼어낸 죽은 URL 목록)."""
     dead_set = {url for url in (dead or []) if url}
@@ -88,7 +93,7 @@ def strip_dead_urls(
 
     removed: List[Dict] = []
     kept: List[Dict] = []
-    for block in blocks_mod.parse_blocks(markdown_text):
+    for block in blocks_mod.parse_blocks(markdown_text, item_sections):
         if block["kind"] == "item" and block["url"] in dead_set:
             removed.append({"title": block["title"], "url": block["url"]})
             continue
@@ -99,7 +104,9 @@ def strip_dead_urls(
     return text, removed, stripped
 
 
-def dedupe_urls(markdown_text: str) -> Tuple[str, List[Dict]]:
+def dedupe_urls(
+    markdown_text: str, item_sections: Optional[Sequence[str]] = None
+) -> Tuple[str, List[Dict]]:
     """같은 URL을 가리키는 뒤쪽 항목 블록을 삭제 (사이클 6 #3).
 
     제목이 같아도 URL 이 다르면 **남긴다** — 소스 간 비병합 계약(같은 사안을
@@ -108,7 +115,7 @@ def dedupe_urls(markdown_text: str) -> Tuple[str, List[Dict]]:
     seen = set()
     removed: List[Dict] = []
     kept: List[Dict] = []
-    for block in blocks_mod.parse_blocks(markdown_text):
+    for block in blocks_mod.parse_blocks(markdown_text, item_sections):
         if block["kind"] == "item":
             if block["url"] in seen:
                 removed.append({"title": block["title"], "url": block["url"]})

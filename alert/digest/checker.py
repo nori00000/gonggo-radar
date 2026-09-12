@@ -8,16 +8,18 @@ from typing import Dict, List, Optional
 import requests
 
 from alert.digest import blocks as blocks_mod
+from alert.digest import sections as sections_mod
 from alert.digest.composer import parse_deadline
 
 
-def markdown_sha256(markdown_text: str) -> str:
-    """검증한 본문의 지문 (계약 W10 크리틱 #3).
+def markdown_sha256(markdown_bytes: bytes) -> str:
+    """검증 결과를 **원시 파일 바이트**에 결속하는 SHA-256 (계약 W10 · PR #1).
 
-    check.json 에 이 값을 남기면 "과거 검증 재사용"을 발송 게이트가 잡아낼 수 있다 —
-    본문이 한 글자라도 바뀌면 해시가 달라지므로 재검증 없이는 발송되지 않는다.
+    정본은 파일 바이트다 — CRLF 만 바뀐 본문도 해시가 달라져 재검증을 요구한다.
+    check.json 의 키는 `markdown_sha256` 하나이고, 텍스트 정규화 해시는 쓰지 않는다.
+    미리보기 지문(state.preview_sha)·승인 카드 지문·`--approved-sha` 도 모두 이 값이다.
     """
-    return hashlib.sha256((markdown_text or "").encode("utf-8")).hexdigest()
+    return hashlib.sha256(markdown_bytes).hexdigest()
 
 
 def dead_urls(result: Dict) -> List[str]:
@@ -58,7 +60,7 @@ PROBE_HEADERS = {
 # 생존 확인에는 응답 본문이 필요 없다. 연결만 확인하고 최대 이만큼만 읽는다.
 MAX_PROBE_BYTES = 64 * 1024
 
-def extract_item_urls(markdown_text: str) -> List[str]:
+def extract_item_urls(markdown_text: str, item_sections=None) -> List[str]:
     """항목 블록의 원문 URL을 문서 순서대로, 중복 없이 뽑는다.
 
     사이클 6 #1: 판정은 `alert.digest.blocks` 가 정본이다 — 여기서 따로 세지 않는다.
@@ -68,7 +70,7 @@ def extract_item_urls(markdown_text: str) -> List[str]:
     """
     urls: List[str] = []
     seen = set()
-    for url in blocks_mod.item_urls(markdown_text):
+    for url in blocks_mod.item_urls(markdown_text, item_sections):
         if url and url not in seen:
             seen.add(url)
             urls.append(url)
@@ -151,7 +153,8 @@ def check_digest(
 
     Returns:
         {"items": [...], "dropped": [...], "pass": bool, "network_checked": bool,
-        "reason": str} 형태의 검증 결과.
+        "reason": str, "item_sections": [...], "commentary_sections": [...],
+        "markdown_sha256": str} 형태의 검증 결과.
 
         계약 v1.2: deadline_parsed는 정보 필드이며 게이트가 아니다. url_alive=False
         항목은 dropped에 기록되고 다이제스트에서 제외된다. pass=False 조건은
@@ -166,22 +169,29 @@ def check_digest(
             "pass": False,
             "network_checked": False,
             "item_blocks": 0,
+            "item_sections": [],
+            "commentary_sections": [],
             "reason": "마크다운 파일 없음",
-            "md_sha256": "",
+            "markdown_sha256": "",
         }
         result = _apply_warnings(result, warnings)
         write_check_result(output_path, result)
         return result
 
-    # 마크다운에서 URL 추출
-    with open(markdown_path, "r", encoding="utf-8") as f:
-        markdown_text = f.read()
+    # 본문 텍스트와 결속 해시는 **같은 읽기의 바이트**에서 나와야 한다 (PR #1).
+    markdown_bytes = markdown_path.read_bytes()
+    markdown_text = markdown_bytes.decode("utf-8")
+    content_hash = markdown_sha256(markdown_bytes)
+
+    # 사이클3 #7: 섹션 정본을 여기서 확정해 check.json 에 남긴다 — prune·preview·
+    # 봇은 이 목록과 **정확 일치**로 판정한다(부분 일치 금지).
+    item_sections, commentary_sections = sections_mod.classify(markdown_text)
 
     # 검사 대상 = 항목의 "원문" 링크(개정 v2.5 #2) + 본문에 남은 나머지 링크
     # (계약 W10 크리틱 #2). 앞쪽은 재조립이 제외할 수 있는 항목 좌표이고, 뒤쪽은
     # 해설·산문에 사람이 써넣은 링크다 — 후자를 안 보면 `/digest 재검토` 경로에서
     # 죽은 링크가 그대로 발송된다(재검토는 재조립을 하지 않는다).
-    item_urls = extract_item_urls(markdown_text)
+    item_urls = extract_item_urls(markdown_text, item_sections)
     urls = list(item_urls)
     seen = set(item_urls)
     for url in body_links(markdown_text):
@@ -197,8 +207,10 @@ def check_digest(
             "pass": False,
             "network_checked": False,
             "item_blocks": 0,
+            "item_sections": list(item_sections),
+            "commentary_sections": list(commentary_sections),
             "reason": "항목 없음",
-            "md_sha256": markdown_sha256(markdown_text),
+            "markdown_sha256": content_hash,
         }
         result = _apply_warnings(result, warnings)
         write_check_result(output_path, result)
@@ -260,8 +272,8 @@ def check_digest(
     #
     # 사이클2 #6·#7: 항목 수는 **링크 수가 아니라 항목 블록 수**다(해설의 참고 링크가
     # 항목으로 세어지면 "공고 0건인데 pass" 가 난다). 섹션 상한 초과도 fail 이다.
-    item_blocks = blocks_mod.item_block_count(markdown_text)
-    cap_violations = blocks_mod.cap_violations(markdown_text)
+    item_blocks = blocks_mod.item_block_count(markdown_text, item_sections)
+    cap_violations = blocks_mod.cap_violations(markdown_text, item_sections)
 
     if not network_checked:
         reason = "네트워크 미검사"
@@ -282,6 +294,8 @@ def check_digest(
         "items": items,
         "dropped": dropped,
         "item_blocks": item_blocks,
+        "item_sections": list(item_sections),
+        "commentary_sections": list(commentary_sections),
         "pass": (
             network_checked
             and alive_count > 0
@@ -292,7 +306,7 @@ def check_digest(
         # 실제로 네트워크 검사한 URL이 0건이면 False
         "network_checked": network_checked,
         "reason": reason,
-        "md_sha256": markdown_sha256(markdown_text),
+        "markdown_sha256": content_hash,
     }
     result = _apply_warnings(result, warnings)
 
