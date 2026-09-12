@@ -30,6 +30,21 @@ class FowiCrawler(BaseCrawler):
         "/user/bbs/bbsList.do?bbsManageId=25",   # 입찰공고
     ]
 
+    # 게시글이 아닌 안내/내비게이션 페이지 패턴.
+    # 2026-09-12 실측: 게시판 목록 페이지의 메뉴 링크(contentsView.do?cntntsId=...)가
+    # 범용 링크 추출 전략의 `view.do` 패턴에 걸려 공고로 적재됐다(10건 전부).
+    NAV_LINK_PATTERNS = (
+        re.compile(r"contentsView\.do", re.I),
+        re.compile(r"[?&]cntntsId=", re.I),
+    )
+
+    # 실제 게시글 링크는 href가 아니라 onclick="javascript:goView('<bbsId>')" 이고,
+    # 본문 URL은 /user/bbs/bbsView.do?bbsManageId=<board>&bbsId=<bbsId> 다.
+    # (2026-09-12 실측: fowi.or.kr 게시판이 POST 폼 submit 방식, GET도 동일 본문 응답)
+    GOVIEW_PATTERN = re.compile(r"goView\(\s*'?(\d+)'?\s*\)", re.I)
+    BBS_MANAGE_ID_PATTERN = re.compile(r"[?&]bbsManageId=(\d+)", re.I)
+    DATE_PATTERN = re.compile(r"\d{4}[-./]\d{1,2}[-./]\d{1,2}")
+
     def __init__(self):
         super().__init__(source_name="fowi")
         if BeautifulSoup is None:
@@ -73,6 +88,13 @@ class FowiCrawler(BaseCrawler):
         soup = BeautifulSoup(response.text, "html.parser")
         items: List[dict] = []
 
+        # 전략 0: fowi 실제 게시판 구조 (onclick goView)
+        bbs_manage_id = self._extract_bbs_manage_id(url)
+        items = self._parse_goview_board(soup, bbs_manage_id)
+        if items:
+            self.logger.info(f"Parsed {len(items)} items using goView strategy")
+            return items
+
         # 전략 1: table 기반 게시판
         items = self._parse_table_board(soup)
         if items:
@@ -96,6 +118,83 @@ class FowiCrawler(BaseCrawler):
             "HTML structure may have changed."
         )
         return []
+
+    @classmethod
+    def _extract_bbs_manage_id(cls, url: str) -> str:
+        """목록 URL에서 bbsManageId를 추출한다 (없으면 기본 게시판 12)."""
+        match = cls.BBS_MANAGE_ID_PATTERN.search(url or "")
+        return match.group(1) if match else "12"
+
+    def _parse_goview_board(
+        self, soup: "BeautifulSoup", bbs_manage_id: str
+    ) -> List[dict]:
+        """fowi 게시판의 실제 구조를 파싱한다.
+
+        게시글 행은 `<a class="pList" onclick="javascript:goView('9191')">제목</a>`
+        형태이고 같은 `<tr>`에 부서·등록일이 들어 있다. href가 `#pList`라서
+        href 기반 전략으로는 게시글을 찾을 수 없다.
+
+        Args:
+            soup: 목록 페이지
+            bbs_manage_id: 게시판 번호 (본문 URL 조립에 사용)
+
+        Returns:
+            공고 항목 목록
+        """
+        items: List[dict] = []
+        seen_ids = set()
+
+        for a_tag in soup.find_all("a", onclick=True):
+            match = self.GOVIEW_PATTERN.search(a_tag.get("onclick", ""))
+            if not match:
+                continue
+
+            bbs_id = match.group(1)
+            title = a_tag.get_text(strip=True)
+            if not title or bbs_id in seen_ids:
+                continue
+            seen_ids.add(bbs_id)
+
+            author, date_str = self._row_metadata(a_tag)
+
+            items.append({
+                "title": title,
+                "link": (
+                    f"/user/bbs/bbsView.do"
+                    f"?bbsManageId={bbs_manage_id}&bbsId={bbs_id}"
+                ),
+                "author": author,
+                "category": "",
+                "date": date_str,
+            })
+
+        return items
+
+    def _row_metadata(self, a_tag) -> tuple[str, str]:
+        """게시글 링크가 속한 행에서 담당부서와 등록일을 추출한다."""
+        row = a_tag.find_parent("tr")
+        if row is None:
+            return "", ""
+
+        cells = row.find_all("td")
+        texts = [cell.get_text(strip=True) for cell in cells]
+
+        date_str = next(
+            (t for t in texts if self.DATE_PATTERN.search(t)), ""
+        )
+
+        author = ""
+        title_idx = next(
+            (i for i, cell in enumerate(cells) if a_tag in cell.find_all("a")),
+            None,
+        )
+        if title_idx is not None and title_idx + 1 < len(texts):
+            candidate = texts[title_idx + 1]
+            is_number = candidate.replace(",", "").isdigit()
+            if candidate and not is_number and not self.DATE_PATTERN.search(candidate):
+                author = candidate
+
+        return author, date_str
 
     def _parse_table_board(self, soup: "BeautifulSoup") -> List[dict]:
         """table 기반 게시판 파싱."""
@@ -275,6 +374,10 @@ class FowiCrawler(BaseCrawler):
             if not is_view_link:
                 continue
 
+            # 안내 페이지는 게시글이 아니다 (contentsView.do 등)
+            if self._is_navigation_link(href):
+                continue
+
             if href in seen_links:
                 continue
             seen_links.add(href)
@@ -289,12 +392,27 @@ class FowiCrawler(BaseCrawler):
 
         return items
 
+    @classmethod
+    def _is_navigation_link(cls, href: str) -> bool:
+        """게시글이 아닌 안내 페이지 링크인지 판정한다.
+
+        Args:
+            href: 링크 URL (상대/절대 무관)
+
+        Returns:
+            안내/내비게이션 페이지면 True
+        """
+        if not href:
+            return False
+        return any(p.search(href) for p in cls.NAV_LINK_PATTERNS)
+
     def _extract_post_id(self, link: str) -> str:
         """URL에서 공고 ID를 추출한다."""
         if not link:
             return ""
 
         id_params = [
+            r"[?&]bbsId=(\d+)",
             r"announcementId=(\d+)", r"notifyId=(\d+)", r"nttId=(\d+)",
             r"seq=(\d+)", r"idx=(\d+)", r"no=(\d+)",
             r"articleId=(\d+)", r"artclId=(\d+)",
@@ -370,6 +488,12 @@ class FowiCrawler(BaseCrawler):
                 return None
 
             link = self._normalize_url(item.get("link", ""), base_url)
+
+            # 어느 파싱 전략을 타든 안내 페이지는 공고로 적재하지 않는다
+            if self._is_navigation_link(link):
+                self.logger.debug(f"Skipping navigation link: {link}")
+                return None
+
             source_id = self._extract_post_id(link)
 
             if not source_id:

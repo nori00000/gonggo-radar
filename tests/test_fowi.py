@@ -1,11 +1,15 @@
 """Tests for FowiCrawler."""
 
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
+from bs4 import BeautifulSoup
 
 from alert.crawlers.fowi import FowiCrawler
 from alert.models import RawAnnouncement
+
+FIXTURES = Path(__file__).parent / "fixtures"
 
 
 class TestFowiCrawler:
@@ -215,3 +219,143 @@ class TestFowiCrawler:
             start, end = crawler._parse_period("")
             assert start is None
             assert end is None
+
+
+class TestFowiBoardParsing:
+    """실제 fowi 게시판(fowi_board_list.html) 파싱.
+
+    픽스처는 2026-09-12 `https://fowi.or.kr/user/bbs/bbsList.do?bbsManageId=12`
+    실응답(200, 79,965 B)이다.
+
+    W7/W8 실측 결함: fowi 행 10건이 전부 `/user/contents/contentsView.do?cntntsId=...`
+    (산림치유 소개·지도사 양성기관 등 정적 안내 페이지)였다. 실제 게시글 링크는
+    href가 아니라 `onclick="javascript:goView('<bbsId>')"`이고, 목록 표
+    `table.BasicTable_02`에 tbody가 없어 기존 table/list 전략이 전부 실패한 뒤
+    범용 링크 전략의 `view.do` 패턴이 `contentsView.do`를 집어삼켰다.
+    """
+
+    @pytest.fixture
+    def crawler(self):
+        config = MagicMock()
+        config.crawler.timeout = 10
+        config.crawler.retry_count = 1
+        config.crawler.retry_delay = 0
+        config.crawler.user_agent = "test-agent"
+        source = MagicMock()
+        source.enabled = True
+        source.base_url = "https://fowi.or.kr"
+        config.crawler.sources = {"fowi": source}
+        with patch("alert.crawlers.base.get_config", return_value=config):
+            yield FowiCrawler()
+
+    @staticmethod
+    def _soup():
+        html = (FIXTURES / "fowi_board_list.html").read_text(encoding="utf-8")
+        return BeautifulSoup(html, "html.parser")
+
+    def test_is_navigation_link(self, crawler):
+        """contentsView.do / cntntsId= 는 안내 페이지."""
+        assert crawler._is_navigation_link(
+            "/user/contents/contentsView.do?cntntsId=380"
+        ) is True
+        assert crawler._is_navigation_link(
+            "https://fowi.or.kr/user/contents/contentsView.do?cntntsId=349"
+        ) is True
+        assert crawler._is_navigation_link(
+            "/user/bbs/bbsView.do?bbsManageId=12&bbsId=9191"
+        ) is False
+        assert crawler._is_navigation_link("") is False
+
+    def test_extract_bbs_manage_id(self, crawler):
+        """목록 URL에서 게시판 번호를 뽑는다."""
+        assert crawler._extract_bbs_manage_id(
+            "https://fowi.or.kr/user/bbs/bbsList.do?bbsManageId=25"
+        ) == "25"
+        # 없으면 기본 게시판
+        assert crawler._extract_bbs_manage_id("https://fowi.or.kr/") == "12"
+
+    def test_goview_strategy_parses_real_posts(self, crawler):
+        """onclick goView에서 게시글 10건을 뽑고 본문 URL을 조립한다."""
+        items = crawler._parse_goview_board(self._soup(), "12")
+
+        assert len(items) == 10
+        first = items[0]
+        assert first["title"] == "2026년 카이스트 멘토링 캠퍼스 투어 모집 안내"
+        assert first["link"] == "/user/bbs/bbsView.do?bbsManageId=12&bbsId=9191"
+        assert first["author"] == "AX정보화팀"
+        assert first["date"] == "2026-09-11"
+        # 안내 페이지는 한 건도 없다
+        assert all("contentsView" not in item["link"] for item in items)
+        assert all("cntntsId" not in item["link"] for item in items)
+
+    def test_href_strategies_find_no_posts_on_real_page(self, crawler):
+        """href 기반 전략만으로는 게시글을 못 찾는다(=goView 전략이 필요한 이유)."""
+        soup = self._soup()
+
+        # table.BasicTable_02에 tbody가 없어 표 전략이 실패한다
+        assert crawler._parse_table_board(soup) == []
+
+        # 범용 링크 전략은 안내 페이지를 더 이상 게시글로 반환하지 않는다
+        generic = crawler._parse_generic_links(soup)
+        assert all("contentsView" not in item["link"] for item in generic)
+        assert all("cntntsId" not in item["link"] for item in generic)
+
+    def test_fetch_board_listing_returns_posts_only(self, crawler):
+        """목록 파싱 결과는 게시글 10건이고 안내 페이지가 0건이다."""
+        html = (FIXTURES / "fowi_board_list.html").read_text(encoding="utf-8")
+        response = MagicMock()
+        response.text = html
+        response.apparent_encoding = "utf-8"
+
+        with patch.object(crawler, "get", return_value=response):
+            items = crawler._fetch_board_listing(
+                "https://fowi.or.kr/user/bbs/bbsList.do?bbsManageId=12"
+            )
+
+        assert len(items) == 10
+        assert all("bbsView.do" in item["link"] for item in items)
+        assert all("contentsView" not in item["link"] for item in items)
+
+    def test_to_announcement_rejects_navigation_link(self, crawler):
+        """어떤 전략을 타든 안내 페이지는 RawAnnouncement가 되지 않는다."""
+        nav_item = {
+            "title": "산림치유효과",
+            "link": "/user/contents/contentsView.do?cntntsId=349",
+            "author": "",
+            "category": "",
+            "date": "",
+        }
+        assert crawler._to_announcement(nav_item, "https://fowi.or.kr") is None
+
+    def test_to_announcement_uses_bbs_id(self, crawler):
+        """게시글은 bbsId를 source_id로 쓴다 (md5 폴백이 아니라)."""
+        post_item = {
+            "title": "2026년 카이스트 멘토링 캠퍼스 투어 모집 안내",
+            "link": "/user/bbs/bbsView.do?bbsManageId=12&bbsId=9191",
+            "author": "AX정보화팀",
+            "category": "",
+            "date": "2026-09-11",
+        }
+        announcement = crawler._to_announcement(post_item, "https://fowi.or.kr")
+
+        assert isinstance(announcement, RawAnnouncement)
+        assert announcement.source_id == "9191"
+        assert announcement.url == (
+            "https://fowi.or.kr/user/bbs/bbsView.do?bbsManageId=12&bbsId=9191"
+        )
+        assert announcement.period_end == "2026-09-11"
+
+    def test_fetch_end_to_end_yields_real_announcements(self, crawler):
+        """fetch()가 게시글 10건을 RawAnnouncement로 돌려준다."""
+        html = (FIXTURES / "fowi_board_list.html").read_text(encoding="utf-8")
+        response = MagicMock()
+        response.text = html
+        response.apparent_encoding = "utf-8"
+
+        with patch.object(crawler, "get", return_value=response):
+            announcements = crawler.fetch()
+
+        assert len(announcements) == 10
+        assert all(a.source == "fowi" for a in announcements)
+        assert all("bbsView.do" in a.url for a in announcements)
+        assert all("contentsView" not in a.url for a in announcements)

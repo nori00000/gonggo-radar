@@ -1,0 +1,1767 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+	<title>공지사항-한국산림복지진흥원</title>
+
+    <meta charset="UTF-8">
+    <meta name="naver-site-verification" content="131499cebd45d919ae87819ddaf86c0181ee9855"/>
+    <meta http-equiv="X-UA-Compatible" content="IE=edge" />
+    <meta name="Author" content="">
+    <meta name="Keywords" content="한국산림복지진흥원">
+    <meta name="description" content="생애주기별 산림복지서비스 제공, 복권기금 녹색자금 운영, 산림복지전문가 등록·관리 및 교육 등">
+    <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, minimum-scale=1">
+    <meta property="og:url" content="https://fowi.or.kr/user/main/main.do">
+	<meta property="og:title" content="한국산림복지진흥원">
+	<meta property="og:type" content="website">
+	<meta property="og:image" content="/images/admin_logo.png">
+	<meta property="og:description" content="생애주기별 산림복지서비스 제공, 복권기금 녹색자금 운영, 산림복지전문가 등록·관리 및 교육 등">
+
+    <style>
+		.GnbNew .Menu li ul.subM01 {
+		width: 140px;
+	    height: 0px;
+	    overflow: hidden;
+	    border-right: 1px solid #cccccc;
+	    background-color: rgba(255,255,255,0.8);
+	    }
+		.GnbNew .Menu li ul.subM01 li {
+		font-size: 13px;
+	    color: #343434;
+	    font-weight: 500;
+	    padding-left: 15px;
+	    margin : 0px;
+	    height:19px;
+	    margin-bottom: 3px;
+	    text-align:left;
+	    text-decoration: none;
+	    width: 140px;
+	    line-height:19px;
+	    }
+		.GnbNew .Menu li ul.subM01 li:first-child {
+		margin-top:15px;
+	    }
+
+		.GnbNew .Menu li ul.subM01 li a:hover, .GnbNew .Menu li ul.subM01 li a:focus {text-decoration: none;color:#0d9242;font-weight:500;text-decoration: none;}
+		.GnbNew .Menu li ul.subM01 li a, .GnbNew .Menu li.on ul.subM01 li a,.GnbNew .Menu li.active ul.subM01  li a {height:19px;color:#343434;font-weight:500;text-decoration: none;}
+		.GnbNew .Menu li.active ul.subM01  li a:hover, .GnbNew .Menu li.active ul.subM01 li a:focus {height:19px;color:#0d9242;font-weight:500;text-decoration: none;}
+		.GnbNew ul.Menu li ul.subM01 li a:before{position: absolute; bottom: 0; left: 0;  width: 0; height: 0px;  content: ''; background: #0d9242; transition: all .3s ease}
+		.GnbNew ul.Menu li.active ul.subM01 li a:before{position: absolute; bottom: 0; left: 0;  width: 100%; height: 0px;  content: ''; background: #0d9242;; transition: all .3s ease}
+		.keywordSearchClose:focus {border:1px solid #fff;}
+		.keywordSearchBtn:focus {border:1px solid #fff;}
+	</style>
+
+    <link rel="shortcut icon" href="/images/favicon.ico" />
+<link rel="stylesheet" type="text/css" href="/css/common.css" />
+		<link rel="stylesheet" type="text/css" href="/css/swiper.css" />
+		<!-- 241031 현행화 -->
+		<script type="text/javascript" src="/js/jquery-2.1.1.js"></script>
+	<script type="text/javascript" src="/js/jquery-ui.js"></script>
+	<script type="text/javascript" src="/js/jquery.rwdImageMaps.js"></script>
+	<!-- 신규추가 -->
+	<script type="text/javascript" src="/js/mainUI.js"></script>
+	<script type="text/javascript" src="/js/swiper.min.js"></script>
+<!-- 241031 현행화 -->
+		<!--  메인시안 변경 추가 -->
+<!--  메인시안 변경 추가 -->
+	<!--// 신규추가 end  -->
+    <script>var app_path = "";</script>
+<!-- 에코힐링(E-book) 운영 : 396 || 로컬 : 89 -->
+<!-- 운영 : 338 || 로컬 : 29 현재 사용X -->
+<!-- 현재 사용X -->
+<!-- 운영 : 380 || 로컬 : 73 -->
+<!-- 운영 : 371 || 로컬 : 64 -->
+<script type="text/javascript" language="javascript" src="/js/jquery.validate.min.js"></script>
+    <script type="text/javascript" language="javascript" src="/js/common.js"></script>
+    <script>
+	    
+	    // XSS 공격 방지
+	    function escapeHtml(unsafe) {
+	        return unsafe
+	             .replace(/&/g, "&amp;")
+	             .replace(/</g, "&lt;")
+	             .replace(/>/g, "&gt;")
+	             .replace(/"/g, "&quot;")
+	             .replace(/'/g, "&#039;");
+	    }
+
+	    function goSearch(){
+    		var searchForm = document.totalSearchForm;
+
+    		searchForm.query.value = escapeHtml(searchForm.query.value);
+
+    		if (searchForm.query.value == "") {
+    			alert("검색어를 입력하세요.");
+    			searchForm.query.focus();
+    			return;
+    		}
+
+    		searchForm.submit();
+	    }
+
+	    var curZoom = 100; 
+	    function zoom(flg) {
+	    	curZoom = curZoom + flg * 10;
+	    	if(flg == 0){
+	    		curZoom = 100;
+	    		$('#restoreZoom').text('화면초기화(100%)');
+	    		document.body.style.zoom = "100%";
+	    		return;
+	    	}
+	    	if(curZoom < 70) {
+	    		alert("더이상 축소할 수 없습니다.");
+	    		curZoom = 70;
+	    		return;
+	    	}
+	    	if(curZoom > 200) {
+	    		alert("더이상 확대할 수 없습니다.");
+	    		curZoom = 200;
+	    		return;
+	    	}
+	    	$('#restoreZoom').text('화면초기화(' + curZoom + '%)');
+	    	document.body.style.zoom = curZoom + "%";
+	    }
+	    
+		$(document).ready(function(){
+			
+			attr = '';
+
+			$('#gnb > li div > a').focusin(function () {
+				if(!$(this).is(':hover')){
+					$(this).siblings('ul').css('display','block').css('z-index', '50000');
+				}
+			});
+
+			$('#gnb > li div > ul > li:last-child').focusout(function() {
+				$(this).parent('ul').css('display', 'none');
+			});
+
+			$('.GnbNew > ul > li').focusin(function(){
+				$('.GnbNew > ul > li').removeClass('active');
+				$('.subGnbNew').stop().animate({height:'0px'},280);
+				$('.subM01').stop().animate({height:'0px'},280);
+				$(this).addClass("active");
+				$('#subGnbNew').stop().animate({height:'260px'},280);
+				$('.subM01').stop().animate({height:'260px'},280);
+			});
+
+			$('.GnbNew > ul > li').focusout(function(){
+				 $('#subGnbNew').stop().animate({height:'0px'},280);
+				 $('.subM01').stop().animate({height:'0px'},280);
+		         $('.GnbNew > ul > li').removeClass('active');
+		         $('.subGnbNew').hover(function(){
+		             $('#subGnbNew').stop().animate({height:'260px'},280);
+		             $('.subM01').stop().animate({height:'260px'},280);
+		         },function() {
+		             $('#subGnbNew').stop().animate({height:'0px'},280);
+		             $('.subM01').stop().animate({height:'0px'},280);
+		         });
+			});
+
+
+			/* $('.subMenuarea > ul > li').focusin(function(){
+				console.log("메인메뉴 out");
+			}); */
+			
+		    $('.LnbZone > ul > li > a').focusin(function(){
+		    	if(!$(this).is(':active')){
+		    		if(!$(this).hasClass('active')){
+		    			$(this).parent().trigger('click');
+		    		}
+		    	}
+		    });
+
+		   	$('.LnbZone > ul > li').focusin(function(){
+		   		$('.LnbZone > ul > li > a').removeClass("active");
+		   		$(this).children('a').addClass("active");
+		   	});
+
+		   	
+			$('.relation01 .site_list li :last').focusout(function() {
+				$('.relation01 .site_list').css('display', 'none');
+			});
+
+			$('.relation01 .familySite').focusin(function() {
+				$('.relation01 .site_list').css('display', 'block');
+			});
+			
+		});
+		
+
+
+
+	    var app_path = "";
+
+	    
+	    var ids = "|24|60|";
+	    var tabNum = 0;
+
+	    tabNum = "2";
+	    
+
+		var index;
+		$(document).ready(function(){
+			$(".navigationInfo > span > a").eq(0).attr("href", app_path + "/");
+	       	if(tabNum != "")
+	       		$('.GnbNew > ul > li').eq(tabNum).addClass('active');
+
+			
+			$('.GnbNew > ul > li').hover (function(){
+	        	$('.GnbNew > ul > li').removeClass('active');
+	            $('.subGnbNew').stop().animate({height:'0px'},280);
+	            $('.subM01').stop().animate({height:'0px'},280);
+	            $(this).addClass("active");
+	            $('#subGnbNew').stop().animate({height:'260px'},280);
+	            $('.subM01').stop().animate({height:'260px'},280);
+	        },function(){
+				$('#subGnbNew').stop().animate({height:'0px'},280);
+	           	$('.subM01').stop().animate({height:'0px'},280);
+	           	$('.GnbNew > ul > li').removeClass('active');
+	           	$('.subGnbNew').hover(function(){
+	            	$('#subGnbNew').stop().animate({height:'260px'},280);
+	               	$('.subM01').stop().animate({height:'260px'},280);
+	           		},function(){
+		            	$('#subGnbNew').stop().animate({height:'0px'},280);
+		               	$('.subM01').stop().animate({height:'0px'},280);
+		               	//$('.GnbNew > ul > li').removeClass('active');
+					});
+	        });
+
+
+		        currentMenu = $(".navigationInfo a").eq(1).text().trim();
+				$.each($('.GnbNew > ul > li'), function(idx){
+			        if($(this).text() == currentMenu){
+			        	$(this).addClass('active');
+			            return;
+			        }
+				});
+
+
+		$('.subM').hover(function(){
+			$('.GnbNew > ul > li').removeClass('active');
+			$('.GnbNew > ul > li').eq($(this).index()).addClass('active');
+		},function(){
+			$('.GnbNew > ul > li').removeClass('active');
+
+			currentMenu = $(".navigationInfo a").eq(1).text().trim();
+			$.each($('.GnbNew > ul > li'), function(idx){
+				if($(this).text() == currentMenu){
+					$(this).addClass('active');
+					return;
+				}
+			});
+
+	    });
+
+
+		
+		$('ul.social-icons li').hover(function() {
+				$(this).stop().animate({"background-position-y": "-38px"}, 100);
+			},function(){
+				$(this).stop().animate({"background-position-y": "0px"}, 100);
+		});
+
+
+		
+		var lnbIdx = 0;
+	    
+
+		$('.LnbZone > ul > li').on('click', function(){
+			$('.LnbZone > ul > li > a').removeClass("active");
+            $(this).children('a').addClass("active");
+            if(lnbIdx != $('.LnbZone > ul > li').index(this)){
+            	lnbIdx = $('.LnbZone > ul > li').index(this);
+                $('.LnbZone > ul > li > ul').slideUp();
+                $(this).children('ul').slideToggle();
+            }else{
+                lnbIdx = -1;
+                $('.LnbZone > ul > li > ul').slideUp();
+            }
+        });
+
+		$(".TabMenu").eq(0).children("ul").children("li").each(function(idx){
+	        $(this).click(function(){
+				$(".TabMenu").eq(0).children("ul").children("li").removeClass("active");
+	            $(this).addClass("active");
+	            $(".TabContent").hide();
+	            $(".TabContent").eq(idx).show();
+	        });
+	        $(this).focus(function(){
+	            $(".TabMenu").eq(0).children("ul").children("li").removeClass("active");
+	            $(this).addClass("active");
+	            $(".TabContent").hide();
+	            $(".TabContent").eq(idx).show();
+	        });
+    	});
+
+		
+		$(".ServiceTab2").eq(0).children("ul").children("li").each(function(idx){
+			$(this).click(function(){
+	            $(".ServiceTab2").eq(0).children("ul").children("li").removeClass("active");
+	            $(this).addClass("active");
+	            $(".ServiceTabContent").hide();
+	            $(".ServiceTabContent").eq(idx).show();
+	        });
+			$(this).focus(function(){
+	            $(".ServiceTab2").eq(0).children("ul").children("li").removeClass("active");
+	            $(this).addClass("active");
+	            $(".ServiceTabContent").hide();
+	            $(".ServiceTabContent").eq(idx).show();
+	        });
+    	});
+
+// 	    $('.tC01').hover(function(){ $('.tC01 .tCA').slideToggle(); });
+// 	    $('.tC02').hover(function(){ $('.tC02 .tCA').slideToggle(); });
+// 	    $('.tC03').hover(function(){ $('.tC03 .tCA').slideToggle(); });
+// 	    $('.tC04').hover(function(){ $('.tC04 .tCA').slideToggle(); });
+// 	    $('.tC05').hover(function(){ $('.tC05 .tCA').slideToggle(); });
+// 	    $('.tC06').hover(function(){ $('.tC06 .tCA').slideToggle(); });
+// 	    $('.tC07').hover(function(){ $('.tC07 .tCA').slideToggle(); });
+		$('.Tabcard li').mouseenter(function(){
+			$(this).find('.tCA').slideDown();
+		});
+
+	});
+	    function noService(){
+	        alert("준비중입니다.");
+	    }
+
+	    function goUrl(url){
+	        location.href="" + url;
+	    }
+
+	    function goPage(linkAdres, trgtAt){
+		  if(linkAdres != ''){
+		      var target;
+
+		      if(linkAdres.substr(0,5) != 'https'){
+		    	  linkAdres = 'http://' + linkAdres;
+		      }
+
+		      if(trgtAt == 'Y'){
+		        target = "_blank";
+		      }else{
+		        target = "_self";
+		      }
+		      window.open(linkAdres, target);
+		  }else {
+		    return false;
+		  }
+		}
+
+	    </script>
+    <script type="text/javascript" language="javascript" src="/js/modules/user/bbs/bbsList.js"></script>
+
+	<!-- Naver Search Advisor -->
+<!-- 	<meta name="naver-site-verification" content="16509d5b194629e44a4d58a535634dac80f7cb34"/> -->
+	<!-- Naver tag (wcslog.js), Analytics -->
+<!--     <script type="text/javascript" src="//wcs.pstatic.net/wcslog.js"></script> -->
+	<script type="text/javascript">
+// 		if(!wcs_add) var wcs_add = {};
+// 		wcs_add["wa"] = "3a41eb8f2ac2d";
+// 		if(window.wcs) {
+// 		  wcs_do();
+// 		}
+	</script>
+
+	<!-- Google Search console -->
+<!-- 	<meta name="google-site-verification" content="8OOOSRPg1hQC80t7D7iuQ7ahiR8ebmOYuWwGesHenhM"/> -->
+	<!-- Google tag (gtag.js), Analytics -->
+<!-- 	<script async src="https://www.googletagmanager.com/gtag/js?id=G-JR8NFD73G2"></script> -->
+	<script>
+// 	  window.dataLayer = window.dataLayer || [];
+// 	  function gtag(){dataLayer.push(arguments);}
+// 	  gtag('js', new Date());
+
+// 	  gtag('config', 'G-1KKH27DGR9');
+	</script>
+</head>
+
+<body>
+    <!-- Google Tag Manager (noscript) -->
+<!-- 	<noscript> -->
+<!-- 		<iframe src="https://www.googletagmanager.com/ns.html?id=GTM-WBF2SKJ3" height="0" width="0" style="display:none;visibility:hidden"></iframe> -->
+<!-- 	</noscript> -->
+	<!-- End Google Tag Manager (noscript) -->
+    <span itemscope="" itemtype="http://schema.org/Organization"  style="display: none;">
+		<link itemprop="url" href="https://www.fowi.or.kr" tabindex="-1">
+		<a title="웹마스터도구(네이버)" itemprop="sameAs" href="https://blog.naver.com/k-fowi" tabindex="-1">웹마스터도구(네이버)</a>
+		<a title="웹마스터도구(페이스북)" itemprop="sameAs" href="https://www.facebook.com/forestfowi" tabindex="-1">웹마스터도구(페이스북)</a>
+		<a title="웹마스터도구(유튜브)" itemprop="sameAs" href="https://www.youtube.com/channel/UC8FI6B8bMlOwv83V_SJ7iYA" tabindex="-1">웹마스터도구(유튜브)</a>
+		<a title="웹마스터도구(인스타그램)" itemprop="sameAs" href="https://www.instagram.com/forestfowi/" tabindex="-1">웹마스터도구(인스타그램)</a>
+	</span>
+	<div id="skipnavigation" title="스킵네비게이션">
+		<ul>
+			<li>
+				<a tabindex="0" href="#Contents">본문 바로가기</a>
+				    </li>
+			<li><a href="#mainManu">주메뉴 바로가기</a></li>
+		</ul>
+	</div>
+
+
+	<div id="wrap">
+		<div class="headerWrap">
+			<!-- 메인페이지 상단 슬라이드배너 시작-->
+<!-- 메인페이지 상단 슬라이드배너 끝-->
+
+<!-- 메인페이지 상단 모바일배너 시작-->
+<div class="mobile-header">
+	<h1 class="fowiLogo">
+		<a href="/" title="홈으로">한국산림복지진흥원</a>
+	</h1>
+	<img src="/images/number.png" alt="고객센터 1566-4460" class="number" width="155">
+	<span class="blind">고객센터(AM 09시 ~ PM 06시) 1566-4460 산림복지시설 예약 및 결제 문의, 이용안내 등</span>
+	<a class="mobile-eng" href="/user/eng/engMain.do"
+		target="_blank" title="영문페이지 이동(새창)"> <i class="fas fa-globe"></i>
+		ENG
+	</a>
+	<div class="mobile-menu">
+		<span class="bar"></span> <span class="bar"></span>
+	</div>
+</div>
+<!-- 메인페이지 상단 모바일배너 끝-->
+
+<div class="header">
+	<div class="headerTop" id="headerTop">
+		<ul id="gnb">
+			<li class="floatL"><a href="javascript:zoom(-1)" title="화면 축소">화면
+					축소</a></li>
+			<li class="floatL"><a href="javascript:zoom(0)" title="화면 초기화"
+				id="restoreZoom">화면 초기화(100%)</a></li>
+			<li class="floatL"><a href="javascript:zoom(1)" title="화면 확대">화면
+					확대</a></li>
+			<li><a href="/user/eng/engMain.do" target="_blank"
+				title="ENG"> <img src="/assets/img/global.png" alt=""
+					width="15" style="padding-bottom: 3px;"> ENG
+			</a></li>
+			<li><a href="/user/contents/contentsView.do?cntntsId=359" target="_blank"
+				title="국립산림치유원">국립산림치유원</a></li>
+			<li>
+				<div class="link">
+					<a href="#headerTop" class="QuickLink">국립숲체원</a>
+					<ul class="site_list">
+						<li><a href="/user/contents/contentsView.do?cntntsId=361" target="_blank"
+							title="국립횡성숲체원">국립횡성숲체원</a></li>
+						<li><a href="/user/contents/contentsView.do?cntntsId=360" target="_blank"
+							title="국립칠곡숲체원">국립칠곡숲체원</a></li>
+						<li><a href="/user/contents/contentsView.do?cntntsId=362" target="_blank"
+							title="국립장성숲체원">국립장성숲체원</a></li>
+						<li><a
+							href="/user/contents/contentsView.do?cntntsId=177"
+							target="_blank" title="국립청도숲체원">국립청도숲체원</a></li>
+						<li><a
+							href="/user/contents/contentsView.do?cntntsId=232"
+							target="_blank" title="국립대전숲체원">국립대전숲체원</a></li>
+						<li><a
+							href="/user/contents/contentsView.do?cntntsId=283"
+							target="_blank" title="국립춘천숲체원">국립춘천숲체원</a></li>
+						<li><a
+							href="/user/contents/contentsView.do?cntntsId=300"
+							target="_blank" title="국립나주숲체원">국립나주숲체원</a></li>
+					</ul>
+				</div>
+			</li>
+			<li>
+				<div class="link02">
+					<a href="#headerTop" class="QuickLink02">국립치유의숲</a>
+					<ul class="site_list02">
+						<li><a
+							href="/user/contents/contentsView.do?cntntsId=142"
+							target="_blank" title="국립양평치유의숲">국립양평치유의숲</a></li>
+						<li><a
+							href="/user/contents/contentsView.do?cntntsId=140"
+							target="_blank" title="국립대관령치유의숲">국립대관령치유의숲</a></li>
+						<li><a
+							href="/user/contents/contentsView.do?cntntsId=161"
+							target="_blank" title="국립대운산치유의숲">국립대운산치유의숲</a></li>
+						<li><a
+							href="/user/contents/contentsView.do?cntntsId=211"
+							target="_blank" title="국립김천치유의숲">국립김천치유의숲</a></li>
+						<li><a
+							href="/user/contents/contentsView.do?cntntsId=217"
+							target="_blank" title="국립제천치유의숲">국립제천치유의숲</a></li>
+						<li><a
+							href="/user/contents/contentsView.do?cntntsId=222"
+							target="_blank" title="국립예산치유의숲">국립예산치유의숲</a></li>
+						<li><a
+							href="/user/contents/contentsView.do?cntntsId=227"
+							target="_blank" title="국립곡성치유의숲">국립곡성치유의숲</a></li>
+					</ul>
+				</div>
+			</li>
+			<li><a href="https://sky.fowi.or.kr" target="_blank"
+				title="국립하늘숲추모원">국립하늘숲추모원</a></li>
+		</ul>
+	</div>
+	<div class="headergnb">
+		<h1 class="fowiLogo">
+			<a href="/" title="홈으로">한국산림복지진흥원</a>
+		</h1>
+		<div class="GnbNew">
+			<ul class="Menu" id="mainManu">
+				<!-- 운영에서는 target="_new" 먹음 -->
+						<li><a href="/user/contents/contentsView.do?cntntsId=162"
+							>산림복지란</a>
+
+							<ul class="subM01">
+								<!-- KST 추가 -->
+								<li><a href="/user/contents/contentsView.do?cntntsId=162"
+											>산림복지</a></li>
+									<li><a href="/user/contents/contentsView.do?cntntsId=346"
+											>산림치유</a></li>
+									<li><a href="/user/contents/contentsView.do?cntntsId=305"
+											>산림교육</a></li>
+									<li><a href="/user/bbs/bbsList.do?bbsManageId=75"
+											>산림복지연구</a></li>
+									</ul></li>
+					<!-- 운영에서는 target="_new" 먹음 -->
+						<li><a href="/user/contents/contentsView.do?cntntsId=358"
+							>주요사업</a>
+
+							<ul class="subM01">
+								<!-- KST 추가 -->
+								<li><a href="/user/contents/contentsView.do?cntntsId=358"
+											>산림복지시설운영</a></li>
+									<li><a href="/user/contents/contentsView.do?cntntsId=412"
+											>산림치유사업</a></li>
+									<li><a href="/user/contents/contentsView.do?cntntsId=435"
+											>산림교육사업</a></li>
+									<li><a href="/user/contents/contentsView.do?cntntsId=411"
+											>산림문화사업</a></li>
+									<li><a href="/user/contents/contentsView.do?cntntsId=382"
+											>전문업 창업 육성</a></li>
+									<li><a href="/user/contents/contentsView.do?cntntsId=376"
+											>전문인력 양성</a></li>
+									<li><a href="/user/contents/contentsView.do?cntntsId=125"
+											>녹색자금 운영</a></li>
+									</ul></li>
+					<!-- 운영에서는 target="_new" 먹음 -->
+						<li><a href="/user/bbs/bbsList.do?bbsManageId=12"
+							>알림마당</a>
+
+							<ul class="subM01">
+								<!-- KST 추가 -->
+								<li><a href="/user/bbs/bbsList.do?bbsManageId=12"
+											>공지사항</a></li>
+									<li><a href="https://www.alio.go.kr/item/itemOrganList.do?apbaId=C1055&reportFormRootNo=B1030"
+											target="_new" title="새창열림">입찰공고</a></li>
+									<li><a href="/user/bbs/bbsList.do?bbsManageId=22"
+											>채용정보</a></li>
+									<li><a href="/user/bbs/bbsList.do?bbsManageId=23"
+											>보도자료</a></li>
+									<li><a href="/user/contents/contentsView.do?cntntsId=396"
+											>매거진</a></li>
+									<li><a href="/user/bbs/bbsList.do?bbsManageId=19"
+											>서식자료</a></li>
+									<li><a href="/user/contents/contentsView.do?cntntsId=169"
+											>FOWI 캐릭터 소개</a></li>
+									<li><a href="/user/bbs/bbsList.do?bbsManageId=64"
+											>CCTV 설치 행정예고</a></li>
+									<li><a href="/user/bbs/bbsList.do?bbsManageId=66"
+											>목적 외 이용 및 제3자 제공</a></li>
+									</ul></li>
+					<!-- 운영에서는 target="_new" 먹음 -->
+						<li><a href="/user/contents/contentsView.do?cntntsId=173"
+							>국민소통</a>
+
+							<ul class="subM01">
+								<!-- KST 추가 -->
+								<li><a href="/user/contents/contentsView.do?cntntsId=173"
+											>고객헌장</a></li>
+									<li><a href="https://www.epeople.go.kr"
+											target="_new" title="새창열림">국민신문고</a></li>
+									<li><a href="https://www.mpm.go.kr/mpm/"
+											target="_new" title="새창열림">적극행정</a></li>
+									<li><a href="/user/bbs/bbsList.do?bbsManageId=86"
+											>국민제안</a></li>
+									<li><a href="/user/bbs/bbsList.do?bbsManageId=88"
+											>칭찬합시다</a></li>
+									<li><a href="/user/bbs/bbsList.do?bbsManageId=24"
+											>홍보자료</a></li>
+									<li><a href="/user/bbs/bbsList.do?bbsManageId=82"
+											>열린게시판</a></li>
+									<li><a href="/user/contents/contentsView.do?cntntsId=289"
+											>윤리·인권경영</a></li>
+									<li><a href="/user/bbs/bbsList.do?bbsManageId=94"
+											>기업성장응답센터</a></li>
+									</ul></li>
+					<!-- 운영에서는 target="_new" 먹음 -->
+						<li><a href="/user/contents/contentsView.do?cntntsId=390"
+							>정보공개</a>
+
+							<ul class="subM01">
+								<!-- KST 추가 -->
+								<li><a href="/user/contents/contentsView.do?cntntsId=390"
+											>정보공개</a></li>
+									<li><a href="/user/publication/publication.do?menu=publict_"
+											>사전정보공표</a></li>
+									<li><a href="/user/bbs/bbsList.do?bbsManageId=96"
+											>사전정보 국민의견함</a></li>
+									<li><a href="/user/disclosure/disclosure.do?menu=disclosure_"
+											>경영공시</a></li>
+									<li><a href="/user/contents/contentsView.do?cntntsId=395"
+											>공공데이터 개방</a></li>
+									<li><a href="/user/bbs/bbsList.do?bbsManageId=39"
+											>사업실명제</a></li>
+									<li><a href="/user/contents/contentsView.do?cntntsId=270"
+											>안전경영</a></li>
+									<li><a href="/user/contents/contentsView.do?cntntsId=276"
+											>방만경영 점검</a></li>
+									<li><a href="/user/contents/contentsView.do?cntntsId=275"
+											>(주)포이파트너스</a></li>
+									</ul></li>
+					<!-- 운영에서는 target="_new" 먹음 -->
+						<li><a href="/user/contents/contentsView.do?cntntsId=351"
+							>진흥원소개</a>
+
+							<ul class="subM01">
+								<!-- KST 추가 -->
+								<li><a href="/user/contents/contentsView.do?cntntsId=351"
+											>진흥원장 인사말</a></li>
+									<li><a href="/user/bbs/bbsList.do?bbsManageId=17"
+											>주요활동</a></li>
+									<li><a href="/user/contents/contentsView.do?cntntsId=352"
+											>진흥원 소개 및 연혁</a></li>
+									<li><a href="/user/contents/contentsView.do?cntntsId=353"
+											>설립근거 및 목적</a></li>
+									<li><a href="/user/contents/contentsView.do?cntntsId=354"
+											>미션 및 비전</a></li>
+									<li><a href="/user/contents/contentsView.do?cntntsId=321"
+											>ESG 경영</a></li>
+									<li><a href="/user/contents/contentsView.do?cntntsId=166"
+											>기관 상징·CI</a></li>
+									<li><a href="/user/contents/contentsView.do?cntntsId=312"
+											>FOWI가 일하는 6원칙</a></li>
+									<li><a href="/user/contents/orgchtView.do?cntntsId=135"
+											>조직안내</a></li>
+									<li><a href="/user/contents/contentsView.do?cntntsId=359"
+											>소속기관</a></li>
+									<li><a href="/user/contents/contentsView.do?cntntsId=121"
+											>오시는 길</a></li>
+									</ul></li>
+					</ul>
+		</div>
+		<ul class="topUtil">
+			<li>
+<!-- 			<a href="https://sooperang.or.kr/main.do" target="_blank" -->
+<!-- 				title="통합예약">예약<br>하기 -->
+<!-- 			</a> -->
+			</li>
+			<li><a id="topSearch" href="#topSearch" title="검색"
+				class="topSearch">검색</a></li>
+		</ul>
+		<img src="/images/number.png" alt="고객센터 1566-4460" class="number" width="155">
+		<span class="blind">고객센터(AM 09시 ~ PM 06시) 1566-4460 산림복지시설 예약 및 결제 문의, 이용안내 등</span>
+	</div>
+
+	<div class="mobile-gnb-bg"></div>
+	<div class="mobile-gnb">
+		<ul>
+			<li><a href="#">정보공개<span></span></a>
+				<ul class="sub-gnb">
+					<li class="has-sub"><a href="#">정보공개</a>
+						<ul>
+							<li><a href="/user/contents/contentsView.do?cntntsId=390">정보공개안내</a></li>
+							<li><a href="/user/contents/contentsView.do?cntntsId=394">업무처리절차</a></li>
+						</ul></li>
+					<li><a href="/user/publication/publication.do?menu=publict_">사전정보공표목록</a></li>
+					<li class="has-sub"><a href="#">경영공시</a>
+						<ul>
+							<li><a
+								href="/user/disclosure/disclosure.do?menu=disclosure_">통합공시</a></li>
+							<li><a
+								href="/user/disclosure/disclosureBbs.do?menu=disclosureBbs">자율공시</a></li>
+						</ul></li>
+					<li class="has-sub"><a href="#">공공데이터 개방</a>
+						<ul>
+							<li><a href="/user/contents/contentsView.do?cntntsId=395">공공데이터
+									개방</a></li>
+							<li><a href="/user/bbs/bbsList.do?bbsManageId=74">공공데이터
+									개방 목록</a></li>
+						</ul></li>
+					<li><a href="/user/bbs/bbsList.do?bbsManageId=39">사업실명제</a></li>
+					<!-- <li class="has-sub"><a href="#">윤리·인권경영</a>
+						<ul>
+							<li><a href="/user/contents/contentsView.do?cntntsId=289">윤리경영
+									정의</a></li>
+							<li><a href="/user/contents/contentsView.do?cntntsId=290">윤리경영
+									규범</a></li>
+							<li><a href="/user/contents/contentsView.do?cntntsId=291">인권경영
+									정의</a></li>
+							<li><a href="/user/contents/contentsView.do?cntntsId=292">인권경영
+									규범</a></li>
+							<li><a href="/user/contents/contentsView.do?cntntsId=149">윤리·인권경영
+									준수서약</a></li>
+							<li><a href="/user/contents/contentsView.do?cntntsId=294">윤리경영
+									신고·상담</a></li>
+							<li><a href="/user/contents/contentsView.do?cntntsId=295">인권경영
+									신고·상담</a></li>
+							<li><a href="/user/bbs/bbsList.do?bbsManageId=70">윤리·인권경영
+									활동·자료</a></li>
+							<li><a href="/user/bbs/bbsList.do?bbsManageId=55">청렴한FoWI</a></li>
+						</ul></li> -->
+					<li class="has-sub"><a href="#">안전경영</a>
+						<ul>
+							<li><a href="/user/contents/contentsView.do?cntntsId=270">안전보건경영방침</a></li>
+							<li><a href="/user/bbs/bbsList.do?bbsManageId=73">안전한
+									산림복지누리기</a></li>
+							<li><a href="/user/contents/contentsView.do?cntntsId=307">안전신고함</a></li>
+						</ul></li>
+					<li class="has-sub"><a href="#">방만경영 점검</a>
+						<ul>
+							<li><a href="/user/contents/contentsView.do?cntntsId=276">방만경영
+									점검</a></li>
+						</ul></li>
+					<li><a href="/user/contents/contentsView.do?cntntsId=275">(주)포이파트너스</a></li>
+				</ul></li>
+			<li><a href="#">산림복지<span></span></a>
+				<ul class="sub-gnb">
+					<li class="has-sub"><a href="#">산림복지</a>
+						<ul>
+							<li><a href="/user/contents/contentsView.do?cntntsId=162">산림복지란</a></li>
+							<li><a href="/user/contents/contentsView.do?cntntsId=337">산림복지서비스
+									소개</a></li>
+							<li><a href="/user/contents/contentsView.do?cntntsId=255">생애주기별
+									산림복지</a></li>
+							<li><a href="/user/contents/contentsView.do?cntntsId=299">한눈에
+									보는 산림복지</a></li>
+<!-- 							<li><a href="/user/search/myCustomSearchList.do?status=init">나의 -->
+<!-- 									맞춤형 산림복지</a></li> -->
+						</ul></li>
+					<li class="has-sub"><a href="#">산림치유</a>
+						<ul>
+							<li><a href="/user/contents/contentsView.do?cntntsId=346">산림치유
+									소개</a></li>
+							<li><a href="/user/contents/contentsView.do?cntntsId=347">산림치유인자</a></li>
+							<li><a href="/user/contents/contentsView.do?cntntsId=348">산림치유대상</a></li>
+							<li><a href="/user/contents/contentsView.do?cntntsId=349">산림치유효과</a></li>
+							<li><a href="/user/bbs/bbsList.do?bbsManageId=45">국외사례</a></li>
+							<li><a href="/user/program/programList.do?progrmSeCd=PS01">산림치유프로그램</a></li>
+							<li><a href="/user/contents/contentsView.do?cntntsId=350">치유의
+									숲</a></li>
+							<li><a href="/user/program/programList.do?progrmSeCd=PS03">치유의
+									숲 기관안내</a></li>
+							<li><a href="/user/contents/contentsView.do?cntntsId=148">(사)한국산림치유포럼</a></li>
+						</ul></li>
+					<li class="has-sub"><a href="#">산림교육</a>
+						<ul>
+							<li><a href="/user/contents/contentsView.do?cntntsId=305">산림교육이란</a></li>
+							<li><a href="/user/contents/contentsView.do?cntntsId=340">산림교육효과</a></li>
+							<li><a href="/user/contents/contentsView.do?cntntsId=345">산림교육법</a></li>
+<!-- 							<li><a href="/user/contents/contentsView.do?cntntsId=32">유아숲체험원</a></li> -->
+							<li><a href="/user/contents/contentsView.do?cntntsId=342">유아숲체험원
+									조성현황</a></li>
+							<li><a href="/user/contents/contentsView.do?cntntsId=343">산림교육센터</a></li>
+							<li><a href="/user/contents/contentsView.do?cntntsId=344">산림교육센터
+									조성현황</a></li>
+							<li><a href="/user/bbs/bbsList.do?bbsManageId=40">산림교육
+									시설안내</a></li>
+							<li><a href="/user/program/programList.do?progrmSeCd=PS02">산림교육
+									프로그램</a></li>
+						</ul></li>
+					<li class="has-sub"><a href="#">산림복지연구</a>
+						<ul>
+							<li><a href="/user/bbs/bbsList.do?bbsManageId=75">연구성과</a></li>
+							<li><a href="/user/bbs/bbsList.do?bbsManageId=77">연구소식</a></li>
+						</ul></li>
+				</ul></li>
+			<li><a href="#">주요사업<span></span></a>
+				<ul class="sub-gnb">
+					<li class="has-sub"><a href="#">산림복지시설현황</a>
+						<ul>
+							<li><a href="/user/contents/contentsView.do?cntntsId=358">운영시설
+									현황</a></li>
+							<!--<li><a href="/user/contents/contentsView.do?cntntsId=136">신규
+									산림복지시설 현황</a></li>-->
+						</ul>
+					</li>
+					<li class="has-sub"><a href="#">녹색자금 운영</a>
+						<ul>
+							<li><a href="/user/bbs/bbsList.do?bbsManageId=57">녹색자금공지사항</a></li>
+							<li><a href="/user/contents/contentsView.do?cntntsId=125">사업개요</a></li>
+							<li><a href="/user/contents/contentsView.do?cntntsId=127">사업내용</a></li>
+							<li><a href="/user/contents/contentsView.do?cntntsId=400">숲체험교육
+									협력사업</a></li>
+							<li><a href="/user/contents/contentsView.do?cntntsId=101">녹색장학사업</a></li>
+							<li><a href="http://gfund.fowi.or.kr/" target="_blank"
+								title="새창열림">녹색자금 통합관리시스템</a></li>
+							<!--<li><a href="http://card.fowi.or.kr/" target="_blank"
+								title="새창열림">녹색자금사업비 관리시스템</a></li>-->
+						</ul></li>
+					<li class="has-sub"><a href="#">전문가 양성</a>
+						<ul>
+							<li><a href="/user/contents/contentsView.do?cntntsId=373">산림치유지도사</a></li>
+							<li><a href="/user/contents/contentsView.do?cntntsId=364">산림교육전문가</a></li>
+						</ul></li>
+					<li class="has-sub"><a href="#">자격증 관리</a>
+						<ul>
+							<li><a href="/user/contents/contentsView.do?cntntsId=376">산림치유지도사
+									평가시험</a></li>
+							<!--<li><a href="/user/contents/contentsView.do?cntntsId=378">산림치유지도사
+									양성기관현황</a></li>-->
+							<li><a href="/user/contents/contentsView.do?cntntsId=378">산림치유지도사 양성기관</a></li>
+							<li><a href="/user/contents/contentsView.do?cntntsId=380">산림치유지도사
+									자격증발급현황</a></li>
+							<li><a href="/user/contents/contentsView.do?cntntsId=367">산림교육전문가
+									양성기관</a></li>
+							<li><a href="/user/contents/contentsView.do?cntntsId=371">산림교육전문가
+									자격증발급현황</a></li>
+							<li><a href="https://license.fowi.or.kr" target="_blank"
+								title="새창열림">자격관리시스템</a></li>
+						</ul></li>
+					<li class="has-sub"><a href="#">전문업 등록</a>
+						<ul>
+							<li><a href="/user/contents/contentsView.do?cntntsId=382">산림복지전문업소개</a></li>
+							<li><a href="/user/contents/contentsView.do?cntntsId=384">등록신청
+									및 절차</a></li>
+							<li><a href="https://forestjobs.fowi.or.kr/jobs/index.do?urlFlag=J" target="_blank"
+								title="새창열림">산림복지전문업 지원시스템</a></li>
+						</ul></li>
+					<li class="has-sub"><a href="#">이용권(바우처)제도</a>
+						<ul>
+							<li><a href="/user/contents/contentsView.do?cntntsId=106">산림복지서비스
+									이용권</a></li>
+							<li><a href="/user/contents/contentsView.do?cntntsId=111">산림복지서비스
+									제공자</a></li>
+							<li><a href="https://www.forestcard.or.kr" target="_blank"
+								title="새창열림">이용권(바우처)신청</a></li>
+						</ul></li>
+					<!--<li class="has-sub"><a href="/user/contents/contentsView.do?cntntsId=163">산림복지 이용 상품권</a>
+						<ul>
+							<li><a href="/user/contents/contentsView.do?cntntsId=163">상품권
+									소개</a></li>
+							<li><a href="/user/contents/contentsView.do?cntntsId=165">상품권
+									접수 및 사용등록</a></li>
+						</ul>
+					</li>-->
+					<li><a href="/user/contents/contentsView.do?cntntsId=163">산림복지 이용 상품권</a></li>
+					<li class="has-sub"><a href="#">사회적가치</a>
+						<ul>
+							<li><a href="/user/contents/contentsView.do?cntntsId=241">안전ㆍ환경</a></li>
+							<!--<li><a href="/user/contents/contentsView.do?cntntsId=242">사회적약자지원</a></li>-->
+							<li><a href="/user/contents/contentsView.do?cntntsId=242">균등기회ㆍ사회통합</a></li>
+							<li><a href="/user/contents/contentsView.do?cntntsId=243">지역ㆍ상생협력</a></li>
+							<li><a href="/user/contents/contentsView.do?cntntsId=244">일자리창출</a></li>
+							<li><a href="/user/contents/contentsView.do?cntntsId=245">윤리ㆍ인권경영</a></li>
+						</ul></li>
+				</ul></li>
+			<li><a href="#">알림마당<span></span></a>
+				<ul class="sub-gnb">
+					<li><a href="/user/bbs/bbsList.do?bbsManageId=12">공지사항</a></li>
+					<li><a href="/user/bbs/bbsList.do?bbsManageId=25">입찰공고</a></li>
+					<li class="has-sub"><a href="#">채용정보</a>
+						<ul>
+							<li><a href="/user/contents/contentsView.do?cntntsId=131">채용안내(인재상)</a></li>
+							<li><a href="/user/bbs/bbsList.do?bbsManageId=22">채용정보</a></li>
+						</ul></li>
+					<li><a href="/user/bbs/bbsList.do?bbsManageId=23">보도자료</a></li>
+					<!--<li class="has-sub"><a href="#">홍보자료</a>
+						<ul>
+							<li><a href="/user/bbs/bbsList.do?bbsManageId=24">홍보영상</a></li>
+							<li><a href="/user/bbs/bbsList.do?bbsManageId=59">녹색자금
+									홍보영상</a></li>
+							<li><a href="/user/bbs/bbsList.do?bbsManageId=17">사진갤러리</a></li>
+							<li><a href="/user/bbs/bbsList.do?bbsManageId=71">비대면
+									숲체험교육사업</a></li>
+							<li><a href="/user/bbs/bbsList.do?bbsManageId=72">공모전
+									수상작/갤러리</a></li>
+						</ul></li>-->
+					<li class="has-sub"><a href="#">매거진</a>
+						<ul>
+							<li><a href="/user/contents/contentsView.do?cntntsId=396">에코힐링
+									E-BooK</a></li>
+							<li><a
+								href="https://blog.naver.com/PostList.nhn?blogId=k-fowi&amp;categoryNo=0&amp;from=postList"
+								target="_blank" title="새창열림">블로그소식</a></li>
+						</ul></li>
+					<li><a href="/user/bbs/bbsList.do?bbsManageId=19">서식자료</a></li>
+					<li><a href="/user/bbs/bbsList.do?bbsManageId=64">CCTV 설치
+							운영 행정예고</a></li>
+					<li><a href="/user/bbs/bbsList.do?bbsManageId=66">목적 외 이용
+							및 제3자 제공</a></li>
+				</ul></li>
+			<li><a href="#">진흥원소개<span></span></a>
+				<ul class="sub-gnb">
+					<li><a href="/user/contents/contentsView.do?cntntsId=351">진흥원장
+							인사말</a></li>
+					<li><a href="/user/bbs/bbsList.do?bbsManageId=17">주요활동</a></li>
+					<li class="has-sub"><a href="#">진흥원 소개 및 연혁</a>
+						<ul>
+							<li><a href="/user/contents/contentsView.do?cntntsId=352">진흥원 소개</a></li>
+							<li><a href="/user/contents/contentsView.do?cntntsId=356">산림복지서비스</a></li>
+						</ul>
+					</li>
+					<li><a href="/user/contents/contentsView.do?cntntsId=353">설립근거
+							및 목적</a></li>
+					<li><a href="/user/contents/contentsView.do?cntntsId=354">미션
+							및 비전</a></li>
+					<!--<li><a href="/user/contents/contentsView.do?cntntsId=355">경영전략</a></li>-->
+					<li class="has-sub"><a href="#">ESG 경영</a>
+						<ul>
+							<li><a href="/user/contents/contentsView.do?cntntsId=321">ESG 전략체계</a></li>
+							<li><a href="/user/contents/contentsView.do?cntntsId=406">지속가능경영</a></li>
+						</ul>
+					</li>
+					<!--<li><a href="/user/contents/contentsView.do?cntntsId=356">연혁</a></li>-->
+					<li class="has-sub"><a href="#">기관 상징·CI</a>
+						<ul>
+							<li><a href="/user/contents/contentsView.do?cntntsId=166">기관 상징·CI</a></li>
+							<li><a href="/user/contents/contentsView.do?cntntsId=167">심볼마크
+									소개</a></li>
+							<li><a href="/user/contents/contentsView.do?cntntsId=168">심볼마크
+									기본색상규정</a></li>
+						</ul></li>
+					<!--<li class="has-sub"><a href="#">FOWI 캐릭터 소개</a>
+						<ul>
+							<li><a href="/user/contents/contentsView.do?cntntsId=169">FOWI
+									캐릭터 소개</a></li>
+							<li><a href="/user/contents/contentsView.do?cntntsId=170">캐릭터
+									기본 응용형</a></li>
+							<li><a href="/user/contents/contentsView.do?cntntsId=171">SNS
+									응용형</a></li>
+						</ul></li>-->
+					<li><a href="/user/contents/orgchtView.do?cntntsId=135">조직안내</a></li>
+					<li class="has-sub"><a href="#">소속기관</a>
+						<ul>
+							<li><a href="/user/contents/contentsView.do?cntntsId=359">국립산림치유원</a></li>
+							<li><a href="/user/contents/contentsView.do?cntntsId=361">국립횡성숲체원</a></li>
+							<li><a href="/user/contents/contentsView.do?cntntsId=360">국립칠곡숲체원</a></li>
+							<li><a href="/user/contents/contentsView.do?cntntsId=362">국립장성숲체원</a></li>
+							<li><a href="/user/contents/contentsView.do?cntntsId=177">국립청도숲체원</a></li>
+							<li><a href="/user/contents/contentsView.do?cntntsId=232">국립대전숲체원</a></li>
+							<li><a href="/user/contents/contentsView.do?cntntsId=283">국립춘천숲체원</a></li>
+							<li><a href="/user/contents/contentsView.do?cntntsId=300">국립나주숲체원</a></li>
+							<li><a href="/user/contents/contentsView.do?cntntsId=142">국립양평치유의숲</a></li>
+							<li><a href="/user/contents/contentsView.do?cntntsId=140">국립대관령치유의숲</a></li>
+							<li><a href="/user/contents/contentsView.do?cntntsId=161">국립대운산치유의숲</a></li>
+							<li><a href="/user/contents/contentsView.do?cntntsId=211">국립김천치유의숲</a></li>
+							<li><a href="/user/contents/contentsView.do?cntntsId=217">국립제천치유의숲</a></li>
+							<li><a href="/user/contents/contentsView.do?cntntsId=222">국립예산치유의숲</a></li>
+							<li><a href="/user/contents/contentsView.do?cntntsId=227">국립곡성치유의숲</a></li>
+							<li><a href="/user/contents/contentsView.do?cntntsId=363">국립하늘숲추모원</a></li>
+						</ul></li>
+					<li><a href="/user/contents/contentsView.do?cntntsId=121">오시는
+							길</a></li>
+				</ul></li>
+<!-- 			<li><a href="#">고객참여<span></span></a>
+				<ul class="sub-gnb">
+					<li class="has-sub"><a href="#">고객헌장</a>
+						<ul>
+							<li><a href="/user/contents/contentsView.do?cntntsId=173">고객헌장</a></li>
+							<li><a href="/user/contents/contentsView.do?cntntsId=175">핵심서비스
+									이행표준</a></li>
+							<li><a href="/user/contents/contentsView.do?cntntsId=174">고객접점
+									이행표준</a></li>
+						</ul>
+					</li>
+ 					<li class="has-sub"><a href="#">고객소통</a> 
+ 						<ul>
+ 							<li><a href="/user/contents/contentsView.do?cntntsId=178">열린게시판</a></li> 
+ 						</ul>
+ 					</li>
+				</ul>
+			</li> -->
+			<li><a href="#">국민소통<span></span></a>
+				<ul class="sub-gnb">
+					<li class="has-sub"><a href="#">고객헌장</a>
+						<ul>
+							<li><a href="/user/contents/contentsView.do?cntntsId=173">고객헌장</a></li>
+							<li><a href="/user/contents/contentsView.do?cntntsId=175">핵심서비스 이행표준</a></li>
+							<li><a href="/user/contents/contentsView.do?cntntsId=174">고객접점 이행표준</a></li>
+						</ul>
+					</li>
+					<li><a href="https://www.epeople.go.kr" target="_blank">전자민원</a></li>
+					<li class="has-sub"><a href="#">적극행정</a>
+						<ul>
+							<li><a href="/user/bbs/bbsList.do?bbsManageId=84">적극행정 선정작</a></li> <!-- 적극행정 선정작 게시판ID 로컬 : 127 / 운영: 84 -->
+							<li><a href="https://www.mpm.go.kr/mpm/" target="_blank">적극행정on</a></li>
+						</ul>
+					</li>
+					<li class="has-sub"><a href="#">국민제안</a>
+						<ul>
+							<li><a href="/user/bbs/bbsList.do?bbsManageId=85">국민참여단(진흥원) 설명</a></li> <!-- 국민참여단(진흥원) 설명 게시판ID 로컬 : 128 / 운영: 85 -->
+							<li><a href="/user/bbs/bbsList.do?bbsManageId=86">2023년 국민제안 내용</a></li> <!-- 2023년 국민제안 내용 설명 게시판ID 로컬 : 129 / 운영: 86 -->
+							<li><a href="/user/bbs/bbsList.do?bbsManageId=87">2023년 국민제안 현황</a></li> <!-- 2023년 국민제안 내용 설명 게시판ID 로컬 : 130 / 운영: 87 -->
+							<li><a href="https://www.mpm.go.kr/mpm/" target="_blank">국민권익위원회</a></li>
+						</ul>
+					</li>
+					<li><a href="/user/bbs/bbsList.do?bbsManageId=88">칭찬합시다</a></li> <!-- 칭찬합시다 게시판ID 로컬 : 131 / 운영: 88 -->
+					<li class="has-sub"><a href="#">홍보자료</a>
+						<ul>
+							<li><a href="/user/bbs/bbsList.do?bbsManageId=24">홍보영상</a></li> <!-- 홍보영상 게시판ID 로컬 : 24 / 운영: 24 -->
+							<li><a href="/user/bbs/bbsList.do?bbsManageId=59">녹색자금 홍보영상</a></li> <!-- 녹색자금 홍보영상 게시판ID 로컬 : 59 / 운영: 59 -->
+							<li><a href="/user/bbs/bbsList.do?bbsManageId=71">비대면 숲체험교육사업</a></li> <!-- 비대면 숲체험교육사업 게시판ID 로컬 : 107 / 운영: 71 -->
+							<li><a href="/user/bbs/bbsList.do?bbsManageId=89">사진공모전 선정작</a></li> <!-- 사진공모전 선정작 게시판ID 로컬 : 132 / 운영: 89 -->
+							<li><a href="/user/bbs/bbsList.do?bbsManageId=90">그림공모전 선정작</a></li> <!-- 그림공모전 선정작 게시판ID 로컬 : 133 / 운영: 90 -->
+							<li><a href="/user/bbs/bbsList.do?bbsManageId=91">영상공모전 선정작</a></li> <!-- 영상공모전 선정작 게시판ID 로컬 : 134 / 운영: 91 -->
+							<li><a href="/user/bbs/bbsList.do?bbsManageId=92">동요공모전 선정작</a></li> <!-- 영상공모전 선정작 게시판ID 로컬 : 136 / 운영: 92 -->
+							<li><a href="/user/bbs/bbsList.do?bbsManageId=93">치유레시피공모전 선정작</a></li> <!-- 영상공모전 선정작 게시판ID 로컬 : 137 / 운영: 93 -->
+						</ul>
+					</li>
+					<li><a href="/user/bbs/bbsList.do?bbsManageId=82">열린게시판</a></li> <!-- 열린게시판 게시판ID 로컬 : 82 / 운영: 82 -->
+					<li class="has-sub"><a href="#">윤리·인권경영</a>
+						<ul>
+							<li><a href="/user/contents/contentsView.do?cntntsId=289">윤리경영 정의</a></li> <!-- 윤리경영 정의 컨텐츠ID 로컬 : 290 / 운영: 289 -->
+							<li><a href="/user/contents/contentsView.do?cntntsId=290">윤리경영 규범</a></li> <!-- 윤리경영 규범 컨텐츠ID 로컬 : 292 / 운영: 290 -->
+							<li><a href="/user/contents/contentsView.do?cntntsId=291">인권경영 정의</a></li> <!-- 인권경영 정의 컨텐츠ID 로컬 : 291 / 운영: 291 -->
+							<li><a href="/user/contents/contentsView.do?cntntsId=292">인권경영 규범</a></li> <!-- 인권경영 규범 컨텐츠ID 로컬 : 295 / 운영: 292 -->
+							<li><a href="/user/contents/contentsView.do?cntntsId=149">윤리·인권경영 준수서약</a></li> <!-- 윤리·인권경영 준수서약 컨텐츠ID 로컬 : 149 / 운영: 149 -->
+							<li><a href="/user/contents/contentsView.do?cntntsId=294">윤리경영 신고·상담</a></li> <!-- 윤리경영 신고·상담 컨텐츠ID 로컬 : 297 / 운영: 294 -->
+							<li><a href="/user/contents/contentsView.do?cntntsId=295">인권경영 신고·상담</a></li> <!-- 인권경영 신고·상담 컨텐츠ID 로컬 : 298 / 운영: 295 -->
+							<li><a href="/user/bbs/bbsList.do?bbsManageId=70">윤리·인권경영 활동·자료</a></li> <!-- 윤리·인권경영 활동·자료 게시판ID 로컬 : 60 / 운영: 70 -->
+							<li><a href="/user/bbs/bbsList.do?bbsManageId=55">청렴한FoWI</a></li> <!-- 청렴한FoWI 게시판ID 로컬 : 55 / 운영: 55 -->
+							<li><a href="https://www.clean.go.kr/index.es?sid=a1" target="_blank">국민권익위원회 청렴포털</a></li>
+						</ul>
+					</li>
+					<li><a href="/user/bbs/bbsList.do?bbsManageId=94">기업성장응답센터</a></li> <!-- 기업성장응답센터 게시판ID 운영 : 94 / 로컬 : 135 -->
+				</ul>
+			</li>
+		</ul>
+	</div>
+
+	<div id="subGnbNew" class="subGnbNew" style="">
+		<div class="area">
+			<div class="titleArea">
+				<div class="titleAreat"></div>
+			</div>
+			<div class="subMenuarea">
+				<!-- 			KST -->
+				</div>
+		</div>
+	</div>
+	</div>
+
+<div class="topSearchView">
+	<div class="topSearchDetail">
+		<h3>찾으시려는 검색어를 입력해 주세요</h3>
+		<div class="keywordSearch">
+			<form method="post" action="/search/searchEngine.do"
+				name="totalSearchForm"><input type="hidden" name="csSignature" value="T3XBEV56aRsZjIA1aEVg1g==" />
+
+				<div class="keywordSearchInput">
+					<label class="topSearchlabel" for="search">검색</label> <input
+						type="hidden" name="isSearchEngine" value="Y" /> <input
+						type="text" name="query" id="search" class="searchKeyword"
+						placeholder="검색어를 입력하세요." value="" /> <input type="hidden"
+						name="search_type" value="" />
+				</div>
+				<!-- <input type="submit"  class="keywordSearchBtn" value="검색" /> -->
+				<button type="button" onclick="javascript:goSearch();" class="keywordSearchBtn" title="검색">검색</button>
+			</form>
+		</div>
+		<a href="#topSearch" class="keywordSearchClose" title="닫기">닫기</a>
+	</div>
+</div></div>
+		<div id="onepage-pagination" title="메뉴">
+		</div>
+     <div id="container">
+             <div id="container-area">
+                 <div class="subarea">
+                     <div class="Lnb">
+                         <!-- |24|60|, |24|60| -->
+<div class="LnbTitle">알림마당</div>
+<div class="LnbZone">
+	<ul class="indents1">
+<li>
+		<a href="/user/bbs/bbsList.do?bbsManageId=12"  class="active">공지사항</a>
+			<ul class="indents2" >
+	</ul>
+		</li>
+	<li>
+		<a href="https://www.alio.go.kr/item/itemOrganList.do?apbaId=C1055&reportFormRootNo=B1030"  target="_blank" title="새창열림">입찰공고</a>
+			<ul class="indents2" style="display:none">
+	</ul>
+		</li>
+	<li>
+		<a href="#"  >채용정보</a>
+			<ul class="indents2" style="display:none">
+	<li><a href="/user/contents/contentsView.do?cntntsId=131" >채용안내(인재상)</a></li> 		
+		<li><a href="/user/bbs/bbsList.do?bbsManageId=22" >채용정보</a></li> 		
+		</ul>
+		</li>
+	<li>
+		<a href="/user/bbs/bbsList.do?bbsManageId=23"  >보도자료</a>
+			<ul class="indents2" style="display:none">
+	</ul>
+		</li>
+	<li>
+		<a href="#"  >매거진</a>
+			<ul class="indents2" style="display:none">
+	<li><a href="/user/contents/contentsView.do?cntntsId=396" >에코힐링 E-BooK</a></li> 		
+		<li><a href="https://blog.naver.com/PostList.nhn?blogId=k-fowi&categoryNo=0&from=postList" target="_blank" title="새창열림">블로그소식</a></li> 		
+		</ul>
+		</li>
+	<li>
+		<a href="/user/bbs/bbsList.do?bbsManageId=19"  >서식자료</a>
+			<ul class="indents2" style="display:none">
+	</ul>
+		</li>
+	<li>
+		<a href="#"  >FOWI 캐릭터 소개</a>
+			<ul class="indents2" style="display:none">
+	<li><a href="/user/contents/contentsView.do?cntntsId=169" >FOWI 캐릭터 소개</a></li> 		
+		<li><a href="/user/contents/contentsView.do?cntntsId=170" >캐릭터 기본 응용형</a></li> 		
+		<li><a href="/user/contents/contentsView.do?cntntsId=171" >SNS 응용형</a></li> 		
+		</ul>
+		</li>
+	<li>
+		<a href="/user/bbs/bbsList.do?bbsManageId=64"  >CCTV 설치 행정예고</a>
+			<ul class="indents2" style="display:none">
+	</ul>
+		</li>
+	<li>
+		<a href="/user/bbs/bbsList.do?bbsManageId=66"  >목적 외 이용 및 제3자 제공</a>
+			<ul class="indents2" style="display:none">
+	</ul>
+		</li>
+	</ul>
+</div></div>
+                     <script>
+if(12 == '39'){
+	document.title = '사업실명제 목록-한국산림복지진흥원'
+} else if (12 == '74'){
+	document.title = '공공데이터 개방 목록-한국산림복지진흥원'
+} else if (12 == '73'){
+	document.title = '안전한 산림복지누리기 목록-한국산림복지진흥원'
+} else if (12 == '45'){
+	document.title = '국외사례 목록-한국산림복지진흥원'
+} else if (12 == '40'){
+	document.title = '주요 산림교육시설 현황 목록-한국산림복지진흥원'
+} else if (12 == '75'){
+	document.title = '연구논문 목록-한국산림복지진흥원'
+} else if (12 == '76'){
+	document.title = '연구보고서 목록-한국산림복지진흥원'
+} else if (12 == '79'){
+	document.title = '포스터 목록-한국산림복지진흥원'
+} else if (12 == '77'){
+	document.title = '이슈브리핑 목록-한국산림복지진흥원'
+} else if (12 == '78'){
+	document.title = '인사이트 목록-한국산림복지진흥원'
+} else if (12 == '62'){
+	document.title = '인포그래픽 목록-한국산림복지진흥원'
+} else if (12 == '57'){
+	document.title = '녹색자금공지사항 목록-한국산림복지진흥원'
+} else if (12 == '12'){
+	document.title = '공지사항 목록-한국산림복지진흥원'
+} else if (12 == '25'){
+	document.title = '입찰공고 목록-한국산림복지진흥원'
+} else if (12 == '22'){
+	document.title = '채용정보 목록-한국산림복지진흥원'
+} else if (12 == '23'){
+	document.title = '보도자료 목록-한국산림복지진흥원'
+} else if (12 == '19'){
+	document.title = '서식자료 목록-한국산림복지진흥원'
+} else if (12 == '64'){
+	document.title = 'CCTV 설치 행정예고 목록-한국산림복지진흥원'
+} else if (12 == '66'){
+	document.title = '목적 외 이용 및 제3자 제공 목록-한국산림복지진흥원'
+} else if (12 == '17'){
+	document.title = '주요활동 목록-한국산림복지진흥원'
+} else if (12 == '84'){
+	document.title = '적극행정 선정작 목록-한국산림복지진흥원'
+} else if (12 == '85'){
+	document.title = '국민참여단(진흥원) 설명 목록-한국산림복지진흥원'
+} else if (12 == '86'){
+	document.title = '2023년 국민제안 내용 목록-한국산림복지진흥원'
+} else if (12 == '87'){
+	document.title = '2023년 국민제안 현황 목록-한국산림복지진흥원'
+} else if (12 == '24'){
+	document.title = '홍보영상  목록-한국산림복지진흥원'
+} else if (12 == '59'){
+	document.title = '녹색자금 홍보영상 목록-한국산림복지진흥원'
+} else if (12 == '71'){
+	document.title = '비대면 숲체험교육사업 목록-한국산림복지진흥원'
+} else if (12 == '89'){
+	document.title = '사진공모전 선정작 목록-한국산림복지진흥원'
+} else if (12 == '90'){
+	document.title = '그림공모전 선정작 목록-한국산림복지진흥원'
+} else if (12 == '91'){
+	document.title = '영상공모전 선정작 목록-한국산림복지진흥원'
+} else if (12 == '92'){
+	document.title = '동요공모전 선정작 목록-한국산림복지진흥원'
+} else if (12 == '93'){
+	document.title = '치유레시피 공모전 선정작 목록-한국산림복지진흥원'
+} else if (12 == '70'){
+	document.title = '윤리·인권경영 활동·자료 목록-한국산림복지진흥원'
+} else if (12 == '55'){
+	document.title = '청렴한FoWI 목록-한국산림복지진흥원'
+}
+
+$(document).ready(function (){
+// 	$("#Ret_URL").val(location.protocol+"//"+location.host+"/sms/kcpcert_proc_req.jsp");
+    $(window).bind("scroll resize", function() {
+        setModalBackground();
+        setModalPasswordForm();
+    });
+    //"안전한 산림복지누리기" 메뉴를 위한 스크립트
+    var safetyForest = document.location.href.split("?");
+    if(safetyForest[1] != "bbsManageId=73"){ //안전한 산림복지누리기 운영 : 73 / 로컬 : 108
+    	document.getElementById("safetyForest").style.display='none';
+    }
+	//"산림복지연구-연구성과-연구논문" 메뉴를 위한 스크립트
+    var researchPaper = document.location.href.split("?");
+    if(researchPaper[1] != "bbsManageId=75"){ //산림복지연구-연구성과-연구논문 운영 : 75 / 로컬 : 110
+    	document.getElementById("researchPaper").style.display='none';
+    }
+	//"산림복지연구-연구성과-연구보고서" 메뉴를 위한 스크립트
+    var researchReport = document.location.href.split("?");
+	console.log(researchReport);
+    if(researchReport[1] != "bbsManageId=76"){ // 운영 : 76 / 로컬 : 111
+    	document.getElementById("researchReport").style.display='none';
+    }
+	//"산림복지연구-연구성과-포스터" 메뉴를 위한 스크립트
+    var researchReport = document.location.href.split("?");
+	console.log(researchReport);
+    if(researchReport[1] != "bbsManageId=95"){
+    	document.getElementById("researchPoster").style.display='none';
+    }
+	//"산림복지연구-연구소식-이슈브리핑" 메뉴를 위한 스크립트
+    var researchData = document.location.href.split("?");
+    if(researchData[1] != "bbsManageId=77"){ // 운영 : 77 / 로컬 : 112
+    	document.getElementById("researchData").style.display='none';
+    }
+  	//"산림복지연구-연구소식-인사이트" 메뉴를 위한 스크립트
+    var researchInsight = document.location.href.split("?");
+    if(researchInsight[1] != "bbsManageId=78"){ // 운영 : 78 / 로컬 : 113
+    	document.getElementById("researchInsight").style.display='none';
+    }
+ 	//"산림복지연구-연구소식-인포그래픽" 메뉴를 위한 스크립트
+    var researchInfographic = document.location.href.split("?");
+    if(researchInfographic[1] != "bbsManageId=62"){ // 운영 : 62 / 로컬 : 62
+    	document.getElementById("researchInfographic").style.display='none';
+    }
+    
+	if("" != ""){
+		alert("");
+	}
+	
+	if("" == "Y"){
+		alert("저장되었습니다.");
+	} else if("" == "N"){
+		alert("저장되지 않았습니다.");
+	}
+
+});
+function insertBbs(){
+	document.location.href="/user/bbs/insertBbs.do";
+}
+
+function hidePopupDiv(name,t){
+	$("#bbsPw").val("");
+    $("div#"+name+"").hide(t);
+    $("#modalBackgroundDiv").hide(t);
+};
+
+function showModalBackground() {
+    setModalBackground();
+    $("#modalBackgroundDiv").show(0);
+};
+
+function setModalBackground() {
+    $("#modalBackgroundDiv").css({
+        "top": 0
+        ,"left": 0
+        ,"width": screen.availWidth
+        ,"height": screen.availHeight
+        , "position": "absolute"
+        ,"z-index":"9988"
+        ,"opacity": .4
+        ,"background-color": "#010010"
+	});
+};
+
+function setModalPasswordForm() {
+    var divH = 198;
+    $("#passwordConfirmDiv").css({
+        "height":divH+"px"
+        ,"top": ($(window).height() / 2) - $('#passwordConfirmDiv').height() / 2+ $(window).scrollTop()
+        ,"left": ($(window).width() / 2) - $('#passwordConfirmDiv').width() / 2+ $(window).scrollLeft()
+        , "position": "absolute"
+        ,"z-index":"9999"});
+};
+
+function showModalPasswordForm() {
+    showModalBackground();
+    setModalPasswordForm();
+    $("#passwordConfirmDiv").show(0);
+    $("#password_in").focus();
+};
+
+
+function goPassWordCheck() {
+	var bbsPw = $("#bbsPw").val();
+	var bbsId = $("#bbsIdEmp").val();
+	var bbsManageId = "12";
+	$('input[name=passWord]').attr('value',bbsPw);
+
+	//add custom value with hidden field
+	const param_password = $("<input type='hidden' value=" + bbsPw + " name='passWord'>");
+	const param_bbsId = $("<input type='hidden' value=" + bbsId + " name='bbsId'>");
+	const param_bbsManageId = $("<input type='hidden' value=" + bbsManageId + " name='bbsManageId'>");
+	$("#bbsForm").append(param_password);
+	$("#bbsForm").append(param_bbsId);
+	$("#bbsForm").append(param_bbsManageId);
+// 	$("#bbsId2").val();
+	if(isEmptyVal(bbsPw)){
+		alert("패스워드를 입력해주세요.");
+		return false;
+	}
+	document.bbsForm.action = "/user/bbs/bbsUserView.do";
+	document.bbsForm.method = "post";
+	document.bbsForm.submit();
+
+}
+
+
+function telAuthCheck(){
+	var loc	= location.href;
+	var hyperVal = (loc.indexOf('loc') > -1)?"http":"https";
+ 	var	Ret_URL = //hyperVal+
+ 	'http://'+loc.split('/')[2]+'/kcp/kcpIpinResult.do?bbsManageId='+12;
+
+	$('#Ret_URL').attr('value',Ret_URL);
+
+	var auth_form = document.form_auth;
+	var return_gubun;
+	var width  = 410;
+	var height = 500;
+	var leftpos = screen.width  / 2 - ( width  / 2 );
+	var toppos  = screen.height / 2 - ( height / 2 );
+	var winopts  = "width=" + width   + ", height=" + height + ", toolbar=no,status=no,statusbar=no,menubar=no,scrollbars=no,resizable=no,top=0,left=0";
+	var position = ",left=" + leftpos + ", top="    + toppos;
+	var AUTH_POP = window.open('','auth_popup', winopts + position);
+
+	auth_form.target = "auth_popup";
+//  	auth_form.action = "https://cert.kcp.co.kr/kcp_cert/cert_view.jsp"; // 인증창 호출 및 결과값 리턴 페이지 주소
+  	auth_form.action = "/sms/kcpcert_proc_req.jsp"; // 인증창 호출 및 결과값 리턴 페이지 주소
+	auth_form.submit();
+}
+
+
+function auth_data(frm) {
+	var auth_form     = document.form_auth;
+	var nField        = frm.elements.length;
+	var response_data = "";
+
+	
+	if(frm.up_hash.value != auth_form.veri_up_hash.value) {
+		alert("up_hash 변조 위험있음");
+	}
+
+	
+	for (i = 0; i < nField; i++) {
+		if(frm.elements[i].value != "") {
+			response_data += frm.elements[i].name + " : " + frm.elements[i].value + "\n";
+		}
+	}
+
+	if(navigator.userAgent.indexOf("Android") > - 1 || navigator.userAgent.indexOf("iPhone") > - 1){
+		document.getElementById( "cert_info" ).style.display = "";
+		document.getElementById( "kcp_cert"  ).style.display = "none";
+	}
+}
+
+
+function auth_type_check() {
+	var auth_form = document.form_auth;
+	if(auth_form.ordr_idxx.value == "") {
+		alert("주문번호는 필수 입니다.");
+		  return false;
+	} else {
+		if(navigator.userAgent.indexOf("Android") > - 1 || navigator.userAgent.indexOf("iPhone") > - 1) {
+			auth_form.target = "kcp_cert";
+			document.getElementById("cert_info").style.display = "none";
+			document.getElementById("kcp_cert").style.display = "";
+		} else {
+			var return_gubun;
+			var width  = 410;
+			var height = 500;
+
+			var leftpos = screen.width  / 2 - ( width  / 2 );
+			var toppos  = screen.height / 2 - ( height / 2 );
+
+			var winopts  = "width=" + width   + ", height=" + height + ", toolbar=no,status=no,statusbar=no,menubar=no,scrollbars=no,resizable=no";
+			var position = ",left=" + leftpos + ", top="    + toppos;
+		}
+		auth_form.target = "form_auth";
+ 		auth_form.action = "/kcp/smartcert_proc_req.action"; // 인증창 호출 및 결과값 리턴 페이지 주소
+//  		auth_form.action = "http://localhost:8085/kcp/smartcert_proc_req.action"; // 인증창 호출 및 결과값 리턴 페이지 주소
+		auth_form.submit();
+	}
+}
+
+
+function goView(bbsId){
+	var url = "";
+
+	if("12" == "101") {
+		url = "User";
+		showModalBackground();
+	    showModalPasswordForm();
+
+	    $("#bbsIdEmp").val(bbsId);
+	} else {
+		document.bbsForm.method = "POST";
+		document.bbsForm.action = "/user/bbs/bbs"+url+"View.do?bbsManageId=12&bbsId=" + bbsId;
+		document.bbsForm.submit();
+	}
+}
+
+function goPage(iPage){
+	document.bbsForm.method = "POST";
+	document.bbsForm.iPage.value = iPage;
+	document.bbsForm.action = "/user/bbs/bbsList.do?bbsManageId=12";
+	document.bbsForm.submit();
+}
+
+function escapeInput() {
+    var searchKeywordInputValue = $('#search_keyword').val();
+    $('#search_keyword').val(escapeHtml(searchKeywordInputValue));
+}
+
+//XSS 공격 방지
+function escapeHtml(unsafe) {
+    return unsafe
+         .replace(/&/g, "&amp;")
+         .replace(/</g, "&lt;")
+         .replace(/>/g, "&gt;")
+         .replace(/"/g, "&quot;")
+         .replace(/'/g, "&#039;");
+}
+</script>
+<form method="post" class="form-horizontal" role="form" id="bbsForm" name="bbsForm"><input type="hidden" name="csSignature" value="T3XBEV56aRsZjIA1aEVg1g==" />
+
+	<input type="hidden" name="iPage" value="1" />
+	<input type="hidden" name="search_title" value="" />
+	<input type="hidden" name="search_keyword" value="" />
+<!-- 	<input type="hidden" name="passWord" value="" /> -->
+<!-- 	<input type="hidden" name="bbsId" value="" /> -->
+</form>
+<input type="hidden" id="bbsIdEmp" value=""/>
+<div class="Contents" id="Contents">
+	<div class="navigation">
+		<h1 class="title">
+			<span class="fgreen">공지사항</span>
+		</h1>
+		<div class="navigationInfo">
+			<span class="">
+				<a href="">
+					<img src="/images/icon_home.jpg" alt="HOME" />
+				</a>
+				<a href="/user/bbs/bbsList.do?bbsManageId=12">
+					알림마당</a>
+	공지사항</span>
+		</div>
+	</div>
+	<div class="ContentZone">
+		<div class="indent0">
+			<!-- 1뎁스 -->
+			<h2 class="subject">공지사항</h2>
+			<div id="researchPaper">
+				<br>
+				<div class="TabBarP">
+					<ul>
+						<li class="wD3 active"><a href="/user/bbs/bbsList.do?bbsManageId=75" title="선택됨">연구논문</a></li> <!-- 운영 : 75 / 로컬 : 110 -->
+						<li class="wD3"><a href="/user/bbs/bbsList.do?bbsManageId=76">연구보고서</a></li> <!-- 운영 : 76 / 로컬 : 111 -->
+						<li class="wD3"><a href="/user/bbs/bbsList.do?bbsManageId=95">포스터</a></li>
+					</ul>
+				</div>
+				<div class="clear mT40"></div>
+			</div>
+			<div id="researchReport">
+				<br>
+				<div class="TabBarP">
+					<ul>
+						<li class="wD3"><a href="/user/bbs/bbsList.do?bbsManageId=75">연구논문</a></li> <!-- 운영 : 75 / 로컬 : 110 -->
+						<li class="wD3 active"><a href="/user/bbs/bbsList.do?bbsManageId=76" title="선택됨">연구보고서</a></li> <!-- 운영 : 76 / 로컬 : 111 -->
+						<li class="wD3"><a href="/user/bbs/bbsList.do?bbsManageId=95">포스터</a></li>
+					</ul>
+				</div>
+				<div class="clear mT40"></div>
+			</div>
+			<div id="researchPoster">
+				<br>
+				<div class="TabBarP">
+					<ul>
+						<li class="wD3"><a href="/user/bbs/bbsList.do?bbsManageId=75">연구논문</a></li> <!-- 운영 : 75 / 로컬 : 110 -->
+						<li class="wD3"><a href="/user/bbs/bbsList.do?bbsManageId=76">연구보고서</a></li> <!-- 운영 : 76 / 로컬 : 111 -->
+						<li class="wD3 active"><a href="/user/bbs/bbsList.do?bbsManageId=95"  title="선택됨">포스터</a></li> <!-- 운영 : 79 / 로컬 : 120 -->
+					</ul>
+				</div>
+				<div class="clear mT40"></div>
+			</div>
+			<div id="researchData">
+				<br>
+				<div class="TabBarP">
+					<ul>
+						<li class="wD3 active"><a href="/user/bbs/bbsList.do?bbsManageId=77" title="선택됨">이슈브리핑</a></li> <!-- 운영 : 77 / 로컬 : 112 -->
+						<li class="wD3"><a href="/user/bbs/bbsList.do?bbsManageId=78">인사이트</a></li> <!-- 운영 : 78 / 로컬 : 113 -->
+						<li class="wD3"><a href="/user/bbs/bbsList.do?bbsManageId=62">인포그래픽</a></li> <!-- 운영 : 62 / 로컬 : 62 -->
+					</ul>
+				</div>
+				<div class="clear mT40"></div>
+			</div>
+			<div id="researchInsight">
+				<br>
+				<div class="TabBarP">
+					<ul>
+						<li class="wD3"><a href="/user/bbs/bbsList.do?bbsManageId=77">이슈브리핑</a></li> <!-- 운영 : 77 / 로컬 : 112 -->
+						<li class="wD3 active"><a href="/user/bbs/bbsList.do?bbsManageId=78" title="선택됨">인사이트</a></li> <!-- 운영 : 78 / 로컬 : 113 -->
+						<li class="wD3"><a href="/user/bbs/bbsList.do?bbsManageId=62">인포그래픽</a></li> <!-- 운영 : 62 / 로컬 : 62 -->
+					</ul>
+				</div>
+				<div class="clear mT40"></div>
+			</div>
+			<div id="researchInfographic">
+				<br>
+				<div class="TabBarP">
+					<ul>
+						<li class="wD3"><a href="/user/bbs/bbsList.do?bbsManageId=77">이슈브리핑</a></li> <!-- 운영 : 77 / 로컬 : 112 -->
+						<li class="wD3"><a href="/user/bbs/bbsList.do?bbsManageId=78">인사이트</a></li> <!-- 운영 : 78 / 로컬 : 113 -->
+						<li class="wD3 active"><a href="/user/bbs/bbsList.do?bbsManageId=62" title="선택됨">인포그래픽</a></li> <!-- 운영 : 62 / 로컬 : 62 -->
+					</ul>
+				</div>
+				<div class="clear mT40"></div>
+			</div>
+			<div id="safetyForest">
+				<br>
+				<table class="BasicTable_07" style="width:98%; margin-left:20px; margin-top: 10px;">
+					<colgroup>
+						<col width="20%">
+						<col width="*">
+					</colgroup>
+					<tbody>
+						<tr>
+							<td><img alt="이용안내fowiLogo" src="../../images/fowiLogo001.png"></td>
+							<td style="text-align:left;">
+								<strong>“안전한 산림복지 누리기”</strong>는 안전하고 건강한 산림복지 실현을 위하여 진흥원에서 제작한 안전 관련 컨텐츠와 안전관리 노력 등 정보들을 국민들에게 제공하기 위한 공간입니다.
+							</td>
+						</tr>
+					</tbody>
+				</table>
+			</div>
+			<div class="BoardSearch">
+				<ul class="board_total floatL">
+					<li>Total : <span>1506</span></li>
+					<li>Page : 1/151</li>
+				</ul>
+				<div class="floatR">
+					<form method="post" onsubmit="escapeInput();"><input type="hidden" name="csSignature" value="T3XBEV56aRsZjIA1aEVg1g==" />
+
+						<select name="search_title" class="floatL" title="검색조건">
+							<option value="subject" selected>제목</option>
+							<option value="cn" ><lable for="cn">내용</lable></option>
+						</select>
+						<input id="search_keyword" type="text" name="search_keyword" title="검색어를 입력하세요." placeholder="검색어를 입력하세요." class="floatL SearchInput" value="" /> 
+						<input type="submit" value="검색" class="floatL SearchSumit" />
+					</form>
+				</div>
+			</div>
+			<table class="BasicTable_02">
+				<!-- 로컬 전용 -->
+				<!-- 운영 전용 -->
+				<caption>공지사항 게시판</caption>
+				<colgroup>
+					<col style="width:8%">
+					<col style="width:59%">
+					<col style="width:15%">
+					<col style="width:10%">
+					<col style="width:8%">
+				</colgroup>
+				<thead>
+				<tr>
+					<th>번호</th>
+					<th>제목</th>
+					<th>작성자</th>
+					<th>작성일</th>
+					<th>조회수</th>
+				</tr>
+				</thead>
+<tr>
+							<td>1506</td>
+							<td class="tleft">
+								<a href="#pList" class="pList" onclick="javascript:goView('9191');return false;" onkeypress="this.onclick;">2026년 카이스트 멘토링 캠퍼스 투어 모집 안내</a>&nbsp;&nbsp;
+							</td>
+							<td>AX정보화팀</td>
+							<td>2026-09-11</td>
+							<td>36</td>
+						</tr>
+		<tr>
+							<td>1505</td>
+							<td class="tleft">
+								<a href="#pList" class="pList" onclick="javascript:goView('9189');return false;" onkeypress="this.onclick;">2026년 4분기 2차 국립횡성숲체원 「나눔의 숲 캠프」모집 공고</a>&nbsp;&nbsp;
+							</td>
+							<td>AX정보화팀</td>
+							<td>2026-09-10</td>
+							<td>148</td>
+						</tr>
+		<tr>
+							<td>1504</td>
+							<td class="tleft">
+								<a href="#pList" class="pList" onclick="javascript:goView('9188');return false;" onkeypress="this.onclick;">2026년「건강출산 행복가정 지원사업」사업 수시모집 공고문(숲동행-10월)</a>&nbsp;&nbsp;
+							</td>
+							<td>AX정보화팀</td>
+							<td>2026-09-10</td>
+							<td>75</td>
+						</tr>
+		<tr>
+							<td>1503</td>
+							<td class="tleft">
+								<a href="#pList" class="pList" onclick="javascript:goView('9186');return false;" onkeypress="this.onclick;">[모집]「2026년 산림복지전문업 통합 온라인 플랫폼 입점 지원사업」참가기업 모집 연장(~9.14.)</a>&nbsp;&nbsp;
+							</td>
+							<td>창업육성지원팀</td>
+							<td>2026-09-09</td>
+							<td>316</td>
+						</tr>
+		<tr>
+							<td>1502</td>
+							<td class="tleft">
+								<a href="#pList" class="pList" onclick="javascript:goView('9185');return false;" onkeypress="this.onclick;">2026년 국립횡성숲체원 숲체험교육사업(산림문화) 모집공고</a>&nbsp;&nbsp;
+							</td>
+							<td>AX정보화팀</td>
+							<td>2026-09-08</td>
+							<td>216</td>
+						</tr>
+		<tr>
+							<td>1501</td>
+							<td class="tleft">
+								<a href="#pList" class="pList" onclick="javascript:goView('9182');return false;" onkeypress="this.onclick;">[국립김해숲체원] 2026년 4분기 숲체험교육사업 모집공고</a>&nbsp;&nbsp;
+							</td>
+							<td>AX정보화팀</td>
+							<td>2026-09-04</td>
+							<td>927</td>
+						</tr>
+		<tr>
+							<td>1500</td>
+							<td class="tleft">
+								<a href="#pList" class="pList" onclick="javascript:goView('9181');return false;" onkeypress="this.onclick;">추석 명절 청탁금지법 선물 바로알기</a>&nbsp;&nbsp;
+							</td>
+							<td>AX정보화팀</td>
+							<td>2026-09-04</td>
+							<td>76</td>
+						</tr>
+		<tr>
+							<td>1499</td>
+							<td class="tleft">
+								<a href="#pList" class="pList" onclick="javascript:goView('9180');return false;" onkeypress="this.onclick;">2026년 4분기 국립춘천숲체원 「나눔의 숲」 캠프 모집 공고</a>&nbsp;&nbsp;
+							</td>
+							<td>AX정보화팀</td>
+							<td>2026-09-04</td>
+							<td>223</td>
+						</tr>
+		<tr>
+							<td>1498</td>
+							<td class="tleft">
+								<a href="#pList" class="pList" onclick="javascript:goView('9151');return false;" onkeypress="this.onclick;">2026년 산림복지 취업아카데미 참가 모집(~9.16.)</a>&nbsp;&nbsp;
+							</td>
+							<td>AX정보화팀</td>
+							<td>2026-09-02</td>
+							<td>555</td>
+						</tr>
+		<tr>
+							<td>1497</td>
+							<td class="tleft">
+								<a href="#pList" class="pList" onclick="javascript:goView('9150');return false;" onkeypress="this.onclick;">[국립나주숲체원] 2026년 4분기 숲체험교육사업 정기모집 공고</a>&nbsp;&nbsp;
+							</td>
+							<td>AX정보화팀</td>
+							<td>2026-09-01</td>
+							<td>437</td>
+						</tr>
+		</table>
+
+			<!--페이징 -->
+			<div class="paging" id="pager"><a class="num active" href="javascript:void(0);" title="현재페이지">1</a><a class="num" href="javascript:void(0);" onclick="javascript:goPage('2')">2</a><a class="num" href="javascript:void(0);" onclick="javascript:goPage('3')">3</a><a class="num" href="javascript:void(0);" onclick="javascript:goPage('4')">4</a><a class="num" href="javascript:void(0);" onclick="javascript:goPage('5')">5</a><a class="num" href="javascript:void(0);" onclick="javascript:goPage('6')">6</a><a class="num" href="javascript:void(0);" onclick="javascript:goPage('7')">7</a><a class="num" href="javascript:void(0);" onclick="javascript:goPage('8')">8</a><a class="num" href="javascript:void(0);" onclick="javascript:goPage('9')">9</a><a class="num" href="javascript:void(0);" onclick="javascript:goPage('10')">10</a><a class="go next" title="다음 페이지로 이동" href="javascript:void(0);" onclick="javascript:goPage('11')"><span style="display:none;">마지막페이지</span></a><a class="go last" title="마지막 페이지로 이동" href="javascript:void(0);" onclick="javascript:goPage('151')"><span style="display:none;">다음페이지</span></a></div><!--페이징 끝-->
+
+			</div>
+	</div>
+</div>
+
+<div id="modalBackgroundDiv" style="display: none; background-color: #e4e8f0;">
+    <div class="close">
+<!--         <a href="javascript:hidePopupDiv('modalBackgroundDiv',0);"> -->
+<!--         </a> -->
+    </div>
+</div>
+<div class="modal_default" id="passwordConfirmDiv" style="display: none;">
+    <div class="modal_inner">
+        <div class="pass_title">
+            <span>패스워드를 입력해 주세요!</span>
+        </div>
+        <form id="passForm" class="pass_form" style="height: 50px"><input type="hidden" name="csSignature" value="T3XBEV56aRsZjIA1aEVg1g==" />
+
+<!--              <label for="password_in"> -->
+            <label for="bbsPw">패스워드</label>
+            <input type="password" id="bbsPw" name="bbsPw" onkeyPress="if(event.keyCode==13){javascript:goPassWordCheck();return false;}" maxlength="6" />
+            <input type="button" onclick="javascript:goPassWordCheck();" class="submit" value="확인" />
+        </form>
+    </div>
+    <button class="modal_close" title="팝업닫기" onClick="javascript:hidePopupDiv('passwordConfirmDiv',0);">팝업닫기</button>
+</div>
+<div class="clear"></div>
+
+	                 </div>
+             </div>
+         </div>
+      <div class="wrapFooter">
+			<div class="WrapFooterInfo">
+	<div class="footerInfoDetail">
+		<ul class="footerQuickInfo">
+			<li><a href="/user/contents/contentsView.do?cntntsId=121">오시는 길</a></li>
+			<li><a href="/user/contents/contentsView.do?cntntsId=460"><strong>개인정보처리방침</strong></a></li>
+			<li><a href="/user/contents/contentsView.do?cntntsId=459">고정형 영상정보처리기기 운영 · 관리 방침</a></li>
+			<li><a href="/user/contents/contentsView.do?cntntsId=410">이동형 영상정보처리기기 운영 · 관리 방침</a></li>
+		</ul>
+
+		<div class="ccmContents">
+			<img alt="소비자중심경영(CCM) 인증마크(CCM인증마크)" src="/images/ccm.png" style="height:100%; width:100%;" />
+		</div>
+		<div class="waContents">
+			<a title="pdf 파일보기" href="/images/newMain/wa2025.pdf" target="_blank">
+				<img alt="(사)한국장애인단체총연합회 한국웹접근성인증평가원 웹 접근성 우수사이트 인증마크(WA인증마크)" src="/images/wa2025.png" style="height:100%; width:100%;" />
+			</a>
+		</div>
+
+<!-- <div class="relation01">
+			<a href="#self" class="familySite">관련사이트 바로가기</a>
+			<ul class="site_list">
+				<li><a href="http://www.forest.go.kr/" target="_blank">산림청</a></li>
+				<li><a href="https://ns.service.go.kr/usr/login" target="_blank">대한민국</a></li>
+				<li><a href="http://www.bokgwon.go.kr" target="_blank">복권위원회</a></li>
+				<li><a href="https://1398.acrc.go.kr" target="_blank">채용비리</a></li>
+				<li><a href="http://www.mybudget.go.kr" target="_blank">국민참여예산</a></li>
+			</ul>
+		</div> -->
+	</div>
+
+</div>
+
+<div class="footerCopy">
+	<div class="copyrightArea">
+		<p>주소 : 대전 서구 구봉산북로 96-90 산림복지종합교육센터 | 대표전화 : 042-719-4000 | 팩스 : 042-719-4049 | 이메일 : info@fowi.or.kr</p>
+		<p>Copyright © 2016 Korea Forest Welfare Institute. All right reserved.</p>
+	</div>
+	<div class="mobile-copyrightArea">
+		<p>
+			주소 : 대전 서구 구봉산북로 96-90 산림복지종합교육센터<br>
+			대표전화 : 042-719-4000<br>
+			팩스 : 042-719-4049<br>
+			이메일 :&nbsp;info@fowi.or.kr
+		</p>
+		<p>
+			Copyright © 2016 Korea Forest Welfare Institute.<br>
+			All right reserved.
+		</p>
+	</div>
+	<div class="snsArea">
+		<ul>
+			<li class="sns03"><a href="http://blog.naver.com/k-fowi" target="_blank">블로그</a></li>
+			<!-- <li class="sns02"><a href="https://twitter.com/fowi_news" target="_blank">트위터</a></li> -->
+			<li class="sns01"><a href="https://www.facebook.com/forestfowi" target="_blank">페이스북</a></li>
+			<li class="sns04"><a href="https://www.youtube.com/channel/UC8FI6B8bMlOwv83V_SJ7iYA" target="_blank">YouTube</a></li>
+			<li class="sns05"><a href="https://instagram.com/forestfowi" target="_blank">Instagram</a></li>
+		</ul>
+	</div>
+</div></div>
+    </div>
+    </body>
+</html>
