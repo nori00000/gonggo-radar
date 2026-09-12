@@ -246,19 +246,20 @@ class TestSeisMainCards:
         )
 
     def test_parse_main_cards_reads_card_metadata(self, crawler, soup):
-        """카드에서 제목/링크/분류/지역/회차/접수기간을 함께 읽는다."""
+        """카드에서 제목/링크/분류/주체/회차/접수기간을 함께 읽는다."""
         items = crawler._parse_main_cards(soup)
         assert len(items) == 22
 
         card = next(i for i in items if "fncPbofrSn=8371" in i["link"])
         assert card["title"] == "2026년 경기도 사회적기업 사회보험료 지원사업 참여기업 모집 공고"
         assert card["category"] == "재정지원"
-        assert card["region"] == "경기도"
         assert card["round"] == "2026년도 (9차)"
         assert card["date"] == "2026.09.01 ~ 2026.12.31"
-        assert card["program"] == "사회보험료 지원 사업"
-        # D-day 배지는 지역으로 오인되지 않는다
-        assert not card["region"].startswith("D-")
+        # 주체는 span.sub 에서만 온다 (ul.info 는 분류 자리다)
+        assert card["sub"] == "사회보험료 지원 사업"
+        assert card["info"] == ["경기도"]
+        # D-day 배지는 어느 필드에도 섞이지 않는다
+        assert not any(value.startswith("D-") for value in card["info"])
 
     def test_duplicate_rounds_collapse_to_one_item(self, crawler, soup):
         """같은 제목·지역의 회차별 링크 9건이 1건으로 합쳐진다."""
@@ -314,13 +315,13 @@ class TestSeisMainCards:
         ]
         assert len(payload["merged_rounds"]) == 9
 
-    def test_distinct_regions_stay_separate(self, crawler, soup):
-        """제목이 달라도 지역이 다른 지정공모는 병합하지 않는다."""
+    def test_distinct_subjects_stay_separate(self, crawler, soup):
+        """지정공모는 주체(span.sub)가 달라 각각 남는다."""
         deduped = crawler._dedupe_items(crawler._parse_main_cards(soup))
-        regions = {
-            i["region"] for i in deduped if i["title"].endswith("지정공모")
+        subjects = {
+            i["sub"] for i in deduped if i["title"].endswith("지정공모")
         }
-        assert {"서울특별시", "광주광역시", "전라남도", "경상북도", "산림청"} <= regions
+        assert {"서울특별시", "광주광역시", "전라남도", "경상북도", "산림청"} <= subjects
 
     def test_every_card_item_has_a_deadline(self, crawler, soup):
         """카드 파싱은 접수기간을 채운다 - 마감 NULL 문제 해소 (판정 4)."""
@@ -361,4 +362,108 @@ class TestSeisMainCards:
         """제목 정규화는 공백·구분기호 차이를 무시한다."""
         assert crawler._normalize_title("2026년  경기도 사회적기업 (모집)") == \
             crawler._normalize_title("2026년 경기도 사회적기업 모집")
+
+
+class TestSeisCardRegionCritique:
+    """Codex 크리틱 #4: ul.info 분류를 지역으로 오인해 별개 공고를 합치던 결함.
+
+    재현 입력: 제목이 같고 ``span.sub`` 가 서울센터/부산센터로 다르며
+    ``ul.info li`` 는 둘 다 "교육" 인 카드 두 장. 예전 파서는 둘 다
+    ``region="교육"`` 으로 읽어 1건으로 병합했다.
+    """
+
+    CARD = """
+    <li class="swiper-slide" data-type="사업공고">
+      <span class="badge cate">사업공고</span>
+      <span class="sub">{sub}</span>
+      <p class="tit"><a href="subPage.do?menuId=30400&tabId=view&itgrdAplyPbancSn={sid}">
+         2026년 사회적기업 성장지원센터 상주기업 모집 공고</a></p>
+      <ul class="info"><li>{info}</li><li>D-10</li></ul>
+      <p class="date">{period}</p>
+    </li>
+    """
+
+    @pytest.fixture
+    def crawler(self):
+        config = MagicMock()
+        config.crawler.timeout = 10
+        config.crawler.retry_count = 1
+        config.crawler.retry_delay = 0
+        config.crawler.user_agent = "test-agent"
+        source = MagicMock()
+        source.enabled = True
+        source.base_url = "https://www.seis.or.kr"
+        config.crawler.sources = {"seis": source}
+        with patch("alert.crawlers.base.get_config", return_value=config):
+            yield SeisCrawler()
+
+    def build(self, crawler, cards):
+        soup = BeautifulSoup("<ul>" + "".join(cards) + "</ul>", "html.parser")
+        items = crawler._parse_main_cards(soup)
+        return items, crawler._dedupe_items(items)
+
+    def test_different_centers_are_two_items(self, crawler):
+        """서울센터/부산센터는 제목이 같아도 2건으로 남는다."""
+        items, deduped = self.build(crawler, [
+            self.CARD.format(sub="서울센터", sid="100", info="교육",
+                             period="2026.09.01 ~ 2026.09.30"),
+            self.CARD.format(sub="부산센터", sid="101", info="교육",
+                             period="2026.09.01 ~ 2026.09.30"),
+        ])
+        assert len(items) == 2
+        assert len(deduped) == 2
+        assert {i["sub"] for i in deduped} == {"서울센터", "부산센터"}
+
+    def test_info_is_category_not_region(self, crawler):
+        """ul.info 값은 분류로 남고 주체 자리에 들어가지 않는다."""
+        _items, deduped = self.build(crawler, [
+            self.CARD.format(sub="서울센터", sid="100", info="교육",
+                             period="2026.09.01 ~ 2026.09.30"),
+        ])
+        assert deduped[0]["info"] == ["교육"]
+        assert deduped[0]["sub"] == "서울센터"
+
+    def test_different_period_end_is_not_merged(self, crawler):
+        """주체·제목이 같아도 접수 종료일이 다르면 1차·2차 별개 공고다."""
+        _items, deduped = self.build(crawler, [
+            self.CARD.format(sub="서울센터", sid="200", info="교육",
+                             period="2026.08.01 ~ 2026.08.31"),
+            self.CARD.format(sub="서울센터", sid="201", info="교육",
+                             period="2026.09.01 ~ 2026.09.30"),
+        ])
+        assert len(deduped) == 2
+        ends = {
+            crawler._to_announcement(i, "https://www.seis.or.kr").period_end
+            for i in deduped
+        }
+        assert ends == {"2026-08-31", "2026-09-30"}
+
+    def test_genuine_round_duplication_still_merges(self, crawler):
+        """주체·제목·종료일이 모두 같은 회차 중복은 여전히 1건으로 합친다."""
+        _items, deduped = self.build(crawler, [
+            self.CARD.format(sub="사회보험료 지원 사업", sid="8371", info="경기도",
+                             period="2026.09.01 ~ 2026.12.31"),
+            self.CARD.format(sub="사회보험료 지원 사업", sid="8370", info="경기도",
+                             period="2026.08.01 ~ 2026.12.31"),
+        ])
+        assert len(deduped) == 1
+        assert deduped[0]["merged_count"] == 2
+        announcement = crawler._to_announcement(deduped[0], "https://www.seis.or.kr")
+        assert announcement.source_id == "8371"          # 최신 회차가 대표
+        assert announcement.period_end == "2026-12-31"
+
+    def test_group_key_components(self, crawler):
+        """중복 판별 키는 제목·주체·종료일 세 조각이다."""
+        base = {"title": "같은 제목", "sub": "서울센터", "date": "2026.09.01 ~ 2026.09.30"}
+        assert crawler._group_key(base) == crawler._group_key(dict(base))
+        assert crawler._group_key(base) != crawler._group_key(
+            {**base, "sub": "부산센터"}
+        )
+        assert crawler._group_key(base) != crawler._group_key(
+            {**base, "date": "2026.09.01 ~ 2026.10.31"}
+        )
+        # 양쪽 다 기간이 없으면 같은 키다
+        assert crawler._group_key({**base, "date": ""}) == crawler._group_key(
+            {**base, "date": ""}
+        )
 

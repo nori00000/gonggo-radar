@@ -190,7 +190,11 @@ class SeisCrawler(BaseCrawler):
             if not category:
                 category = self._clean(card.get("data-type", "") or "")
 
-            region = ""
+            # ul.info 는 **분류**(교육/시설·공간/행사 등)와 회차·D-day가 섞여
+            # 들어오는 자리다. 지역으로 오인하면 "교육" 같은 값이 지역이 되어
+            # 서울센터/부산센터 공고가 한 건으로 병합된다(Codex 크리틱 #4).
+            # 주체(지역·기관·사업명)는 span.sub 만 본다.
+            info_values = []
             round_label = ""
             for info in card.select("ul.info li"):
                 value = self._clean(info.get_text(strip=True))
@@ -199,8 +203,7 @@ class SeisCrawler(BaseCrawler):
                 if self._ROUND_RE.search(value):
                     round_label = round_label or value
                     continue
-                if not region:
-                    region = value
+                info_values.append(value)
 
             items.append({
                 "title": title,
@@ -208,9 +211,9 @@ class SeisCrawler(BaseCrawler):
                 "author": "",
                 "category": category,
                 "date": self._clean(date_elem.get_text(strip=True)) if date_elem else "",
-                "region": region,
+                "sub": self._clean(sub.get_text(strip=True)) if sub else "",
+                "info": info_values,
                 "round": round_label,
-                "program": self._clean(sub.get_text(strip=True)) if sub else "",
             })
 
         return items
@@ -228,13 +231,28 @@ class SeisCrawler(BaseCrawler):
         post_no = int(post_id) if post_id.isdigit() else -1
         return (item.get("date", "") or "", round_no, post_no)
 
+    def _group_key(self, item: dict) -> tuple:
+        """중복 판별 키 - 제목·주체·접수 종료일이 **모두** 같아야 한 공고다.
+
+        접수 종료일을 키에 넣는 이유(Codex 크리틱 #4): 같은 제목의 1차·2차
+        공고는 접수기간이 다른 **별개 공고**다. 종료일이 다르면 병합하지
+        않는다. 양쪽 다 종료일이 없으면 같은 것으로 본다.
+        """
+        _, period_end = self._parse_period(item.get("date", "").strip())
+        return (
+            self._normalize_title(item.get("title", "")),
+            item.get("sub", "") or "",
+            period_end or "",
+        )
+
     def _dedupe_items(self, items: List[dict]) -> List[dict]:
         """같은 공고의 복수 링크를 1건으로 합친다 (계약 v2.1 판정 6-①).
 
-        SEIS 메인은 회차마다 별개 링크(``fncPbofrSn``)를 나열하므로 제목과
-        지역이 같으면 한 공고로 본다. 대표는 접수 시작일이 가장 늦고 회차
-        번호가 가장 큰 항목(= 현재 진행 회차)이며, 병합된 나머지 링크의
-        ID와 회차는 감사할 수 있도록 ``merged_source_ids`` 에 남긴다.
+        SEIS 메인은 회차마다 별개 링크(``fncPbofrSn``)를 나열하므로
+        **제목·주체(span.sub)·접수 종료일이 모두 같을 때만** 한 공고로 본다.
+        대표는 접수 시작일이 가장 늦고 회차 번호가 가장 큰 항목(= 현재 진행
+        회차)이며, 병합된 나머지 링크의 ID와 회차는 감사할 수 있도록
+        ``merged_source_ids`` 에 남긴다.
 
         Args:
             items: 파싱된 공고 딕셔너리 리스트
@@ -244,11 +262,7 @@ class SeisCrawler(BaseCrawler):
         """
         groups: "OrderedDict[tuple, List[dict]]" = OrderedDict()
         for item in items:
-            key = (
-                self._normalize_title(item.get("title", "")),
-                item.get("region", "") or "",
-            )
-            groups.setdefault(key, []).append(item)
+            groups.setdefault(self._group_key(item), []).append(item)
 
         deduped: List[dict] = []
         for group in groups.values():

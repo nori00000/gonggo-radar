@@ -3,20 +3,32 @@
 
 크롤러 수리(커밋 6cfed6d·080a38b)는 **앞으로 들어오는** 데이터만 바로잡는다.
 이미 저장된 행은 재크롤로 사라지지 않으므로 이 스크립트가 치운다.
+파일명은 seis에서 출발한 역사적 이름이고, 실제 범위는 아래 4종이다.
 
-파일명은 seis에서 출발한 역사적 이름이고, 실제 정리 범위는 아래 4종이다.
+규칙은 **적용 순서가 있다** (Codex 크리틱 #1):
 
-1. **복수 링크 / ID 오매칭 중복 삭제** — ``seis``(회차별 링크가 같은 공고를
-   9행까지 만듦), ``socialenterprise``(게시판 구분자 ``bsIdx`` 를 글 ID로
-   써서 한 글이 2행), ``smartfarm``(``href="#void"`` 가 해소되지 않아 한 글이
-   2행). 세 소스 모두 **대표 1행만** 남긴다.
-2. **socialenterprise 가짜 마감** — 게시일이 ``period_end`` 에 들어가 있어
-   판정 4의 "마감 경과 → 제외" 에 걸리면 살아있는 공고가 사라진다.
-3. **coop 가짜 접수 시작일** — 게시일이 ``period_start`` 에 들어가 있어
-   존재하지 않는 접수기간이 브리핑에 표시된다.
+- **규칙 A** (모든 소스): 대표 행의 ``raw_data.merged_source_ids`` 에 적힌
+  source_id를 삭제한다. 이때 대표 행은 *canonical* 로 잠기고 이후 어떤
+  규칙도 건드리지 못한다. A를 B보다 먼저 적용하지 않으면 A가 지목한
+  대표를 B가 지워 **묶음 전체가 사라진다**.
+- **규칙 B** (``seis`` 전용, 크리틱 #2): 정규화 제목 · 주체(span.sub) ·
+  접수 종료일이 **모두** 같은 묶음만 병합한다. 지역·회차·접수기간이 다르면
+  별개 공고다. 다른 소스에는 적용하지 않는다.
+- **규칙 C** (seis 외): "source_id가 자기 URL의 글번호 자리에 없다" 는
+  **증명 가능한 결함**만 지운다 (``bsIdx`` 를 글 ID로 쓴 행, ``#void`` 로
+  남은 행). 제목이 같아도 양쪽 모두 제 글번호를 갖고 있으면 손대지 않는다.
+- **불변식**: 어떤 묶음도 0행이 되지 않고 canonical은 반드시 살아남는다.
+  위반하면 아무것도 지우지 않고 종료한다.
 
-기본은 ``--dry-run`` 이다. 실제로 쓰려면 ``--apply`` 를 명시해야 하고,
-그때만 DB를 ``announcements.db.bak-<timestamp>`` 로 백업한다.
+그 밖에 정리하는 것:
+
+- **socialenterprise 가짜 마감**: 게시일이 ``period_end`` 에 들어간 행.
+  단, 원문이 **당일 접수**(``date`` 가 범위 표기)라고 말하는 행은 남긴다
+  (크리틱 #9).
+- **coop 가짜 접수 시작일**: 게시일이 ``period_start`` 에 들어간 행.
+
+기본은 ``--dry-run`` 이다. ``--apply`` 를 명시해야 쓰며, 그때만 SQLite
+backup API로 백업한다(WAL 포함 - 크리틱 #5).
 
 사용::
 
@@ -28,20 +40,21 @@
 import argparse
 import json
 import re
-import shutil
 import sqlite3
 import sys
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Set, Tuple
 
 DEFAULT_DB = "alert/data/announcements.db"
 
-# 중복 정리 대상 소스 (같은 규칙 B를 공유한다)
-DEDUPE_SOURCES = ("seis", "socialenterprise", "smartfarm")
+# 규칙 B(제목·주체·종료일 병합)는 회차별 링크를 뿌리는 seis 에만 쓴다
+RULE_B_SOURCE = "seis"
+# 규칙 C(글번호 오매칭·미해소 URL)를 적용할 소스
+RULE_C_SOURCES = ("socialenterprise", "smartfarm")
+CLEANUP_SOURCES = (RULE_B_SOURCE,) + RULE_C_SOURCES
 
-# 소스별 "글 고유번호" 파라미터 - 대표 행 선정의 결정적 근거.
-# 수리된 크롤러의 _extract_post_id 와 같은 파라미터를 본다.
+# 소스별 "글 고유번호" 파라미터 - 수리된 _extract_post_id 와 같은 자리를 본다
 POST_ID_PARAMS: Dict[str, Tuple[str, ...]] = {
     "seis": ("fncPbofrSn", "dsgnPbofrSn", "itgrdAplyPbancSn", "epsdNo"),
     "socialenterprise": ("bIdx",),
@@ -50,6 +63,9 @@ POST_ID_PARAMS: Dict[str, Tuple[str, ...]] = {
 
 # 중복 판별용 제목 정규화 - 크롤러의 SeisCrawler._normalize_title 과 같은 규칙
 _TITLE_NOISE = re.compile(r"[\s·.,()\[\]{}「」『』\-~/]+")
+# 기간 문자열에 범위 표기가 있으면 게시일이 아니라 원문이 말한 접수기간이다
+_RANGE_MARK = re.compile(r"[~∼〜]|부터")
+_DATE_TOKEN = re.compile(r"\d{4}\s*[.\-/년]\s*\d{1,2}\s*[.\-/월]\s*\d{1,2}")
 
 
 def normalize_title(title: str) -> str:
@@ -68,20 +84,18 @@ def load_raw(raw_data: Optional[str]) -> dict:
     return loaded if isinstance(loaded, dict) else {}
 
 
+def row_subject(row: sqlite3.Row) -> str:
+    """공고의 주체(지역·기관·사업명) - 새 파서는 ``sub``, 구 파서는 ``region``."""
+    payload = load_raw(row["raw_data"])
+    return str(payload.get("sub") or payload.get("region") or "")
+
+
 def id_matches_url(source: str, source_id: str, url: str) -> bool:
-    """source_id 가 URL의 **글 고유번호 자리**에 실제로 들어 있는지 본다.
+    """source_id 가 URL의 **글번호 자리**에 실제로 들어 있는지 본다.
 
-    같은 글이 두 행으로 갈린 경우(``bsIdx`` 오매칭, ``#void`` 미해소) 어느
-    쪽이 진짜인지는 이것으로 갈린다 - 예를 들어 ``bsIdx=10002&bIdx=252628``
-    URL에서 ``10002`` 는 게시판 구분자이므로 ``bIdx`` 자리에 없다.
-
-    Args:
-        source: 소스 이름
-        source_id: 저장된 source_id
-        url: 저장된 상세 URL
-
-    Returns:
-        고유번호 자리에서 일치하면 True
+    같은 글이 두 행으로 갈린 경우 어느 쪽이 진짜인지는 이것으로 갈린다 -
+    ``bsIdx=10002&bIdx=252628`` 에서 ``10002`` 는 게시판 구분자이므로
+    ``bIdx`` 자리에 없다.
     """
     if not source_id or not url:
         return False
@@ -91,11 +105,22 @@ def id_matches_url(source: str, source_id: str, url: str) -> bool:
     return False
 
 
+def url_is_unresolved(source: str, url: str) -> bool:
+    """상세 URL이 해소되지 않은 행인지 본다 (``#void``, 글번호 없음)."""
+    if not url:
+        return True
+    if url.endswith("#void") or "#void" in url:
+        return True
+    return not any(
+        re.search(rf"[?&]{re.escape(param)}=\d+", url, re.I)
+        for param in POST_ID_PARAMS.get(source, ())
+    )
+
+
 def canonical_rank(row: sqlite3.Row) -> Tuple[int, str, int, int]:
     """대표 행 선정 순위 (큰 쪽이 이긴다).
 
-    순서대로: ①URL의 고유번호 자리와 일치 ②접수 시작일이 늦음
-    ③회차 번호가 큼 ④공고번호가 큼.
+    ①URL의 글번호 자리와 일치 ②접수 시작일이 늦음 ③회차가 큼 ④번호가 큼.
     """
     payload = load_raw(row["raw_data"])
     round_match = re.search(r"(\d+)\s*차", str(payload.get("round", "")))
@@ -106,26 +131,8 @@ def canonical_rank(row: sqlite3.Row) -> Tuple[int, str, int, int]:
     return (url_ok, row["period_start"] or "", round_no, post_no)
 
 
-def find_duplicates(
-    conn: sqlite3.Connection, source: str
-) -> Tuple[List[sqlite3.Row], List[str]]:
-    """한 소스에서 삭제할 중복 행과 판단 근거를 찾는다.
-
-    두 규칙을 함께 쓴다:
-
-    - (규칙 A) 대표 행의 ``raw_data.merged_source_ids`` 에 적힌 source_id.
-      수리된 파서가 병합하며 남긴 감사 기록이므로 가장 확실하다.
-    - (규칙 B) 정규화 제목이 같고 **같은 주(created_at 기준)** 에 적재된 묶음.
-      수리 이전 데이터에는 감사 기록이 없으므로 이 규칙이 필요하다.
-
-    Args:
-        conn: 열린 DB 커넥션
-        source: 소스 이름
-
-    Returns:
-        (삭제 대상 행 리스트, 사람이 읽을 근거 문장 리스트)
-    """
-    rows = conn.execute(
+def _fetch_rows(conn: sqlite3.Connection, source: str) -> List[sqlite3.Row]:
+    return conn.execute(
         "SELECT id, source, source_id, title, url, period_start, period_end,"
         "       raw_data, created_at,"
         "       strftime('%Y-%W', created_at) AS week"
@@ -133,67 +140,172 @@ def find_duplicates(
         (source,),
     ).fetchall()
 
+
+def find_duplicates(
+    conn: sqlite3.Connection, source: str
+) -> Tuple[List[sqlite3.Row], List[str], Set[int]]:
+    """한 소스에서 삭제할 중복 행과 근거, canonical 집합을 낸다.
+
+    Args:
+        conn: 열린 DB 커넥션
+        source: 소스 이름
+
+    Returns:
+        ``(삭제 대상 행, 근거 문장, canonical 행 id 집합)``
+
+    Raises:
+        RuntimeError: 어떤 묶음이든 0행이 되는 계획이 나오면 (불변식 위반)
+    """
+    rows = _fetch_rows(conn, source)
     by_source_id: Dict[str, sqlite3.Row] = {r["source_id"]: r for r in rows}
     doomed: Dict[int, sqlite3.Row] = {}
     reasons: List[str] = []
 
-    # 규칙 A: 대표 행이 남긴 병합 기록
+    # ---------- 규칙 A (먼저, canonical 잠금) ----------
+    canonical: Set[int] = set()
     for row in rows:
         merged = load_raw(row["raw_data"]).get("merged_source_ids") or []
+        if not merged:
+            continue
+        canonical.add(row["id"])
         for merged_id in merged:
             victim = by_source_id.get(str(merged_id))
-            if victim is not None and victim["id"] != row["id"]:
-                doomed[victim["id"]] = victim
-                reasons.append(
-                    f"  [A] id={victim['id']} source_id={victim['source_id']} "
-                    f"-> 대표 source_id={row['source_id']} 의 merged_source_ids"
-                )
-
-    # 규칙 B: 같은 제목 + 같은 주
-    groups: Dict[Tuple[str, str], List[sqlite3.Row]] = {}
-    for row in rows:
-        groups.setdefault(
-            (normalize_title(row["title"]), row["week"] or ""), []
-        ).append(row)
-
-    for (_title_key, week), group in groups.items():
-        if len(group) < 2:
-            continue
-        keeper = max(group, key=canonical_rank)
-        keeper_note = (
-            "URL 고유번호 일치"
-            if id_matches_url(source, keeper["source_id"], keeper["url"] or "")
-            else "접수시작일/회차/번호 최대"
-        )
-        for row in group:
-            if row["id"] == keeper["id"] or row["id"] in doomed:
+            if victim is None or victim["id"] == row["id"]:
                 continue
-            doomed[row["id"]] = row
+            doomed[victim["id"]] = victim
             reasons.append(
-                f"  [B] id={row['id']} source_id={row['source_id']} "
-                f"-> 같은 제목·같은 주({week}) 대표 source_id={keeper['source_id']}"
-                f" ({keeper_note})"
+                f"  [A] id={victim['id']} source_id={victim['source_id']} "
+                f"-> 대표 source_id={row['source_id']} 의 merged_source_ids"
+            )
+    # canonical 은 A가 지목했어도 지우지 않는다 (기록 충돌 시 대표 보존)
+    for row_id in canonical:
+        if doomed.pop(row_id, None) is not None:
+            reasons.append(
+                f"  [A!] id={row_id} 은 canonical 이므로 삭제 목록에서 제외 (기록 충돌)"
             )
 
+    survivors = [r for r in rows if r["id"] not in doomed]
+
+    # ---------- 규칙 B (seis 전용) 또는 규칙 C ----------
+    if source == RULE_B_SOURCE:
+        groups: Dict[Tuple[str, str, str], List[sqlite3.Row]] = {}
+        for row in survivors:
+            key = (
+                normalize_title(row["title"]),
+                row_subject(row),
+                row["period_end"] or "",
+            )
+            groups.setdefault(key, []).append(row)
+
+        for (_title, subject, period_end), group in groups.items():
+            if len(group) < 2:
+                continue
+            locked = [r for r in group if r["id"] in canonical]
+            keeper = locked[0] if locked else max(group, key=canonical_rank)
+            for row in group:
+                if row["id"] == keeper["id"] or row["id"] in canonical:
+                    continue
+                doomed[row["id"]] = row
+                reasons.append(
+                    f"  [B] id={row['id']} source_id={row['source_id']} -> 대표 "
+                    f"source_id={keeper['source_id']} (제목·주체{subject or '(없음)'}"
+                    f"·종료일{period_end or '(없음)'} 동일)"
+                )
+    else:
+        groups_by_title: Dict[str, List[sqlite3.Row]] = {}
+        for row in survivors:
+            groups_by_title.setdefault(normalize_title(row["title"]), []).append(row)
+
+        for group in groups_by_title.values():
+            if len(group) < 2:
+                continue
+            provable = [
+                r for r in group
+                if id_matches_url(source, r["source_id"], r["url"] or "")
+            ]
+            if not provable:
+                continue  # 근거가 없으면 손대지 않는다
+            keeper = max(provable, key=canonical_rank)
+            for row in group:
+                if row["id"] == keeper["id"] or row["id"] in canonical:
+                    continue
+                if id_matches_url(source, row["source_id"], row["url"] or ""):
+                    continue  # 제 글번호를 가진 행은 별개 공고로 본다
+                same_url = (row["url"] or "") == (keeper["url"] or "")
+                unresolved = url_is_unresolved(source, row["url"] or "")
+                if not (same_url or unresolved):
+                    continue
+                cause = "같은 URL + 글번호 자리 불일치" if same_url else "URL 미해소(#void)"
+                doomed[row["id"]] = row
+                reasons.append(
+                    f"  [C] id={row['id']} source_id={row['source_id']} -> 대표 "
+                    f"source_id={keeper['source_id']} ({cause})"
+                )
+
+    # ---------- 불변식 ----------
+    _assert_invariants(source, rows, doomed, canonical)
+
     ordered = sorted(doomed.values(), key=lambda r: r["id"])
-    return ordered, reasons
+    return ordered, reasons, canonical
+
+
+def _assert_invariants(
+    source: str,
+    rows: List[sqlite3.Row],
+    doomed: Dict[int, sqlite3.Row],
+    canonical: Set[int],
+) -> None:
+    """canonical 생존 + 제목 묶음당 최소 1행 생존을 확인한다."""
+    killed_canonical = canonical & set(doomed)
+    if killed_canonical:
+        raise RuntimeError(
+            f"{source}: canonical 행이 삭제 목록에 있다 (id={sorted(killed_canonical)})"
+        )
+
+    by_title: Dict[str, List[sqlite3.Row]] = {}
+    for row in rows:
+        by_title.setdefault(normalize_title(row["title"]), []).append(row)
+    for title, group in by_title.items():
+        remaining = [r for r in group if r["id"] not in doomed]
+        if not remaining:
+            raise RuntimeError(
+                f"{source}: 제목 묶음이 전멸한다 (title={title[:40]!r}, "
+                f"{len(group)}행 전부 삭제 대상)"
+            )
+
+
+def _mentions_range(payload: dict) -> bool:
+    """raw_data 에 원문이 말한 **기간**(범위 표기)이 들어 있는지 본다."""
+    for key in ("date", "period", "WRITE_DATE", "quote_deadline"):
+        value = str(payload.get(key) or "")
+        if not value:
+            continue
+        if _RANGE_MARK.search(value):
+            return True
+        if len(_DATE_TOKEN.findall(value)) >= 2:
+            return True
+    return False
 
 
 def find_fake_deadlines(
-    conn: sqlite3.Connection, skip_ids: Optional[set] = None
+    conn: sqlite3.Connection, skip_ids: Optional[Set[int]] = None
 ) -> Tuple[List[sqlite3.Row], List[str]]:
     """socialenterprise 의 게시일=마감 행을 찾는다.
 
-    지시받은 조건은 ``period_end == DATE(created_at)`` 이지만, 실측에서는
-    게시일이 적재일보다 하루 이상 앞서기 때문에 그 조건만으로는 한 행도
-    잡히지 않았다(예: period_end=2026-09-11, created_at=2026-09-12).
-    그래서 실제 지문인 ``period_start == period_end`` (단일 게시일이
-    기간으로 해석된 흔적) 도 함께 본다. 상세 인용에서 온 진짜 기간
-    (``raw_data.quote_period_end``) 은 건드리지 않는다.
+    두 조건 중 하나라도 맞으면 대상이다:
+
+    1. ``period_end == DATE(created_at)`` 이고 raw_data에 날짜·인용 근거가 없다
+       (지시받은 조건).
+    2. ``period_start == period_end`` 이고 raw_data의 목록 날짜가 **단일
+       날짜**다 - 게시일 하나가 기간으로 해석된 지문.
+
+    **당일 접수를 명시한 원문은 남긴다** (Codex 크리틱 #9):
+    ``raw_data.date = "2026-09-15 ~ 2026-09-15"`` 처럼 범위 표기나 날짜
+    두 개가 있으면 원문이 스스로 기간을 말한 것이므로 건드리지 않는다.
 
     Args:
         conn: 열린 DB 커넥션
-        skip_ids: (b) 단계에서 이미 삭제되는 행 id - 이중 계상을 막는다
+        skip_ids: (b)에서 이미 삭제되는 행 id - 이중 계상을 막는다
 
     Returns:
         (period_end 를 비울 행 리스트, 근거 문장 리스트)
@@ -211,33 +323,36 @@ def find_fake_deadlines(
     reasons: List[str] = []
     for row in rows:
         if row["id"] in skip_ids:
-            continue  # (b)에서 이미 삭제되는 행
+            continue
         payload = load_raw(row["raw_data"])
-        if payload.get("quote_period_end"):
+        if payload.get("quote_period_end") or payload.get("quote_deadline"):
             continue  # 상세 인용에서 온 진짜 마감
+        if _mentions_range(payload):
+            continue  # 원문이 당일 접수/기간을 명시한 행 (크리틱 #9)
+
         if row["period_end"] == row["created_date"]:
             doomed.append(row)
             reasons.append(
                 f"  [지시조건] id={row['id']} period_end={row['period_end']} "
-                f"== date(created_at)"
+                f"== date(created_at), 원문 기간 표기 없음"
             )
         elif row["period_end"] == row["period_start"]:
             doomed.append(row)
             reasons.append(
                 f"  [게시일지문] id={row['id']} period_start=period_end="
-                f"{row['period_end']} (단일 게시일이 기간으로 해석됨)"
+                f"{row['period_end']}, 목록 날짜가 단일 날짜"
             )
     return doomed, reasons
 
 
 def find_fake_starts(
-    conn: sqlite3.Connection, skip_ids: Optional[set] = None
+    conn: sqlite3.Connection, skip_ids: Optional[Set[int]] = None
 ) -> Tuple[List[sqlite3.Row], List[str]]:
     """coop 의 게시일=접수 시작일 행을 찾는다.
 
     coop 목록은 게시일만 주는데 그것이 ``period_start`` 에 들어가 있었다
-    (판정 4에 따라 크롤러는 이제 비워 둔다). ``period_end`` 가 없고 상세
-    인용 기록도 없는 행이 그 흔적이다.
+    (판정 4에 따라 크롤러는 이제 비워 둔다). 마감이 없고 인용 근거도 없으며
+    원문이 기간을 말하지 않은 행이 그 흔적이다.
     """
     rows = conn.execute(
         "SELECT id, source_id, title, period_start, period_end, raw_data"
@@ -252,24 +367,41 @@ def find_fake_starts(
     reasons: List[str] = []
     for row in rows:
         if row["id"] in skip_ids:
-            continue  # (b)에서 이미 삭제되는 행
-        if load_raw(row["raw_data"]).get("quote_period_start"):
+            continue
+        payload = load_raw(row["raw_data"])
+        if payload.get("quote_period_start") or _mentions_range(payload):
             continue
         doomed.append(row)
         reasons.append(
             f"  [게시일지문] id={row['id']} period_start={row['period_start']} "
-            f"(마감 없음 + 인용 없음)"
+            f"(마감 없음 + 인용 없음 + 원문 기간 표기 없음)"
         )
     return doomed, reasons
 
 
+def backup_database(db_path: Path, backup_path: Path) -> None:
+    """SQLite backup API로 백업한다 - WAL의 미체크포인트 커밋까지 포함한다.
+
+    ``shutil.copy2`` 는 ``-wal`` 파일을 빼먹으므로 최근 커밋이 백업에서
+    누락될 수 있다(Codex 크리틱 #5).
+    """
+    source = sqlite3.connect(str(db_path))
+    destination = sqlite3.connect(str(backup_path))
+    try:
+        with destination:
+            source.backup(destination)
+    finally:
+        destination.close()
+        source.close()
+
+
 def counts(conn: sqlite3.Connection) -> Dict[str, int]:
-    """정리 전/후 비교용 집계 (중복 대상 소스는 소스별로 나눈다)."""
+    """정리 전/후 비교용 집계 (소스별)."""
     def one(sql: str, params: tuple = ()) -> int:
         return conn.execute(sql, params).fetchone()[0]
 
     values: Dict[str, int] = {}
-    for source in DEDUPE_SOURCES:
+    for source in CLEANUP_SOURCES:
         values[f"{source}_rows"] = one(
             "SELECT COUNT(*) FROM announcements WHERE source = ?", (source,)
         )
@@ -292,7 +424,7 @@ def counts(conn: sqlite3.Connection) -> Dict[str, int]:
 def print_counts(label: str, values: Dict[str, int]) -> None:
     print(f"\n[{label}]")
     for key, value in values.items():
-        print(f"  {key:<30} {value}")
+        print(f"  {key:<34} {value}")
 
 
 def main() -> int:
@@ -323,16 +455,8 @@ def main() -> int:
     mode = "APPLY" if apply_changes else "DRY-RUN"
     print(f"=== cleanup_seis_duplicates ({mode}) ===")
     print(f"DB: {db_path}")
-    print(f"중복 정리 대상 소스: {', '.join(DEDUPE_SOURCES)}")
-
-    # (a) 백업 - 실제로 쓸 때만
-    timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-    backup_path = db_path.with_name(f"{db_path.name}.bak-{timestamp}")
-    if apply_changes:
-        shutil.copy2(db_path, backup_path)
-        print(f"백업 생성: {backup_path}")
-    else:
-        print(f"백업 예정 경로(미생성): {backup_path}")
+    print(f"규칙 B(제목·주체·종료일): {RULE_B_SOURCE}")
+    print(f"규칙 C(글번호 오매칭·URL 미해소): {', '.join(RULE_C_SOURCES)}")
 
     conn = sqlite3.connect(str(db_path))
     conn.row_factory = sqlite3.Row
@@ -340,33 +464,41 @@ def main() -> int:
     before = counts(conn)
     print_counts("before", before)
 
-    # (b) 소스별 중복
     duplicates: Dict[str, List[sqlite3.Row]] = {}
     print("\n[b] 중복 삭제 대상")
-    for source in DEDUPE_SOURCES:
-        rows, reasons = find_duplicates(conn, source)
-        duplicates[source] = rows
-        print(f"  {source}: {len(rows)} 행")
-        for line in reasons:
-            print(f"  {line}")
+    try:
+        for source in CLEANUP_SOURCES:
+            rows, reasons, canonical = find_duplicates(conn, source)
+            duplicates[source] = rows
+            locked = f", canonical {len(canonical)}건 잠금" if canonical else ""
+            print(f"  {source}: {len(rows)} 행{locked}")
+            for line in reasons:
+                print(f"  {line}")
+    except RuntimeError as exc:
+        print(f"\n불변식 위반 - 아무것도 변경하지 않고 중단합니다:\n  {exc}", file=sys.stderr)
+        conn.close()
+        return 2
     total_duplicates = sum(len(rows) for rows in duplicates.values())
     print(f"  합계: {total_duplicates} 행")
 
     doomed_ids = {row["id"] for rows in duplicates.values() for row in rows}
 
-    # (c) socialenterprise 가짜 마감 - (b)에서 지워지는 행은 제외해 이중 계상을 막는다
     fake_deadlines, deadline_reasons = find_fake_deadlines(conn, doomed_ids)
     print(f"\n[c] socialenterprise period_end -> NULL: {len(fake_deadlines)} 행")
     for line in deadline_reasons:
         print(line)
 
-    # (c-확장) coop 가짜 접수 시작일
     fake_starts, start_reasons = find_fake_starts(conn, doomed_ids)
     print(f"\n[c+] coop period_start -> NULL: {len(fake_starts)} 행")
     for line in start_reasons:
         print(line)
 
+    timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    backup_path = db_path.with_name(f"{db_path.name}.bak-{timestamp}")
+
     if apply_changes:
+        backup_database(db_path, backup_path)
+        print(f"\n백업 생성(SQLite backup API, WAL 포함): {backup_path}")
         with conn:
             if doomed_ids:
                 conn.executemany(
@@ -391,16 +523,15 @@ def main() -> int:
         projected = dict(before)
         for source, rows in duplicates.items():
             projected[f"{source}_rows"] -= len(rows)
-        # 중복 삭제로 함께 사라지는 socialenterprise 마감 행까지 반영한다
         deleted_se_with_deadline = sum(
-            1 for row in duplicates.get("socialenterprise", [])
-            if row["period_end"]
+            1 for row in duplicates.get("socialenterprise", []) if row["period_end"]
         )
         projected["se_rows_with_deadline"] -= len(fake_deadlines) + deleted_se_with_deadline
         projected["coop_rows_with_start"] -= len(fake_starts)
         projected["total_rows"] -= total_duplicates
         print_counts("after (예상)", projected)
-        print("\n실제로 정리하려면 --apply 를 붙여 다시 실행하세요.")
+        print(f"\n백업 예정 경로(미생성): {backup_path}")
+        print("실제로 정리하려면 --apply 를 붙여 다시 실행하세요.")
 
     conn.close()
     return 0

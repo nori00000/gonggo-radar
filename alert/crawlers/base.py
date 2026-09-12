@@ -3,18 +3,22 @@ import abc
 import json
 import time
 import requests
-from typing import Dict, List, Optional
+from typing import Dict, Iterable, List, Optional
 from ..models import RawAnnouncement
 from ..config import get_config
 from ..utils.logger import setup_logger
 from .detail_quotes import (
+    ALWAYS_OPEN,
     BROWSER_USER_AGENT,
+    DETAIL_BUDGET_SEC,
     DETAIL_DELAY_SEC,
     DETAIL_TIMEOUT,
-    QUOTE_DEADLINE,
+    MAX_DETAIL_BYTES,
+    MAX_DETAIL_REQUESTS,
+    apply_quote_period,
     extract_quotes,
+    has_quote_keys,
     normalize_text,
-    period_from_quote,
 )
 
 
@@ -110,10 +114,27 @@ class BaseCrawler(abc.ABC):
         source_cfg = self.config.crawler.sources.get(self.source_name)
         return getattr(source_cfg, "fetch_detail", False) is True
 
+    @staticmethod
+    def _decode(body: bytes, header_encoding: Optional[str]) -> str:
+        """응답 본문을 디코드한다 (헤더 우선, 그다음 utf-8/cp949 시도)."""
+        candidates = [header_encoding, "utf-8", "cp949"]
+        for encoding in candidates:
+            if not encoding:
+                continue
+            try:
+                return body.decode(encoding)
+            except (UnicodeDecodeError, LookupError):
+                continue
+        return body.decode("utf-8", errors="replace")
+
     def fetch_detail_quotes(self, detail_url: str) -> Dict[str, str]:
         """상세 페이지에서 마감/자격/금액 인용을 가져온다.
 
-        브라우저 User-Agent와 10초 타임아웃으로 요청한다(계약 v2.1 V2).
+        브라우저 User-Agent, 10초 타임아웃, **재시도 없음**, 본문
+        256KB 상한으로 요청한다. 재시도를 하지 않는 이유는 인용 하나가
+        재시도 3회(최악 40초 이상)를 쓸 가치가 없기 때문이고, 본문 상한은
+        타임아웃보다 느리게 계속 흘려보내는 응답을 끊기 위한 것이다
+        (계약 v2.1 V2 + Codex 크리틱 #8).
 
         Args:
             detail_url: 상세 페이지 URL
@@ -124,27 +145,65 @@ class BaseCrawler(abc.ABC):
         if not detail_url:
             return {}
 
-        response = self.get(
-            detail_url,
-            timeout=DETAIL_TIMEOUT,
-            headers={"User-Agent": BROWSER_USER_AGENT},
-        )
-        if response is None:
-            return {}
+        response = None
+        try:
+            response = self.session.get(
+                detail_url,
+                timeout=DETAIL_TIMEOUT,
+                headers={"User-Agent": BROWSER_USER_AGENT},
+                stream=True,
+            )
+            response.raise_for_status()
 
-        response.encoding = response.apparent_encoding or "utf-8"
-        return extract_quotes(normalize_text(response.text))
+            declared = response.headers.get("Content-Length")
+            if declared and declared.isdigit() and int(declared) > MAX_DETAIL_BYTES:
+                self.logger.warning(
+                    f"Detail body too large ({declared} bytes), skipping {detail_url}"
+                )
+                return {}
+
+            chunks = []
+            total = 0
+            for chunk in response.iter_content(chunk_size=8192):
+                if not chunk:
+                    continue
+                chunks.append(chunk)
+                total += len(chunk)
+                if total > MAX_DETAIL_BYTES:
+                    self.logger.warning(
+                        f"Detail body exceeded {MAX_DETAIL_BYTES} bytes, "
+                        f"skipping {detail_url}"
+                    )
+                    return {}
+            body = b"".join(chunks)
+        except requests.RequestException as exc:
+            self.logger.warning(f"Detail fetch failed for {detail_url}: {exc}")
+            return {}
+        finally:
+            if response is not None:
+                response.close()
+
+        html = self._decode(body, response.encoding)
+        return extract_quotes(normalize_text(html))
 
     def enrich_with_quotes(
-        self, announcements: List[RawAnnouncement]
+        self,
+        announcements: List[RawAnnouncement],
+        skip_source_ids: Optional[Iterable[str]] = None,
     ) -> List[RawAnnouncement]:
         """각 공고의 상세 페이지를 1초 1건으로 훑어 인용을 채운다.
 
         ``fetch_detail`` 이 꺼져 있으면 아무것도 하지 않는다. 인용이 없으면
         키를 만들지 않는다 - 값을 지어내지 않는 것이 계약이다.
 
+        실행시간 상한(Codex 크리틱 #8): 소스·실행당 새 요청
+        ``MAX_DETAIL_REQUESTS`` 건, 총 ``DETAIL_BUDGET_SEC`` 초. 한도에
+        걸리면 경고를 남기고 멈춘다(수집 자체는 실패시키지 않는다).
+        이미 인용이 있는 항목과 ``skip_source_ids`` 에 든 항목은 건너뛴다.
+
         Args:
             announcements: 목록 단계에서 만든 공고 리스트 (제자리에서 수정)
+            skip_source_ids: 이미 인용을 받은 공고의 source_id (재요청 방지)
 
         Returns:
             같은 리스트
@@ -152,41 +211,77 @@ class BaseCrawler(abc.ABC):
         if not self.wants_detail():
             return announcements
 
-        for index, announcement in enumerate(announcements):
+        skip = set(skip_source_ids or ())
+        started = time.monotonic()
+        made = 0
+
+        for announcement in announcements:
             url = announcement.url or ""
             if not url or url.endswith("#void"):
                 continue
-            if index:
+            if announcement.source_id in skip:
+                continue
+            if has_quote_keys(self._load_raw(announcement)):
+                continue
+
+            if made >= MAX_DETAIL_REQUESTS:
+                self.logger.warning(
+                    f"{self.source_name}: detail request cap "
+                    f"({MAX_DETAIL_REQUESTS}) reached, skipping the rest"
+                )
+                break
+            if time.monotonic() - started > DETAIL_BUDGET_SEC:
+                self.logger.warning(
+                    f"{self.source_name}: detail time budget "
+                    f"({DETAIL_BUDGET_SEC}s) exhausted after {made} requests"
+                )
+                break
+
+            if made:
                 time.sleep(DETAIL_DELAY_SEC)
             quotes = self.fetch_detail_quotes(url)
+            made += 1
             if quotes:
                 self._apply_quotes(announcement, quotes)
 
         return announcements
 
+    @staticmethod
+    def _load_raw(announcement: RawAnnouncement) -> dict:
+        """raw_data JSON을 딕셔너리로 읽는다 (깨져 있으면 감싸서 보존)."""
+        if not announcement.raw_data:
+            return {}
+        try:
+            loaded = json.loads(announcement.raw_data)
+        except (ValueError, TypeError):
+            return {"list_raw": announcement.raw_data}
+        return loaded if isinstance(loaded, dict) else {"list_raw": announcement.raw_data}
+
     def _apply_quotes(
         self, announcement: RawAnnouncement, quotes: Dict[str, str]
     ) -> None:
-        """인용을 raw_data에 싣고, 확신할 수 있는 날짜만 기간 필드에 반영한다."""
-        start, end = period_from_quote(quotes.get(QUOTE_DEADLINE, ""))
+        """인용을 raw_data에 싣고, 확신할 수 있는 날짜만 기간 필드에 반영한다.
+
+        "상시 / 예산 소진 시" 공고는 마감을 만들지 않고 ``always_open`` 으로
+        표시한다 - 게시 다음 날 만료로 처리되는 것을 막는다(크리틱 #3).
+        """
+        start, end, always_open = apply_quote_period(quotes)
         if start:
             announcement.period_start = start
-        if end:
+        if always_open:
+            announcement.period_end = None
+        elif end:
             announcement.period_end = end
 
-        payload: dict = {}
-        if announcement.raw_data:
-            try:
-                loaded = json.loads(announcement.raw_data)
-            except (ValueError, TypeError):
-                loaded = None
-            payload = loaded if isinstance(loaded, dict) else {"list_raw": announcement.raw_data}
-
+        payload = self._load_raw(announcement)
         payload.update(quotes)
         if start:
             payload["quote_period_start"] = start
-        if end:
+        if end and not always_open:
             payload["quote_period_end"] = end
+        if always_open:
+            payload[ALWAYS_OPEN] = True
+            payload.pop("quote_period_end", None)
 
         announcement.raw_data = json.dumps(payload, ensure_ascii=False)
 
