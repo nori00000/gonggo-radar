@@ -24,6 +24,7 @@ from alert.digest.composer import (
     SECTION_LIMITS,
     HOLD_REASON_URL_TOO_LONG,
     KAKAO_CHUNK_LIMIT,
+    prefix_signature,
     SOURCE_DIVERSITY_LIMIT,
     URL_TOO_LONG_NOTICE,
     VERDICT_APPLY,
@@ -2160,8 +2161,23 @@ class TestFixCycle4:
         assert sanitize_title("<img src=x onerror=1> 공고") == (
             "＜img src=x onerror=1＞ 공고"
         )
-        # 정상 표기는 그대로 읽힌다
-        assert sanitize_title("[모집] 산림 공고(~9.30)") == "[모집] 산림 공고(~9.30)"
+        # 사이클 8 #2: 선두 대괄호는 전각 짝으로 중화된다 (라벨 흉내·링크 문법 차단).
+        # 괄호 **내용**과 꼬리 표기는 그대로 남는다.
+        assert sanitize_title("[모집] 산림 공고(~9.30)") == "［모집］ 산림 공고(~9.30)"
+
+    def test_sanitize_title_neutralizes_leading_structure(self):
+        """DB 제목이 문서 구조를 바꾸지 못한다 (사이클 8 #2 / Codex 4차 HIGH #3)."""
+        assert sanitize_title("## 산림 제도 개정") == "＃＃ 산림 제도 개정"
+        assert sanitize_title("*산림 제도 개정") == "＊산림 제도 개정"
+        assert sanitize_title("- 산림 제도 개정") == "－ 산림 제도 개정"
+        assert sanitize_title("> 인용 제목") == "＞ 인용 제목"
+        assert sanitize_title("+ 더하기 제목") == "＋ 더하기 제목"
+        assert sanitize_title("1. 산림 제도 개정") == "1． 산림 제도 개정"
+        assert sanitize_title("[D-9] 위조 라벨 제목") == "［D-9］ 위조 라벨 제목"
+        # 항목 줄 구분자와 겹치는 em dash 는 en dash 로 (제목/꼬리 경계 보호)
+        assert sanitize_title("산림 — 제도 개정") == "산림 – 제도 개정"
+        # 선두가 아닌 기호는 손대지 않는다
+        assert sanitize_title("산림 제도 개정 * 추가") == "산림 제도 개정 * 추가"
 
     def test_extract_item_urls_only_reads_origin_links(self):
         markdown = (
@@ -2578,6 +2594,40 @@ class TestFixCycle4:
         assert {item["region"] for item in published} == {"경기", "강원"}
         assert data["merged_ids"] == []
 
+    @pytest.mark.parametrize("prefix", ["[모집공고]", "[2026년]", "[공지사항]"])
+    def test_unresolved_region_does_not_merge(self, tmp_path, prefix):
+        """지역 미확정(None)끼리도 접두 문자열이 다르면 별개 공고다 (사이클 8 #3).
+
+        Codex 4차 HIGH #1 재현 입력: `[모집공고][경기]`/`[모집공고][강원]` 은
+        접두 태그가 `NON_REGION_PREFIX_TAGS` 에 없어 지역 탐색이 멈추고 region 이
+        양쪽 None 이 됐다 — 병합 키가 같아져 유효 공고가 sections·holds 양쪽에서
+        사라졌다(게시 1 · merged_ids=[2]).
+        """
+        db_path = tmp_path / f"c8_merge_{abs(hash(prefix))}.db"
+        _create_announcements_table(db_path)
+        for index, region in enumerate(["경기", "강원"]):
+            _insert_one(
+                db_path, source="seis", source_id=f"m_{index}",
+                title=f"{prefix}[{region}] 사회적기업 사업개발비 지원사업 모집",
+                url=f"https://example.com/m-{index}",
+                period_start="2026-09-08", period_end="2026-09-30",
+                created_at=W37_CREATED_AT,
+            )
+        data = compose_digest_data(
+            str(db_path), week_str=W37, today=W37_TODAY
+        )
+        published = data["sections"][VERDICT_APPLY]
+        assert len(published) == 2, [item["title"] for item in published]
+        assert data["merged_ids"] == []
+        assert {item["prefix_signature"] for item in published} == {
+            f"{prefix}[경기]", f"{prefix}[강원]"
+        }
+
+    def test_prefix_signature_is_part_of_the_merge_key(self):
+        assert prefix_signature("[모집공고][경기] 지원사업") == "[모집공고][경기]"
+        assert prefix_signature("[2026년] 지원사업") == "[2026년]"
+        assert prefix_signature("지원사업 모집") == ""
+
     def test_prefix_brackets_and_region_scan_rules(self):
         """선두 괄호 순회 규칙 (사이클 7 #1)."""
         assert prefix_brackets("[모집][경기] 지원사업 모집") == ["모집", "경기"]
@@ -2855,13 +2905,18 @@ class TestFixCycle5:
     @pytest.mark.parametrize(
         "title",
         [
-            "[모집](~9.30) 산림 지원사업",
-            "[모집](산림사업자) 지원사업",
-            "「2026년 산림 공고」(~9.30)",
+            ("[모집](~9.30) 산림 지원사업", "［모집］(~9.30) 산림 지원사업"),
+            ("[모집](산림사업자) 지원사업", "［모집］(산림사업자) 지원사업"),
+            ("「2026년 산림 공고」(~9.30)", "「2026년 산림 공고」(~9.30)"),
         ],
     )
     def test_sanitize_title_preserves_non_url_parens(self, title):
-        assert sanitize_title(title) == title
+        """비URL 괄호 표기는 보존한다 — 선두 대괄호만 전각으로 중화 (사이클 8 #2)."""
+        raw, expected = title
+        assert sanitize_title(raw) == expected
+        # 꼬리 표기는 어떤 경우에도 잃지 않는다
+        if "(~9.30)" in raw:
+            assert "(~9.30)" in sanitize_title(raw)
 
     def test_sanitize_title_still_strips_real_links(self):
         assert sanitize_title("산림 [신청](https://example.com/dead) 모집") == (
@@ -2885,7 +2940,82 @@ class TestFixCycle5:
         markdown = compose_digest(
             db_path=str(db_path), week_str=W13, today=W13_TODAY
         )
-        assert "[모집](~9.30) 산림 지원사업 참여기업" in markdown
+        assert "［모집］(~9.30) 산림 지원사업 참여기업" in markdown
+
+    @pytest.mark.parametrize(
+        "title",
+        ["## 산림 제도 개정 시행", "*산림 제도 개정 시행", "1. 산림 제도 개정 시행"],
+    )
+    def test_structural_title_does_not_move_sections(self, tmp_path, title):
+        """구조 구문으로 시작하는 DB 제목도 정상 항목으로 실린다 (사이클 8 #2).
+
+        Codex 4차 HIGH #3 재현 입력: `## …` 제목은 뒤 항목까지 산문 섹션으로
+        밀어냈고(preview 1·HTML 링크 4·pass), `*…` 제목은 정상 항목을 산문으로
+        판정해 0건·fail 이었다.
+        """
+        from alert.digest import blocks as blocks_mod
+
+        db_path = tmp_path / f"c8_struct_{abs(hash(title))}.db"
+        _create_announcements_table(db_path)
+        _insert_one(
+            db_path, source="lawmaking", source_id="s1", title=title,
+            url="https://example.com/s1", period_end="2026-12-31",
+        )
+        _insert_one(
+            db_path, source="kofpi", source_id="s2",
+            title="산림 지원사업 참여기업 모집 공고",
+            url="https://example.com/s2", period_end="2026-12-31",
+        )
+        out = tmp_path / f"{W13}.md"
+        markdown = compose_digest(
+            db_path=str(db_path), week_str=W13, output_path=out, today=W13_TODAY
+        )
+        # 섹션 구조가 그대로다 (`## ` 헤딩은 composer 가 만든 것뿐)
+        headings = [line for line in markdown.split("\n") if line.startswith("## ")]
+        assert all(
+            line[3:] in SECTION_HEADINGS.values() for line in headings
+        ), headings
+        # 항목 수 == 마커 수 == 정본 수
+        manifest = json.loads(
+            (tmp_path / f"{W13}.items.json").read_text(encoding="utf-8")
+        )
+        assert blocks_mod.item_block_count(markdown) == len(manifest["items"])
+        assert markdown.count("<!-- item id=") == len(manifest["items"])
+        assert blocks_mod.prose_lines_in_item_sections(markdown) == []
+        # 원문 표기는 HTML·카톡에 남는다 (전각으로 중화됐을 뿐)
+        from scripts.send_digest import markdown_to_html
+        assert "산림 제도 개정 시행" in markdown_to_html(markdown)
+        assert "산림 제도 개정 시행" in kakao_file_text_from_markdown(markdown)
+
+    def test_items_manifest_binds_md_to_db(self, tmp_path):
+        """compose 가 items.json 을 함께 쓰고, 그 내용이 md·DB 와 맞는다 (사이클 8 #1)."""
+        db_path = tmp_path / "c8_manifest.db"
+        _create_announcements_table(db_path)
+        _insert_one(
+            db_path, source="kofpi", source_id="m1",
+            title="산림 지원사업 참여기업 모집 공고",
+            url="https://example.com/m1", period_end="2026-12-31",
+        )
+        out = tmp_path / f"{W13}.md"
+        markdown = compose_digest(
+            db_path=str(db_path), week_str=W13, output_path=out, today=W13_TODAY
+        )
+        manifest = json.loads(
+            (tmp_path / f"{W13}.items.json").read_text(encoding="utf-8")
+        )
+        assert manifest["week"] == W13
+        assert manifest["markdown_sha256"] == markdown_sha256(out.read_bytes())
+        assert [entry["url"] for entry in manifest["items"]] == [
+            "https://example.com/m1"
+        ]
+        entry = manifest["items"][0]
+        assert entry["section"] == VERDICT_APPLY
+        assert entry["deadline_label"]
+        assert entry["title"] == sanitize_title(
+            "산림 지원사업 참여기업 모집 공고"
+        )
+        # md 의 마커 id 가 정본·DB 와 같은 id 다
+        assert f"<!-- item id={entry['id']} -->" in markdown
 
     # ─── (4) 지역 오탐 ──────────────────────────────────────────────────
     @pytest.mark.parametrize(
@@ -2999,6 +3129,80 @@ class TestFixCycle5:
         markdown = render_markdown(data)
         assert long_url not in markdown
         assert HOLD_REASON_URL_TOO_LONG in markdown
+
+    @pytest.mark.parametrize("url_len", [4090, 4092, 4094, 4096, 4140])
+    def test_kakao_fit_decision_matches_the_render(self, tmp_path, url_len):
+        """적합성 판정과 렌더가 같은 함수를 본다 (사이클 8 #4).
+
+        Codex 4차 MEDIUM #4: URL 4,092자는 `kakao_item_fits=True` 로 게시됐는데
+        카톡에서는 안내 문구로 대체됐다(원문 유실) — 경계가 갈라져 있었다.
+        """
+        db_path = tmp_path / f"c8_fit_{url_len}.db"
+        _create_announcements_table(db_path)
+        url = "https://example.com/" + "a" * (url_len - 20)
+        _insert_one(
+            db_path, source="kofpi", source_id="fit",
+            title="산림 지원사업 참여기업 모집 공고",
+            url=url, period_end="2026-12-31",
+        )
+        data = compose_digest_data(
+            str(db_path), week_str=W13, today=W13_TODAY
+        )
+        published = data["sections"][VERDICT_APPLY]
+        chunks = render_kakao_chunks(data)
+        assert all(len(chunk) <= KAKAO_CHUNK_LIMIT for chunk in chunks)
+        if published:
+            # 게시했다면 카톡에 **원문 URL이 그대로** 실려야 한다
+            assert any(url in chunk for chunk in chunks), url_len
+            assert URL_TOO_LONG_NOTICE not in "".join(chunks)
+        else:
+            # 게시하지 않았다면 보류 사유가 남아야 한다
+            assert [item["reason"] for item in data["holds"]] == [
+                HOLD_REASON_URL_TOO_LONG
+            ]
+
+    def test_long_prose_url_is_replaced_and_warned(self, tmp_path):
+        """해설의 한도 초과 URL 은 카톡·미리보기에서 치환되고 경고로 남는다 (#4)."""
+        from alert.digest import preview as preview_mod
+        from alert.digest.checker import check_digest
+
+        long_url = "https://example.com/" + "b" * 4120
+        db_path = tmp_path / "c8_prose.db"
+        _create_announcements_table(db_path)
+        _insert_one(
+            db_path, source="kofpi", source_id="p1",
+            title="산림 지원사업 참여기업 모집 공고",
+            url="https://example.com/p1", period_end="2026-12-31",
+        )
+        out = tmp_path / f"{W13}.md"
+        markdown = compose_digest(
+            db_path=str(db_path), week_str=W13, output_path=out, today=W13_TODAY
+        )
+        annotated = markdown.replace(
+            MARKER, f"참고 [자료]({long_url}) 입니다"
+        )
+        out.write_text(annotated, encoding="utf-8")
+
+        kakao = kakao_file_text_from_markdown(annotated)
+        chunks = kakao.split(f"\n{KAKAO_CHUNK_SEPARATOR}\n")
+        assert all(len(chunk) <= KAKAO_CHUNK_LIMIT for chunk in chunks)
+        assert long_url not in kakao
+        assert URL_TOO_LONG_NOTICE in kakao
+
+        body = preview_mod.render_preview(W13, annotated, {"pass": True})
+        assert all(
+            len(chunk) <= preview_mod.TELEGRAM_LIMIT
+            for chunk in preview_mod.chunk_text(body)
+        )
+        assert long_url not in body
+
+        with mock.patch(
+            "alert.digest.checker.check_url_alive", return_value=True
+        ):
+            result = check_digest(
+                db_path=str(db_path), markdown_path=out, output_path=None
+            )
+        assert result["long_prose_urls"] == [long_url]
 
     def test_oversized_url_never_makes_an_oversize_chunk(self):
         """손으로 고친 본문에서 와도 오버사이즈 조각은 만들지 않는다 (#9)."""

@@ -95,7 +95,8 @@ def strip_dead_urls(
     kept: List[Dict] = []
     for block in blocks_mod.parse_blocks(markdown_text, item_sections):
         if block["kind"] == "item" and block["url"] in dead_set:
-            removed.append({"title": block["title"], "url": block["url"]})
+            removed.append({"title": block["title"], "url": block["url"],
+                            "item_id": block.get("item_id")})
             continue
         kept.append(block)
 
@@ -118,7 +119,8 @@ def dedupe_urls(
     for block in blocks_mod.parse_blocks(markdown_text, item_sections):
         if block["kind"] == "item":
             if block["url"] in seen:
-                removed.append({"title": block["title"], "url": block["url"]})
+                removed.append({"title": block["title"], "url": block["url"],
+                                "item_id": block.get("item_id")})
                 continue
             seen.add(block["url"])
         kept.append(block)
@@ -129,3 +131,32 @@ def dedupe_urls(
     _mark_empty_sections(kept)
     text, _ = _render(kept, markdown_text)
     return text, removed
+
+
+def drop_from_manifest(manifest: Dict, removed: Sequence[Dict]) -> Dict:
+    """항목 정본 파일에서 제거된 항목을 뺀다 (사이클 8 #1).
+
+    본문에서만 지우고 정본을 그대로 두면 "항목 수 불일치" 로 게이트가 막힌다 —
+    재검토는 본문과 정본을 **함께** 갱신한다.
+
+    기준은 **id** 다. URL 로 지우면 같은 URL 을 가리키는 중복 항목을 접을 때
+    남겨둔 쪽까지 정본에서 사라져 개수가 어긋난다(URL 중복이 바로 그 경우다).
+    id 를 모르는 기록(산문 링크 등)은 URL 로 지운다.
+    """
+    dead_ids = {
+        str(item["item_id"]) for item in (removed or [])
+        if item.get("item_id") is not None
+    }
+    dead_urls_only = {
+        item.get("url") for item in (removed or [])
+        if item.get("item_id") is None and item.get("url")
+    }
+    if not dead_ids and not dead_urls_only:
+        return manifest
+    updated = dict(manifest)
+    updated["items"] = [
+        entry for entry in manifest.get("items") or []
+        if str(entry.get("id")) not in dead_ids
+        and entry.get("url") not in dead_urls_only
+    ]
+    return updated

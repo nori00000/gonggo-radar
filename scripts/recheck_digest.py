@@ -19,7 +19,12 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from alert.digest import prune
 from alert.digest import sections as sections_mod
-from alert.digest.composer import kakao_file_text_from_markdown
+from alert.digest.composer import (
+    kakao_file_text_from_markdown,
+    load_items_manifest,
+    refresh_manifest_binding,
+    write_items_manifest,
+)
 from alert.digest.checker import (
     check_digest,
     dead_urls,
@@ -46,6 +51,10 @@ def recheck(markdown_path: Path, db_path: str, check_path: Path):
     """(검증 결과, 제거된 항목 목록). 본문을 고쳤으면 파일도 갱신되어 있다."""
     dropped = []
     result = None
+    # 사이클 8 #1: 손으로 고친 본문도 재검토가 다시 결속한다 — 정본의 해시만
+    # 지금 본문으로 맞춘다(항목 목록은 손대지 않는다. 그것을 본문에서 다시 뽑으면
+    # 고쳐진 제목이 스스로 정당화되어 게이트가 비어버린다).
+    refresh_manifest_binding(markdown_path)
     for attempt in range(MAX_PRUNE_ROUNDS):
         result = check_digest(
             db_path=db_path,
@@ -63,6 +72,7 @@ def recheck(markdown_path: Path, db_path: str, check_path: Path):
         deduped, duplicates = prune.dedupe_urls(text, item_sections)
         if duplicates:
             markdown_path.write_text(deduped, encoding="utf-8")
+            _drop_from_manifest(markdown_path, duplicates)
             dropped.extend(duplicates)
             for item in duplicates:
                 print(f"  중복 URL 제거: {item['title']} ({item['url']})")
@@ -78,6 +88,7 @@ def recheck(markdown_path: Path, db_path: str, check_path: Path):
             # 제거 대상을 본문에서 찾지 못했다 → 더 돌려도 같다. 아래에서 pass=false.
             break
         markdown_path.write_text(pruned, encoding="utf-8")
+        _drop_from_manifest(markdown_path, removed)
         dropped.extend(removed)
         # 해설·본문에서 링크만 떼어낸 죽은 URL도 check.json 에 남긴다 —
         # 미리보기 헤더의 "죽은 URL 제외 N건" 이 실제 제거 건수와 맞아야 한다.
@@ -93,6 +104,17 @@ def recheck(markdown_path: Path, db_path: str, check_path: Path):
     # md 의 죽은 링크만 지워서, 카톡 발송본에는 죽은 링크가 그대로 남았다.
     _refresh_kakao(markdown_path)
     return result, dropped
+
+
+def _drop_from_manifest(markdown_path: Path, removed) -> None:
+    """제거된 항목을 정본 파일에서도 빼고 해시를 다시 맞춘다 (사이클 8 #1)."""
+    manifest = load_items_manifest(markdown_path)
+    if manifest is None:
+        return
+    write_items_manifest(
+        markdown_path, prune.drop_from_manifest(manifest, removed or [])
+    )
+    refresh_manifest_binding(markdown_path)
 
 
 def _refresh_kakao(markdown_path: Path) -> None:

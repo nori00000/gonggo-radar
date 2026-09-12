@@ -391,17 +391,23 @@ def prose_lines_in_item_sections(
 
 
 def link_audit(
-    markdown_text: str, item_sections: Optional[Sequence[str]] = None
+    markdown_text: str,
+    item_sections: Optional[Sequence[str]] = None,
+    allowed_urls: Optional[Sequence[str]] = None,
 ) -> Dict:
-    """본문 링크 수의 내역 (사이클 7 — HTML 링크 수 == 항목 수 + 해설 링크 수).
+    """본문 링크 내역 (사이클 8 #1: 항목 섹션의 링크는 정본 URL 집합에만 있어야 한다).
 
     Returns:
-        {"total": 본문 전체 링크 수, "items": 항목 블록 링크 수,
+        {"total": 본문 전체 링크 수, "items": 항목 블록의 **정본 URL** 링크 수,
          "commentary": 항목 섹션 **밖**(머리말·산문 섹션) 링크 수,
-         "stray": 항목 섹션 안의 마커 없는 링크 수}
+         "stray": 항목 섹션 안에서 정본에 없는 링크 수}
 
-    `total != items + commentary` 이면 발송 HTML 에 항목도 해설도 아닌 링크가
-    실린다는 뜻이다 — 위조 항목이 상한을 우회하는 경로다.
+    사이클 7 판은 항목 블록 안의 링크를 몇 개든 `items` 로 합산했다 — 정상 항목의
+    **제목에 링크를 하나 더 끼우면** `items` 가 함께 늘어 총계가 맞아버렸다
+    (항목 3 · HTML 링크 4 · pass). 이제 판정 기준은 개수가 아니라 **정본 URL 집합**이고,
+    항목 섹션의 초과 링크는 1개라도 `stray` 로 남아 게이트를 떨어뜨린다.
+    `allowed_urls` 가 없으면 블록의 원문 URL 자신을 정본으로 본다(정본 파일 부재 시
+    checker 가 따로 fail-closed 한다).
     """
     total = 0
     items = 0
@@ -410,16 +416,22 @@ def link_audit(
     for block in parse_blocks(markdown_text, item_sections):
         if block["kind"] == "comment":
             continue                    # 주석은 발송본에 실리지 않는다
-        counted = sum(
-            len(find_links(line)) for line in block["lines"]
-            if not _is_comment(line)
+        allowed = (
+            set(allowed_urls) if allowed_urls is not None
+            else ({block["url"]} if block["kind"] == "item" else set())
         )
-        total += counted
-        if block["kind"] == "item":
-            items += counted
-        elif block.get("in_item_section"):
-            stray += counted
-        else:
-            commentary += counted
+        for line in block["lines"]:
+            if _is_comment(line):
+                continue
+            for link in find_links(line):
+                total += 1
+                if block["kind"] == "item" and link.url in allowed:
+                    items += 1
+                elif block.get("in_item_section"):
+                    stray += 1
+                elif block["kind"] == "item":
+                    stray += 1
+                else:
+                    commentary += 1
     return {"total": total, "items": items,
             "commentary": commentary, "stray": stray}

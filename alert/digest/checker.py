@@ -9,7 +9,12 @@ import requests
 
 from alert.digest import blocks as blocks_mod
 from alert.digest import sections as sections_mod
-from alert.digest.composer import parse_deadline
+from alert.digest.composer import (
+    ITEMS_JSON_SUFFIX,
+    fit_prose_urls,
+    load_items_manifest,
+    parse_deadline,
+)
 
 
 def markdown_sha256(markdown_bytes: bytes) -> str:
@@ -29,6 +34,97 @@ def dead_urls(result: Dict) -> List[str]:
         for item in (result or {}).get("items") or []
         if not item.get("url_alive")
     ]
+
+
+def manifest_problems(
+    markdown_text: str,
+    markdown_bytes: bytes,
+    item_sections,
+    manifest: Optional[Dict],
+    db_path: str,
+) -> List[str]:
+    """md 의 항목 블록을 **항목 정본 파일과 DB** 에 1:1 대조 (사이클 8 #1).
+
+    마커 id 만으로는 출처를 증명하지 못한다 — `<!-- item id=999 -->` 를 손으로 붙이면
+    빈 DB에서도 통과했다. 결속 사슬은 이렇다:
+
+        md 블록의 마커 id  →  items.json 의 (id, url, 제목)  →  DB announcements.id 의 url
+
+    어느 고리가 끊겨도 발송하지 않는다. 문제 목록을 돌려주고, 비어 있으면 정합이다.
+    """
+    if manifest is None:
+        return [f"항목 정본 파일 없음 (<주차>{ITEMS_JSON_SUFFIX}) — 재조립 필요"]
+
+    problems: List[str] = []
+    recorded_hash = manifest.get("markdown_sha256")
+    if recorded_hash and recorded_hash != markdown_sha256(markdown_bytes):
+        problems.append("항목 정본 파일이 이 본문의 것이 아님 — 재검토 필요")
+
+    entries = {}
+    for entry in manifest.get("items") or []:
+        if isinstance(entry, dict) and entry.get("id") is not None:
+            entries[str(entry["id"])] = entry
+
+    blocks = blocks_mod.item_blocks(markdown_text, item_sections)
+    if len(blocks) != len(entries):
+        problems.append(
+            f"항목 수 불일치: 본문 {len(blocks)}건 ≠ 정본 {len(entries)}건"
+        )
+
+    seen = set()
+    for block in blocks:
+        item_id = str(block.get("item_id"))
+        entry = entries.get(item_id)
+        if entry is None:
+            problems.append(f"정본에 없는 항목 id={item_id}")
+            continue
+        if item_id in seen:
+            problems.append(f"중복된 항목 id={item_id}")
+            continue
+        seen.add(item_id)
+        if block["url"] != entry.get("url"):
+            problems.append(
+                f"id={item_id} URL 불일치: 본문 {block['url']} ≠ 정본 {entry.get('url')}"
+            )
+        expected_title = entry.get("title")
+        if expected_title and block["fields"]["title"] != expected_title:
+            problems.append(
+                f"id={item_id} 제목 불일치: 본문 {block['fields']['title']!r} "
+                f"≠ 정본 {expected_title!r}"
+            )
+
+    missing = sorted(set(entries) - seen)
+    if missing:
+        problems.append("본문에 없는 정본 항목 id=" + ", ".join(missing))
+
+    problems.extend(_db_problems(entries, db_path))
+    return problems
+
+
+def _db_problems(entries: Dict[str, Dict], db_path: str) -> List[str]:
+    """정본의 (id, url) 이 DB 와 맞는지 (사이클 8 #1의 마지막 고리)."""
+    if not entries:
+        return []
+    problems: List[str] = []
+    try:
+        conn = sqlite3.connect(db_path)
+        try:
+            for item_id, entry in entries.items():
+                row = conn.execute(
+                    "SELECT url FROM announcements WHERE id = ? LIMIT 1",
+                    (item_id,),
+                ).fetchone()
+                if row is None:
+                    problems.append(f"DB에 없는 항목 id={item_id}")
+                elif row[0] != entry.get("url"):
+                    problems.append(
+                        f"id={item_id} DB URL 불일치: {row[0]} ≠ {entry.get('url')}"
+                    )
+        finally:
+            conn.close()
+    except sqlite3.Error as exc:
+        problems.append(f"DB 대조 실패: {exc}")
+    return problems
 
 
 def parse_period_end(period_end_str: Optional[str]) -> bool:
@@ -171,6 +267,7 @@ def check_digest(
             "item_blocks": 0,
             "item_sections": [],
             "commentary_sections": [],
+            "manifest_problems": ["마크다운 파일 없음"],
             "reason": "마크다운 파일 없음",
             "markdown_sha256": "",
         }
@@ -281,9 +378,29 @@ def check_digest(
     prose_lines = blocks_mod.prose_lines_in_item_sections(
         markdown_text, item_sections
     )
-    # 발송 HTML 의 링크 수 == 항목 수 + 해설·산문 섹션 링크 수
-    links = blocks_mod.link_audit(markdown_text, item_sections)
-    link_mismatch = links["total"] != links["items"] + links["commentary"]
+
+    # 사이클 8 #1: 항목을 **텍스트가 아니라 데이터**에 결속한다.
+    manifest = load_items_manifest(markdown_path)
+    problems = manifest_problems(
+        markdown_text, markdown_bytes, item_sections, manifest, db_path
+    )
+    allowed_urls = [
+        entry.get("url") for entry in (manifest or {}).get("items") or []
+        if entry.get("url")
+    ]
+    # 항목 섹션의 링크는 정본 URL 집합에만 있어야 한다 (초과 1개라도 fail)
+    links = blocks_mod.link_audit(
+        markdown_text, item_sections,
+        allowed_urls if manifest is not None else None,
+    )
+    link_mismatch = (
+        links["stray"] > 0
+        or links["total"] != links["items"] + links["commentary"]
+    )
+
+    # 사이클 8 #4: 해설의 한도 초과 URL 은 카톡·미리보기에서 안내 문구로 바뀐다.
+    # 조용히 바뀌면 사람이 모르므로 경고로 남긴다(pass 는 바꾸지 않는다).
+    _, long_prose_urls = fit_prose_urls(markdown_text)
 
     if not network_checked:
         reason = "네트워크 미검사"
@@ -291,6 +408,8 @@ def check_digest(
         reason = "생존 항목 없음"
     elif len(dropped) > 0:
         reason = f"본문에 죽은 URL {len(dropped)}건 잔존"
+    elif problems:
+        reason = "항목 정본 대조 실패: " + "; ".join(problems[:3])
     elif prose_lines:
         reason = "항목 섹션에 산문 {}건: {}".format(
             len(prose_lines), prose_lines[0][:40]
@@ -316,7 +435,9 @@ def check_digest(
         "item_sections": list(item_sections),
         "commentary_sections": list(commentary_sections),
         "prose_in_item_sections": prose_lines,
+        "manifest_problems": problems,
         "link_audit": links,
+        "long_prose_urls": long_prose_urls,
         "pass": (
             network_checked
             and alive_count > 0
@@ -324,6 +445,7 @@ def check_digest(
             and item_blocks > 0
             and not cap_violations
             and not prose_lines
+            and not problems
             and not link_mismatch
         ),
         # 실제로 네트워크 검사한 URL이 0건이면 False

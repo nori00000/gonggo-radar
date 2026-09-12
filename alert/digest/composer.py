@@ -11,6 +11,7 @@ v2.1의 뼈대 (2026-09-13 확정안, 판정 1~9):
 """
 
 import csv
+import hashlib
 import json
 import re
 import sqlite3
@@ -449,18 +450,59 @@ _MD_LINK_IN_TITLE_RE = re.compile(
 _AUTOLINK_RE = re.compile(r"<(\s*(?:https?://|www\.)[^>]*)>")
 
 
+# 제목 선두에서 **문서 구조를 바꿀 수 있는** 마크다운 구문 → 전각 치환 (사이클 8 #2).
+# DB 제목이 `## 산림 제도 개정` 이면 발송본에서 섹션 헤딩이 되어 뒤 항목이 전부 산문
+# 섹션으로 밀려났고, `*산림 제도 개정` 이면 정상 항목이 산문으로 판정돼 0건·fail 이었다.
+# 제목은 사람이 읽는 문자열이고, 구조는 composer 만 만든다 — 그 경계를 문자로 못박는다.
+_LEADING_FULLWIDTH = {
+    "#": "＃", "*": "＊", "-": "－", "+": "＋", ">": "＞", "|": "｜",
+    "~": "～", "=": "＝", "·": "・", "•": "・",
+}
+_LEADING_BRACKET_RE = re.compile(r"^\[([^\[\]]*)\]")
+_LEADING_ORDERED_RE = re.compile(r"^(\d+)\.")
+# 항목 줄의 구분자와 겹치는 em dash — 제목 안에 있으면 제목/꼬리 경계가 흔들린다.
+_EM_DASH = "—"
+_EN_DASH = "–"
+
+
+def neutralize_title_structure(text: str) -> str:
+    """제목 선두의 마크다운 구문을 중화한다 (사이클 8 #2).
+
+    ①선두 대괄호 짝 → 전각 `［…］` (`[D-9]` 라벨 흉내·링크 문법 차단)
+    ②선두 기호 런(`#`·`*`·`-`·`>` …) → 전각
+    ③선두 번호 목록 `1.` → `1．`
+    ④제목 안의 em dash → en dash (항목 줄 구분자 ` — ` 와 겹치지 않게)
+    """
+    if not text:
+        return text
+    index = 0
+    while index < len(text) and text[index] in _LEADING_FULLWIDTH:
+        index += 1
+    if index:
+        text = "".join(_LEADING_FULLWIDTH[c] for c in text[:index]) + text[index:]
+    matched = _LEADING_BRACKET_RE.match(text)
+    if matched:
+        text = "［" + matched.group(1) + "］" + text[matched.end():]
+    matched = _LEADING_ORDERED_RE.match(text)
+    if matched:
+        text = matched.group(1) + "．" + text[matched.end():]
+    return text.replace(_EM_DASH, _EN_DASH)
+
+
 def sanitize_title(title: str) -> str:
-    """제목에서 링크 문법과 HTML 태그 형성 가능성을 제거한다.
+    """제목에서 링크 문법·HTML 태그·**문서 구조 구문**을 제거한다.
 
     - `[텍스트](http…)` → `텍스트` (URL은 버린다 — 링크는 "원문" 필드의 몫)
     - `<https://…>` → `https://…` (꺾쇠 제거)
     - 남은 `<`·`>`는 전각으로 바꿔 태그가 만들어지지 못하게 한다
-    - 괄호 내용이 URL이 아니면 손대지 않는다 (`[모집](~9.30)` 유지)
+    - 괄호 내용이 URL이 아니면 내용은 유지한다 (`(~9.30)` 보존)
+    - **선두 마크다운 구문은 전각으로 중화한다** (사이클 8 #2 — 구조 변형 차단)
     """
     text = normalize_title(title)
     text = _MD_LINK_IN_TITLE_RE.sub(lambda m: m.group(1), text)
     text = _AUTOLINK_RE.sub(lambda m: m.group(1).strip(), text)
     text = text.replace("<", "＜").replace(">", "＞")
+    text = neutralize_title_structure(" ".join(text.split()))
     return " ".join(text.split())
 
 
@@ -600,6 +642,17 @@ def prefix_bracket(title: str) -> str:
     """제목 맨 앞 괄호의 내용 (없으면 빈 문자열)."""
     groups = prefix_brackets(title)
     return groups[0] if groups else ""
+
+
+def prefix_signature(title: str) -> str:
+    """제목 선두 괄호 그룹 **전체 문자열** (병합 키의 일부 — 사이클 8 #3).
+
+    지역 추론이 실패해 `region` 이 양쪽 None 이 되면, 예전 병합 키는 두 공고를
+    같은 것으로 봤다 — `[모집공고][경기]`/`[모집공고][강원]` 이 하나로 합쳐지며
+    유효 공고가 sections·holds 양쪽에서 사라졌다. 접두 문자열이 다르면 다른 공고다.
+    """
+    groups = prefix_brackets(title)
+    return "".join(f"[{group}]" for group in groups)
 
 
 def is_non_region_tag(text: str) -> bool:
@@ -1033,6 +1086,7 @@ def _build_item(row: Sequence, classification: Classification, today: date) -> D
         "matched": list(classification.matched),
         "tags": list(classification.tags),
         "region": classification.region,
+        "prefix_signature": prefix_signature(title),
         "target": target_display(classification.tags, classification.region),
         "period_end": period_end or "",
         "deadline": deadline.isoformat() if deadline else "",
@@ -1089,6 +1143,9 @@ def _mergeable(left: Dict, right: Dict) -> bool:
     if tuple(left["tags"]) != tuple(right["tags"]):
         return False
     if (left["region"] or "") != (right["region"] or ""):
+        return False
+    # 사이클 8 #3: 지역 미확정(None)끼리도 접두 괄호가 다르면 별개 공고다.
+    if left.get("prefix_signature", "") != right.get("prefix_signature", ""):
         return False
     if _is_new_round(left) or _is_new_round(right):
         return False
@@ -1349,7 +1406,7 @@ def compose_digest_data(
     fitting: List[Dict] = []
     url_too_long: List[Dict] = []
     for item in kept:
-        (fitting if kakao_item_fits(item["url"]) else url_too_long).append(item)
+        (fitting if kakao_item_fits(item) else url_too_long).append(item)
     kept = fitting
 
     sections: Dict[str, List[Dict]] = {VERDICT_APPLY: [], VERDICT_NOTICE: []}
@@ -1466,6 +1523,81 @@ def item_line(item: Dict) -> str:
         head = f"[{item['label']}] {head}"
 
     return f"{head} — " + " · ".join(parts)
+
+
+ITEMS_JSON_SUFFIX = ".items.json"
+
+
+def items_json_path(markdown_path) -> Path:
+    """발송본 마크다운 경로 → 항목 정본 파일 경로."""
+    markdown_path = Path(markdown_path)
+    name = markdown_path.name
+    stem = name[:-3] if name.endswith(".md") else name
+    return markdown_path.with_name(stem + ITEMS_JSON_SUFFIX)
+
+
+def items_manifest(data: Dict, markdown_bytes: bytes = b"") -> Dict:
+    """항목 **정본**(사이클 8 #1). 검증은 이 데이터에 결속된다.
+
+    md 는 사람이 고칠 수 있는 텍스트다 — 마커 id 만으로는 "누가 이 항목을 만들었나"를
+    증명하지 못했다(`<!-- item id=999 -->` 를 손으로 붙이면 빈 DB에서도 통과했다).
+    그래서 compose 가 만든 항목 목록을 파일로 남기고, checker 가 md 의 블록을
+    ①이 목록 ②DB 의 해당 id 와 1:1로 대조한다.
+    """
+    return {
+        "week": data["week"],
+        "markdown_sha256": hashlib.sha256(markdown_bytes).hexdigest(),
+        "items": [
+            {
+                "id": item["id"],
+                "url": item["url"],
+                "title": sanitize_title(item["title"]),
+                "section": section,
+                "deadline_label": item["label"],
+            }
+            for section in ITEM_SECTIONS
+            for item in (data["sections"].get(section) or [])
+        ],
+    }
+
+
+def load_items_manifest(markdown_path) -> Optional[Dict]:
+    """항목 정본 파일을 읽는다. 없거나 깨졌으면 None (호출자가 fail-closed)."""
+    path = items_json_path(markdown_path)
+    try:
+        loaded = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(loaded, dict) or not isinstance(loaded.get("items"), list):
+        return None
+    return loaded
+
+
+def write_items_manifest(markdown_path, manifest: Dict) -> None:
+    """항목 정본 파일을 쓴다."""
+    items_json_path(markdown_path).write_text(
+        json.dumps(manifest, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+
+
+def refresh_manifest_binding(markdown_path) -> Optional[Dict]:
+    """md 를 고친 뒤 정본 파일의 `markdown_sha256` 만 갱신한다.
+
+    항목 목록(id·url·제목)은 **손대지 않는다** — 그것을 md 에서 다시 뽑으면
+    손으로 고친 제목이 스스로 정당화되어 게이트가 비어버린다.
+    """
+    manifest = load_items_manifest(markdown_path)
+    if manifest is None:
+        return None
+    try:
+        manifest["markdown_sha256"] = hashlib.sha256(
+            Path(markdown_path).read_bytes()
+        ).hexdigest()
+    except OSError:
+        return manifest
+    write_items_manifest(markdown_path, manifest)
+    return manifest
 
 
 def item_marker(item: Dict) -> str:
@@ -1587,16 +1719,50 @@ def _is_url_line(line: str) -> bool:
     return stripped.startswith("http://") or stripped.startswith("https://")
 
 
-def kakao_item_fits(url: str, limit: int = KAKAO_CHUNK_LIMIT) -> bool:
-    """이 URL 을 가진 항목이 카톡 한 조각 안에 들어갈 수 있는가 (#9).
+def kakao_item_block(item: Dict) -> str:
+    """카톡 항목 덩어리 (제목 줄 + URL 줄) — 적합성 판정과 렌더가 같은 문자열을 본다."""
+    return f"{item_line(item)}\n  {item['url']}"
 
-    제목은 줄일 수 있지만 URL 은 줄일 수 없다 — URL 줄 하나가 한도를 넘으면
-    어떤 제목으로도 조각이 한도 안에 들어가지 않는다. 그런 항목은 오버사이즈
-    조각을 만드는 대신 compose 단계에서 **보류**로 내린다.
+
+def kakao_item_fits(item: Dict, limit: int = KAKAO_CHUNK_LIMIT) -> bool:
+    """제목을 줄인 뒤의 **렌더된 조각 전체**가 한도 안에 들어가는가 (사이클 8 #4).
+
+    예전에는 URL 길이만 봤다 — `len(url_line) + 2 <= limit` 는 경계에서
+    `_shrink_item_block` 의 판정(`room <= 1`)과 어긋나, URL 4,092자 항목이
+    "게시 가능"으로 통과한 뒤 카톡에서는 안내 문구로 대체됐다(원문 유실).
+    판정과 렌더가 같은 함수를 보게 만들어 경계가 갈라질 수 없게 한다.
     """
-    url_line = f"  {(url or '').strip()}"
-    # `제목 한 글자 + 개행 + URL 줄` 도 안 들어가면 불가능하다
-    return len(url_line) + 2 <= limit
+    block = kakao_item_block(item)
+    return len(_shrink_item_block(block, limit)) <= limit
+
+
+def fit_prose_urls(text: str, limit: int = KAKAO_CHUNK_LIMIT) -> Tuple[str, List[str]]:
+    """산문·해설의 한도 초과 URL 을 안내 문구로 치환 (사이클 8 #4 / #9).
+
+    항목은 compose 가 보류로 내리지만 해설 URL 은 사람이 써넣는다 — 그것 하나로
+    카톡·미리보기 조각이 한도를 넘었다. (치환한 URL 목록, check.json 경고용)
+    """
+    from alert.digest import blocks as blocks_mod
+
+    replaced: List[str] = []
+    lines = []
+    for line in (text or "").split("\n"):
+        links = [
+            link for link in blocks_mod.find_links(line)
+            if len(link.url) + 4 > limit
+        ]
+        for link in reversed(links):
+            if link.url not in replaced:
+                replaced.append(link.url)
+            line = line[:link.start] + URL_TOO_LONG_NOTICE + line[link.end:]
+        bare = line.strip()
+        if len(bare) > limit and (bare.startswith("http://")
+                                  or bare.startswith("https://")):
+            if bare not in replaced:
+                replaced.append(bare)
+            line = line[:len(line) - len(line.lstrip())] + URL_TOO_LONG_NOTICE
+        lines.append(line)
+    return "\n".join(lines), replaced
 
 
 def _is_item_block(block: str) -> bool:
@@ -1683,13 +1849,14 @@ def kakao_blocks(data: Dict, headline: Optional[str] = None) -> List[str]:
         if not items:
             blocks.append("  (항목 없음)")
         for item in items:
-            blocks.append(f"{item_line(item)}\n  {item['url']}")
+            blocks.append(kakao_item_block(item))
         blocks.append("")
 
     if data.get("council_notes"):
         blocks.append(SECTION_HEADINGS[SECTION_COUNCIL])
         for note in data["council_notes"]:
-            blocks.append(f"· {note}")
+            # 사이클 8 #4: 해설의 한도 초과 URL 은 안내 문구로 (조각 초과 금지)
+            blocks.append(fit_prose_urls(f"· {note}")[0])
         blocks.append("")
 
     if data.get("member_news"):
@@ -1741,6 +1908,7 @@ def kakao_blocks_from_markdown(markdown_text: str) -> List[str]:
     body: List[str] = []
     seen_section = False
 
+    markdown_text, _ = fit_prose_urls(markdown_text)
     for block in blocks_mod.parse_blocks(markdown_text):
         kind = block["kind"]
         if kind == "comment":
@@ -1829,6 +1997,11 @@ def compose_digest(
         output_path = Path(output_path)
         output_path.parent.mkdir(parents=True, exist_ok=True)
         output_path.write_text(markdown, encoding="utf-8")
+        # 사이클 8 #1: 항목 정본 파일. 해시는 **방금 쓴 파일 바이트**에서 뽑는다
+        # (텍스트를 다시 인코딩하면 개행 변환으로 어긋날 수 있다).
+        write_items_manifest(
+            output_path, items_manifest(data, output_path.read_bytes())
+        )
         output_path.with_name(
             output_path.name.replace(".md", "") + ".kakao.txt"
         ).write_text(kakao_file_text(data), encoding="utf-8")

@@ -8,6 +8,7 @@ from pathlib import Path
 import pytest
 
 from alert.digest import blocks as blocks_mod
+from alert.digest import composer as composer_mod
 from alert.digest import prune as prune_mod
 from alert.digest import sections as sections_mod
 from alert.digest import state as state_mod
@@ -476,15 +477,7 @@ def test_recheck_digest_preserves_commentary(tmp_path, monkeypatch):
     annotated, _ = apply_headline(SAMPLE_MD, "손으로 확정한 의견")
     md = tmp_path / "2026-W37.md"
     md.write_text(annotated, encoding="utf-8")
-    db = tmp_path / "empty.db"
-    import sqlite3
-
-    conn = sqlite3.connect(db)
-    conn.execute(
-        "CREATE TABLE announcements (url TEXT, period_end TEXT, title TEXT)"
-    )
-    conn.commit()
-    conn.close()
+    db = _bind(md)
 
     monkeypatch.setattr(
         "alert.digest.checker.check_url_alive", lambda url, timeout=8: True
@@ -707,12 +700,43 @@ def test_send_digest_refuses_check_without_hash(tmp_path, monkeypatch):
     assert _send(md) == 2
 
 
-def _empty_db(tmp_path):
-    db = tmp_path / "empty.db"
+def _bind(markdown_path):
+    """md 의 항목 블록에서 **항목 정본 파일과 DB** 를 만든다 (사이클 8 #1 픽스처).
+
+    실제 경로에서는 compose 가 둘을 함께 쓴다. 테스트는 손으로 조립한 본문을 쓰므로,
+    그 본문의 마커 id·URL·제목을 정본과 DB 에 심어 결속 사슬을 완성한다 —
+    결속을 검사하는 테스트(`id=999` 위조 등)는 이 헬퍼를 쓰지 않는다.
+    """
+    markdown_path = Path(markdown_path)
+    markdown_text = markdown_path.read_text(encoding="utf-8")
+    db = markdown_path.parent / "bound.db"
     conn = sqlite3.connect(db)
-    conn.execute("CREATE TABLE announcements (url TEXT, period_end TEXT, title TEXT)")
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS announcements "
+        "(id INTEGER PRIMARY KEY, url TEXT, period_end TEXT, title TEXT)"
+    )
+    entries = []
+    for block in blocks_mod.item_blocks(markdown_text):
+        item_id = int(block["item_id"])
+        entries.append({
+            "id": item_id,
+            "url": block["url"],
+            "title": block["fields"]["title"],
+            "section": block["section"],
+            "deadline_label": block["fields"]["label"],
+        })
+        conn.execute(
+            "INSERT OR REPLACE INTO announcements (id, url, period_end, title)"
+            " VALUES (?, ?, ?, ?)",
+            (item_id, block["url"], "2026-12-31", block["fields"]["title"]),
+        )
     conn.commit()
     conn.close()
+    composer_mod.write_items_manifest(markdown_path, {
+        "week": "2026-W37",
+        "markdown_sha256": markdown_sha256(markdown_path.read_bytes()),
+        "items": entries,
+    })
     return db
 
 
@@ -720,7 +744,7 @@ def test_recheck_records_markdown_sha256(tmp_path, monkeypatch):
     annotated, _ = apply_headline(SAMPLE_MD, "확정 의견")
     md = tmp_path / "2026-W37.md"
     md.write_text(annotated, encoding="utf-8")
-    db = _empty_db(tmp_path)
+    db = _bind(md)
     monkeypatch.setattr(
         "alert.digest.checker.check_url_alive", lambda url, timeout=8: True
     )
@@ -783,7 +807,7 @@ def test_checker_fails_when_dead_url_stays_in_body(tmp_path, monkeypatch):
         "alert.digest.checker.check_url_alive",
         lambda url, timeout=8: url != DEAD,
     )
-    result = check_digest(db_path=str(_empty_db(tmp_path)), markdown_path=md)
+    result = check_digest(db_path=str(_bind(md)), markdown_path=md)
     assert result["pass"] is False
     assert "죽은 URL" in result["reason"]
     assert [item["url"] for item in result["dropped"]] == [DEAD]
@@ -801,7 +825,7 @@ def test_recheck_removes_dead_item_block(tmp_path, monkeypatch):
     )
     monkeypatch.setattr(
         "sys.argv",
-        ["recheck_digest.py", str(md), "--db", str(_empty_db(tmp_path))],
+        ["recheck_digest.py", str(md), "--db", str(_bind(md))],
     )
     assert recheck_main() == 0
     body = md.read_text(encoding="utf-8")
@@ -825,7 +849,7 @@ def test_recheck_strips_dead_link_inside_commentary(tmp_path, monkeypatch):
     )
     monkeypatch.setattr(
         "sys.argv",
-        ["recheck_digest.py", str(md), "--db", str(_empty_db(tmp_path))],
+        ["recheck_digest.py", str(md), "--db", str(_bind(md))],
     )
     assert recheck_main() == 0
     body = md.read_text(encoding="utf-8")
@@ -845,7 +869,7 @@ def test_recheck_fails_when_every_item_is_dead(tmp_path, monkeypatch):
     )
     monkeypatch.setattr(
         "sys.argv",
-        ["recheck_digest.py", str(md), "--db", str(_empty_db(tmp_path))],
+        ["recheck_digest.py", str(md), "--db", str(_bind(md))],
     )
     assert recheck_main() == 1
     check = json.loads((tmp_path / "2026-W37.check.json").read_text(encoding="utf-8"))
@@ -1552,7 +1576,7 @@ def test_checker_fails_on_prose_in_item_section(tmp_path, monkeypatch):
     monkeypatch.setattr(
         "alert.digest.checker.check_url_alive", lambda url, timeout=8: True
     )
-    result = check_digest(db_path=str(_empty_db(tmp_path)), markdown_path=md)
+    result = check_digest(db_path=str(_bind(md)), markdown_path=md)
     assert result["pass"] is False
     assert "항목 섹션에 산문" in result["reason"]
     assert result["prose_in_item_sections"]
@@ -1569,7 +1593,7 @@ def test_checker_link_audit_counts_items_and_commentary(tmp_path, monkeypatch):
     monkeypatch.setattr(
         "alert.digest.checker.check_url_alive", lambda url, timeout=8: True
     )
-    result = check_digest(db_path=str(_empty_db(tmp_path)), markdown_path=md)
+    result = check_digest(db_path=str(_bind(md)), markdown_path=md)
     audit = result["link_audit"]
     assert audit == {"total": 5, "items": 4, "commentary": 1, "stray": 0}
     assert result["pass"] is True
@@ -1676,22 +1700,26 @@ def test_item_blocks_counts_blocks_not_links():
 def test_checker_fails_when_no_item_blocks(tmp_path, monkeypatch):
     """공고가 0건이면 해설 링크가 살아 있어도 pass=false (Codex 신규 #6)."""
     only_commentary = SAMPLE_MD
-    for url in ("https://example.com/a", "https://example.com/b",
-                "https://example.com/c", "https://example.com/d"):
-        only_commentary = only_commentary.replace(url, "https://dead.invalid/x")
+    for index, url in enumerate((
+        "https://example.com/a", "https://example.com/b",
+        "https://example.com/c", "https://example.com/d",
+    )):
+        only_commentary = only_commentary.replace(
+            url, f"https://dead.invalid/x{index}"
+        )
     only_commentary = only_commentary.replace(
         preview_mod.MARKER, "참고 [자료](https://alive.example/ok)"
     )
     md = tmp_path / "2026-W37.md"
+    md.write_text(only_commentary, encoding="utf-8")
     monkeypatch.setattr(
         "alert.digest.checker.check_url_alive",
         lambda url, timeout=8: "dead.invalid" not in url,
     )
     monkeypatch.setattr(
         "sys.argv",
-        ["recheck_digest.py", str(md), "--db", str(_empty_db(tmp_path))],
+        ["recheck_digest.py", str(md), "--db", str(_bind(md))],
     )
-    md.write_text(only_commentary, encoding="utf-8")
     assert recheck_main() == 1
     check = json.loads((tmp_path / "2026-W37.check.json").read_text(encoding="utf-8"))
     assert check["pass"] is False
@@ -1756,7 +1784,7 @@ def test_recheck_dedupes_same_url_after_link_strip(tmp_path, monkeypatch):
     )
     monkeypatch.setattr(
         "sys.argv",
-        ["recheck_digest.py", str(md), "--db", str(_empty_db(tmp_path))],
+        ["recheck_digest.py", str(md), "--db", str(_bind(md))],
     )
     assert recheck_main() == 0
     final = md.read_text(encoding="utf-8")
@@ -1789,7 +1817,7 @@ def test_cap_violation_fails_the_gate(tmp_path, monkeypatch):
     monkeypatch.setattr(
         "alert.digest.checker.check_url_alive", lambda url, timeout=8: True
     )
-    result = check_digest(db_path=str(_empty_db(tmp_path)), markdown_path=md)
+    result = check_digest(db_path=str(_bind(md)), markdown_path=md)
     assert result["pass"] is False
     assert "섹션 상한 초과" in result["reason"]
 
@@ -2052,7 +2080,7 @@ def test_check_json_records_exact_section_lists(tmp_path, monkeypatch):
     monkeypatch.setattr(
         "alert.digest.checker.check_url_alive", lambda url, timeout=8: True
     )
-    result = check_digest(db_path=str(_empty_db(tmp_path)), markdown_path=md)
+    result = check_digest(db_path=str(_bind(md)), markdown_path=md)
     assert result["item_sections"] == list(sections_mod.V2_ITEM_SECTIONS)
     assert result["commentary_sections"] == ["🤝 협의회에서"]
     assert result["item_blocks"] == 4
@@ -2229,7 +2257,7 @@ def test_recheck_regenerates_kakao_from_markdown(tmp_path, monkeypatch):
     )
     monkeypatch.setattr(
         "sys.argv",
-        ["recheck_digest.py", str(md), "--db", str(_empty_db(tmp_path))],
+        ["recheck_digest.py", str(md), "--db", str(_bind(md))],
     )
     assert recheck_main() == 0
 
@@ -2269,3 +2297,253 @@ def test_kakao_chunk_boundaries_match_item_boundaries(tmp_path):
         # 제목(축약됐을 수도 있다)과 URL 이 같은 조각에 있다
         head = block["title"][:12]
         assert head in holders[0]
+
+
+# ══ 사이클 8 #1: 항목을 텍스트가 아니라 데이터에 결속 ══════════════════
+def _write_manifest(markdown_path, entries, week="2026-W37", sha=None):
+    """손으로 만든 정본 파일 (결속 실패 경로를 재현하기 위한 픽스처)."""
+    composer_mod.write_items_manifest(markdown_path, {
+        "week": week,
+        "markdown_sha256": (
+            sha if sha is not None
+            else markdown_sha256(Path(markdown_path).read_bytes())
+        ),
+        "items": entries,
+    })
+
+
+def _db_with(tmp_path, rows):
+    """(id, url) 행만 가진 대조용 DB."""
+    db = tmp_path / "cross.db"
+    conn = sqlite3.connect(db)
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS announcements "
+        "(id INTEGER PRIMARY KEY, url TEXT, period_end TEXT, title TEXT)"
+    )
+    for item_id, url in rows:
+        conn.execute(
+            "INSERT OR REPLACE INTO announcements (id, url, period_end, title)"
+            " VALUES (?, ?, '2026-12-31', '')",
+            (item_id, url),
+        )
+    conn.commit()
+    conn.close()
+    return db
+
+
+FORGED_MD = """# 📋 협의회 주간 정책브리핑 2026-W37 (9/7~9/13)
+
+이번 주 한 줄: 확정 문구
+
+## ✅ 신청하세요 (마감순)
+
+<!-- item id=999 -->
+자료를 참고해 주세요 — 기관 · 대상: 산림사업자 · 마감 9/22
+  [원문](https://example.com/live)
+"""
+
+
+def test_forged_marker_id_fails_without_manifest(tmp_path, monkeypatch):
+    """`<!-- item id=999 -->` 는 정본 파일이 없으면 통과하지 못한다 (Codex 4차 HIGH #2).
+
+    예전에는 마커만 붙이면 **빈 DB에서도 1건·pass** 였다 — 마커는 출처 증명이 아니다.
+    """
+    md = tmp_path / "2026-W37.md"
+    md.write_text(FORGED_MD, encoding="utf-8")
+    monkeypatch.setattr(
+        "alert.digest.checker.check_url_alive", lambda url, timeout=8: True
+    )
+    result = check_digest(
+        db_path=str(_db_with(tmp_path, [])), markdown_path=md, output_path=None
+    )
+    assert result["pass"] is False
+    assert "항목 정본 파일 없음" in result["reason"]
+    assert result["manifest_problems"]
+
+
+def test_forged_marker_id_fails_against_db(tmp_path, monkeypatch):
+    """정본을 손으로 만들어도 DB 에 그 id 가 없으면 통과하지 못한다 (#1의 마지막 고리)."""
+    md = tmp_path / "2026-W37.md"
+    md.write_text(FORGED_MD, encoding="utf-8")
+    _write_manifest(md, [{
+        "id": 999, "url": "https://example.com/live",
+        "title": "자료를 참고해 주세요", "section": "신청하세요",
+        "deadline_label": "D-9",
+    }])
+    monkeypatch.setattr(
+        "alert.digest.checker.check_url_alive", lambda url, timeout=8: True
+    )
+    result = check_digest(
+        db_path=str(_db_with(tmp_path, [])), markdown_path=md, output_path=None
+    )
+    assert result["pass"] is False
+    assert "DB에 없는 항목 id=999" in " ".join(result["manifest_problems"])
+
+
+def test_manifest_url_must_match_the_db_row(tmp_path, monkeypatch):
+    """정본의 URL 이 DB 의 그 id 의 URL 과 달라도 통과하지 못한다."""
+    md = tmp_path / "2026-W37.md"
+    md.write_text(FORGED_MD, encoding="utf-8")
+    _write_manifest(md, [{
+        "id": 999, "url": "https://example.com/live",
+        "title": "자료를 참고해 주세요", "section": "신청하세요",
+        "deadline_label": "D-9",
+    }])
+    db = _db_with(tmp_path, [(999, "https://example.com/other")])
+    monkeypatch.setattr(
+        "alert.digest.checker.check_url_alive", lambda url, timeout=8: True
+    )
+    result = check_digest(db_path=str(db), markdown_path=md, output_path=None)
+    assert result["pass"] is False
+    assert "DB URL 불일치" in " ".join(result["manifest_problems"])
+
+
+def test_manifest_detects_edited_title(tmp_path, monkeypatch):
+    """본문 제목을 손으로 고치면 정본과 어긋나 통과하지 못한다 (#1)."""
+    md = tmp_path / "2026-W37.md"
+    md.write_text(SAMPLE_MD, encoding="utf-8")
+    db = _bind(md)
+    edited = SAMPLE_MD.replace(
+        "사회적협동조합·사회적기업 공공조달 1:1 컨설팅 참여기업 모집",
+        "손으로 바꾼 제목",
+    )
+    md.write_text(edited, encoding="utf-8")
+    composer_mod.refresh_manifest_binding(md)       # 해시는 맞춰도
+    monkeypatch.setattr(
+        "alert.digest.checker.check_url_alive", lambda url, timeout=8: True
+    )
+    result = check_digest(db_path=str(db), markdown_path=md, output_path=None)
+    assert result["pass"] is False
+    assert "제목 불일치" in " ".join(result["manifest_problems"])
+
+
+def test_manifest_detects_item_count_difference(tmp_path, monkeypatch):
+    """본문에서 항목 하나를 지우면 개수 차이로 통과하지 못한다 (#1)."""
+    md = tmp_path / "2026-W37.md"
+    md.write_text(SAMPLE_MD, encoding="utf-8")
+    db = _bind(md)
+    trimmed, removed, _ = prune_mod.strip_dead_urls(
+        SAMPLE_MD, ["https://example.com/b"]
+    )
+    assert removed
+    md.write_text(trimmed, encoding="utf-8")
+    composer_mod.refresh_manifest_binding(md)
+    monkeypatch.setattr(
+        "alert.digest.checker.check_url_alive", lambda url, timeout=8: True
+    )
+    result = check_digest(db_path=str(db), markdown_path=md, output_path=None)
+    assert result["pass"] is False
+    assert "항목 수 불일치" in " ".join(result["manifest_problems"])
+
+
+def test_stale_manifest_hash_fails_the_gate(tmp_path, monkeypatch):
+    """정본이 다른 본문의 것이면 통과하지 못한다 (재검토가 다시 결속한다)."""
+    md = tmp_path / "2026-W37.md"
+    md.write_text(SAMPLE_MD, encoding="utf-8")
+    db = _bind(md)
+    manifest = composer_mod.load_items_manifest(md)
+    manifest["markdown_sha256"] = "0" * 64
+    composer_mod.write_items_manifest(md, manifest)
+    monkeypatch.setattr(
+        "alert.digest.checker.check_url_alive", lambda url, timeout=8: True
+    )
+    result = check_digest(db_path=str(db), markdown_path=md, output_path=None)
+    assert result["pass"] is False
+    assert "이 본문의 것이 아님" in " ".join(result["manifest_problems"])
+
+    # 재검토가 결속을 다시 맞추면 통과한다
+    monkeypatch.setattr("sys.argv", ["recheck_digest.py", str(md), "--db", str(db)])
+    assert recheck_main() == 0
+
+
+def test_extra_link_in_a_title_is_not_counted_as_an_item(tmp_path, monkeypatch):
+    """정상 항목의 제목에 링크를 하나 끼워도 통과하지 못한다 (Codex 4차 HIGH #2).
+
+    사이클 7 판은 항목 블록 안의 링크를 몇 개든 `items` 로 합산해 총계가 맞아버렸다
+    (항목 3 · HTML 링크 4 · pass). 이제 기준은 **정본 URL 집합**이다.
+    """
+    md = tmp_path / "2026-W37.md"
+    md.write_text(SAMPLE_MD, encoding="utf-8")
+    db = _bind(md)
+    injected = SAMPLE_MD.replace(
+        "산림재난방지법 시행령 일부개정령안 입법예고 —",
+        "산림재난방지법 [추가](https://evil.example/x) 입법예고 —",
+    )
+    md.write_text(injected, encoding="utf-8")
+    composer_mod.refresh_manifest_binding(md)
+    monkeypatch.setattr(
+        "alert.digest.checker.check_url_alive", lambda url, timeout=8: True
+    )
+    result = check_digest(db_path=str(db), markdown_path=md, output_path=None)
+    assert result["link_audit"]["stray"] == 1
+    assert result["pass"] is False
+    from scripts.send_digest import markdown_to_html
+    # 발송 HTML 에는 링크가 5개 실린다 — 항목 4 + 위조 1
+    assert markdown_to_html(injected).count("<a ") == 5
+
+
+def test_recheck_keeps_manifest_in_step_with_the_body(tmp_path, monkeypatch):
+    """재검토가 죽은 항목을 지우면 정본에서도 사라진다 (#1)."""
+    md = tmp_path / "2026-W37.md"
+    annotated, _ = apply_headline(SAMPLE_MD, "확정 의견")
+    md.write_text(annotated, encoding="utf-8")
+    db = _bind(md)
+    dead_item = "https://example.com/b"
+    monkeypatch.setattr(
+        "alert.digest.checker.check_url_alive",
+        lambda url, timeout=8: url != dead_item,
+    )
+    monkeypatch.setattr("sys.argv", ["recheck_digest.py", str(md), "--db", str(db)])
+    assert recheck_main() == 0
+
+    manifest = composer_mod.load_items_manifest(md)
+    assert [entry["url"] for entry in manifest["items"]] == [
+        "https://example.com/a", "https://example.com/c", "https://example.com/d",
+    ]
+    assert manifest["markdown_sha256"] == markdown_sha256(md.read_bytes())
+    check = json.loads((tmp_path / "2026-W37.check.json").read_text("utf-8"))
+    assert check["pass"] is True
+    assert check["manifest_problems"] == []
+
+
+def test_apply_commentary_keeps_the_manifest_bound(tmp_path, monkeypatch):
+    """확정 입력이 본문을 고치면 정본 결속도 함께 갱신된다 (#1)."""
+    md = tmp_path / "2026-W37.md"
+    md.write_text(SAMPLE_MD, encoding="utf-8")
+    db = _bind(md)
+    assert apply_commentary_main(
+        ["2026-W37", "--headline", "확정 한 줄", "--out-dir", str(tmp_path)]
+    ) == 0
+    manifest = composer_mod.load_items_manifest(md)
+    assert manifest["markdown_sha256"] == markdown_sha256(md.read_bytes())
+    monkeypatch.setattr(
+        "alert.digest.checker.check_url_alive", lambda url, timeout=8: True
+    )
+    result = check_digest(db_path=str(db), markdown_path=md, output_path=None)
+    assert result["manifest_problems"] == []
+    assert result["pass"] is True
+
+
+# ══ 사이클 8 #5: headline 은 한 줄 ══════════════════════════════════════
+def test_headline_rejects_multiple_lines(tmp_path, monkeypatch):
+    """여러 줄 headline 은 거부한다 — 둘째 줄이 본문에 남아 누적됐다 (Codex 4차 #5)."""
+    md = tmp_path / "2026-W37.md"
+    md.write_text(SAMPLE_MD, encoding="utf-8")
+    monkeypatch.setattr(
+        "sys.argv",
+        ["apply_commentary.py", "2026-W37", "--headline", "첫줄\n둘째줄",
+         "--out-dir", str(tmp_path)],
+    )
+    from scripts.apply_commentary import main as commentary_main
+
+    assert commentary_main() == 2
+    assert md.read_text(encoding="utf-8") == SAMPLE_MD
+
+
+def test_apply_headline_is_idempotent_for_multiline_input():
+    """함수 자체도 멱등하다 — 개행은 공백으로 접는다 (#5)."""
+    once, _ = apply_headline(SAMPLE_MD, "첫줄\n둘째줄")
+    twice, changed = apply_headline(once, "첫줄\n둘째줄")
+    assert changed is False and twice == once
+    assert once.count("둘째줄") == 1
+    assert "이번 주 한 줄: 첫줄 둘째줄" in once

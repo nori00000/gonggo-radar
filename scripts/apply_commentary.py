@@ -27,6 +27,7 @@ from alert.digest.composer import (
     SECTION_HEADINGS,
     SECTION_MEMBER,
     kakao_file_text_from_markdown,
+    refresh_manifest_binding,
 )
 from alert.digest.preview import MARKER
 
@@ -49,6 +50,12 @@ NO_FIELD_MESSAGE = (
     "✗ --headline 또는 --commentary 중 하나는 있어야 합니다 "
     "(어느 자리를 확정할지 추론하지 않습니다)"
 )
+# 사이클 8 #5: "이번 주 한 줄"은 **한 줄**이다. 여러 줄을 받으면 둘째 줄부터가
+# 별도 산문 줄로 남아, 다시 적용할 때 꼬리가 누적됐다(멱등 깨짐).
+HEADLINE_MULTILINE_REJECT = (
+    "✗ --headline 은 한 줄이어야 합니다 (개행이 들어오면 둘째 줄부터가 "
+    "본문에 남아 재적용 시 누적됩니다) — 여러 줄은 --commentary 를 쓰세요"
+)
 
 
 def commentary_error(commentary: str) -> str:
@@ -66,7 +73,9 @@ def apply_headline(markdown_text: str, headline: str):
     확정 마커가 남아 있으면 치환하고, 이미 확정돼 있으면 **덮어쓴다**.
     그 줄 자체가 없으면 바꿀 자리가 없으므로 False 를 돌려준다.
     """
-    text = (headline or "").strip()
+    # 사이클 8 #5: 한 줄만 받는다 — 개행이 들어오면 통째로 공백으로 접는다
+    # (호출자는 CLI 에서 이미 거부되지만, 함수 자체도 멱등해야 한다).
+    text = " ".join((headline or "").split())
     lines = markdown_text.split("\n")
     for index, line in enumerate(lines):
         if not line.startswith(HEADLINE_PREFIX):
@@ -165,6 +174,9 @@ def main(argv=None):
         if error:
             print(error, file=sys.stderr)
             return 2
+    if args.headline and "\n" in args.headline.strip():
+        print(HEADLINE_MULTILINE_REJECT, file=sys.stderr)
+        return 2
 
     markdown_path = Path(args.out_dir) / f"{args.week}.md"
     if not markdown_path.exists():
@@ -250,6 +262,11 @@ def main(argv=None):
             kakao_file_text_from_markdown(updated), encoding="utf-8"
         )
         print(f"✓ 카톡 평문 동기화: {kakao_path}")
+
+        # 사이클 8 #1: 본문을 고쳤으므로 정본 파일의 결속 해시를 다시 맞춘다.
+        # 항목 목록은 그대로 — 확정 입력은 항목을 건드리지 않는다.
+        if refresh_manifest_binding(markdown_path) is not None:
+            print("✓ 항목 정본 결속 갱신")
 
         record = (args.commentary or args.headline or "").strip()
         try:
