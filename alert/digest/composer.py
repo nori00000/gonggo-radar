@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Optional, List, Dict, Set, Tuple
 
 # 섹션 분류 기준 (categorize_item과 섹션별 SQL 쿼리가 공유하는 단일 정본)
-FOREST_SOURCES = ("forest_service", "fowi", "kofpi")
+FOREST_SOURCES = ("forest_service", "forest_press", "fowi", "kofpi", "lawmaking")
 SSE_SOURCES = ("socialenterprise", "seis", "mois_sse", "coop")
 ANNOUNCEMENT_KEYWORDS = ("공고", "모집", "지원", "신청", "공모", "채용")
 

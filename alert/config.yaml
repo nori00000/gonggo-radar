@@ -100,6 +100,7 @@ crawler:
     fowi:
       enabled: true
       base_url: "https://fowi.or.kr"
+      bypass_threshold: true
     seis:
       enabled: true
       base_url: "https://www.seis.or.kr"
