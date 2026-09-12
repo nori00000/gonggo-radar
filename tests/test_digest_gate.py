@@ -716,8 +716,14 @@ def _bind(markdown_path):
         "(id INTEGER PRIMARY KEY, url TEXT, period_end TEXT, title TEXT)"
     )
     entries = []
+    block_lines = {
+        str(block["item_id"]): block["lines"]
+        for block in blocks_mod.parse_blocks(markdown_text)
+        if block["kind"] == "item"
+    }
     for block in blocks_mod.item_blocks(markdown_text):
         item_id = int(block["item_id"])
+        lines = block_lines[str(item_id)]
         entries.append({
             "id": item_id,
             "url": block["url"],
@@ -727,6 +733,10 @@ def _bind(markdown_path):
                 block["section"], block["section"]
             ),
             "deadline_label": block["fields"]["label"],
+            # 사이클 10 #2: 렌더된 줄 그대로 + DB 마감
+            "line": lines[1],
+            "origin_line": lines[2],
+            "period_end": "2026-12-31",
         })
         conn.execute(
             "INSERT OR REPLACE INTO announcements (id, url, period_end, title)"
@@ -2802,3 +2812,213 @@ def test_normal_body_has_no_kakao_problems(tmp_path, monkeypatch):
     result = check_digest(db_path=str(db), markdown_path=md, output_path=None)
     assert result["kakao_problems"] == []
     assert result["pass"] is True
+
+
+# ══ 사이클 10: 항목 줄 편집 불가 · 본문 전체 URL · 채널 동일성 ══════════
+def _alive(monkeypatch, dead=()):
+    monkeypatch.setattr(
+        "alert.digest.checker.check_url_alive",
+        lambda url, timeout=8: url not in set(dead),
+    )
+
+
+@pytest.mark.parametrize("edit", [
+    ("[D-9] 사회적협동조합", "[D-109] 사회적협동조합"),        # 라벨·마감 조작
+    ("· 마감 9/22", "· 마감 12/31"),                          # 마감 표기
+    ("· 대상: 사협·사회적기업", "· 대상: 누구나"),             # 대상
+    ("협동조합포털(기재부)", "산림청"),                        # 기관
+])
+def test_item_line_edit_requires_recompose(tmp_path, monkeypatch, edit):
+    """항목 줄은 **편집 불가 영역**이다 (사이클 10 #2 / Codex 6차 HIGH #2).
+
+    md 만 고쳐 마감·대상·기관·라벨을 바꾸고 재검토해도 통과했고, 바뀐 마감이
+    카톡에 실렸다. 이제 정본이 담은 렌더 결과와 문자열이 다르면 멈춘다.
+    """
+    md = tmp_path / "2026-W37.md"
+    md.write_text(SAMPLE_MD, encoding="utf-8")
+    db = _bind(md)
+    before, after = edit
+    md.write_text(SAMPLE_MD.replace(before, after, 1), encoding="utf-8")
+    composer_mod.refresh_manifest_binding(md)       # 해시를 맞춰도
+    _alive(monkeypatch)
+
+    result = check_digest(db_path=str(db), markdown_path=md, output_path=None)
+    assert result["pass"] is False, edit
+    assert any("항목 줄이 정본과 다름" in problem
+               for problem in result["manifest_problems"]), result["manifest_problems"]
+
+    # 재검토도 결속해주지 않는다
+    monkeypatch.setattr("sys.argv", ["recheck_digest.py", str(md), "--db", str(db)])
+    assert recheck_main() == 1
+    check = json.loads((tmp_path / "2026-W37.check.json").read_text("utf-8"))
+    assert check["pass"] is False
+    assert "재조립 필요" in check["reason"]
+
+
+def test_origin_line_edit_requires_recompose(tmp_path, monkeypatch):
+    """원문 줄도 정본과 문자열이 같아야 한다 (사이클 10 #2)."""
+    md = tmp_path / "2026-W37.md"
+    md.write_text(SAMPLE_MD, encoding="utf-8")
+    db = _bind(md)
+    md.write_text(
+        SAMPLE_MD.replace("  [원문](https://example.com/a)",
+                          "[원문](https://example.com/a)", 1),
+        encoding="utf-8",
+    )
+    composer_mod.refresh_manifest_binding(md)
+    _alive(monkeypatch)
+    result = check_digest(db_path=str(db), markdown_path=md, output_path=None)
+    assert result["pass"] is False
+    assert any("원문 줄이 정본과 다름" in problem
+               for problem in result["manifest_problems"])
+
+
+def test_db_deadline_change_requires_recompose(tmp_path, monkeypatch):
+    """DB 마감이 바뀌면 정본이 낡았다 — 재조립을 요구한다 (사이클 10 #2)."""
+    md = tmp_path / "2026-W37.md"
+    md.write_text(SAMPLE_MD, encoding="utf-8")
+    db = _bind(md)
+    conn = sqlite3.connect(db)
+    conn.execute("UPDATE announcements SET period_end = '2026-09-12' WHERE id = 11")
+    conn.commit()
+    conn.close()
+    _alive(monkeypatch)
+    result = check_digest(db_path=str(db), markdown_path=md, output_path=None)
+    assert result["pass"] is False
+    assert any("DB 마감 변경" in problem
+               for problem in result["manifest_problems"])
+
+
+def test_editable_areas_still_pass(tmp_path, monkeypatch):
+    """이번 주 한 줄·협의회에서·회원사 소식은 여전히 편집할 수 있다 (사이클 10 #2)."""
+    md = tmp_path / "2026-W37.md"
+    md.write_text(SAMPLE_MD, encoding="utf-8")
+    db = _bind(md)
+    edited, _ = apply_headline(SAMPLE_MD, "이번 주는 인증 공고")
+    edited, _ = apply_commentary(edited, "자격 요건 완화를 건의했습니다.")
+    edited = edited.rstrip("\n") + "\n\n## 🏢 회원사 소식\n\n· 회원사A: 신규 사업 개시\n"
+    md.write_text(edited, encoding="utf-8")
+    composer_mod.refresh_manifest_binding(md)
+    _alive(monkeypatch)
+    result = check_digest(db_path=str(db), markdown_path=md, output_path=None)
+    assert result["manifest_problems"] == []
+    assert result["pass"] is True
+
+
+# ══ #3 맨몸 산문 URL 도 생존 검사 대상 ══════════════════════════════════
+def test_bare_prose_url_is_checked_for_liveness(tmp_path, monkeypatch):
+    """해설에 그냥 붙여넣은 죽은 주소도 검사한다 (Codex 6차 HIGH #3)."""
+    dead = "https://dead.invalid/resource"
+    md = tmp_path / "2026-W37.md"
+    md.write_text(SAMPLE_MD, encoding="utf-8")
+    db = _bind(md)
+    edited, _ = apply_headline(SAMPLE_MD, f"참고 {dead}")
+    md.write_text(edited, encoding="utf-8")
+    composer_mod.refresh_manifest_binding(md)
+
+    assert dead in blocks_mod.bare_urls(edited)
+    assert dead in blocks_mod.body_urls(edited)
+    _alive(monkeypatch, dead=[dead])
+    result = check_digest(db_path=str(db), markdown_path=md, output_path=None)
+    assert result["pass"] is False
+    assert dead in [item["url"] for item in result["dropped"]]
+
+
+def test_bare_url_in_member_news_is_checked(tmp_path, monkeypatch):
+    """회원사 소식의 맨몸 URL 도 마찬가지다 (#3)."""
+    dead = "https://dead.invalid/member"
+    body = SAMPLE_MD.rstrip("\n") + (
+        f"\n\n## 🏢 회원사 소식\n\n· 회원사A: 자료는 {dead} 입니다\n"
+    )
+    md = tmp_path / "2026-W37.md"
+    md.write_text(body, encoding="utf-8")
+    db = _bind(md)
+    _alive(monkeypatch, dead=[dead])
+    result = check_digest(db_path=str(db), markdown_path=md, output_path=None)
+    assert result["pass"] is False
+    assert dead in [item["url"] for item in result["dropped"]]
+
+
+# ══ #4 한 줄에 긴 링크 둘 ══════════════════════════════════════════════
+LONG_A = "https://example.com/a" + "a" * 4180
+LONG_B = "https://example.com/b" + "b" * 4080
+
+
+def test_two_long_links_on_one_line_are_both_replaced(tmp_path, monkeypatch):
+    """한 줄의 긴 링크 두 개가 모두 치환된다 (Codex 6차 MEDIUM #4).
+
+    첫 치환 뒤 옛 좌표로 두 번째를 처리해, B 는 실제로 남았는데 "치환 완료" 로
+    기록됐다 — 카톡에서는 분절되고 HTML 에는 B 링크가 그대로 실렸다.
+    """
+    from scripts.send_digest import markdown_to_html
+
+    body = SAMPLE_MD.replace(
+        "· (면담·건의·수렴 현황 — 이번 주 기록 없음)",
+        f"· [A]({LONG_A}) [B]({LONG_B})",
+    )
+    md = tmp_path / "2026-W37.md"
+    md.write_text(body, encoding="utf-8")
+    db = _bind(md)
+    _alive(monkeypatch)
+
+    kakao = composer_mod.kakao_file_text_from_markdown(body)
+    html = markdown_to_html(body)
+    preview_body = preview_mod.render_preview("2026-W37", body, PASS_CHECK)
+    for name, rendered in (("kakao", kakao), ("html", html),
+                           ("preview", preview_body)):
+        assert LONG_A not in rendered, name
+        assert LONG_B not in rendered, name
+    assert composer_mod.markdown_kakao_problems(body) == []
+    result = check_digest(db_path=str(db), markdown_path=md, output_path=None)
+    assert set(result["long_prose_urls"]) == {LONG_A, LONG_B}
+    assert all(
+        len(chunk) <= composer_mod.KAKAO_CHUNK_LIMIT
+        for chunk in kakao.split(f"\n{KAKAO_CHUNK_SEPARATOR}\n")
+    )
+
+
+# ══ #5 항목 원문 URL 은 채널 간 동일 ═══════════════════════════════════
+def test_item_origin_url_is_identical_across_channels(tmp_path):
+    """md·미리보기·카톡·HTML 이 **같은 항목 URL** 을 싣는다 (Codex 6차 MEDIUM #5).
+
+    공통 치환 함수가 항목 원문 줄까지 산문으로 처리해, 긴 항목 URL 이 채널마다
+    달라졌다(md·미리보기엔 원문, HTML·재생성 카톡엔 안내 문구).
+    """
+    from scripts.send_digest import markdown_to_html
+
+    long_item_url = "https://example.com/item" + "c" * 4060   # 항목으로 게시 가능
+    body = SAMPLE_MD.replace("https://example.com/a", long_item_url)
+    md = tmp_path / "2026-W37.md"
+    md.write_text(body, encoding="utf-8")
+
+    kakao = composer_mod.kakao_file_text_from_markdown(body)
+    html = markdown_to_html(body)
+    preview_body = preview_mod.render_preview("2026-W37", body, PASS_CHECK)
+    for name, rendered in (("md", body), ("kakao", kakao), ("html", html),
+                           ("preview", preview_body)):
+        assert long_item_url in rendered, name
+        assert composer_mod.URL_TOO_LONG_NOTICE not in rendered, name
+    # 짧은 항목 URL 도 네 채널에서 같다
+    for url in blocks_mod.item_urls(body):
+        assert all(url in rendered for rendered in (body, kakao, html,
+                                                    preview_body)), url
+
+
+# ══ #6 선두 괄호의 장소 문맥 ═══════════════════════════════════════════
+def test_leading_venue_bracket_is_not_a_region():
+    """`[설명회 장소: 서울]` 은 선두에 있어도 자격 지역이 아니다 (Codex 6차 #6)."""
+    from alert.digest.composer import infer_region, target_display, infer_target_tags
+
+    for title in (
+        "[설명회 장소: 서울] 사회적기업 지원사업 모집",
+        "사회적기업 지원사업 모집 [설명회 장소: 서울]",
+        "[개최 장소: 대전] 사회적기업 지원사업 모집",
+        "[서울에서] 사회적기업 지원사업 모집",
+    ):
+        assert infer_region(title) is None, title
+    # 자격 지역은 여전히 잡는다
+    assert infer_region("[경기] 사회적기업 지원사업 모집") == "경기"
+    tags = infer_target_tags("[설명회 장소: 서울] 사회적기업 지원사업 모집")
+    assert "(서울)" not in target_display(tags, infer_region(
+        "[설명회 장소: 서울] 사회적기업 지원사업 모집"
+    ))

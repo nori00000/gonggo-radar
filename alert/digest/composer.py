@@ -322,8 +322,10 @@ EMPTY_SECTION_LINE = "*(항목 없음)*"
 KAKAO_EMPTY_SECTION_LINE = "  (항목 없음)"
 _BOLD_RE = re.compile(r"\*\*([^*]+)\*\*")
 
-# 중복 병합 임계값 (판정 ⑥): 같은 소스·같은 주 제목 3-gram Jaccard
-DEDUP_JACCARD = 0.6
+# "유사 항목 n" **표시** 임계값 (판정 ⑥③). 병합에는 쓰지 않는다 — 사이클 10 #1에서
+# 유사도 병합을 폐기했다. 유사도는 편집자에게 알리는 신호일 뿐이고, 무엇을 지울지는
+# 사람이 `제외` 로 판단한다.
+SIMILAR_JACCARD = 0.6
 NGRAM_SIZE = 3
 
 # 개정 v2.6 (8): created_at에 오프셋이 있으면 KST로 환산해 주간 창을 판정한다.
@@ -518,6 +520,19 @@ def _strip_tokens(text: str) -> str:
     return " ".join(text.split())
 
 
+def merge_title_key(title: str) -> str:
+    """병합 판정용 **보수** 정규화 — 공백·구두점만 지운다 (사이클 10 #1).
+
+    괄호·날짜·회차·기관 토큰을 **전부 보존**한다. 유사도 병합이 지웠던 것이 바로
+    그 토큰들이었고, 그래서 `… [경기] 모집` / `… [강원] 모집`(Jaccard 0.6)과
+    `… 모집 (3차)` / `… (4차)`(Jaccard 1.0)가 하나로 합쳐지며 유효 공고가
+    sections·holds 양쪽에서 사라졌다.
+
+    병합은 이 키가 **완전히 같을 때만** 일어난다.
+    """
+    return " ".join(_SYMBOL_RE.sub(" ", normalize_title(title)).split())
+
+
 def dedup_key(title: str) -> str:
     """중복 판정용 정규화 — **괄호 내용은 남긴다** (사이클 9 #2).
 
@@ -695,7 +710,9 @@ def infer_region(title: str) -> Optional[str]:
     # (`[모집공고]`)에서 멈춰서 그 뒤의 `[경기]` 를 놓쳤다 — 지역이 None 이 되어
     # 경기/강원 공고가 하나로 병합됐다(Codex 5차 HIGH #3·HIGH #1 잔여).
     for group in prefix_brackets(title):
-        region = _region_from(group)
+        # 사이클 10 #6: 선두 괄호에도 장소 문맥을 걷어낸다 —
+        # `[설명회 장소: 서울]` 은 자격 지역이 아니다(후미 괄호와 같은 규칙).
+        region = _region_from(_drop_venue_context(group))
         if region:
             # 괄호에서 확정하고 끝낸다 — 괄호 밖 2차 탐색을 하면 행사 장소
             # (`(설명회 장소: 서울)`)가 섞여 자격 지역이 사라진다.
@@ -1172,71 +1189,63 @@ def _mergeable(left: Dict, right: Dict) -> bool:
     return True
 
 
-def _dedup_same_source(items: List[Dict], today: date) -> List[Dict]:
-    """같은 소스·같은 주 안에서 제목 유사도 ≥ DEDUP_JACCARD면 대표 1건으로 병합 (판정 ⑥).
+def _merge_key(item: Dict) -> tuple:
+    """병합 키 (사이클 10 #1): 같은 소스 · 같은 기관 · 같은 유효 마감 · 같은 제목.
 
-    개정 v2.2 F4: 제목이 같아도 **인정된 마감이 다르면 다른 회차**이므로 병합하지 않는다.
-    개정 v2.5 #5: 판정·대상 태그·지역이 다르면 병합하지 않는다.
-    개정 v2.5 #3: 병합 그룹의 유효 마감은 그룹 내 non-null 마감의 **최대값**이다.
-    대표는 ①사업자 신호가 있는 쪽 ②마감이 늦은 쪽 순으로 고른다.
+    제목은 보수 정규화(공백·구두점만 제거)로 비교하며, **완전히 같아야** 한다.
+    """
+    return (
+        item["source"],
+        item["org"],
+        item["deadline"],
+        merge_title_key(item["title"]),
+    )
+
+
+def _dedup_same_source(items: List[Dict], today: date) -> List[Dict]:
+    """**같은 공고가 두 번 들어온 것만** 합친다 (사이클 10 #1 — 유사도 병합 폐기).
+
+    조건: `_merge_key` 가 완전히 같고 `_mergeable`(판정·대상·지역·접두)도 통과할 때.
+    근사 중복은 합치지 않는다 — 유사도(3-gram Jaccard) 병합은 서로 다른 공고를
+    지웠다(`[경기]`/`[강원]` 0.6 · `(3차)`/`(4차)` 1.0). 대신 "유사 항목 n" 으로
+    표시해 편집자가 `제외` 로 판단한다.
+
+    대표는 ①사업자 신호가 있는 쪽 ②마감이 늦은 쪽 순으로 고른다. 마감이 같아야
+    병합되므로 그룹 마감 재계산(개정 v2.5 #3)은 필요 없다.
     """
     kept: List[Dict] = []
-    kept_grams: List[frozenset] = []
+    index_by_key: Dict[tuple, int] = {}
     for item in items:
-        grams = title_ngrams(item["title"])
-        merged = False
-        for index, (other, other_grams) in enumerate(zip(kept, kept_grams)):
-            if other["source"] != item["source"]:
-                continue
-            if jaccard(grams, other_grams) < DEDUP_JACCARD:
-                continue
-            if not _mergeable(other, item):
-                continue
-            if item["deadline"] and other["deadline"] and (
-                item["deadline"] != other["deadline"]
-            ):
-                # 다른 회차 — 병합하지 않는다
-                continue
-
-            merged = True
-            group_deadline = max(item["deadline"], other["deadline"])
-            # 대표: 사업자 신호 → 마감 늦은 쪽
-            challenger_wins = (item["has_b2b"], item["deadline"]) > (
-                other["has_b2b"], other["deadline"]
-            )
-            if challenger_wins:
-                item["merged_ids"] = (
-                    list(other["merged_ids"]) + [other["id"]]
-                )
-                kept[index] = item
-                kept_grams[index] = grams
-                winner = item
-            else:
-                other["merged_ids"].append(item["id"])
-                winner = other
-            if group_deadline != winner["deadline"]:
-                _refresh_deadline(
-                    winner, parse_deadline(group_deadline), today
-                )
-            break
-        if merged:
+        key = _merge_key(item)
+        index = index_by_key.get(key)
+        if index is None or not _mergeable(kept[index], item):
+            index_by_key.setdefault(key, len(kept))
+            kept.append(item)
             continue
-        kept.append(item)
-        kept_grams.append(grams)
+        other = kept[index]
+        # 대표: 사업자 신호 → 마감 늦은 쪽
+        if (item["has_b2b"], item["deadline"]) > (
+            other["has_b2b"], other["deadline"]
+        ):
+            item["merged_ids"] = list(other["merged_ids"]) + [other["id"]]
+            kept[index] = item
+        else:
+            other["merged_ids"].append(item["id"])
     return kept
 
 
-def _mark_cross_source_similar(items: List[Dict]) -> None:
-    """다른 소스 간 의미 중복은 자동 병합하지 않고 "유사 항목 n"으로만 표기 (판정 ⑥③)."""
+def _mark_similar(items: List[Dict]) -> None:
+    """자동 병합하지 않은 근사 중복을 "유사 항목 n" 으로만 표기 (판정 ⑥③ + 사이클 10 #1).
+
+    같은 소스든 다른 소스든 가리지 않는다 — 유사도 병합을 폐기했으므로 같은 소스의
+    근사 중복도 발송본에 나란히 실리고, 편집자는 이 표시를 보고 판단한다.
+    """
     grams = [title_ngrams(item["title"]) for item in items]
     for i, item in enumerate(items):
-        count = 0
-        for j, other in enumerate(items):
-            if i == j or other["source"] == item["source"]:
-                continue
-            if jaccard(grams[i], grams[j]) >= DEDUP_JACCARD:
-                count += 1
-        item["similar_count"] = count
+        item["similar_count"] = sum(
+            1 for j in range(len(items))
+            if j != i and jaccard(grams[i], grams[j]) >= SIMILAR_JACCARD
+        )
 
 
 def _posted_ordinal(item: Dict) -> int:
@@ -1478,7 +1487,7 @@ def compose_digest_data(
         holds.append(item)
 
     published = sections[VERDICT_APPLY] + sections[VERDICT_NOTICE]
-    _mark_cross_source_similar(published)
+    _mark_similar(published)
 
     for number, item in enumerate(holds, start=1):
         item["number"] = number
@@ -1574,6 +1583,13 @@ def items_manifest(data: Dict, markdown_bytes: bytes = b"") -> Dict:
                 "title": sanitize_title(item["title"]),
                 "section": section,
                 "deadline_label": item["label"],
+                # 사이클 10 #2: 렌더된 **줄 그대로**를 담는다. checker 가 md 의 해당
+                # 줄과 문자열 동일성을 검사하므로, 마감·대상·기관·라벨을 손으로
+                # 고치면 즉시 "재조립 필요" 가 된다(항목 줄은 편집 불가 영역).
+                "line": item_line(item),
+                "origin_line": f"  [원문]({item['url']})",
+                # DB 마감 원문 — DB 쪽이 바뀌면 정본이 낡았다는 뜻이다
+                "period_end": item.get("period_end") or "",
             }
             for section in ITEM_SECTIONS
             for item in (data["sections"].get(section) or [])
@@ -1773,33 +1789,39 @@ def fit_prose_urls(text: str, limit: int = KAKAO_CHUNK_LIMIT) -> Tuple[str, List
     replaced: List[str] = []
     lines = []
     for line in (text or "").split("\n"):
-        # ① 마크다운 링크부터 (긴 것 먼저) — 줄이 한도 안에 들어오면 멈춘다
-        if len(line) > limit:
-            for link in sorted(
-                blocks_mod.find_links(line), key=lambda link: -len(link.url)
-            ):
-                if len(line) <= limit:
-                    break
-                if link.url not in replaced:
-                    replaced.append(link.url)
-                line = line.replace(
-                    line[link.start:link.end], URL_TOO_LONG_NOTICE, 1
-                )
+        # 사이클 10 #5: **항목의 원문 줄은 건드리지 않는다.** 항목 URL 이 한도에 맞지
+        # 않으면 compose 가 보류로 내리므로(kakao_item_fits), 여기서 치환하면 채널마다
+        # 다른 URL 이 나가고(md·미리보기엔 원문, HTML·재생성 카톡엔 안내 문구) 정본
+        # 대조도 깨진다.
+        if blocks_mod.origin_url(line) is not None:
+            lines.append(line)
+            continue
+
+        # ① 마크다운 링크부터 (긴 것 먼저). **매번 다시 스캔**한다 — 한 번 치환하면
+        # 나머지 링크의 좌표가 밀려서, 옛 좌표로 자른 두 번째 링크는 실제로 남는데
+        # "치환 완료" 로 기록됐다(사이클 10 #4).
+        while len(line) > limit:
+            links = blocks_mod.find_links(line)
+            if not links:
+                break
+            link = max(links, key=lambda found: len(found.url))
+            if link.url not in replaced:
+                replaced.append(link.url)
+            line = line[:link.start] + URL_TOO_LONG_NOTICE + line[link.end:]
+
         # ② 맨몸 URL 토큰 (`· https://…`) — 글머리·들여쓰기는 보존한다
-        if len(line) > limit:
+        while len(line) > limit:
             tokens = line.split(" ")
-            order = sorted(
-                (index for index, token in enumerate(tokens)
-                 if _is_url_line(token)),
-                key=lambda index: -len(tokens[index]),
-            )
-            for index in order:
-                if len(" ".join(tokens)) <= limit:
-                    break
-                token = tokens[index]
-                if token not in replaced:
-                    replaced.append(token)
-                tokens[index] = URL_TOO_LONG_NOTICE
+            candidates = [
+                index for index, token in enumerate(tokens)
+                if _is_url_line(token)
+            ]
+            if not candidates:
+                break
+            index = max(candidates, key=lambda i: len(tokens[i]))
+            if tokens[index] not in replaced:
+                replaced.append(tokens[index])
+            tokens[index] = URL_TOO_LONG_NOTICE
             line = " ".join(tokens)
         lines.append(line)
     return "\n".join(lines), replaced
@@ -1829,21 +1851,13 @@ def markdown_kakao_problems(markdown_text: str) -> List[str]:
         if len(chunk) > KAKAO_CHUNK_LIMIT
     ]
     joined = "\n".join(chunks)
-    _, replaced = fit_prose_urls(markdown_text)
-    replaced_urls = set(replaced)
-
-    # 마크다운 링크 + 맨몸 URL 줄 (`· https://…`) 을 모두 본다
-    candidates = list(blocks_mod.body_link_urls(markdown_text))
-    for line in (markdown_text or "").split("\n"):
-        stripped = line.strip()
-        if stripped.startswith("· "):
-            stripped = stripped[2:].strip()
-        if _is_url_line(stripped):
-            candidates.append(stripped)
-
-    for url in dict.fromkeys(candidates):
-        if url in replaced_urls or url in joined:
-            continue
+    # 사이클 10 #4: "치환했다" 는 기록을 믿지 않고 **실제 결과물**을 본다 —
+    # 좌표 밀림으로 치환에 실패한 링크가 기록만 남긴 채 살아 있었다.
+    for url in dict.fromkeys(blocks_mod.body_urls(markdown_text)):
+        if url in joined:
+            continue                       # 온전히 실렸다
+        if URL_TOO_LONG_NOTICE in joined and len(url) + 4 > KAKAO_CHUNK_LIMIT:
+            continue                       # 안내 문구로 치환됐다
         problems.append(f"URL 분절/유실: {url[:48]}…")
     return problems
 

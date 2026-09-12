@@ -53,6 +53,7 @@ from alert.digest.composer import (
     bracket_regions,
     dedup_key,
     infer_region,
+    merge_title_key,
     prefix_bracket,
     prefix_brackets,
     sanitize_title,
@@ -472,13 +473,17 @@ class TestComposer:
         )
 
     def test_compose_digest_dedup_same_source_merges(self, tmp_path):
-        """판정 ⑥: 같은 소스·같은 주 제목 유사도 ≥0.6은 대표 1건으로 병합."""
+        """판정 ⑥ (사이클 10 #1): **완전 동일** 제목만 대표 1건으로 병합한다.
+
+        공백·구두점 차이는 같은 제목으로 본다. 유사도(3-gram Jaccard) 병합은
+        폐기됐다 — 괄호·회차 토큰이 정규화에서 사라져 서로 다른 공고를 지웠다.
+        """
         db_path = tmp_path / "dedup.db"
         _create_announcements_table(db_path)
 
         rows = [
             ("dup_a", "임업 경영 컨설팅 참여기업 모집 공고"),
-            ("dup_b", "임업 경영 컨설팅 참여기업 모집  \t공고(~9.30)"),
+            ("dup_b", "임업 경영 컨설팅 참여기업 모집  \t공고"),
             ("uniq_1", "숲가꾸기 사업자 조달 계약 공모"),
         ]
         for source_id, title in rows:
@@ -497,6 +502,85 @@ class TestComposer:
 
         assert _count_items(body) == 2
         assert body.count("임업 경영 컨설팅 참여기업 모집") == 1
+
+    def test_near_duplicate_is_not_merged_but_flagged(self, tmp_path):
+        """근사 중복은 **합치지 않고** "유사 항목 n" 으로만 표시 (사이클 10 #1).
+
+        Codex 6차 HIGH #1 재현 입력의 일반형: 괄호·회차 토큰만 다른 제목은
+        유사도로는 0.6~1.0 이지만 서로 다른 공고일 수 있다. 판단은 편집자 몫이다.
+        """
+        db_path = tmp_path / "near.db"
+        _create_announcements_table(db_path)
+        for source_id, title in (
+            ("near_a", "임업 경영 컨설팅 참여기업 모집 공고"),
+            ("near_b", "임업 경영 컨설팅 참여기업 모집 공고(~9.30)"),
+        ):
+            _insert_one(
+                db_path, source="kofpi", source_id=source_id, title=title,
+                url=f"https://example.com/{source_id}",
+            )
+        data = compose_digest_data(
+            str(db_path), week_str=W13, today=W13_TODAY
+        )
+        published = data["sections"][VERDICT_APPLY]
+        assert len(published) == 2
+        assert data["merged_ids"] == []
+        # 편집자에게는 "유사 항목" 으로 알린다
+        assert all(item["similar_count"] >= 1 for item in published)
+        markdown = render_markdown(data)
+        assert "유사 항목" in markdown
+
+    @pytest.mark.parametrize("shape", [
+        "사회적기업 사업개발비 지원사업 [{}] 모집",       # 중간 괄호
+        "사회적기업 사업개발비 지원사업 모집 [{}]",       # 후미 괄호
+        "[{}] 사회적기업 사업개발비 지원사업 모집",       # 선두 괄호
+    ])
+    def test_region_bracket_anywhere_is_never_merged(self, tmp_path, shape):
+        """지역 괄호가 제목 어디에 있어도 병합되지 않는다 (사이클 10 #1).
+
+        Codex 6차 HIGH #1: 후미는 고쳤지만 **중간 괄호**로 옮기면 지역이 양쪽
+        None 이 되고 유사도 0.6 으로 병합돼 게시 1·보류 0 이 됐다.
+        완전 동일 제목만 병합하므로 위치와 무관하게 갈라진다.
+        """
+        db_path = tmp_path / f"c10_mid_{abs(hash(shape))}.db"
+        _create_announcements_table(db_path)
+        for index, region in enumerate(["경기", "강원"]):
+            _insert_one(
+                db_path, source="seis", source_id=f"mid_{index}",
+                title=shape.format(region),
+                url=f"https://example.com/mid-{index}",
+                period_start="2026-09-08", period_end="2026-09-30",
+                created_at=W37_CREATED_AT,
+            )
+        data = compose_digest_data(
+            str(db_path), week_str=W37, today=W37_TODAY
+        )
+        assert len(data["sections"][VERDICT_APPLY]) == 2
+        assert data["merged_ids"] == []
+
+    def test_round_token_is_never_merged(self, tmp_path):
+        """`(3차)`/`(4차)` 는 다른 회차다 — 마감이 NULL 이어도 병합 금지 (#1)."""
+        db_path = tmp_path / "c10_round.db"
+        _create_announcements_table(db_path)
+        for index, label in enumerate(["3차", "4차"]):
+            _insert_one(
+                db_path, source="kofpi", source_id=f"rd_{index}",
+                title=f"산림 지원사업 참여기업 모집 ({label})",
+                url=f"https://example.com/rd-{index}",
+                period_start="2026-09-08", period_end=None,
+                created_at=W37_CREATED_AT,
+            )
+        data = compose_digest_data(
+            str(db_path), week_str=W37, today=W37_TODAY
+        )
+        assert len(data["sections"][VERDICT_APPLY]) == 2
+        assert data["merged_ids"] == []
+
+    def test_merge_title_key_is_conservative(self):
+        """병합 키는 공백·구두점만 지운다 (괄호·날짜·회차 전부 보존 — #1)."""
+        assert merge_title_key("산림 공고") == merge_title_key("산림  \t공고")
+        for other in ("산림 공고(~9.30)", "산림 공고 [경기]", "산림 공고 (3차)"):
+            assert merge_title_key("산림 공고") != merge_title_key(other), other
 
     def test_compose_digest_cross_source_similar_is_annotated_not_merged(
         self, tmp_path
@@ -1811,38 +1895,56 @@ class TestFixCycle1:
             "https://example.com/round-1",
         }
 
-    def test_same_title_same_deadline_keeps_open_representative(self, tmp_path):
-        """마감이 같으면 병합. 한쪽만 마감이 있으면 열린 쪽이 대표."""
+    def test_same_title_same_deadline_merges_into_one(self, tmp_path):
+        """제목·마감이 완전히 같으면 병합하고, 다르면 병합하지 않는다 (사이클 10 #1)."""
         db_path = tmp_path / "rep.db"
         _create_announcements_table(db_path)
 
-        _insert_one(
-            db_path,
-            source="kofpi",
-            source_id="rep_none",
-            title="산림분야 오픈이노베이션 참여기업 모집 공고",
-            url="https://example.com/rep-none",
-            period_end=None,
-            period_start="2026-03-24",
-        )
-        _insert_one(
-            db_path,
-            source="kofpi",
-            source_id="rep_open",
-            title="산림분야 오픈이노베이션 참여기업 모집 공고(~12.20)",
-            url="https://example.com/rep-open",
-            period_end="2026-12-20",
-            period_start="2026-03-23",
-        )
+        for source_id in ("rep_a", "rep_b"):
+            _insert_one(
+                db_path,
+                source="kofpi",
+                source_id=source_id,
+                title="산림분야 오픈이노베이션 참여기업 모집 공고",
+                url=f"https://example.com/{source_id}",
+                period_end="2026-12-20",
+                period_start="2026-03-23",
+            )
 
         data = compose_digest_data(
             str(db_path), week_str=W13, today=W13_TODAY
         )
         published = data["sections"][VERDICT_APPLY]
-
         assert len(published) == 1
-        assert published[0]["url"] == "https://example.com/rep-open"
         assert published[0]["deadline"] == "2026-12-20"
+        assert len(data["merged_ids"]) == 1
+
+    def test_one_sided_deadline_is_a_different_round(self, tmp_path):
+        """한쪽만 마감이 있으면 **다른 회차**다 — 병합하지 않는다 (사이클 10 #1).
+
+        예전에는 그룹 마감을 최대값으로 합쳐 한 건으로 만들었다. 마감이 다르면
+        서로 다른 회차일 수 있으므로 둘 다 싣고 편집자가 판단한다.
+        """
+        db_path = tmp_path / "rep2.db"
+        _create_announcements_table(db_path)
+        _insert_one(
+            db_path, source="kofpi", source_id="rep_none",
+            title="산림분야 오픈이노베이션 참여기업 모집 공고",
+            url="https://example.com/rep-none",
+            period_end=None, period_start="2026-03-24",
+        )
+        _insert_one(
+            db_path, source="kofpi", source_id="rep_open",
+            title="산림분야 오픈이노베이션 참여기업 모집 공고",
+            url="https://example.com/rep-open",
+            period_end="2026-12-20", period_start="2026-03-23",
+        )
+        data = compose_digest_data(
+            str(db_path), week_str=W13, today=W13_TODAY
+        )
+        published = data["sections"][VERDICT_APPLY]
+        assert len(published) == 2
+        assert data["merged_ids"] == []
 
     def test_posting_date_artifact_does_not_fake_a_new_round(self, tmp_path):
         """period_start == period_end(게시일 위장)는 "다른 회차"가 되지 못한다."""
@@ -2265,7 +2367,12 @@ class TestFixCycle4:
         assert check["residual_urls"] == ["https://example.com/dead"]
 
     # ─── #3 마감 경과 복제본 ────────────────────────────────────────────
-    def test_expired_group_is_excluded_after_merge(self, tmp_path):
+    def test_expired_row_is_excluded_and_open_row_survives(self, tmp_path):
+        """만료 행은 배제되고 마감 없는 행은 남는다 (사이클 10 #1).
+
+        마감이 다르면 병합하지 않으므로 각 행이 제 판정을 받는다 — 예전에는
+        그룹 마감을 합쳐 둘 다 배제했고, 살아 있는 쪽이 사라질 수 있었다.
+        """
         db_path = tmp_path / "c4_3.db"
         _create_announcements_table(db_path)
         for index, period_end in enumerate(["2026-09-12", None]):
@@ -2283,7 +2390,10 @@ class TestFixCycle4:
         data = compose_digest_data(
             str(db_path), week_str=W37, today=W37_TODAY
         )
-        assert data["sections"][VERDICT_APPLY] == []
+        published = data["sections"][VERDICT_APPLY]
+        assert [item["url"] for item in published] == [
+            "https://example.com/exp-1"
+        ]
         assert [item["reason"] for item in data["excluded"]] == ["마감 경과"]
 
     # ─── #4 상한 초과 무기록 삭제 금지 + 불변식 ─────────────────────────
@@ -3352,17 +3462,17 @@ class TestFixCycle5:
             None,
             '{"title": "산림복지 지원사업 참여기업 모집 공고(연장 ~9.30)"}',
         ),
-        # 대표 교체 (괄호를 지우면 같은 제목 — 사업자 신호 있는 쪽이 대표)
+        # 완전 동일 제목·마감 (사이클 10 #1: 이때만 병합한다)
         (
             "forest_service",
-            "산림 탄소 흡수량 산정 지원 모집 안내",
+            "산림 탄소 흡수량 산정 지원 참여기업 모집 안내",
             "2026-09-08",
             "2026-09-25",
             "",
         ),
         (
             "forest_service",
-            "산림 탄소 흡수량 산정 지원 모집 안내(참여기업)",
+            "산림 탄소 흡수량 산정 지원 참여기업 모집 안내",
             "2026-09-08",
             "2026-09-25",
             "",

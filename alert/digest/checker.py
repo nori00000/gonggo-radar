@@ -93,6 +93,11 @@ def manifest_problems(
                 continue
             entries[key] = entry
 
+    block_lines = {
+        str(block.get("item_id")): block["lines"]
+        for block in blocks_mod.parse_blocks(markdown_text, item_sections)
+        if block["kind"] == "item"
+    }
     blocks = blocks_mod.item_blocks(markdown_text, item_sections)
     if len(blocks) != len(entries):
         problems.append(
@@ -128,6 +133,21 @@ def manifest_problems(
             problems.append(
                 f"id={item_id} 섹션 불일치: 본문 {block_section!r} "
                 f"≠ 정본 {entry.get('section')!r}"
+            )
+        # 사이클 10 #2: **항목 줄은 편집 불가 영역**이다. 정본이 담은 렌더 결과와
+        # 문자열이 정확히 같아야 한다 — 마감·대상·기관·라벨을 손으로 고치면
+        # (`[D-17] … 마감 9/30` → `[D-109] … 마감 12/31`) 여기서 멈춘다.
+        # 편집이 허용되는 곳은 이번 주 한 줄·협의회에서·회원사 소식뿐이다.
+        lines = block_lines.get(item_id) or []
+        expected_line = entry.get("line")
+        if expected_line and len(lines) > 1 and lines[1] != expected_line:
+            problems.append(
+                f"id={item_id} 항목 줄이 정본과 다름 — 재조립 필요"
+            )
+        expected_origin = entry.get("origin_line")
+        if expected_origin and len(lines) > 2 and lines[2] != expected_origin:
+            problems.append(
+                f"id={item_id} 원문 줄이 정본과 다름 — 재조립 필요"
             )
 
     missing = sorted(set(entries) - seen)
@@ -183,7 +203,8 @@ def _db_problems(entries: Dict[str, Dict], db_path: str) -> List[str]:
         try:
             for item_id, entry in entries.items():
                 row = conn.execute(
-                    "SELECT url, title FROM announcements WHERE id = ? LIMIT 1",
+                    "SELECT url, title, period_end FROM announcements"
+                    " WHERE id = ? LIMIT 1",
                     (item_id,),
                 ).fetchone()
                 if row is None:
@@ -199,6 +220,14 @@ def _db_problems(entries: Dict[str, Dict], db_path: str) -> List[str]:
                         f"id={item_id} DB 제목 불일치: {expected!r} "
                         f"≠ 정본 {entry.get('title')!r}"
                     )
+                # 사이클 10 #2: DB 마감이 바뀌면 정본이 낡았다 — 렌더된 마감 표기가
+                # 더 이상 근거와 맞지 않으므로 재조립을 요구한다.
+                if "period_end" in entry:
+                    if (row[2] or "") != (entry.get("period_end") or ""):
+                        problems.append(
+                            f"id={item_id} DB 마감 변경: {row[2]!r} "
+                            f"≠ 정본 {entry.get('period_end')!r} — 재조립 필요"
+                        )
         finally:
             conn.close()
     except sqlite3.Error as exc:
@@ -253,8 +282,8 @@ def extract_item_urls(markdown_text: str, item_sections=None) -> List[str]:
 
 
 def body_links(markdown_text: str) -> List[str]:
-    """본문(주석 제외)에 남아 있는 모든 링크 URL (균형 괄호·스킴 필수)."""
-    return blocks_mod.body_link_urls(markdown_text)
+    """본문(주석 제외)의 모든 URL — 마크다운 링크 + 맨몸 URL (사이클 10 #3)."""
+    return blocks_mod.body_urls(markdown_text)
 
 
 def check_url_alive(url: str, timeout: int = 8) -> bool:
@@ -370,7 +399,9 @@ def check_digest(
     item_urls = extract_item_urls(markdown_text, item_sections)
     urls = list(item_urls)
     seen = set(item_urls)
-    for url in body_links(markdown_text):
+    # 사이클 10 #3: 마크다운 링크 + **맨몸 URL** 까지 전부 검사한다 — 해설·회원사
+    # 소식에 그냥 붙여넣은 죽은 주소가 카톡·메일에 그대로 실렸다.
+    for url in blocks_mod.body_urls(markdown_text):
         if url and url not in seen:
             seen.add(url)
             urls.append(url)

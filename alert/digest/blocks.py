@@ -45,6 +45,8 @@ from alert.digest import sections as sections_mod
 
 # 링크 후보로 인정하는 스킴 (사이클 6 #4). `~9.30`·`산림사업자` 같은 괄호는 URL이 아니다.
 _SCHEME_RE = re.compile(r"^(?:https?://|www\.)", re.IGNORECASE)
+# 마크다운 문법 없이 본문에 적힌 URL (사이클 10 #3)
+_BARE_URL_RE = re.compile(r"https?://\S+", re.IGNORECASE)
 
 # 항목의 원문 링크 줄은 링크 하나로만 이루어진다.
 ORIGIN_LINK_TEXT = "원문"
@@ -165,7 +167,7 @@ def origin_url(line: str) -> Optional[str]:
 
 
 def body_link_urls(markdown_text: str) -> List[str]:
-    """본문(HTML 주석 줄 제외)에 실제로 남아 있는 모든 링크 URL (문서 순서)."""
+    """본문(HTML 주석 줄 제외)의 **마크다운 링크** URL (문서 순서)."""
     urls: List[str] = []
     for line in (markdown_text or "").split("\n"):
         if _is_comment(line):
@@ -173,6 +175,42 @@ def body_link_urls(markdown_text: str) -> List[str]:
         for link in find_links(line):
             urls.append(link.url)
     return urls
+
+
+def bare_urls(markdown_text: str) -> List[str]:
+    """마크다운 링크 문법 **없이** 본문에 적힌 URL (사이클 10 #3).
+
+    해설·회원사 소식에 사람이 주소를 그냥 붙여넣는 일이 흔하다. 렌더러는 그것을
+    본문 그대로 내보내므로 죽은 링크 검사에도 들어와야 한다 — 예전에는 항목의
+    "원문" 링크만 검사해서, 죽은 해설 URL 이 그대로 카톡에 실렸다.
+
+    끝의 구두점은 렌더러가 URL 의 일부로 내보내므로 함께 잡는다(사람이 붙여넣은
+    주소가 무엇인지는 렌더 결과가 정한다).
+    """
+    urls: List[str] = []
+    for line in (markdown_text or "").split("\n"):
+        if _is_comment(line):
+            continue
+        # 마크다운 링크 안의 URL 은 제외 — body_link_urls 가 이미 센다
+        masked = line
+        for link in reversed(find_links(line)):
+            masked = masked[:link.start] + " " * (link.end - link.start) \
+                + masked[link.end:]
+        for match in _BARE_URL_RE.finditer(masked):
+            urls.append(match.group(0))
+    return urls
+
+
+def body_urls(markdown_text: str) -> List[str]:
+    """본문에 실린 **모든** URL — 마크다운 링크 + 맨몸 URL (중복 제거, 문서 순서).
+
+    죽은 링크 검사·조각 온전성 검사가 공유하는 정본 목록이다.
+    """
+    seen = []
+    for url in body_link_urls(markdown_text) + bare_urls(markdown_text):
+        if url and url not in seen:
+            seen.append(url)
+    return seen
 
 
 # ─── 항목 줄 판정 ────────────────────────────────────────────────────────
