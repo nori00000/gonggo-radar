@@ -44,9 +44,17 @@ from typing import Dict, List, NamedTuple, Optional, Sequence, Tuple
 from alert.digest import sections as sections_mod
 
 # 링크 후보로 인정하는 스킴 (사이클 6 #4). `~9.30`·`산림사업자` 같은 괄호는 URL이 아니다.
-_SCHEME_RE = re.compile(r"^(?:https?://|www\.)", re.IGNORECASE)
+# 사이클 11 #6: **호스트가 있어야** URL 이다 — `"http://"` 같은 스킴 설명은 주소가
+# 아니므로 생존 검사 대상에서 뺀다(따옴표·괄호는 호스트 문자가 아니다).
+_HOST_CHARS = r"[^\s\"'<>()\[\]]"
+_SCHEME_RE = re.compile(
+    r"^(?:https?://" + _HOST_CHARS + r"|www\." + _HOST_CHARS + r")",
+    re.IGNORECASE,
+)
 # 마크다운 문법 없이 본문에 적힌 URL (사이클 10 #3)
-_BARE_URL_RE = re.compile(r"https?://\S+", re.IGNORECASE)
+_BARE_URL_RE = re.compile(
+    r"https?://" + _HOST_CHARS + r"+", re.IGNORECASE
+)
 
 # 항목의 원문 링크 줄은 링크 하나로만 이루어진다.
 ORIGIN_LINK_TEXT = "원문"
@@ -191,14 +199,29 @@ def bare_urls(markdown_text: str) -> List[str]:
     for line in (markdown_text or "").split("\n"):
         if _is_comment(line):
             continue
-        # 마크다운 링크 안의 URL 은 제외 — body_link_urls 가 이미 센다
-        masked = line
-        for link in reversed(find_links(line)):
-            masked = masked[:link.start] + " " * (link.end - link.start) \
-                + masked[link.end:]
+        # 링크의 **URL 부분만** 가린다 — 표시문은 남겨서 그 안의 주소도 찾는다
+        # (사이클 11 #3: `[https://dead/x](https://live/y)` 의 dead 는 사람 눈에
+        # 보이는 주소이고 카톡·메일에 그대로 실린다. 목적지만 검사하면 놓친다).
+        masked = _mask_link_targets(line)
         for match in _BARE_URL_RE.finditer(masked):
             urls.append(match.group(0))
     return urls
+
+
+def _mask_link_targets(line: str) -> str:
+    """`[표시문](URL)` 에서 **URL 부분만** 공백으로 가린다 (길이 보존)."""
+    masked = line
+    for link in reversed(find_links(line)):
+        text_start = link.start + 1
+        text_end = text_start + len(link.text)
+        masked = (
+            masked[:link.start]
+            + " "
+            + masked[text_start:text_end]
+            + " " * (link.end - text_end)
+            + masked[link.end:]
+        )
+    return masked
 
 
 def body_urls(markdown_text: str) -> List[str]:

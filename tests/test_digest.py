@@ -576,6 +576,92 @@ class TestComposer:
         assert len(data["sections"][VERDICT_APPLY]) == 2
         assert data["merged_ids"] == []
 
+    @pytest.mark.parametrize("labels", [
+        ("Ⅲ차", "Ⅳ차"),            # 로마 숫자 (Nl)
+        ("３차", "４차"),            # 전각 숫자 (Nd)
+        ("3차", "4차"),              # ASCII
+        ("제Ⅲ기", "제Ⅳ기"),
+    ])
+    def test_unicode_round_token_is_never_merged(self, tmp_path, labels):
+        """어떤 스크립트의 회차 토큰도 병합 키에서 사라지지 않는다 (사이클 11 #1).
+
+        Codex 7차 HIGH #1 재현 입력: `[^0-9A-Za-z가-힣…]` 문자 클래스가 ASCII·한글
+        밖의 글자를 전부 지워서 `(Ⅲ차)`/`(Ⅳ차)`·`(３차)`/`(４차)` 가 둘 다
+        `…모집차` 로 같아졌다 — 게시 1·보류 0·merged_ids=[2].
+        """
+        db_path = tmp_path / f"c11_round_{abs(hash(labels))}.db"
+        _create_announcements_table(db_path)
+        for index, label in enumerate(labels):
+            _insert_one(
+                db_path, source="kofpi", source_id=f"u_{index}",
+                title=f"사회적기업 지원사업 모집 ({label})",
+                url=f"https://example.com/u-{index}",
+                period_start="2026-09-08", period_end=None,
+                created_at=W37_CREATED_AT,
+            )
+        data = compose_digest_data(
+            str(db_path), week_str=W37, today=W37_TODAY
+        )
+        published = data["sections"][VERDICT_APPLY]
+        assert len(published) == 2, [item["title"] for item in published]
+        assert data["merged_ids"] == []
+
+    def test_merge_title_key_keeps_letters_and_numbers(self):
+        """병합 키는 공백(Z*)·구두점(P*)만 지운다 (사이클 11 #1)."""
+        # 로마 숫자·전각 숫자·한자·라틴 확장 전부 남는다
+        for left, right in (
+            ("모집 (Ⅲ차)", "모집 (Ⅳ차)"),
+            ("모집 (３차)", "모집 (４차)"),
+            ("모집 (三次)", "모집 (四次)"),
+            ("모집 (IIIrd)", "모집 (IVth)"),
+        ):
+            assert merge_title_key(left) != merge_title_key(right), (left, right)
+        # 공백·구두점 차이는 같은 제목이다 (LOW #6 도 함께 닫힌다)
+        assert merge_title_key("사업개발비 지원사업") == merge_title_key(
+            "사업개발비지원사업"
+        )
+        assert merge_title_key("산림 공고!") == merge_title_key("산림공고")
+
+    def test_space_variant_duplicate_is_merged(self, tmp_path):
+        """공백만 다른 같은 제목은 병합된다 (Codex 7차 LOW #6)."""
+        db_path = tmp_path / "c11_space.db"
+        _create_announcements_table(db_path)
+        for index, title in enumerate((
+            "사회적기업 사업개발비 지원사업 참여기업 모집",
+            "사회적기업 사업개발비지원사업 참여기업 모집",
+        )):
+            _insert_one(
+                db_path, source="seis", source_id=f"sp_{index}", title=title,
+                url=f"https://example.com/sp-{index}",
+                period_start="2026-09-08", period_end="2026-09-30",
+                created_at=W37_CREATED_AT,
+            )
+        data = compose_digest_data(
+            str(db_path), week_str=W37, today=W37_TODAY
+        )
+        assert len(data["sections"][VERDICT_APPLY]) == 1
+        assert len(data["merged_ids"]) == 1
+
+    @pytest.mark.parametrize("group", [
+        "설명회 장소 서울", "설명회 장소: 서울", "서울 개최", "개최 장소 대전",
+        "서울에서", "서울 회장", "교육장 서울",
+    ])
+    def test_venue_group_without_colon_is_not_a_region(self, group):
+        """콜론이 없어도 장소 문맥이면 자격 지역이 아니다 (사이클 11 #5)."""
+        from alert.digest.composer import is_venue_group
+
+        assert is_venue_group(group), group
+        for title in (f"[{group}] 사회적기업 지원사업 모집",
+                      f"사회적기업 지원사업 모집 [{group}]",
+                      f"사회적기업 지원사업 모집({group})"):
+            assert infer_region(title) is None, title
+
+    def test_qualification_region_still_wins(self):
+        """장소 필터가 자격 지역을 삼키지 않는다 (사이클 11 #5)."""
+        assert infer_region("[경기] 사회적기업 지원사업 모집") == "경기"
+        assert infer_region("[세종대전충청센터] 설명회 안내") == "충청"
+        assert infer_region("사회적기업 지원사업 모집 [강원]") == "강원"
+
     def test_merge_title_key_is_conservative(self):
         """병합 키는 공백·구두점만 지운다 (괄호·날짜·회차 전부 보존 — #1)."""
         assert merge_title_key("산림 공고") == merge_title_key("산림  \t공고")

@@ -713,7 +713,8 @@ def _bind(markdown_path):
     conn = sqlite3.connect(db)
     conn.execute(
         "CREATE TABLE IF NOT EXISTS announcements "
-        "(id INTEGER PRIMARY KEY, url TEXT, period_end TEXT, title TEXT)"
+        "(id INTEGER PRIMARY KEY, url TEXT, period_start TEXT,"
+        " period_end TEXT, title TEXT)"
     )
     entries = []
     block_lines = {
@@ -733,15 +734,18 @@ def _bind(markdown_path):
                 block["section"], block["section"]
             ),
             "deadline_label": block["fields"]["label"],
-            # 사이클 10 #2: 렌더된 줄 그대로 + DB 마감
+            # 사이클 10 #2 + 11 #2: 렌더된 줄 그대로 + DB 기간(시작·마감)
             "line": lines[1],
             "origin_line": lines[2],
+            "period_start": "2026-09-08",
             "period_end": "2026-12-31",
         })
         conn.execute(
-            "INSERT OR REPLACE INTO announcements (id, url, period_end, title)"
-            " VALUES (?, ?, ?, ?)",
-            (item_id, block["url"], "2026-12-31", block["fields"]["title"]),
+            "INSERT OR REPLACE INTO announcements"
+            " (id, url, period_start, period_end, title)"
+            " VALUES (?, ?, ?, ?, ?)",
+            (item_id, block["url"], "2026-09-08", "2026-12-31",
+             block["fields"]["title"]),
         )
     conn.commit()
     conn.close()
@@ -2364,6 +2368,21 @@ def test_kakao_chunk_boundaries_match_item_boundaries(tmp_path):
 
 
 # ══ 사이클 8 #1: 항목을 텍스트가 아니라 데이터에 결속 ══════════════════
+def _forged_entry():
+    """손으로 만든 정본 항목 (신필드까지 채운다 — 사이클 11 #2)."""
+    return {
+        "id": 999,
+        "url": "https://example.com/live",
+        "title": "자료를 참고해 주세요",
+        "section": "신청하세요",
+        "deadline_label": "D-9",
+        "line": "자료를 참고해 주세요 — 기관 · 대상: 산림사업자 · 마감 9/22",
+        "origin_line": "  [원문](https://example.com/live)",
+        "period_start": "2026-09-08",
+        "period_end": "2026-12-31",
+    }
+
+
 def _write_manifest(markdown_path, entries, week="2026-W37", sha=None):
     """손으로 만든 정본 파일 (결속 실패 경로를 재현하기 위한 픽스처)."""
     composer_mod.write_items_manifest(markdown_path, {
@@ -2382,12 +2401,14 @@ def _db_with(tmp_path, rows):
     conn = sqlite3.connect(db)
     conn.execute(
         "CREATE TABLE IF NOT EXISTS announcements "
-        "(id INTEGER PRIMARY KEY, url TEXT, period_end TEXT, title TEXT)"
+        "(id INTEGER PRIMARY KEY, url TEXT, period_start TEXT,"
+        " period_end TEXT, title TEXT)"
     )
     for item_id, url in rows:
         conn.execute(
-            "INSERT OR REPLACE INTO announcements (id, url, period_end, title)"
-            " VALUES (?, ?, '2026-12-31', '')",
+            "INSERT OR REPLACE INTO announcements"
+            " (id, url, period_start, period_end, title)"
+            " VALUES (?, ?, '2026-09-08', '2026-12-31', '')",
             (item_id, url),
         )
     conn.commit()
@@ -2429,11 +2450,7 @@ def test_forged_marker_id_fails_against_db(tmp_path, monkeypatch):
     """정본을 손으로 만들어도 DB 에 그 id 가 없으면 통과하지 못한다 (#1의 마지막 고리)."""
     md = tmp_path / "2026-W37.md"
     md.write_text(FORGED_MD, encoding="utf-8")
-    _write_manifest(md, [{
-        "id": 999, "url": "https://example.com/live",
-        "title": "자료를 참고해 주세요", "section": "신청하세요",
-        "deadline_label": "D-9",
-    }])
+    _write_manifest(md, [_forged_entry()])
     monkeypatch.setattr(
         "alert.digest.checker.check_url_alive", lambda url, timeout=8: True
     )
@@ -2448,11 +2465,7 @@ def test_manifest_url_must_match_the_db_row(tmp_path, monkeypatch):
     """정본의 URL 이 DB 의 그 id 의 URL 과 달라도 통과하지 못한다."""
     md = tmp_path / "2026-W37.md"
     md.write_text(FORGED_MD, encoding="utf-8")
-    _write_manifest(md, [{
-        "id": 999, "url": "https://example.com/live",
-        "title": "자료를 참고해 주세요", "section": "신청하세요",
-        "deadline_label": "D-9",
-    }])
+    _write_manifest(md, [_forged_entry()])
     db = _db_with(tmp_path, [(999, "https://example.com/other")])
     monkeypatch.setattr(
         "alert.digest.checker.check_url_alive", lambda url, timeout=8: True
@@ -3022,3 +3035,180 @@ def test_leading_venue_bracket_is_not_a_region():
     assert "(서울)" not in target_display(tags, infer_region(
         "[설명회 장소: 서울] 사회적기업 지원사업 모집"
     ))
+
+
+# ══ 사이클 11: 정본 구버전 · 표시문 URL · URL 단위 검증 ═════════════════
+@pytest.mark.parametrize("field", [
+    "line", "origin_line", "period_start", "period_end", "deadline_label",
+])
+def test_legacy_manifest_requires_recompose(tmp_path, monkeypatch, field):
+    """신필드가 없는 **구버전 정본**은 통과하지 못한다 (사이클 11 #2).
+
+    Codex 7차 HIGH #2 재현 입력: 사이클 9 이전 산출물의 정본을 그대로 두고 md 만
+    마감을 고쳐 재검토하면 통과했다 — 없는 필드를 조용히 건너뛰었기 때문이다.
+    """
+    monkeypatch.setattr(
+        "alert.digest.checker.check_url_alive", lambda url, timeout=8: True
+    )
+    md = tmp_path / "2026-W37.md"
+    md.write_text(SAMPLE_MD, encoding="utf-8")
+    db = _bind(md)
+    manifest = composer_mod.load_items_manifest(md)
+    for entry in manifest["items"]:
+        entry.pop(field, None)
+    composer_mod.write_items_manifest(md, manifest)
+
+    result = check_digest(db_path=str(db), markdown_path=md, output_path=None)
+    assert result["pass"] is False, field
+    assert any("정본 구버전 — 재조립 필요" in problem
+               for problem in result["manifest_problems"]), result["manifest_problems"]
+
+    # 재검토도 결속해주지 않는다
+    monkeypatch.setattr("sys.argv", ["recheck_digest.py", str(md), "--db", str(db)])
+    assert recheck_main() == 1
+
+
+def test_legacy_manifest_blocks_deadline_edit(tmp_path, monkeypatch):
+    """구버전 정본 + md 마감 편집 → 통과하지 못한다 (사이클 11 #2)."""
+    monkeypatch.setattr(
+        "alert.digest.checker.check_url_alive", lambda url, timeout=8: True
+    )
+    md = tmp_path / "2026-W37.md"
+    md.write_text(SAMPLE_MD, encoding="utf-8")
+    db = _bind(md)
+    manifest = composer_mod.load_items_manifest(md)
+    for entry in manifest["items"]:            # 사이클 9 형태로 되돌린다
+        for field in ("line", "origin_line", "period_start", "period_end"):
+            entry.pop(field, None)
+    composer_mod.write_items_manifest(md, manifest)
+    md.write_text(SAMPLE_MD.replace("· 마감 9/22", "· 마감 12/31", 1),
+                  encoding="utf-8")
+    composer_mod.refresh_manifest_binding(md)
+
+    monkeypatch.setattr("sys.argv", ["recheck_digest.py", str(md), "--db", str(db)])
+    assert recheck_main() == 1
+    check = json.loads((tmp_path / "2026-W37.check.json").read_text("utf-8"))
+    assert check["pass"] is False
+    assert "재조립 필요" in check["reason"]
+
+
+def test_db_period_start_change_requires_recompose(tmp_path, monkeypatch):
+    """DB 게시일만 바뀌어도 재조립을 요구한다 (사이클 11 #2).
+
+    Codex 7차 HIGH #2: `period_end` 는 그대로 두고 `period_start` 만 바꾸면
+    통과했지만, 같은 DB 로 재조립하면 유효 마감이 달라져 배제된다.
+    """
+    monkeypatch.setattr(
+        "alert.digest.checker.check_url_alive", lambda url, timeout=8: True
+    )
+    md = tmp_path / "2026-W37.md"
+    md.write_text(SAMPLE_MD, encoding="utf-8")
+    db = _bind(md)
+    conn = sqlite3.connect(db)
+    conn.execute("UPDATE announcements SET period_start = '2026-09-01' WHERE id = 11")
+    conn.commit()
+    conn.close()
+    result = check_digest(db_path=str(db), markdown_path=md, output_path=None)
+    assert result["pass"] is False
+    assert any("DB 게시일 변경" in problem
+               for problem in result["manifest_problems"]), result["manifest_problems"]
+
+
+DEAD_IN_TEXT = "https://dead.invalid/resource"
+
+
+def test_dead_url_inside_link_text_is_checked(tmp_path, monkeypatch):
+    """링크 **표시문** 안의 죽은 주소도 검사한다 (사이클 11 #3).
+
+    Codex 7차 HIGH #3 재현 입력: `[https://dead/x](https://live/y)` 는 목적지만
+    검사돼 통과했고, 사람 눈에 보이는(그리고 카톡에 그대로 실리는) dead 주소는
+    검사되지 않았다.
+    """
+    body = SAMPLE_MD.replace(
+        "· (면담·건의·수렴 현황 — 이번 주 기록 없음)",
+        f"· 참고 [{DEAD_IN_TEXT}](https://live.example/ref)",
+    )
+    assert DEAD_IN_TEXT in blocks_mod.bare_urls(body)
+    assert DEAD_IN_TEXT in blocks_mod.body_urls(body)
+    assert "https://live.example/ref" in blocks_mod.body_urls(body)
+
+    md = tmp_path / "2026-W37.md"
+    md.write_text(body, encoding="utf-8")
+    db = _bind(md)
+    monkeypatch.setattr(
+        "alert.digest.checker.check_url_alive",
+        lambda url, timeout=8: url != DEAD_IN_TEXT,
+    )
+    result = check_digest(db_path=str(db), markdown_path=md, output_path=None)
+    assert result["pass"] is False
+    assert DEAD_IN_TEXT in [item["url"] for item in result["dropped"]]
+
+
+def test_quoted_scheme_is_not_a_url(tmp_path, monkeypatch):
+    """`"http://"` 같은 스킴 설명은 URL 후보가 아니다 (사이클 11 #6)."""
+    body = SAMPLE_MD.replace(
+        "· (면담·건의·수렴 현황 — 이번 주 기록 없음)",
+        '· 스킴은 "http://" 또는 "https://" 입니다',
+    )
+    assert blocks_mod.bare_urls(body) == []
+    md = tmp_path / "2026-W37.md"
+    md.write_text(body, encoding="utf-8")
+    db = _bind(md)
+    monkeypatch.setattr(
+        "alert.digest.checker.check_url_alive", lambda url, timeout=8: True
+    )
+    result = check_digest(db_path=str(db), markdown_path=md, output_path=None)
+    assert result["pass"] is True, result["reason"]
+
+
+LONG_1 = "https://example.com/one" + "1" * 4180
+LONG_2 = "https://example.com/two" + "2" * 4080
+
+
+def test_mixed_long_urls_are_verified_per_url(tmp_path, monkeypatch):
+    """긴 URL 검증은 **URL 단위**다 (사이클 11 #4).
+
+    Codex 7차 MEDIUM #4 재현 입력: 한 줄은 치환되고 다른 줄(베어 URL)은 분절된
+    상태가, 출력 어딘가의 안내 문구 하나로 면제돼 통과했다.
+    """
+    monkeypatch.setattr(
+        "alert.digest.checker.check_url_alive", lambda url, timeout=8: True
+    )
+    body = SAMPLE_MD.replace(
+        "· (면담·건의·수렴 현황 — 이번 주 기록 없음)",
+        f"· 참고 [A]({LONG_1})\n· 참고: {LONG_2}",
+    )
+    md = tmp_path / "2026-W37.md"
+    md.write_text(body, encoding="utf-8")
+    db = _bind(md)
+
+    kakao = composer_mod.kakao_file_text_from_markdown(body)
+    # 둘 다 치환되고 분절 조각이 남지 않는다
+    for url in (LONG_1, LONG_2):
+        assert url not in kakao, url[:40]
+        assert url[:60] not in kakao, url[:40]
+    assert composer_mod.markdown_kakao_problems(body) == []
+    result = check_digest(db_path=str(db), markdown_path=md, output_path=None)
+    assert set(result["long_prose_urls"]) == {LONG_1, LONG_2}
+    assert result["kakao_problems"] == []
+    assert result["pass"] is True, result["reason"]
+
+
+def test_properly_replaced_long_link_is_not_flagged(tmp_path, monkeypatch):
+    """정상 치환된 `[자료이름](긴 URL)` 은 분절로 오판되지 않는다 (사이클 11 #4)."""
+    monkeypatch.setattr(
+        "alert.digest.checker.check_url_alive", lambda url, timeout=8: True
+    )
+    url = "https://example.com/" + "q" * 4072       # 4,092자
+    body = SAMPLE_MD.replace(
+        "· (면담·건의·수렴 현황 — 이번 주 기록 없음)",
+        f"· 참고 [자료이름]({url}) 입니다",
+    )
+    md = tmp_path / "2026-W37.md"
+    md.write_text(body, encoding="utf-8")
+    db = _bind(md)
+    assert composer_mod.markdown_kakao_problems(body) == []
+    result = check_digest(db_path=str(db), markdown_path=md, output_path=None)
+    assert result["kakao_problems"] == []
+    assert result["long_prose_urls"] == [url]
+    assert result["pass"] is True, result["reason"]

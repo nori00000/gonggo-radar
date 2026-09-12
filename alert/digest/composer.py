@@ -16,6 +16,7 @@ import json
 import re
 import sqlite3
 import sys
+import unicodedata
 from collections import Counter
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
@@ -366,6 +367,10 @@ _PREFIX_BRACKET_RE = re.compile(
 _VENUE_CONTEXT_RE = re.compile(
     r"(?:개최\s*)?장소\s*[:：][^)\]]*|[가-힣]{2,5}에서|개최지\s*[:：][^)\]]*"
 )
+# 콜론 없는 장소 문맥 (사이클 11 #5). `[설명회 장소 서울]`·`[서울 개최]` 처럼
+# 구분 기호가 없어도 행사 장소는 자격 지역이 아니다. **괄호 그룹 안에서만** 본다 —
+# 본문 전체에 적용하면 `장` 같은 짧은 토큰이 정상 제목을 삼킨다.
+_VENUE_TOKEN_RE = re.compile(r"장소|개최|에서|회장|장")
 # 괄호 내용을 지우고 남은 알맹이가 이보다 짧으면 부호만 지우는 쪽으로 되돌린다.
 _MIN_DEDUP_KEY_CHARS = 8
 _DATE_TOKEN_RE = re.compile(
@@ -521,16 +526,28 @@ def _strip_tokens(text: str) -> str:
 
 
 def merge_title_key(title: str) -> str:
-    """병합 판정용 **보수** 정규화 — 공백·구두점만 지운다 (사이클 10 #1).
+    """병합 판정용 **보수** 정규화 — 공백(Z*)과 구두점(P*)만 지운다 (사이클 11 #1).
 
-    괄호·날짜·회차·기관 토큰을 **전부 보존**한다. 유사도 병합이 지웠던 것이 바로
-    그 토큰들이었고, 그래서 `… [경기] 모집` / `… [강원] 모집`(Jaccard 0.6)과
-    `… 모집 (3차)` / `… (4차)`(Jaccard 1.0)가 하나로 합쳐지며 유효 공고가
-    sections·holds 양쪽에서 사라졌다.
+    판정 기준은 **unicodedata 범주**다. 문자(L*)·숫자(N*)·기호(S*)·결합문자(M*)는
+    스크립트를 가리지 않고 전부 보존한다 — 로마 숫자 `Ⅲ`(Nl)·전각 숫자 `３`(Nd)도
+    회차 정보이므로 남는다.
 
+    예전에는 `[^0-9A-Za-z가-힣…]` 문자 클래스로 지웠다. ASCII·한글 밖의 모든 글자가
+    사라졌고, 그래서 `… 모집 (Ⅲ차)` / `… (Ⅳ차)` 와 `(３차)` / `(４차)` 가 둘 다
+    `…모집차` 로 같아지며 서로 다른 회차가 하나로 병합됐다 —
+    유효 공고가 sections·holds 양쪽에서 사라졌다(Codex 7차 HIGH #1).
+
+    공백까지 지우므로 `사업개발비 지원사업` 과 `사업개발비지원사업` 은 같은 제목이다
+    (Codex 7차 LOW #6: 공백 변형 중복이 슬롯을 따로 차지하던 문제도 함께 닫힌다).
     병합은 이 키가 **완전히 같을 때만** 일어난다.
     """
-    return " ".join(_SYMBOL_RE.sub(" ", normalize_title(title)).split())
+    kept = []
+    for char in normalize_title(title):
+        category = unicodedata.category(char)
+        if category[0] in ("Z", "P") or char.isspace():
+            continue
+        kept.append(char)
+    return "".join(kept)
 
 
 def dedup_key(title: str) -> str:
@@ -669,6 +686,8 @@ def bracket_regions(title: str) -> Tuple[str, ...]:
     """
     found = []
     for group in _ANY_BRACKET_GROUP_RE.findall(normalize_title(title)):
+        if is_venue_group(group):
+            continue
         region = _region_from(_drop_venue_context(group))
         if region and region not in found:
             found.append(region)
@@ -693,6 +712,15 @@ def _drop_venue_context(text: str) -> str:
     return " ".join(_VENUE_CONTEXT_RE.sub(" ", text).split())
 
 
+def is_venue_group(group: str) -> bool:
+    """괄호 그룹이 **행사 장소** 문맥인가 (사이클 11 #5).
+
+    콜론이 있든 없든(`장소: 서울`·`장소 서울`·`서울 개최`) 장소 토큰이 보이면
+    그 괄호의 지역은 신청 자격이 아니다.
+    """
+    return bool(_VENUE_TOKEN_RE.search(group or ""))
+
+
 def infer_region(title: str) -> Optional[str]:
     """제목에서 **신청 자격 지역**을 추론 (개정 v2.4 (b) + v2.6 (2)(4)).
 
@@ -710,8 +738,10 @@ def infer_region(title: str) -> Optional[str]:
     # (`[모집공고]`)에서 멈춰서 그 뒤의 `[경기]` 를 놓쳤다 — 지역이 None 이 되어
     # 경기/강원 공고가 하나로 병합됐다(Codex 5차 HIGH #3·HIGH #1 잔여).
     for group in prefix_brackets(title):
-        # 사이클 10 #6: 선두 괄호에도 장소 문맥을 걷어낸다 —
-        # `[설명회 장소: 서울]` 은 자격 지역이 아니다(후미 괄호와 같은 규칙).
+        # 사이클 10 #6 + 11 #5: 선두 괄호에도 장소 문맥을 걷어낸다 —
+        # `[설명회 장소: 서울]`·`[설명회 장소 서울]` 은 자격 지역이 아니다.
+        if is_venue_group(group):
+            continue
         region = _region_from(_drop_venue_context(group))
         if region:
             # 괄호에서 확정하고 끝낸다 — 괄호 밖 2차 탐색을 하면 행사 장소
@@ -720,6 +750,8 @@ def infer_region(title: str) -> Optional[str]:
 
     # **후미** 괄호도 본다 (`… 지원사업 모집 [경기]`·`…(충청 권역)`).
     for group in trailing_brackets(title):
+        if is_venue_group(group):
+            continue
         region = _region_from(_drop_venue_context(group))
         if region:
             return region
@@ -1122,6 +1154,7 @@ def _build_item(row: Sequence, classification: Classification, today: date) -> D
         "region": classification.region,
         "prefix_signature": prefix_signature(title),
         "target": target_display(classification.tags, classification.region),
+        "period_start": period_start or "",
         "period_end": period_end or "",
         "deadline": deadline.isoformat() if deadline else "",
         "posted": posted.isoformat() if posted else "",
@@ -1588,7 +1621,10 @@ def items_manifest(data: Dict, markdown_bytes: bytes = b"") -> Dict:
                 # 고치면 즉시 "재조립 필요" 가 된다(항목 줄은 편집 불가 영역).
                 "line": item_line(item),
                 "origin_line": f"  [원문]({item['url']})",
-                # DB 마감 원문 — DB 쪽이 바뀌면 정본이 낡았다는 뜻이다
+                # DB 기간 원문 — DB 쪽이 바뀌면 정본이 낡았다는 뜻이다.
+                # period_start 도 담는다: 게시일이 바뀌면 유효 마감(마감 경과 판정)이
+                # 달라지는데, period_end 만 보면 그것을 놓친다 (사이클 11 #2).
+                "period_start": item.get("period_start") or "",
                 "period_end": item.get("period_end") or "",
             }
             for section in ITEM_SECTIONS
@@ -1851,15 +1887,24 @@ def markdown_kakao_problems(markdown_text: str) -> List[str]:
         if len(chunk) > KAKAO_CHUNK_LIMIT
     ]
     joined = "\n".join(chunks)
-    # 사이클 10 #4: "치환했다" 는 기록을 믿지 않고 **실제 결과물**을 본다 —
-    # 좌표 밀림으로 치환에 실패한 링크가 기록만 남긴 채 살아 있었다.
+    # 사이클 11 #4: 판정을 **URL 단위**로 한다. 예전에는 출력 어딘가에 안내 문구가
+    # 하나라도 있으면 모든 긴 URL 을 면제해서, 한 줄은 치환되고 다른 줄은 분절된
+    # 상태가 통과했다. 반대로 정상 치환된 URL 이 "분절/유실" 로 걸리기도 했다.
+    _, replaced = fit_prose_urls(markdown_text)
+    replaced_urls = set(replaced)
     for url in dict.fromkeys(blocks_mod.body_urls(markdown_text)):
         if url in joined:
-            continue                       # 온전히 실렸다
-        if URL_TOO_LONG_NOTICE in joined and len(url) + 4 > KAKAO_CHUNK_LIMIT:
-            continue                       # 안내 문구로 치환됐다
+            continue                       # ① 온전히 실렸다
+        if url in replaced_urls and _no_fragment(url, joined):
+            continue                       # ② 안내 문구로 치환됐다 (조각 없음)
         problems.append(f"URL 분절/유실: {url[:48]}…")
     return problems
+
+
+def _no_fragment(url: str, rendered: str) -> bool:
+    """치환됐다면 결과물에 URL 조각이 남아 있지 않아야 한다 (사이클 11 #4)."""
+    fragment = url[:_URL_FRAGMENT_PROBE]
+    return len(fragment) < _URL_FRAGMENT_PROBE or fragment not in rendered
 
 
 def _is_item_block(block: str) -> bool:
@@ -1883,6 +1928,8 @@ def _shrink_item_block(block: str, limit: int) -> str:
 
 
 URL_TOO_LONG_NOTICE = "(URL 길이 초과 — 원문 확인)"
+# 치환된 URL 의 조각이 결과물에 남았는지 확인할 때 쓰는 접두 길이
+_URL_FRAGMENT_PROBE = 60
 
 
 def _url_too_long_block(block: str, limit: int) -> str:

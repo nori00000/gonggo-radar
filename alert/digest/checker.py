@@ -158,7 +158,21 @@ def manifest_problems(
     return problems
 
 
-REQUIRED_ENTRY_FIELDS = ("id", "url", "title", "section")
+# 정본 항목의 필수 필드 (사이클 11 #2).
+# `line`·`origin_line`·`period_start`·`period_end`·`deadline_label` 이 없으면
+# **구버전 정본**이다 — 그 정본으로는 항목 줄 편집·DB 기간 변경을 잡을 수 없으므로
+# 재조립을 요구한다(예전에는 없는 필드를 조용히 건너뛰어 통과했다).
+REQUIRED_ENTRY_FIELDS = (
+    "id", "url", "title", "section",
+    "line", "origin_line", "period_start", "period_end", "deadline_label",
+)
+LEGACY_MANIFEST_FIELDS = (
+    "line", "origin_line", "period_start", "period_end", "deadline_label",
+)
+# 값이 비어 있어도 되는 필드 — **키의 존재**만 요구한다.
+# `deadline_label` 은 알아두세요 항목에서 빈 문자열이 정상이고(라벨을 렌더하지
+# 않는다), DB 기간은 NULL 인 소스가 실제로 있다(seis·coop: period_start NULL).
+OPTIONAL_VALUE_FIELDS = ("period_start", "period_end", "deadline_label")
 
 
 def _schema_problems(manifest: Dict) -> List[str]:
@@ -179,12 +193,20 @@ def _schema_problems(manifest: Dict) -> List[str]:
             continue
         missing = [
             field for field in REQUIRED_ENTRY_FIELDS
-            if entry.get(field) in (None, "")
+            if field not in entry
+            or (entry.get(field) in (None, "")
+                and field not in OPTIONAL_VALUE_FIELDS)
         ]
         if missing:
-            problems.append(
-                f"정본 items[{index}] 필수 필드 누락: {', '.join(missing)}"
-            )
+            if any(field in LEGACY_MANIFEST_FIELDS for field in missing):
+                problems.append(
+                    f"정본 구버전 — 재조립 필요 (items[{index}] 누락: "
+                    f"{', '.join(missing)})"
+                )
+            else:
+                problems.append(
+                    f"정본 items[{index}] 필수 필드 누락: {', '.join(missing)}"
+                )
     return problems
 
 
@@ -203,8 +225,8 @@ def _db_problems(entries: Dict[str, Dict], db_path: str) -> List[str]:
         try:
             for item_id, entry in entries.items():
                 row = conn.execute(
-                    "SELECT url, title, period_end FROM announcements"
-                    " WHERE id = ? LIMIT 1",
+                    "SELECT url, title, period_start, period_end"
+                    " FROM announcements WHERE id = ? LIMIT 1",
                     (item_id,),
                 ).fetchone()
                 if row is None:
@@ -220,13 +242,20 @@ def _db_problems(entries: Dict[str, Dict], db_path: str) -> List[str]:
                         f"id={item_id} DB 제목 불일치: {expected!r} "
                         f"≠ 정본 {entry.get('title')!r}"
                     )
-                # 사이클 10 #2: DB 마감이 바뀌면 정본이 낡았다 — 렌더된 마감 표기가
-                # 더 이상 근거와 맞지 않으므로 재조립을 요구한다.
-                if "period_end" in entry:
-                    if (row[2] or "") != (entry.get("period_end") or ""):
+                # 사이클 10 #2 + 11 #2: DB **기간**이 바뀌면 정본이 낡았다 —
+                # 렌더된 마감 표기가 더 이상 근거와 맞지 않으므로 재조립을 요구한다.
+                # period_start 도 본다: 게시일이 바뀌면 유효 마감(마감 경과 판정)이
+                # 달라지는데, period_end 만 보면 그것을 놓친다.
+                for column, field, label in (
+                    (2, "period_start", "게시일"),
+                    (3, "period_end", "마감"),
+                ):
+                    if field not in entry:
+                        continue
+                    if (row[column] or "") != (entry.get(field) or ""):
                         problems.append(
-                            f"id={item_id} DB 마감 변경: {row[2]!r} "
-                            f"≠ 정본 {entry.get('period_end')!r} — 재조립 필요"
+                            f"id={item_id} DB {label} 변경: {row[column]!r} "
+                            f"≠ 정본 {entry.get(field)!r} — 재조립 필요"
                         )
         finally:
             conn.close()
