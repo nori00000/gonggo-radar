@@ -105,7 +105,7 @@ crawler:
     seis:
       enabled: true
       base_url: "https://www.seis.or.kr"
-      fetch_detail: true
+      fetch_detail: false
     ggeea:
       enabled: true
       base_url: "https://www.ggeea.or.kr"
@@ -119,7 +119,7 @@ crawler:
       enabled: true
       base_url: "https://www.kofpi.or.kr"
       bypass_threshold: true
-      fetch_detail: true
+      fetch_detail: false
     forest_press:
       enabled: true
       base_url: "https://www.forest.go.kr"
@@ -128,7 +128,7 @@ crawler:
       enabled: true
       base_url: "https://opinion.lawmaking.go.kr"
       bypass_threshold: true
-      fetch_detail: true
+      fetch_detail: false
     coop:
       enabled: true
       base_url: "https://www.coop.go.kr"

@@ -1086,3 +1086,76 @@ class TestFinalGateYearInference:
         assert period_from_quote(
             "모집기간 1차 2026.08.01~8.31 2차 9.01~9.30", today=TODAY
         ) == ("2026-09-01", "2026-09-30")
+
+
+class TestGate5ParserFixes:
+    """5차 게이트의 파서 결함 - 상세 수집이 꺼져 있어도 공통 파서다.
+
+    ``fetch_detail`` 이 전 소스에서 꺼져 이 경로는 실행되지 않지만,
+    한 줄 수정으로 되는 것은 고쳐 두라는 판정에 따라 수리했다.
+    """
+
+    def test_start_marker_beats_a_later_until(self):
+        """날짜에 **밀착한** "부터" 가 뒤쪽 "까지" 보다 우선한다 (게이트 #2).
+
+        재현: ``접수기간 2026.09.01부터 예산 소진 시까지`` 가
+        ``(None, "2026-09-01")`` 이 되어 시작일이 마감으로 저장됐다.
+        """
+        assert period_from_quote(
+            "접수기간 2026.09.01부터 예산 소진 시까지", today=TODAY
+        ) == ("2026-09-01", None)
+
+    @pytest.mark.parametrize("quote,expected", [
+        ("접수기간 2026.09.30까지, 이후 접수불가", (None, "2026-09-30")),
+        ("모집기간 2026. 9. 7.(월) ~ 9. 30.(수) 15:00까지",
+         ("2026-09-07", "2026-09-30")),
+        ("접수기한 2026.09.30.까지", (None, "2026-09-30")),
+    ])
+    def test_until_cases_do_not_regress(self, quote, expected):
+        assert period_from_quote(quote, today=TODAY) == expected
+
+    @pytest.mark.parametrize("padding", [274, 275, 276, 277, 280, 300])
+    def test_length_cap_never_cuts_a_date_in_half(self, padding):
+        """길이 상한이 날짜 가운데를 잘라 가짜 마감을 만들지 않는다 (게이트 #1).
+
+        재현: ``"접수기간 " + "가"*276 + "2026.09.01~2026.09.30"`` 에서
+        인용이 ``…2026.09.3`` 으로 끊겨 **2026-09-03** 이 저장됐다.
+        """
+        html = (
+            '<div class="board_view"><p>접수기간 '
+            + "가" * padding
+            + "2026.09.01~2026.09.30</p></div>"
+        )
+        quotes = extract_quotes(normalize_text(html))
+        start, end = period_from_quote(quotes.get(QUOTE_DEADLINE, ""), today=TODAY)
+        # 온전히 들어오면 정답, 잘리면 아무 값도 내지 않는다 - 가짜는 없다
+        assert (start, end) in {("2026-09-01", "2026-09-30"), (None, None)}
+        assert end != "2026-09-03"
+
+    def test_leading_paren_explanation_is_not_a_boundary(self):
+        """값 맨 앞의 괄호 설명은 다른 라벨이 아니다 (게이트 #7 REGRESSED)."""
+        html = (
+            '<div class="board_view"><table><tr><th>접수기간</th>'
+            "<td>(제출서류 완비 기준) 2026.09.01~2026.09.30</td>"
+            "</tr></table></div>"
+        )
+        quotes = extract_quotes(normalize_text(html))
+        assert quotes[QUOTE_DEADLINE] == (
+            "접수기간 (제출서류 완비 기준) 2026.09.01~2026.09.30"
+        )
+        assert period_from_quote(quotes[QUOTE_DEADLINE], today=TODAY) == (
+            "2026-09-01", "2026-09-30"
+        )
+
+    def test_paren_label_after_content_still_bounds(self):
+        """값이 시작된 뒤의 괄호 라벨은 여전히 경계다 (4차 게이트 #6 유지)."""
+        html = (
+            '<div class="board_view"><table><tr><td>'
+            "접수기간 2026.09.01부터<br>(교육기간) 2026.09.20~2026.09.30"
+            "</td></tr></table></div>"
+        )
+        quotes = extract_quotes(normalize_text(html))
+        assert "2026.09.20" not in quotes[QUOTE_DEADLINE]
+        assert period_from_quote(quotes[QUOTE_DEADLINE], today=TODAY) == (
+            "2026-09-01", None
+        )

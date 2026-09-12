@@ -103,6 +103,10 @@ _REPEATED_TOKEN = re.compile(
 )
 # 본문 텍스트에 이스케이프된 HTML이 그대로 실려 나오는 경우
 _LEAKED_MARKUP = re.compile(r"<\s*/?\s*[A-Za-z]")
+# 날짜 토큰을 이루는 문자들 - 길이 상한이 이 사이에서 끊기면 토큰을 버린다
+_DATE_CHARS = re.compile(r"[0-9.\-/년월일~∼〜 ]")
+# 값으로 볼 수 없는 장식 문자 - 이것만 남으면 "값이 아직 없다"
+_VALUE_CONTENT = re.compile(rf"[\s{_MARKS}()\[\]{{}}<>【】「」:：·\-–—]")
 
 # 인용을 **끝내야 하는** 다른 라벨들 (최종 게이트 #4).
 # "접수기간 …부터 교육기간 2026.09.20~09.30" 에서 교육기간의 날짜가 접수
@@ -312,6 +316,11 @@ def _foreign_label_start(window: str, key: str, own_label: str) -> Optional[int]
             # 라벨 앞의 괄호·대괄호·콜론·공백은 장식이므로 벗겨 낸다.
             # "(교육기간) 2026.09.20~09.30" 이 경계로 잡히지 않아 접수
             # 마감에 09-20이 새어 들어왔다 (4차 게이트 #6).
+            # 값이 아직 시작되지도 않았으면 끝낼 것이 없다. 값 맨 앞의
+            # 괄호 설명 "(제출서류 완비 기준) 2026.09.01~…" 을 다른 라벨로
+            # 오인해 인용 전체를 버렸다 (5차 게이트 #7 REGRESSED).
+            if not _VALUE_CONTENT.sub("", window[:index]):
+                continue
             prefix = window[:index].rstrip(" ()[]{}<>【】「」:：·-–—")
             if prefix and prefix[-1] not in _MARKS + _BULLET_BOUNDARY:
                 continue  # 문장 중간에 우연히 나온 낱말
@@ -361,6 +370,16 @@ def _cut_quote(text: str, start: int, label: str, key: str = "") -> str:
             continue
         if not char.isspace() and char not in "()[]:：-–—,.":
             seen_content = True
+
+    # 길이 상한이 **날짜 토큰 가운데**를 자르면 가짜 마감이 생긴다
+    # (5차 게이트 #1: "…2026.09.01~2026.09.3" -> 09-03). 상한에 걸렸고
+    # 그 자리가 날짜 토큰 안이면 그 토큰 전체를 버린다.
+    if end == limit and end < len(text) and _DATE_CHARS.search(text[end]):
+        back = end
+        while back > scan_from and _DATE_CHARS.search(text[back - 1]):
+            back -= 1
+        if back > scan_from:
+            end = back
 
     window = text[scan_from:end]
 
@@ -446,6 +465,7 @@ _EXPLICIT_YEAR = re.compile(r"\d{4}")
 _RANGE_GAP_MAX = 12    # 두 날짜 사이 간격 상한 (넘으면 범위로 보지 않는다)
 _UNTIL_WINDOW = 15     # 날짜 뒤에서 "까지/이내" 를 찾는 창
 _FROM_WINDOW = 6       # 날짜 뒤에서 "부터/이후" 를 찾는 창 (바로 붙은 경우만)
+_ADJACENT_WINDOW = 4   # 날짜에 밀착한 시작 신호 창 - "까지" 보다 우선한다
 _LABEL_WINDOW = 15     # 날짜 앞에서 "마감:" 라벨을 찾는 창
 
 
@@ -619,7 +639,12 @@ def _candidates(quote: str) -> List[Tuple[int, Optional[str], Optional[str]]]:
         until_tail = quote[token[1]:token[1] + _UNTIL_WINDOW]
         from_tail = quote[token[1]:token[1] + _FROM_WINDOW]
         head = quote[max(0, token[0] - _LABEL_WINDOW):token[0]]
-        if _UNTIL.search(until_tail) or _DEADLINE_LABEL.search(head):
+        # 날짜에 **바로 붙은** "부터" 가 뒤쪽 "까지" 보다 우선한다
+        # (5차 게이트 #2: "2026.09.01부터 예산 소진 시까지" 가 그 날짜를
+        # 종료일로 만들었다). 시작 신호는 날짜에 밀착해 있어야 한다.
+        if _FROM.search(quote[token[1]:token[1] + _ADJACENT_WINDOW]):
+            candidates.append((token[0], token[2], None))
+        elif _UNTIL.search(until_tail) or _DEADLINE_LABEL.search(head):
             candidates.append((token[0], None, token[2]))
         elif _FROM.search(from_tail):
             candidates.append((token[0], token[2], None))
@@ -737,6 +762,29 @@ def has_quote_keys(payload: Dict[str, object]) -> bool:
 # 살아남는다.
 
 WORKER_MODULE = "alert.crawlers.detail_quotes"
+
+# ---------------------------------------------------------------------------
+# 비활성 상태 (2026-09-13): ``fetch_detail`` 이 전 소스에서 꺼져 있으므로
+# 아래 워커 경로는 실행되지 않는다. 5차 게이트가 남긴 **미수정 결함**을
+# 여기 적어 둔다 - 다시 켤 때 이것부터 봐야 한다.
+#
+#   (게이트 #5, MEDIUM) 부모가 SIGKILL 되면 자식이 고아로 남는다. 부모의
+#       240초 watchdog도 함께 사라진다. 좀비 누적은 입증되지 않았다.
+#       → 해법 방향: 자식에 자체 watchdog(부모 pid 감시) 또는 프로세스 그룹
+#         kill. 한 줄 수정이 아니라 미수정으로 둔다.
+#   (게이트 #6, MEDIUM) 항목 알람이 소진된 뒤 ``finally`` 의
+#       ``response.close()`` 가 다시 기다려 항목 상한을 0.84초까지 넘겼다.
+#       부모의 소스 예산은 유지된다. → 해법 방향: close를 알람 밖으로 빼거나
+#       소켓을 강제 종료. 미수정.
+#   (게이트 #8, MEDIUM) 자식 stdout을 UTF-8로 고정하지 않아
+#       ``PYTHONIOENCODING=cp949`` 환경에서 부모 디코딩이 실패하면 **이미
+#       출력된 결과까지** 버려진다. charset 없는 응답을 ISO-8859-1로 먼저
+#       디코딩하는 문제도 함께 있다. 미수정.
+#   (게이트 #4/#6, MEDIUM) ``get_quote_attempts``/``set_quote_attempts`` 가
+#       운영 경로(main._crawl_single)에 연결되지 않아 회전이 동작하지 않는다.
+#       사이클 5 보고에서 연결했다고 적었으나 **실제로는 반영되지 않았다**
+#       (게이트가 잡아냈다). 상세가 꺼져 있어 무해하지만 미수정이다.
+# ---------------------------------------------------------------------------
 
 
 class _ItemTimeout(Exception):

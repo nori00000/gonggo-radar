@@ -571,13 +571,44 @@ class TestGate4DeadlineEvidence:
 class TestGate4RegionAndSameUrl:
     """4차 게이트 #8: 전국 와일드카드와 같은 URL 규칙."""
 
-    def test_nationwide_is_compatible_with_any_region(self):
+    def test_nationwide_is_not_a_wildcard(self):
+        """"전국" 와일드카드는 철회됐다 (5차 게이트 #3 REGRESSED).
+
+        지역 하나를 넘기려던 완화가 주체 서명 전체를 무효화해, 대표가
+        ``info=[전국]`` 이면 다른 지역의 **정상 공고까지 삭제 승인**됐다.
+        지역은 엄격 비교한다 - 병합을 놓치는 비용이 정상 행을 지우는
+        비용보다 싸다.
+        """
         from alert.crawlers.dedupe_keys import group_key, keys_compatible
 
         seoul = group_key("공고", ["서울"], "2026-09-30")
         nationwide = group_key("공고", ["전국"], "2026-09-30")
         assert seoul != nationwide
-        assert keys_compatible(seoul, nationwide) is True
+        assert keys_compatible(seoul, nationwide) is False
+
+    def test_nationwide_canonical_does_not_delete_another_region(self, db):
+        """대표가 [전국]이어도 다른 지역 행을 지우지 않는다 (게이트 #3 재현).
+
+        재현 입력: 같은 제목·같은 마감, 대표 ``sub=서울센터 info=[전국]`` 이
+        ``merged_source_ids=[2]`` 를 들고 있고 상대는 ``sub=부산센터
+        info=[부산]``. 와일드카드가 있던 동안 규칙 A가 부산 행을 삭제
+        대상으로 승인했다.
+        """
+        conn, _ = db
+        insert(conn, source_id="1", title="상주기업 모집 공고",
+               url=SEIS_URL.format(sid="1"), period_end="2026-09-30",
+               raw_data={"sub": "서울센터", "info": ["전국"],
+                         "merged_source_ids": ["2"]})
+        busan = insert(conn, source_id="2", title="상주기업 모집 공고",
+                       url=SEIS_URL.format(sid="2"), period_end="2026-09-30",
+                       raw_data={"sub": "부산센터", "info": ["부산"]})
+
+        doomed, reasons, canonical = cleanup.find_duplicates(conn, "seis")
+        assert doomed == []
+        assert canonical == set()
+        assert "병합 기록 무시" in " ".join(reasons)
+        survivors = {r["id"] for r in conn.execute("SELECT id FROM announcements")}
+        assert busan in survivors
 
     def test_different_real_regions_stay_incompatible(self):
         from alert.crawlers.dedupe_keys import group_key, keys_compatible

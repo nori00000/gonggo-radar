@@ -34,10 +34,11 @@ _REGION_RE = re.compile("|".join(re.escape(token) for token in REGION_TOKENS))
 
 _TITLE_NOISE = re.compile(r"[\s·.,()\[\]{}「」『』\-~/]+")
 
-# "전국" 은 특정 지역이 아니라 **모든 지역** 을 뜻한다. 같은 공고를
-# 한쪽은 "서울", 한쪽은 "전국" 으로 적어 두면 별개 공고로 갈렸다
-# (4차 게이트 #8). 와일드카드로 다룬다.
-NATIONWIDE_TOKENS = ("전국", "전지역", "전 지역")
+# "전국" 와일드카드는 **철회했다** (5차 게이트 #3 REGRESSED).
+# 지역 하나를 넘기려던 완화가 주체 서명 전체를 무효화해, 대표가
+# ``sub=서울센터, info=[전국]`` 이면 ``sub=부산센터, info=[부산]`` 인
+# **정상 공고까지 삭제 승인**됐다. 서울/전국 표기가 갈리는 비용(병합을
+# 놓침)이 정상 행을 지우는 비용보다 싸다. 지역은 엄격 비교한다.
 
 
 def normalize_title(title: str) -> str:
@@ -129,12 +130,6 @@ def group_key(
     )
 
 
-def is_nationwide(signature: Sequence[str]) -> bool:
-    """주체 서명이 "전국" 을 말하는지 본다."""
-    joined = " ".join(signature or ())
-    return any(token in joined for token in NATIONWIDE_TOKENS)
-
-
 def keys_compatible(
     first: Tuple[str, Tuple[str, ...], str],
     second: Tuple[str, Tuple[str, ...], str],
@@ -147,7 +142,6 @@ def keys_compatible(
 
     - 한쪽에 주체 메타데이터가 **없으면** 주체를 비교하지 않는다 - 대표에만
       메타데이터가 추가된 정상 병합을 거부하면 안 된다.
-    - 한쪽이 **"전국"** 이면 어떤 지역과도 호환된다 (4차 게이트 #8).
     - ``ignore_deadline`` 이면 **마감을 모르는 경우에만** 마감 키를 넘긴다.
       실제 종료일이 서로 다르면 같은 공고가 아니다.
 
@@ -161,8 +155,7 @@ def keys_compatible(
     """
     if first[0] != second[0]:
         return False
-    subjects_differ = bool(first[1]) and bool(second[1]) and first[1] != second[1]
-    if subjects_differ and not (is_nationwide(first[1]) or is_nationwide(second[1])):
+    if bool(first[1]) and bool(second[1]) and first[1] != second[1]:
         return False
     if first[2] == second[2]:
         return True
