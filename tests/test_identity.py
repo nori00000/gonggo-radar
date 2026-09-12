@@ -64,27 +64,35 @@ class TestCleanText:
 
 
 class TestSeisSourceIdSeparatesAnnouncements:
-    """seis ``source_id`` 는 종류·연도·게시판을 담는다."""
+    """seis ``source_id`` = **href 원문 전체**의 해시 (18차 게이트).
+
+    번호를 뽑아 조합하는 규칙은 다섯 사이클 동안 계속 무언가를 잃었다
+    (종류·연도·게시판·한정자 이름·경로 뒷부분). 잃을 때마다 서로 다른
+    공고가 한 행이 되어 남의 마감이 저장·전달됐다. 그래서 조합을 버렸다 -
+    **사이트가 다른 링크를 준 것은 다른 공고다**.
+    """
 
     @pytest.fixture
     def crawler(self):
         return make(SeisCrawler, "seis")
 
-    @pytest.mark.parametrize("link,expected", [
-        ("/subPage.do?fncPbofrSn=8371", "fnc:8371"),
-        ("/subPage.do?dsgnPbofrSn=8322", "dsgn:8322"),
-        ("/subPage.do?itgrdAplyPbancSn=1272", "itgrd:1272"),
-        ("/subPage.do?statsYr=2026&epsdNo=4", "epsd:2026:4"),
-        ("/subPage.do?statsYr=2027&epsdNo=4", "epsd:2027:4"),
-        ("/boardView.do?boardId=A&nttId=42", "ntt:A:42"),
-        ("/boardView.do?boardId=B&nttId=42", "ntt:B:42"),
-        # 17차 게이트: ``sid`` 도 게시판 구분자다
-        ("/boardView.do?sid=A&nttId=42", "ntt:A:42"),
-        ("/boardView.do?sid=B&nttId=42", "ntt:B:42"),
-        ("/subPage.do?bsIdx=10002&bIdx=252629", "bidx:10002:252629"),
+    @pytest.mark.parametrize("link", [
+        "/subPage.do?fncPbofrSn=8371",
+        "/subPage.do?statsYr=2026&epsdNo=4",
+        "/boardView.do?sid=A&nttId=42",
+        "/board/100/detail/201",
+        "https://www.seis.or.kr/some-page",
     ])
-    def test_extract_post_id(self, crawler, link, expected):
-        assert crawler._extract_post_id(link) == expected
+    def test_href_is_the_id(self, crawler, link):
+        digest = crawler._extract_post_id(link)
+        assert digest.startswith("u:")
+        assert len(digest) == len("u:") + 16
+        # 같은 href 는 언제나 같은 ID (재수집이 같은 행을 찾는다)
+        assert crawler._extract_post_id(link) == digest
+
+    def test_no_link_has_no_id(self, crawler):
+        assert crawler._extract_post_id("") == ""
+        assert crawler._extract_post_id("   ") == ""
 
     @pytest.mark.parametrize("first,second", [
         # 같은 번호, 다른 종류 (12차 게이트)
@@ -95,11 +103,26 @@ class TestSeisSourceIdSeparatesAnnouncements:
         ("/boardView.do?boardId=A&nttId=42", "/boardView.do?boardId=B&nttId=42"),
         ("/boardView.do?sid=A&nttId=42", "/boardView.do?sid=B&nttId=42"),
         ("/subPage.do?bsIdx=1&bIdx=99", "/subPage.do?bsIdx=2&bIdx=99"),
+        # 18차 게이트: 한정자 **이름**도 잃지 않는다
+        ("/boardView.do?sid=A&nttId=42", "/boardView.do?boardId=A&nttId=42"),
+        # 18차 게이트: 경로의 뒷부분도 잃지 않는다
+        ("/board/100/detail/201", "/board/100/detail/202"),
     ])
-    def test_same_number_in_a_different_slot_never_collides(
-        self, crawler, first, second
-    ):
+    def test_any_difference_in_the_href_separates(self, crawler, first, second):
         assert crawler._extract_post_id(first) != crawler._extract_post_id(second)
+
+    @pytest.mark.parametrize("first,second", [
+        # 18차 게이트: 제목만 해시하면 기관이 다른 공고가 한 행이 된다
+        ({"title": "새 지원 공고", "author": "서울센터", "date": "2026.09.11"},
+         {"title": "새 지원 공고", "author": "부산센터", "date": "2026.09.11"}),
+        ({"title": "새 지원 공고", "sub": "서울센터", "date": "2026.09.11"},
+         {"title": "새 지원 공고", "sub": "서울센터", "date": "2026.10.11"}),
+    ])
+    def test_title_id_uses_organisation_and_date(self, crawler, first, second):
+        left = crawler._title_post_id(first, first["title"])
+        right = crawler._title_post_id(second, second["title"])
+        assert left.startswith("t:") and right.startswith("t:")
+        assert left != right
 
     def test_every_id_carries_a_prefix(self, crawler):
         """접두 없는 ID 는 **옛 규칙의 행**으로 판정되므로 남기면 안 된다."""
@@ -188,9 +211,9 @@ class TestRowsNeverOverwriteEachOther:
         rows = db._conn.execute(
             "SELECT source_id, title FROM announcements ORDER BY title"
         ).fetchall()
-        assert [(r["source_id"], r["title"]) for r in rows] == [
-            ("ntt:A:42", "A 공고"), ("ntt:B:42", "B 공고"),
-        ]
+        assert [r["title"] for r in rows] == ["A 공고", "B 공고"]
+        assert len({r["source_id"] for r in rows}) == 2
+        assert all(r["source_id"].startswith("u:") for r in rows)
 
     def test_seis_sid_variants_stay_two_rows(self, db):
         """17차 HIGH 재현: ``sid=A/B`` + 같은 글번호 → 2행, 덮어쓰기 없음."""
@@ -208,10 +231,10 @@ class TestRowsNeverOverwriteEachOther:
         rows = db._conn.execute(
             "SELECT source_id, title, period_end FROM announcements ORDER BY title"
         ).fetchall()
-        assert [(r["source_id"], r["title"], r["period_end"]) for r in rows] == [
-            ("ntt:A:42", "A 공고", "2026-10-30"),
-            ("ntt:B:42", "B 공고", "2026-11-30"),
+        assert [(r["title"], r["period_end"]) for r in rows] == [
+            ("A 공고", "2026-10-30"), ("B 공고", "2026-11-30"),
         ]
+        assert len({r["source_id"] for r in rows}) == 2
 
     def test_g2b_orders_keep_their_own_deadline(self, db):
         """차수는 크롤러가 이미 ``source_id`` 에 넣는다 (기간은 화이트리스트 밖)."""
@@ -328,9 +351,9 @@ class TestLegacyRowsGoDark:
 
     @pytest.mark.parametrize("source,source_id,expected", [
         ("seis", "8371", True),           # 옛 규칙: 번호만
-        ("seis", "fnc:8371", False),
-        ("seis", "epsd:2026:4", False),
-        ("seis", "md5:abcd", False),
+        ("seis", "fnc:8371", False),      # 12~17차의 중간 형식도 새 형식이다
+        ("seis", "u:abcd1234", False),
+        ("seis", "t:abcd1234", False),
         # 다른 소스의 ID 형식은 바뀌지 않았다 - 건드리지 않는다
         ("bizinfo", "PBLN_000", False),
         ("g2b", "20260900123-00", False),
@@ -367,7 +390,7 @@ class TestLegacyRowsGoDark:
         assert len(db.get_unnotified()) == 4
 
     def test_new_seis_rows_are_untouched(self, db):
-        self.seed(db, "seis", "fnc:8371", period_end="2026-11-30")
+        self.seed(db, "seis", "u:abcd1234", period_end="2026-11-30")
         assert db.mark_legacy_rows(EVIDENCE_KEYS) == 0
         row = db._conn.execute(
             "SELECT legacy, period_end FROM announcements"
@@ -380,7 +403,7 @@ class TestLegacyRowsGoDark:
         db.mark_legacy_rows(EVIDENCE_KEYS)
 
         fresh = RawAnnouncement(
-            source="seis", source_id="fnc:8371", title="새 행",
+            source="seis", source_id="u:abcd1234", title="새 행",
             url="https://www.seis.or.kr/subPage.do?fncPbofrSn=8371",
             raw_data=json.dumps(
                 {"date": "접수기간 2026.09.01 ~ 2026.09.30"}, ensure_ascii=False
@@ -395,6 +418,6 @@ class TestLegacyRowsGoDark:
             " ORDER BY legacy"
         ).fetchall()
         assert [(r["source_id"], r["legacy"], r["period_end"]) for r in rows] == [
-            ("fnc:8371", 0, "2026-09-30"), ("8371", 1, None),
+            ("u:abcd1234", 0, "2026-09-30"), ("8371", 1, None),
         ]
-        assert [a.source_id for a in db.get_unnotified()] == ["fnc:8371"]
+        assert [a.source_id for a in db.get_unnotified()] == ["u:abcd1234"]

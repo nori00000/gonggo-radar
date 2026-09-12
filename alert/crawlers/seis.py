@@ -277,7 +277,7 @@ class SeisCrawler(BaseCrawler):
         """같은 공고 묶음에서 대표를 고르는 순위 - 최신 회차가 이긴다."""
         round_match = self._ROUND_RE.search(item.get("round", "") or "")
         round_no = int(round_match.group(1)) if round_match else -1
-        post_no = self._post_number(self._extract_post_id(item.get("link", "")))
+        post_no = self._post_number(item.get("link", ""))
         return (item.get("date", "") or "", round_no, post_no)
 
     def _group_key(self, item: dict) -> tuple:
@@ -535,71 +535,55 @@ class SeisCrawler(BaseCrawler):
 
         return items
 
-    # 공고 종류별 고유 ID. **번호만 쓰면 종류가 다른 공고가 충돌한다**
-    # (11차 게이트 HIGH): ``fncPbofrSn=42`` 재정지원과 ``dsgnPbofrSn=42``
-    # 지정공모가 둘 다 ``"42"`` 여서, 하나가 다른 하나의 기간을 덮어썼다.
-    # 그래서 ID 는 ``종류:번호`` 다.
+    # ── 공고 ID ───────────────────────────────────────────────────
     #
-    # 범용 파라미터(seq/idx/no)는 반드시 ?/& 뒤에서만 인정한다 - 그렇지
-    # 않으면 "epsdNo=4" 가 "no=4" 로 잡히는 접두사 오매칭이 생긴다.
-    ID_PARAMS = (
-        ("fnc", r"fncPbofrSn=(\d+)"),
-        ("dsgn", r"dsgnPbofrSn=(\d+)"),
-        ("itgrd", r"itgrdAplyPbancSn=(\d+)"),
-        ("epsd", r"epsdNo=(\d+)"),
-        ("ann", r"announcementId=(\d+)"),
-        ("ntfy", r"notifyId=(\d+)"),
-        ("ntt", r"nttId=(\d+)"),
-        ("bidx", r"[?&]bIdx=(\d+)"),
-        ("artcl", r"articleId=(\d+)"),
-        ("artcl", r"artclId=(\d+)"),
-        ("seq", r"[?&]seq=(\d+)"),
-        ("idx", r"[?&]idx=(\d+)"),
-        ("no", r"[?&]no=(\d+)"),
-    )
-
-    # 번호만으로는 특정되지 않는 공고가 있다. 인증 공고는 회차 번호를 해마다
-    # 다시 쓰므로 ``statsYr=2026&epsdNo=4`` 와 ``statsYr=2027&epsdNo=4`` 가
-    # 서로 다른 공고인데 ID 가 같았다 (12차 게이트 HIGH). URL 이 공고를
-    # 특정하는 데 쓰는 파라미터는 **전부** ID 에 넣는다.
-    # 게시판·구분자 파라미터 후보. 같은 글번호가 구분자마다 다시 쓰이므로,
-    # URL 에 있는 것을 **전부** ID 에 넣는다. 하나라도 빠지면 서로 다른
-    # 공고가 한 행이 되어 남의 마감이 덮어써진다 (13·17차 게이트).
-    BOARD_PARAMS = ("sid", "bsIdx", "boardId")
-
-    ID_QUALIFIERS = (r"statsYr=(\d{4})",) + tuple(
-        rf"[?&]{name}=([A-Za-z0-9_-]+)" for name in BOARD_PARAMS
-    )
-
-    def _extract_post_id(self, link: str) -> str:
-        """URL에서 ``종류[:한정자…]:번호`` 형태의 공고 ID를 추출한다."""
-        if not link:
-            return ""
-
-        qualifiers = []
-        for pattern in self.ID_QUALIFIERS:
-            match = re.search(pattern, link, re.I)
-            if match:
-                qualifiers.append(match.group(1))
-
-        for kind, pattern in self.ID_PARAMS:
-            match = re.search(pattern, link, re.I)
-            if match:
-                return ":".join([kind, *qualifiers, match.group(1)])
-
-        path_match = re.search(r"/(\d{3,})", link)
-        if path_match:
-            return ":".join(["path", *qualifiers, path_match.group(1)])
-
-        # 마지막 수단도 **접두를 붙인다** - 접두 없는 ID 는 옛 규칙의 행으로
-        # 판정되어(``identity.is_legacy_source_id``) 매번 레거시 표시된다.
-        return "md5:" + hashlib.md5(link.encode("utf-8")).hexdigest()[:16]
+    # 18차 게이트: 번호를 뽑아 조합하는 규칙(종류·한정자·경로 숫자)은 다섯
+    # 사이클 동안 계속 무언가를 **잃었다** - 종류를 잃고(12차), 연도를
+    # 잃고(12차), 게시판을 잃고(13·17차), 한정자 **이름**을 잃고, 경로의
+    # 뒷부분을 잃었다. 잃을 때마다 서로 다른 공고가 한 행이 되어 남의
+    # 마감이 저장·전달됐다.
+    #
+    # 그래서 조합을 버린다. **href 원문 전체**가 곧 ID 다:
+    #
+    #   - href 가 있으면 ``u:`` + sha1(원문)[:16] - 파라미터를 지우거나
+    #     정규화하지 않는다. 사이트가 다른 링크를 준 것은 다른 공고다.
+    #   - href 가 없으면 ``t:`` + sha1(제목|기관|게시일)[:16]
+    #
+    # 접두는 ``u:``/``t:`` 둘뿐이고, 둘 다 ``:`` 를 담으므로 레거시 규칙
+    # ("seis 인데 ``:`` 가 없다" = 옛 숫자 ID 행)은 그대로 성립한다.
+    _WHITESPACE = re.compile(r"\s+")
 
     @staticmethod
-    def _post_number(source_id: str) -> int:
-        """``종류:번호`` 에서 번호만 (정렬용). 번호가 없으면 -1."""
-        tail = (source_id or "").rsplit(":", 1)[-1]
-        return int(tail) if tail.isdigit() else -1
+    def _digest(value: str) -> str:
+        return hashlib.sha1(value.encode("utf-8")).hexdigest()[:16]
+
+    def _extract_post_id(self, link: str) -> str:
+        """href 원문 전체가 ID 다 (``u:`` + sha1). 링크가 없으면 빈 문자열."""
+        cleaned = self._WHITESPACE.sub("", link or "")
+        if not cleaned:
+            return ""
+        return "u:" + self._digest(cleaned)
+
+    def _title_post_id(self, item: dict, title: str) -> str:
+        """href 가 없는 항목 - 제목·기관·게시일로 가른다 (``t:`` + sha1).
+
+        제목만 해시하면 같은 제목의 서울센터·부산센터 공고가 한 행이 된다
+        (18차 게이트 HIGH).
+        """
+        organisation = (
+            item.get("author") or item.get("sub") or item.get("organ") or ""
+        )
+        parts = [title, organisation, item.get("date") or ""]
+        signature = "|".join(
+            self._WHITESPACE.sub(" ", str(part or "")).strip() for part in parts
+        )
+        return "t:" + self._digest(signature)
+
+    @staticmethod
+    def _post_number(link: str) -> int:
+        """정렬용 글번호 - 링크의 **마지막 숫자**. 없으면 -1."""
+        numbers = re.findall(r"\d+", link or "")
+        return int(numbers[-1]) if numbers else -1
 
     def _normalize_url(self, link: str, base_url: str) -> str:
         """상대 URL을 절대 URL로 변환한다."""
@@ -665,12 +649,8 @@ class SeisCrawler(BaseCrawler):
             source_id = self._extract_post_id(link)
 
             if not source_id:
-                # href 가 없는 항목(표 제목만 있는 행). 여기도 **접두를
-                # 붙인다** - 접두 없는 seis ID 는 옛 규칙의 행으로 판정되어
-                # 새 수집이 매번 레거시로 표시된다 (17차 게이트 MEDIUM).
-                source_id = "md5:" + hashlib.md5(
-                    title.encode("utf-8")
-                ).hexdigest()[:16]
+                # href 가 없는 항목(표 제목만 있는 행)
+                source_id = self._title_post_id(item, title)
 
             author = item.get("author", "").strip()
             category = item.get("category", "").strip()

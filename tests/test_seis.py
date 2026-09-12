@@ -45,22 +45,25 @@ class TestSeisCrawler:
         with patch("alert.crawlers.base.get_config", return_value=mock_seis_config):
             crawler = SeisCrawler()
 
-            # Parameter-based ID - **종류 접두**를 포함한다 (11차 게이트)
-            assert crawler._extract_post_id("https://example.com?nttId=12345") == "ntt:12345"
-            assert crawler._extract_post_id("https://example.com?seq=67890") == "seq:67890"
-            assert crawler._extract_post_id("https://example.com?idx=54321") == "idx:54321"
-
-            # Path-based ID
-            assert crawler._extract_post_id("https://example.com/view/123456") == "path:123456"
+            # 18차 게이트: ID 는 **href 원문 전체**의 해시다 (``u:``)
+            for link in ("https://example.com?nttId=12345",
+                         "https://example.com?seq=67890",
+                         "https://example.com/view/123456"):
+                digest = crawler._extract_post_id(link)
+                assert digest.startswith("u:")
+                assert len(digest) == len("u:") + 16
+            # 서로 다른 링크는 서로 다른 ID
+            assert crawler._extract_post_id("https://example.com?nttId=12345") != (
+                crawler._extract_post_id("https://example.com?nttId=12346")
+            )
 
             # Empty link
             assert crawler._extract_post_id("") == ""
 
-            # Hash fallback for unrecognized pattern - 접두를 붙인다
-            # (접두 없는 ID 는 옛 규칙의 행으로 판정된다)
+            # 패턴을 모르는 링크도 같은 규칙이다
             result = crawler._extract_post_id("https://example.com/some-page")
-            assert result.startswith("md5:")
-            assert len(result) == len("md5:") + 16
+            assert result.startswith("u:")
+            assert len(result) == len("u:") + 16
 
     def test_normalize_url(self, mock_seis_config):
         """_normalize_url() should handle relative and absolute URLs."""
@@ -312,7 +315,7 @@ class TestSeisMainCards:
 
         announcement = crawler._to_announcement(merged, "https://www.seis.or.kr")
         assert announcement is not None
-        assert announcement.source_id == "fnc:8371"
+        assert announcement.source_id == crawler._extract_post_id(announcement.url)
         assert announcement.url == (
             "https://www.seis.or.kr/subPage.do"
             "?menuId=30200&tabId=pbancMainView&fncPbofrSn=8371"
@@ -375,37 +378,30 @@ class TestSeisMainCards:
             for i in deduped
         ]
         assert len(ids) == len(set(ids))
-        assert "fnc:8371" in ids
-        # 인·지정 공모는 dsgnPbofrSn 을 쓴다 (예전에는 MD5 해시로 떨어졌다)
-        assert "dsgn:8322" in ids
-        # 종류 접두가 있으므로 같은 번호라도 종류가 다르면 다른 ID 다
-        assert len({i.split(":", 1)[0] for i in ids}) > 1
+        # 18차 게이트: ID 는 href 해시이므로 링크가 다르면 ID 도 다르다
+        assert all(i.startswith("u:") for i in ids)
+        links = [
+            crawler._to_announcement(i, "https://www.seis.or.kr").url
+            for i in deduped
+        ]
+        assert len(set(links)) == len(links)
 
-    def test_epsd_no_is_not_matched_as_generic_no_param(self, crawler):
-        """"epsdNo=4" 가 범용 "no=" 패턴에 걸려 다른 공고와 충돌하지 않는다."""
-        link = (
-            "/subPage.do?menuId=30100&tabId=certPageView&statsYr=2026&epsdNo=4"
-        )
-        # 12차 게이트: 연도(statsYr)까지 ID 에 들어간다
-        assert crawler._extract_post_id(link) == "epsd:2026:4"
-        # 같은 자리에 다른 파라미터가 와도 고유번호를 먼저 본다
-        assert crawler._extract_post_id(
-            "/subPage.do?menuId=30200&tabId=pbancMainView&fncPbofrSn=8371"
-        ) == "fnc:8371"
-        assert crawler._extract_post_id(
-            "/subPage.do?menuId=30100&tabId=certPageView&dsgnPbofrSn=8322"
-        ) == "dsgn:8322"
-
-    def test_same_number_in_different_kinds_never_collides(self, crawler):
-        """11차 게이트: ``fncPbofrSn=42`` 와 ``dsgnPbofrSn=42`` 는 다른 공고다."""
-        financial = crawler._extract_post_id(
-            "/subPage.do?menuId=30200&tabId=pbancMainView&fncPbofrSn=42"
-        )
-        designation = crawler._extract_post_id(
-            "/subPage.do?menuId=30100&tabId=certPageView&dsgnPbofrSn=42"
-        )
-        assert (financial, designation) == ("fnc:42", "dsgn:42")
-        assert financial != designation
+    @pytest.mark.parametrize("first,second", [
+        # 같은 회차 번호, 다른 연도 (12차 게이트)
+        ("/subPage.do?tabId=certPageView&statsYr=2026&epsdNo=4",
+         "/subPage.do?tabId=certPageView&statsYr=2027&epsdNo=4"),
+        # 같은 번호, 다른 종류 (11차 게이트)
+        ("/subPage.do?tabId=pbancMainView&fncPbofrSn=42",
+         "/subPage.do?tabId=certPageView&dsgnPbofrSn=42"),
+        # 같은 글번호, 다른 게시판 구분자 (13·17·18차 게이트)
+        ("/boardView.do?sid=A&nttId=42", "/boardView.do?sid=B&nttId=42"),
+        ("/boardView.do?sid=A&nttId=42", "/boardView.do?boardId=A&nttId=42"),
+        # 경로 뒷부분 (18차 게이트)
+        ("/board/100/detail/201", "/board/100/detail/202"),
+    ])
+    def test_links_that_differ_never_collide(self, crawler, first, second):
+        """href 가 조금이라도 다르면 다른 공고다 (18차 게이트)."""
+        assert crawler._extract_post_id(first) != crawler._extract_post_id(second)
 
     def test_normalize_title_ignores_spacing_noise(self, crawler):
         """제목 정규화는 공백·구분기호 차이를 무시한다."""
@@ -504,7 +500,8 @@ class TestSeisCardRegionCritique:
             )
             for i in deduped
         ]
-        assert {a.source_id for a in built} == {"itgrd:8371", "itgrd:8370"}
+        assert len({a.source_id for a in built}) == 2
+        assert all(a.source_id.startswith("u:") for a in built)
         assert {a.period_end for a in built} == {"2026-12-31"}
 
     def test_group_key_components(self, crawler):

@@ -863,9 +863,10 @@ class TestGate11Reproductions:
             "SELECT source_id, legacy, period_end FROM announcements"
             " ORDER BY legacy"
         ).fetchall()
-        assert [(r["source_id"], r["legacy"], r["period_end"]) for r in rows] == [
-            ("fnc:42", 0, "2026-09-30"), ("42", 1, None),
+        assert [(r["legacy"], r["period_end"]) for r in rows] == [
+            (0, "2026-09-30"), (1, None),
         ]
+        assert rows[0]["source_id"] == "fnc:42"       # 새 행 (레거시 아님)
         assert [a.source_id for a in db.get_unnotified()] == ["fnc:42"]
 
     def test_stale_seis_row_is_revalidated_and_not_notified(self, db):
@@ -957,7 +958,7 @@ class TestGate12Reproductions:
         crawler = make(SeisCrawler)
         first = crawler._extract_post_id(self.cert_link(2026, 4))
         second = crawler._extract_post_id(self.cert_link(2027, 4))
-        assert (first, second) == ("epsd:2026:4", "epsd:2027:4")
+        assert first != second
 
         for year, end in ((2026, "2026-09-30"), (2027, "2027-11-30")):
             db.insert_announcement(
