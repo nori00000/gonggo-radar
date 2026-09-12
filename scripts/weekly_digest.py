@@ -10,7 +10,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from alert.digest.composer import compose_digest
-from alert.digest.checker import check_digest, write_check_result
+from alert.digest.checker import body_links, check_digest, write_check_result
 from alert.digest import state as state_mod
 
 # 죽은 URL 제외 → 재조립을 반복하는 최대 횟수 (무한 루프 방지)
@@ -68,6 +68,7 @@ def main():
     warnings: list[str] = []
     dropped: list[dict] = []
     dropped_urls: set[str] = set()
+    stats: dict = {}
     result = None
 
     # 계약 W10: 사람이 텔레그램에서 제외한 항목은 상태 파일이 정본이다.
@@ -95,6 +96,7 @@ def main():
                 forms_csv_path=forms_csv_path,
                 warnings_out=warnings if attempt == 1 else None,
                 exclude_urls=dropped_urls or None,
+                stats_out=stats,
             )
             print(f"✓ {label}: {markdown_path}")
             kakao_path = markdown_path.with_name(f"{markdown_path.stem}.kakao.txt")
@@ -134,6 +136,31 @@ def main():
         result["pass"] = False
         result["reason"] = "; ".join(
             filter(None, ["죽은 URL 반복 검출", result.get("reason", "")])
+        )
+
+    # 개정 v2.5 (#2): 제외된 URL이 본문에 남아 있으면 발송을 막는다.
+    # 제목에 주입된 링크는 "원문" 링크 구조가 아니어서 검사 루프가 못 보기 때문이다.
+    markdown_text = markdown_path.read_text(encoding="utf-8")
+    residual = sorted(dropped_urls.intersection(body_links(markdown_text)))
+    if residual:
+        result["pass"] = False
+        result["reason"] = "; ".join(
+            filter(
+                None,
+                [
+                    f"제외된 URL이 본문에 남아 있음 {len(residual)}건",
+                    result.get("reason", ""),
+                ],
+            )
+        )
+        result["residual_urls"] = residual
+
+    # 개정 v2.5 (#8): 조용한 날짜 파싱 실패를 reason에 남긴다 (pass는 바꾸지 않는다)
+    failures = stats.get("date_parse_failures") or 0
+    if failures:
+        result["date_parse_failures"] = failures
+        result["reason"] = "; ".join(
+            filter(None, [result.get("reason", ""), f"날짜 파싱 실패 {failures}건"])
         )
 
     # 누적 제외 목록을 기록 (items는 최종 산출물에 실린 항목)

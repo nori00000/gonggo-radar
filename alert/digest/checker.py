@@ -39,28 +39,46 @@ PROBE_HEADERS = {
 # 생존 확인에는 응답 본문이 필요 없다. 연결만 확인하고 최대 이만큼만 읽는다.
 MAX_PROBE_BYTES = 64 * 1024
 
-# [텍스트](URL)
-_LINK_RE = re.compile(r"\[([^\]]+)\]\(([^)]+)\)")
+# 항목 링크는 `  [원문](URL)` 한 줄뿐이다 (형식 v2.1).
+_ORIGIN_LINK_RE = re.compile(r"^\[원문\]\((\S+)\)$")
+# 어떤 형태든 마크다운 링크 (본문 잔존 검사용)
+_ANY_LINK_RE = re.compile(r"\[([^\]]+)\]\(([^)\s]+)\)")
 # HTML 주석 줄 (형식 v2.1의 보류 목록). 발송본에 실리지 않으므로 게이트 대상도 아니다.
 _COMMENT_LINE_RE = re.compile(r"^\s*<!--")
 
 
 def extract_item_urls(markdown_text: str) -> List[str]:
-    """다이제스트 마크다운에서 검사 대상 URL을 문서 순서대로, 중복 없이 뽑는다.
+    """검사 대상 URL을 문서 순서대로, 중복 없이 뽑는다.
 
-    HTML 주석 줄(보류 목록)은 발송 HTML에 실리지 않으므로 건너뛴다.
+    개정 v2.5 (#2): **"원문" 링크 구조에서만** 뽑는다. 제목에 주입된 마크다운 링크를
+    검사 대상으로 세면, 재조립이 원문 URL만 제외하는 사이 제목 속 죽은 링크가
+    발송본에 남는다. 제목 쪽은 composer.sanitize_title이 링크 문법을 제거하고,
+    weekly_digest가 "제외된 URL이 본문에 남아 있지 않은지"를 따로 확인한다.
     """
     urls: List[str] = []
     seen = set()
     for line in markdown_text.splitlines():
         if _COMMENT_LINE_RE.match(line):
             continue
-        for _text, url in _LINK_RE.findall(line):
-            url = url.strip()
-            if not url or url in seen:
-                continue
-            seen.add(url)
-            urls.append(url)
+        matched = _ORIGIN_LINK_RE.match(line.strip())
+        if not matched:
+            continue
+        url = matched.group(1).strip()
+        if not url or url in seen:
+            continue
+        seen.add(url)
+        urls.append(url)
+    return urls
+
+
+def body_links(markdown_text: str) -> List[str]:
+    """본문(주석 제외)에 실제로 남아 있는 모든 마크다운 링크 URL."""
+    urls: List[str] = []
+    for line in markdown_text.splitlines():
+        if _COMMENT_LINE_RE.match(line):
+            continue
+        for _text, url in _ANY_LINK_RE.findall(line):
+            urls.append(url.strip())
     return urls
 
 

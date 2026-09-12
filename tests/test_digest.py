@@ -17,28 +17,42 @@ from alert.digest.composer import (
     SECTION_HEADINGS,
     HOLD_REASON_DIVERSITY,
     HOLD_REASON_SECTION_CAP,
+    ITEM_SECTIONS,
+    KAKAO_CHUNK_SEPARATOR,
+    KAKAO_HEADLINE_PLACEHOLDER,
+    KAKAO_HEADLINE_PREFIX,
     SECTION_LIMITS,
     SOURCE_DIVERSITY_LIMIT,
     VERDICT_APPLY,
     VERDICT_EXCLUDE,
     VERDICT_HOLD,
     VERDICT_NOTICE,
+    chunk_plaintext,
     classify_item,
     compose_digest,
     compose_digest_data,
     extract_quotes,
     get_week_date_range,
     infer_target_tags,
+    hold_comment,
     jaccard,
+    kakao_file_text,
     normalize_title,
+    parse_deadline,
+    refresh_kakao_headline,
+    render_kakao_chunks,
     render_kakao,
     render_markdown,
+    sanitize_title,
     source_display_name,
     target_display,
     title_ngrams,
+    week_bounds,
 )
 from alert.digest.checker import (
+    body_links,
     check_digest,
+    extract_item_urls,
     parse_period_end,
     check_url_alive,
 )
@@ -624,7 +638,7 @@ class TestComposer:
             db_path=str(db_path), week_str=W13, today=W13_TODAY
         )
 
-        assert "<!-- 보류: 1. 국유림 산림경영 현장 이야기 | 섹션 판정 불명 -->" in markdown
+        assert "<!-- 보류: 1. 국유림 산림경영 현장 이야기 | 섹션 판정 불명 | id=" in markdown
         # 발송 HTML 변환은 주석 줄을 건너뛴다
         html = markdown_to_html(markdown)
         assert "국유림 산림경영 현장 이야기" not in html
@@ -753,7 +767,7 @@ class TestChecker:
     def test_check_digest_network_checked_field(self, sample_announcements, tmp_path):
         """network_checked 필드 포함."""
         md_path = tmp_path / "test.md"
-        md_path.write_text("# 테스트\n\n[test](https://example.com)")
+        md_path.write_text("# 테스트\n\n[원문](https://example.com)")
 
         result = check_digest(
             db_path=sample_announcements,
@@ -768,7 +782,7 @@ class TestChecker:
         """check.json에 reason 필드."""
         md_path = tmp_path / "test.md"
         check_path = tmp_path / "test.check.json"
-        md_path.write_text("# 테스트\n\n[test](https://example.com)")
+        md_path.write_text("# 테스트\n\n[원문](https://example.com)")
 
         check_digest(
             db_path=sample_announcements,
@@ -800,7 +814,7 @@ class TestChecker:
         """생성 단계 경고가 있으면 pass=false + reason 기록."""
         md_path = tmp_path / "test.md"
         check_path = tmp_path / "test.check.json"
-        md_path.write_text("# 테스트\n\n[test](https://example.com)")
+        md_path.write_text("# 테스트\n\n[원문](https://example.com)")
 
         result = check_digest(
             db_path=sample_announcements,
@@ -1052,7 +1066,8 @@ class TestSendDigest:
 
         # raw 태그가 실제 태그로 파싱되지 않아야 함
         assert "<script" not in html
-        assert "&lt;script&gt;" in html
+        # 개정 v2.5 (#2): 제목의 꺾쇠는 전각으로 바뀌어 태그가 만들어지지 않는다
+        assert "＜script＞" in html
         # author·파싱 불가 마감은 렌더 경로에 아예 들어오지 않는다
         assert "onerror" not in html
         assert "onload" not in html
@@ -1699,7 +1714,7 @@ class TestFixCycle1:
         markdown = compose_digest(
             db_path=str(db_path), week_str=W13, today=W13_TODAY
         )
-        assert "소스 다양성 상한(같은 소스 2건) -->" in markdown
+        assert "소스 다양성 상한(같은 소스 2건) | id=" in markdown
 
     # ─── F4: 같은 제목 다른 회차 ────────────────────────────────────────
     def test_same_title_different_deadline_not_merged(self, tmp_path):
@@ -1877,9 +1892,9 @@ class TestFixCycle2:
             db_path=str(db_path), week_str=W13, today=W13_TODAY
         )
         assert _count_items(_section_body(markdown, APPLY_HEADING)) == 5
-        assert f"| {HOLD_REASON_DIVERSITY} -->" in markdown
-        assert f"| {HOLD_REASON_SECTION_CAP} -->" in markdown
-        assert markdown.count(f"| {HOLD_REASON_SECTION_CAP} -->") == 2
+        assert f"| {HOLD_REASON_DIVERSITY} | id=" in markdown
+        assert f"| {HOLD_REASON_SECTION_CAP} | id=" in markdown
+        assert markdown.count(f"| {HOLD_REASON_SECTION_CAP} | id=") == 2
 
 
 class TestFixCycle3:
@@ -2045,3 +2060,533 @@ class TestFixCycle3:
         )
         assert markdown.count(MARKER) == 1
         assert f"이번 주 한 줄: {MARKER}" in markdown
+
+
+W37 = "2026-W37"
+W37_CREATED_AT = "2026-09-10T12:00:00"
+W37_TODAY = date(2026, 9, 13)
+
+
+class TestFixCycle4:
+    """개정 v2.5 — Codex 실크리틱 14건의 재현 입력 고정 (#1은 main 레인 몫)."""
+
+    # ─── #2 제목 링크 주입 / 죽은 링크 잔존 ─────────────────────────────
+    def test_title_markdown_link_is_not_rendered(self, tmp_path):
+        db_path = tmp_path / "c4_2.db"
+        _create_announcements_table(db_path)
+        _insert_one(
+            db_path,
+            source="kofpi",
+            source_id="inject",
+            title="산림 지원사업 [신청](https://example.com/dead) 모집",
+            url="https://example.com/live",
+            period_end="2026-12-31",
+        )
+
+        markdown = compose_digest(
+            db_path=str(db_path), week_str=W13, today=W13_TODAY
+        )
+
+        assert "https://example.com/dead" not in markdown
+        assert "산림 지원사업 신청 모집" in markdown
+        assert extract_item_urls(markdown) == ["https://example.com/live"]
+
+    def test_sanitize_title_neutralizes_links_and_tags(self):
+        assert sanitize_title("A [신청](https://x/y) B") == "A 신청 B"
+        assert sanitize_title("<https://x/y> 공고") == "https://x/y 공고"
+        assert sanitize_title("<img src=x onerror=1> 공고") == (
+            "＜img src=x onerror=1＞ 공고"
+        )
+        # 정상 표기는 그대로 읽힌다
+        assert sanitize_title("[모집] 산림 공고(~9.30)") == "[모집] 산림 공고(~9.30)"
+
+    def test_extract_item_urls_only_reads_origin_links(self):
+        markdown = (
+            "## ✅ 신청하세요 (마감순)\n\n"
+            "산림 지원사업 [신청](https://example.com/dead) 모집 — 기관\n"
+            "  [원문](https://example.com/live)\n"
+        )
+        assert extract_item_urls(markdown) == ["https://example.com/live"]
+        assert "https://example.com/dead" in body_links(markdown)
+
+    def test_residual_dropped_url_in_body_fails_closed(
+        self, tmp_path, monkeypatch
+    ):
+        """재검사 루프가 못 본 죽은 링크가 본문에 남으면 pass=false."""
+        import scripts.weekly_digest as weekly_digest
+
+        db_path = tmp_path / "c4_residual.db"
+        _create_announcements_table(db_path)
+        _insert_one(
+            db_path,
+            source="kofpi",
+            source_id="live",
+            title="산림 지원사업 참여기업 모집 공고",
+            url="https://example.com/live",
+        )
+        out_dir = tmp_path / "out"
+
+        def fake_compose(**kwargs):
+            path = Path(kwargs["output_path"])
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(
+                "# 테스트\n\n"
+                "## ✅ 신청하세요 (마감순)\n\n"
+                "산림 지원사업 참여기업 모집 — 한국임업진흥원 · 마감 미정\n"
+                "  [원문](https://example.com/live)\n\n"
+                "남은 링크 [보기](https://example.com/dead)\n",
+                encoding="utf-8",
+            )
+            return ""
+
+        monkeypatch.setattr(weekly_digest, "compose_digest", fake_compose)
+        monkeypatch.setattr(
+            "alert.digest.checker.check_url_alive",
+            lambda url, timeout=8: url != "https://example.com/dead",
+        )
+        monkeypatch.setattr(
+            "alert.digest.checker.extract_item_urls",
+            lambda text: [
+                "https://example.com/live",
+                "https://example.com/dead",
+            ],
+        )
+        monkeypatch.setattr(
+            sys,
+            "argv",
+            [
+                "weekly_digest.py",
+                "--db", str(db_path),
+                "--week", W13,
+                "--out-dir", str(out_dir),
+                "--forms", str(tmp_path / "none.csv"),
+            ],
+        )
+
+        assert weekly_digest.main() == 1
+        with open(out_dir / f"{W13}.check.json", encoding="utf-8") as fh:
+            check = json.load(fh)
+        assert check["pass"] is False
+        assert "제외된 URL이 본문에 남아 있음" in check["reason"]
+        assert check["residual_urls"] == ["https://example.com/dead"]
+
+    # ─── #3 마감 경과 복제본 ────────────────────────────────────────────
+    def test_expired_group_is_excluded_after_merge(self, tmp_path):
+        db_path = tmp_path / "c4_3.db"
+        _create_announcements_table(db_path)
+        for index, period_end in enumerate(["2026-09-12", None]):
+            _insert_one(
+                db_path,
+                source="kofpi",
+                source_id=f"exp_{index}",
+                title="산림 지원사업 참여기업 모집 공고",
+                url=f"https://example.com/exp-{index}",
+                period_start="2026-09-08",
+                period_end=period_end,
+                created_at=W37_CREATED_AT,
+            )
+
+        data = compose_digest_data(
+            str(db_path), week_str=W37, today=W37_TODAY
+        )
+        assert data["sections"][VERDICT_APPLY] == []
+        assert [item["reason"] for item in data["excluded"]] == ["마감 경과"]
+
+    # ─── #4 상한 초과 무기록 삭제 금지 + 불변식 ─────────────────────────
+    def test_notice_cap_overflow_is_recorded(self, tmp_path):
+        db_path = tmp_path / "c4_4.db"
+        _create_announcements_table(db_path)
+        for index, source in enumerate(
+            ["kofpi", "fowi", "forest_service", "lawmaking"]
+        ):
+            _insert_one(
+                db_path,
+                source=source,
+                source_id=f"n_{index}",
+                title="산림 정책 개정 안내",
+                url=f"https://example.com/n-{index}",
+                period_end=None,
+                period_start=f"2026-09-0{index + 5}",
+                created_at=W37_CREATED_AT,
+            )
+
+        data = compose_digest_data(
+            str(db_path), week_str=W37, today=W37_TODAY
+        )
+        assert len(data["sections"][VERDICT_NOTICE]) == 3
+        overflow = [
+            item
+            for item in data["holds"]
+            if item["reason"] == HOLD_REASON_SECTION_CAP
+        ]
+        assert len(overflow) == 1
+
+    def test_candidate_partition_invariant(self, tmp_path):
+        """창 내 모든 후보 = 섹션 ∪ 보류 ∪ 배제 ∪ 병합됨."""
+        db_path = tmp_path / "c4_inv.db"
+        _create_announcements_table(db_path)
+        rows = (
+            ("kofpi", "산림분야 오픈이노베이션 참여기업 모집 공고", "2026-09-30"),
+            ("kofpi", "산림분야 오픈이노베이션 참여기업 모집 공고", "2026-09-30"),
+            ("fowi", "나눔의 숲 캠프 모집 공고", None),
+            ("lawmaking", "산지관리법 시행령 일부개정령안 입법예고", "2026-10-19"),
+            ("smartfarm", "스마트팜 시스템 작업 안내", None),
+            ("coop", "사회적협동조합 공공조달 컨설팅 참여기업 모집", "2026-09-25"),
+            ("seis", "사회적기업 사무공간 신규 입주기업 모집 공고", None),
+            ("forest_press", "산림청, 국제산림협력 해법 모색", None),
+        )
+        for index, (source, title, period_end) in enumerate(rows):
+            _insert_one(
+                db_path,
+                source=source,
+                source_id=f"inv_{index}",
+                title=title,
+                url=f"https://example.com/inv-{index}",
+                period_end=period_end,
+                period_start="2026-09-08",
+                created_at=W37_CREATED_AT,
+            )
+
+        data = compose_digest_data(
+            str(db_path), week_str=W37, today=W37_TODAY
+        )
+        placed = set()
+        for section in ITEM_SECTIONS:
+            placed.update(item["id"] for item in data["sections"][section])
+        placed.update(item["id"] for item in data["holds"])
+        placed.update(item["id"] for item in data["excluded"])
+        placed.update(data["merged_ids"])
+
+        assert placed == set(data["candidate_ids"])
+
+    # ─── #5 판정·대상이 다르면 병합 금지 ────────────────────────────────
+    def test_participant_notice_does_not_swallow_business_notice(self, tmp_path):
+        db_path = tmp_path / "c4_5.db"
+        _create_announcements_table(db_path)
+        for index, title in enumerate(
+            [
+                "2026년 산림복지서비스 활성화 지원사업 참가자 모집",
+                "2026년 산림복지서비스 활성화 지원사업 참가기업 모집",
+            ]
+        ):
+            _insert_one(
+                db_path,
+                source="fowi",
+                source_id=f"m_{index}",
+                title=title,
+                url=f"https://example.com/m-{index}",
+                period_start="2026-09-08",
+                period_end="2026-09-30",
+                created_at=W37_CREATED_AT,
+            )
+
+        data = compose_digest_data(
+            str(db_path), week_str=W37, today=W37_TODAY
+        )
+        published = [item["url"] for item in data["sections"][VERDICT_APPLY]]
+        held = [item["url"] for item in data["holds"]]
+
+        assert published == ["https://example.com/m-1"]
+        assert "https://example.com/m-0" in held
+        assert data["merged_ids"] == []
+
+    # ─── #6 노이즈는 제목에만 ───────────────────────────────────────────
+    def test_summary_boilerplate_does_not_exclude(self):
+        result = classify_item(
+            "사회적기업 사업개발비 지원사업 모집",
+            "신청은 사회적기업 통합정보시스템에서 접수",
+            "seis",
+        )
+        assert result.verdict == VERDICT_APPLY
+
+    def test_noise_with_institution_signal_is_held_not_excluded(self):
+        result = classify_item("산림 안전점검 의무 강화 시행", "", "forest_service")
+        assert result.verdict == VERDICT_HOLD
+        assert result.reason == "노이즈 의심: 점검"
+
+    # ─── #7 미리보기 = 발송본 ───────────────────────────────────────────
+    def test_preview_shows_every_send_section(self, tmp_path):
+        from alert.digest import preview as preview_mod
+        from scripts.apply_commentary import apply_commentary
+
+        csv_path = tmp_path / "forms.csv"
+        csv_path.write_text(
+            "접수일,회원사,유형,내용,관련정책\n"
+            "2026-09-10,회원사A,동정,신규 사업 개시,\n",
+            encoding="utf-8",
+        )
+        db_path = tmp_path / "c4_7.db"
+        _create_announcements_table(db_path)
+        _insert_one(
+            db_path,
+            source="kofpi",
+            source_id="p1",
+            title="산림 지원사업 참여기업 모집 공고",
+            url="https://example.com/p1",
+            period_end="2026-12-31",
+        )
+
+        data = compose_digest_data(
+            str(db_path),
+            week_str=W13,
+            forms_csv_path=csv_path,
+            today=W13_TODAY,
+        )
+        data["council_notes"] = ["산림청 면담 완료"]
+        markdown = render_markdown(data)
+        annotated, replaced = apply_commentary(
+            markdown, "첫 줄 해설\n두 번째 줄 해설"
+        )
+        assert replaced is True
+
+        text = preview_mod.render_preview(W13, annotated, {"pass": True})
+        assert "산림청 면담 완료" in text
+        assert "회원사A" in text
+        assert "신규 사업 개시" in text
+        assert "첫 줄 해설" in text
+        assert "두 번째 줄 해설" in text
+
+    # ─── #8 날짜 파서 ───────────────────────────────────────────────────
+    @pytest.mark.parametrize(
+        "value,expected",
+        [
+            ("2026. 9. 12.", date(2026, 9, 12)),
+            ("2026-9-12 18:00", date(2026, 9, 12)),
+            ("2026년 9월 7일", date(2026, 9, 7)),
+            ("26.09.30.(수)", date(2026, 9, 30)),
+            ("2026/09/30", date(2026, 9, 30)),
+            ("2026-09-12T09:46:29.074620", date(2026, 9, 12)),
+            ("", None),
+            ("접수기간 확인", None),
+        ],
+    )
+    def test_parse_deadline_formats(self, value, expected):
+        assert parse_deadline(value) == expected
+
+    def test_korean_posted_date_is_fresh_not_standing(self, tmp_path):
+        db_path = tmp_path / "c4_8.db"
+        _create_announcements_table(db_path)
+        _insert_one(
+            db_path,
+            source="kofpi",
+            source_id="kdate",
+            title="산림 지원사업 참여기업 모집 공고",
+            url="https://example.com/kdate",
+            period_start="2026년 9월 7일",
+            period_end=None,
+            created_at=W37_CREATED_AT,
+        )
+        markdown = compose_digest(
+            db_path=str(db_path), week_str=W37, today=W37_TODAY
+        )
+        assert "[새 소식]" in markdown
+        assert "[상시]" not in markdown
+
+    def test_date_parse_failures_counted(self, tmp_path):
+        db_path = tmp_path / "c4_8b.db"
+        _create_announcements_table(db_path)
+        _insert_one(
+            db_path,
+            source="kofpi",
+            source_id="bad",
+            title="산림 지원사업 참여기업 모집 공고",
+            url="https://example.com/bad",
+            period_start="접수기간 별도 공지",
+            period_end="추후 안내",
+            created_at=W37_CREATED_AT,
+        )
+        stats: dict = {}
+        compose_digest(
+            db_path=str(db_path),
+            week_str=W37,
+            today=W37_TODAY,
+            stats_out=stats,
+        )
+        assert stats["date_parse_failures"] == 2
+
+    # ─── #9 KST 주간 경계 ───────────────────────────────────────────────
+    def test_week_bounds_is_exclusive_range(self):
+        assert week_bounds(W37) == ("2026-09-07", "2026-09-14")
+
+    def test_kst_week_boundary(self, tmp_path):
+        db_path = tmp_path / "c4_9.db"
+        _create_announcements_table(db_path)
+        _insert_one(
+            db_path,
+            source="kofpi",
+            source_id="inside",
+            title="산림 지원사업 참여기업 모집 공고",
+            url="https://example.com/inside",
+            created_at="2026-09-07T00:30:00+09:00",
+        )
+        _insert_one(
+            db_path,
+            source="fowi",
+            source_id="outside",
+            title="임업 경영 컨설팅 참여기업 모집",
+            url="https://example.com/outside",
+            created_at="2026-09-14T00:30:00+09:00",
+        )
+        data = compose_digest_data(
+            str(db_path), week_str=W37, today=W37_TODAY
+        )
+        urls = [item["url"] for item in data["sections"][VERDICT_APPLY]]
+        assert urls == ["https://example.com/inside"]
+
+    # ─── #10 제도 우선 ──────────────────────────────────────────────────
+    def test_institution_priority_beats_opportunity(self):
+        result = classify_item(
+            "산지관리법 시행령 개정 입법예고 공고", "", "lawmaking"
+        )
+        assert result.verdict == VERDICT_NOTICE
+
+    def test_bare_plan_keyword_needs_forest_context(self):
+        assert classify_item("산림 탄소중립 추진계획", "", "forest_service").verdict == (
+            VERDICT_NOTICE
+        )
+        # 산림 업종 키워드가 없으면 단독 `계획`은 제도 신호로 인정하지 않는다
+        assert classify_item(
+            "사회적기업 성장 추진계획", "", "seis"
+        ).verdict == VERDICT_HOLD
+
+    # ─── #11 지역 접두사 ────────────────────────────────────────────────
+    def test_region_prefix_prevents_merge(self, tmp_path):
+        db_path = tmp_path / "c4_11.db"
+        _create_announcements_table(db_path)
+        for index, region in enumerate(["경기", "강원"]):
+            _insert_one(
+                db_path,
+                source="seis",
+                source_id=f"r_{index}",
+                title=f"[{region}] 사회적기업 사업개발비 지원사업 모집",
+                url=f"https://example.com/r-{index}",
+                period_start="2026-09-08",
+                period_end="2026-09-30",
+                created_at=W37_CREATED_AT,
+            )
+
+        data = compose_digest_data(
+            str(db_path), week_str=W37, today=W37_TODAY
+        )
+        published = data["sections"][VERDICT_APPLY]
+        assert len(published) == 2
+        assert {item["region"] for item in published} == {"경기", "강원"}
+        assert data["merged_ids"] == []
+
+    # ─── #12 카톡 분할·동기화 ───────────────────────────────────────────
+    def test_kakao_chunks_respect_limit(self, tmp_path):
+        db_path = tmp_path / "c4_12.db"
+        _create_announcements_table(db_path)
+        _insert_one(
+            db_path,
+            source="kofpi",
+            source_id="long",
+            title="산림 지원사업 참여기업 모집 공고 " + "가" * 4100,
+            url="https://example.com/long",
+            period_end="2026-12-31",
+        )
+        data = compose_digest_data(
+            str(db_path), week_str=W13, today=W13_TODAY
+        )
+        chunks = render_kakao_chunks(data)
+        assert len(chunks) > 1
+        assert all(len(chunk) <= 4096 for chunk in chunks)
+        assert KAKAO_CHUNK_SEPARATOR in kakao_file_text(data)
+
+    def test_chunk_plaintext_is_lossless(self):
+        text = "\n".join(f"{i}. " + "가" * 200 for i in range(1, 120))
+        chunks = chunk_plaintext(text)
+        assert len(chunks) > 1
+        assert "\n".join(chunks) == text
+
+    def test_apply_commentary_syncs_kakao(self, tmp_path):
+        import scripts.apply_commentary as apply_mod
+
+        db_path = tmp_path / "c4_12b.db"
+        _create_announcements_table(db_path)
+        _insert_one(
+            db_path,
+            source="kofpi",
+            source_id="sync",
+            title="산림 지원사업 참여기업 모집 공고",
+            url="https://example.com/sync",
+            period_end="2026-12-31",
+        )
+        out_dir = tmp_path / "digests"
+        compose_digest(
+            db_path=str(db_path),
+            week_str=W13,
+            output_path=out_dir / f"{W13}.md",
+            today=W13_TODAY,
+        )
+        kakao_path = out_dir / f"{W13}.kakao.txt"
+        assert KAKAO_HEADLINE_PLACEHOLDER in kakao_path.read_text(
+            encoding="utf-8"
+        )
+
+        rc = apply_mod.main(
+            [W13, "이번 주는 산림형 예비사회적기업 지정 공고", "--out-dir", str(out_dir)]
+        )
+        assert rc in (0, 1)
+        kakao_text = kakao_path.read_text(encoding="utf-8")
+        assert KAKAO_HEADLINE_PLACEHOLDER not in kakao_text
+        assert "이번 주는 산림형 예비사회적기업 지정 공고" in kakao_text
+
+    def test_refresh_kakao_headline_rechunks(self):
+        text = (
+            "📋 협의회 주간 정책브리핑 2026-W37 (9/7~9/13)\n"
+            f"{KAKAO_HEADLINE_PREFIX}{KAKAO_HEADLINE_PLACEHOLDER}\n\n"
+            "✅ 신청하세요 (마감순)\n"
+        )
+        updated = refresh_kakao_headline(text, "확정 문구")
+        assert f"{KAKAO_HEADLINE_PREFIX}확정 문구" in updated
+        assert KAKAO_HEADLINE_PLACEHOLDER not in updated
+
+    # ─── #13 보류 주석 구분자·id ────────────────────────────────────────
+    def test_hold_comment_escapes_pipe_and_carries_id(self):
+        item = {
+            "number": 3,
+            "title": "산림 이야기 | 강원",
+            "reason": "섹션 판정 불명",
+            "id": 77,
+        }
+        line = hold_comment(item)
+        assert line == "<!-- 보류: 3. 산림 이야기 ｜ 강원 | 섹션 판정 불명 | id=77 -->"
+
+    def test_hold_comment_roundtrips_through_preview(self):
+        from alert.digest import preview as preview_mod
+
+        item = {
+            "number": 1,
+            "title": "산림 이야기 | 강원",
+            "reason": "섹션 판정 불명",
+            "id": 77,
+        }
+        parsed = preview_mod.parse_digest(hold_comment(item))
+        assert parsed["holds"] == [
+            {
+                "number": 1,
+                "title": "산림 이야기 ｜ 강원",
+                "reason": "섹션 판정 불명",
+                "id": 77,
+            }
+        ]
+
+    # ─── #14 인덱스 사용 ────────────────────────────────────────────────
+    def test_window_query_uses_created_at_index(self, tmp_path):
+        db_path = tmp_path / "c4_14.db"
+        _create_announcements_table(db_path)
+        conn = sqlite3.connect(str(db_path))
+        conn.execute(
+            "CREATE INDEX idx_ann_created ON announcements(created_at)"
+        )
+        start, end = week_bounds(W37)
+        plan = conn.execute(
+            "EXPLAIN QUERY PLAN SELECT id FROM announcements "
+            "WHERE created_at >= ? AND created_at < ?",
+            (start, end),
+        ).fetchall()
+        conn.close()
+        detail = " ".join(str(row[-1]) for row in plan)
+        assert "SEARCH" in detail
+        assert "SCAN announcements" not in detail

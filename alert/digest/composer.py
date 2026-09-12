@@ -103,8 +103,17 @@ INSTITUTION_KEYWORDS = (
     "제도",
     "정책",
     "기본계획",
-    "계획 발표",
+    "계획",
+    "발표",
 )
+
+# 개정 v2.5 (#10): 이 키워드가 제목에 있으면 `공고`가 같이 있어도 알아두세요가 우선이다
+# (`산지관리법 시행령 개정 입법예고 공고`가 신청 섹션으로 갔고, 의견 마감이 지나면
+# 제도 변경 자체가 배제됐다).
+INSTITUTION_PRIORITY_KEYWORDS = ("입법예고", "행정예고", "고시")
+
+# 단독으로는 너무 넓은 제도 키워드 — 산림 업종 키워드를 동반할 때만 인정한다.
+BARE_INSTITUTION_KEYWORDS = ("계획", "발표")
 
 # 산림 업종 키워드.
 # 판정 ③ 단서: "치유"는 `산림치유`로만 인정(치유농업 배제), "조경"은 회사 축이므로 제외.
@@ -285,6 +294,12 @@ QUOTE_FALLBACK = "원문 확인"
 DEDUP_JACCARD = 0.6
 NGRAM_SIZE = 3
 
+# 카톡 평문 분할 (개정 v2.5 #12). 카카오톡 한 메시지 한도와 같은 4096자.
+KAKAO_CHUNK_LIMIT = 4096
+KAKAO_CHUNK_SEPARATOR = "---8<---"
+KAKAO_HEADLINE_PREFIX = "이번 주 한 줄: "
+KAKAO_HEADLINE_PLACEHOLDER = "(확정 필요)"
+
 # 인용 span을 찾을 수 없는 raw_data 키 (링크는 사람이 읽는 문구가 아니다)
 _RAW_SKIP_KEYS = ("link", "url", "href")
 
@@ -373,6 +388,29 @@ def get_week_date_range(week_str: str) -> Tuple[str, str]:
 def normalize_title(title: str) -> str:
     """제목 정규화: 공백 정규화 (개행·탭 제거)."""
     return " ".join((title or "").split())
+
+
+# 개정 v2.5 (#2): 제목은 링크·HTML을 렌더하지 않는다. 링크는 "원문" 필드로만 나간다.
+_MD_LINK_IN_TITLE_RE = re.compile(r"\[([^\]]*)\]\((?:[^()\s]|\([^()]*\))*\)")
+_AUTOLINK_RE = re.compile(r"<(\s*https?://[^>]*)>")
+
+
+def sanitize_title(title: str) -> str:
+    """제목에서 링크 문법과 HTML 태그 형성 가능성을 제거한다.
+
+    - `[텍스트](URL)` → `텍스트` (URL은 버린다 — 링크는 "원문" 필드의 몫)
+    - `<https://…>` → `https://…` (꺾쇠 제거)
+    - 남은 `<`·`>`는 전각으로 바꿔 태그가 만들어지지 못하게 한다
+    - 남은 `](` 는 `] (` 로 끊어 링크 문법이 재조립되지 못하게 한다
+
+    `[모집]`·`(~9.30)` 같은 정상 표기는 그대로 읽히도록 대괄호·괄호 자체는 남긴다.
+    """
+    text = normalize_title(title)
+    text = _MD_LINK_IN_TITLE_RE.sub(lambda m: m.group(1), text)
+    text = _AUTOLINK_RE.sub(lambda m: m.group(1).strip(), text)
+    text = text.replace("<", "＜").replace(">", "＞")
+    text = text.replace("](", "] (")
+    return " ".join(text.split())
 
 
 def _strip_tokens(text: str) -> str:
@@ -484,8 +522,19 @@ def infer_target_tags(text: str) -> Tuple[str, ...]:
     return tuple(tag for tag in TAG_ORDER if tag in tags)
 
 
+def _institution_hits(title: str, forest: Tuple[str, ...]) -> Tuple[str, ...]:
+    """제목의 제도 키워드. 단독 `계획`·`발표`는 산림 업종 키워드 동반 시에만 인정 (#10)."""
+    hits = _hits(title, INSTITUTION_KEYWORDS)
+    if not hits:
+        return ()
+    if forest:
+        return hits
+    strong = tuple(kw for kw in hits if kw not in BARE_INSTITUTION_KEYWORDS)
+    return strong
+
+
 def classify_item(title: str, summary: str, source: str) -> Classification:
-    """제목·요약·소스만 보고 섹션/보류/배제를 결정하는 순수 함수 (룰 v2.1).
+    """제목·요약·소스만 보고 섹션/보류/배제를 결정하는 순수 함수 (룰 v2.1 + 개정 v2.5).
 
     Args:
         title: 공고 제목
@@ -494,7 +543,7 @@ def classify_item(title: str, summary: str, source: str) -> Classification:
 
     Returns:
         Classification. 마감 경과 판정은 날짜가 필요하므로 여기서 하지 않는다
-        (compose 단계에서 VERDICT_EXCLUDE "마감 경과"로 강등된다).
+        (compose 단계에서 중복 병합 **뒤에** VERDICT_EXCLUDE "마감 경과"로 강등된다).
     """
     title = normalize_title(title)
     summary = normalize_title(summary or "")
@@ -502,40 +551,59 @@ def classify_item(title: str, summary: str, source: str) -> Classification:
 
     # ② 소스 풀. 협의회 소스가 아니면 제목의 사회적경제 정체성 키워드만이 통행권이다.
     if source not in COUNCIL_SOURCES:
-        identity_in_title = _hits(title, SSE_IDENTITY_KEYWORDS)
-        if not identity_in_title:
+        if not _hits(title, SSE_IDENTITY_KEYWORDS):
             return Classification(
                 VERDICT_EXCLUDE, "협의회 소스 풀 외", (), (), None
             )
 
-    # ③ 노이즈 사전
-    noise = _hits(text, NOISE_KEYWORDS)
-    if noise:
-        return Classification(
-            VERDICT_EXCLUDE, f"노이즈: {noise[0]}", noise, (), None
-        )
-
     # ③ 관련성 = 산림 업종 ∨ 사회적경제 정체성
     forest = _hits(text, FOREST_INDUSTRY_KEYWORDS)
     identity = _hits(text, SSE_IDENTITY_KEYWORDS)
-    if not forest and not identity:
-        return Classification(VERDICT_EXCLUDE, "관련성 없음", (), (), None)
-
     relevance = forest + identity
-
-    # ① 대상 태그를 못 붙이면 발송본에 싣지 않는다
     tags = infer_target_tags(text)
-    if not tags:
-        return Classification(VERDICT_HOLD, "대상 태그 없음", relevance, (), None)
-
     region = infer_region(title)
 
     # 기회·제도 신호는 **제목에서만** 인정한다 (룰 v2.1의 "제목/본문"을 제목으로 좁힘).
     # 근거(W37 실측): forest_press 보도자료 요약에는 "모집"·"정책"·"시행" 같은 상용구가
-    # 늘 들어 있어서 본문까지 보면 관리소 활동 기사가 신청/제도 섹션으로 올라온다
-    # ("산림청, 국익 중심 실용외교…" 가 신청하세요에 실렸다). 제목에 없는 기회는
-    # 배제가 아니라 **보류**로 내려가므로 편집자가 `핀 n`으로 되살릴 수 있다(판정 ⑦).
+    # 늘 들어 있어서 본문까지 보면 관리소 활동 기사가 신청/제도 섹션으로 올라온다.
     opportunity = _hits(title, OPPORTUNITY_KEYWORDS)
+    institution = _institution_hits(title, forest)
+
+    # ③ 노이즈 사전 — 개정 v2.5 (#6): **제목에만** 적용한다. 요약의 "통합정보시스템에서
+    # 접수" 같은 접수 안내 상용구로 유효 공고를 영구 배제하던 결함을 막는다.
+    # 제목에 기회·제도 신호가 같이 있으면 배제가 아니라 **보류**(편집자 복구 가능).
+    noise = _hits(title, NOISE_KEYWORDS)
+    if noise:
+        if relevance and (opportunity or institution):
+            return Classification(
+                VERDICT_HOLD,
+                f"노이즈 의심: {noise[0]}",
+                relevance + noise,
+                tags,
+                region,
+            )
+        return Classification(
+            VERDICT_EXCLUDE, f"노이즈: {noise[0]}", noise, (), None
+        )
+
+    if not relevance:
+        return Classification(VERDICT_EXCLUDE, "관련성 없음", (), (), None)
+
+    # ① 대상 태그를 못 붙이면 발송본에 싣지 않는다
+    if not tags:
+        return Classification(VERDICT_HOLD, "대상 태그 없음", relevance, (), None)
+
+    # 개정 v2.5 (#10): 입법예고·행정예고·고시는 `공고`보다 우선한다.
+    priority = _hits(title, INSTITUTION_PRIORITY_KEYWORDS)
+    if priority:
+        return Classification(
+            VERDICT_NOTICE,
+            f"제도: {priority[0]}",
+            relevance + institution,
+            tags,
+            region,
+        )
+
     if opportunity:
         # 개정 v2.2 F1: 참가자 모집(B2C)은 보류. 사업자 신호가 하나라도 있으면 통과.
         b2c = _hits(title, B2C_SIGNAL_KEYWORDS)
@@ -556,7 +624,6 @@ def classify_item(title: str, summary: str, source: str) -> Classification:
             region,
         )
 
-    institution = _hits(title, INSTITUTION_KEYWORDS)
     if institution:
         return Classification(
             VERDICT_NOTICE,
@@ -570,30 +637,38 @@ def classify_item(title: str, summary: str, source: str) -> Classification:
 
 
 # ─── 마감 처리 (판정 ④) ──────────────────────────────────────────────────
-_DEADLINE_FORMATS = ("%Y-%m-%d", "%Y.%m.%d", "%Y/%m/%d")
+# 개정 v2.5 (#8): `2026. 9. 12.`, `2026-9-12 18:00`, `2026년 9월 7일`, `26.09.30.(수)`,
+# `2026/09/30` 를 모두 받는다. 고정폭 슬라이싱(text[:10])이 이들을 조용히 None으로
+# 떨어뜨려 마감 지난 공고가 살아남고, 게시일이 [상시]로 오판됐다.
+_DATE_RE = re.compile(
+    r"^\s*(\d{2,4})\s*[.\-/년]\s*(\d{1,2})\s*[.\-/월]\s*(\d{1,2})"
+)
 
 
 def parse_deadline(value: Optional[str]) -> Optional[date]:
-    """구조화된 마감일 문자열을 date로. 파싱 불가는 None."""
+    """날짜 문자열을 date로. 파싱 불가는 None (문자열 앞쪽의 날짜만 본다)."""
     if not value or not isinstance(value, str):
         return None
-    text = value.strip()
-    if not text:
+    matched = _DATE_RE.match(value)
+    if not matched:
+        return None
+    year, month, day = (int(g) for g in matched.groups())
+    if year < 100:
+        year += 2000
+    try:
+        return date(year, month, day)
+    except ValueError:
         return None
 
-    for fmt in _DEADLINE_FORMATS:
-        try:
-            return datetime.strptime(text[:10], fmt).date()
-        except ValueError:
-            continue
 
-    matched = re.match(r"^(\d{4})\s*년\s*(\d{1,2})\s*월\s*(\d{1,2})\s*일", text)
-    if matched:
-        try:
-            return date(*(int(g) for g in matched.groups()))
-        except ValueError:
-            return None
-    return None
+def date_parse_failed(value: Optional[str]) -> bool:
+    """값이 있는데 날짜로 못 읽었는가 (파싱 실패 카운트용)."""
+    if value is None:
+        return False
+    text = str(value).strip()
+    if not text:
+        return False
+    return parse_deadline(text) is None
 
 
 def effective_deadline(
@@ -731,10 +806,47 @@ def load_form_responses(
 
 
 def _parse_created_date(created_at: Optional[str]) -> Optional[date]:
-    """created_at 문자열 → date."""
+    """날짜 문자열 → date. 고정폭 슬라이싱 없이 parse_deadline에 맡긴다 (#8)."""
     if not created_at:
         return None
-    return parse_deadline(str(created_at)[:10])
+    return parse_deadline(str(created_at))
+
+
+def _deadline_fields(
+    deadline: Optional[date],
+    posted_known: Optional[date],
+    quoted_tail: Optional[str],
+    today: date,
+) -> Dict:
+    """마감 표기 3단계 (개정 v2.4 (a)). "마감 원문 확인" 단독 표기는 폐지."""
+    if deadline is not None:
+        short = format_month_day(deadline)
+        return {
+            "days_left": (deadline - today).days,
+            "label": f"D-{(deadline - today).days}",
+            "deadline_short": short,
+            "deadline_display": f"마감 {short}",
+            "sort_bucket": 0,
+        }
+
+    # 판정 ④: "새 소식"은 게시 7일 이내임을 **알 때만** 붙인다. 모르면 "상시"(보수).
+    fresh = (
+        posted_known is not None
+        and (today - posted_known).days <= NEW_WINDOW_DAYS
+    )
+    if posted_known is not None:
+        display = "접수 {}부터, 마감 {}".format(
+            format_month_day(posted_known), quoted_tail or "원문 확인"
+        )
+    else:
+        display = f"마감 {quoted_tail or '미정'}"
+    return {
+        "days_left": None,
+        "label": LABEL_NEW if fresh else LABEL_STANDING,
+        "deadline_short": "",
+        "deadline_display": display,
+        "sort_bucket": 1 if fresh else 2,
+    }
 
 
 def _build_item(row: Sequence, classification: Classification, today: date) -> Dict:
@@ -758,41 +870,15 @@ def _build_item(row: Sequence, classification: Classification, today: date) -> D
     posted_known = _parse_created_date(period_start)
     posted = posted_known or _parse_created_date(created_at)
     quotes = extract_quotes(summary, raw_data)
-
-    # 개정 v2.4 (a): 마감 표기 3단계. "마감 원문 확인" 단독 표기는 폐지.
     quoted = quotes["quote_deadline"]
-    has_quote = quoted != QUOTE_FALLBACK
-    if deadline is not None:
-        days_left = (deadline - today).days
-        label = f"D-{days_left}"
-        deadline_short = format_month_day(deadline)
-        deadline_display = f"마감 {deadline_short}"
-        sort_bucket = 0
-    else:
-        days_left = None
-        deadline_short = ""
-        # 판정 ④: "새 소식"은 게시 7일 이내임을 **알 때만** 붙인다. 모르면 "상시"(보수).
-        fresh = (
-            posted_known is not None
-            and (today - posted_known).days <= NEW_WINDOW_DAYS
-        )
-        label = LABEL_NEW if fresh else LABEL_STANDING
-        # 인용 span이 있으면 "원문 확인"/"미정" 자리를 **원문 문구 그대로** 채운다
-        # (판정 ⑦ — 창작이 아니라 인용이므로 정보를 버리지 않는다).
-        tail = quoted if has_quote else None
-        if posted_known is not None:
-            deadline_display = "접수 {}부터, 마감 {}".format(
-                format_month_day(posted_known), tail or "원문 확인"
-            )
-        else:
-            deadline_display = f"마감 {tail or '미정'}"
-        sort_bucket = 1 if fresh else 2
+    quoted_tail = quoted if quoted != QUOTE_FALLBACK else None
+    clean_title = normalize_title(title)
 
     item = {
         "id": item_id,
         "source": source,
         "org": source_display_name(source),
-        "title": normalize_title(title),
+        "title": clean_title,
         "summary": normalize_title(summary or ""),
         "url": url,
         "verdict": classification.verdict,
@@ -803,30 +889,59 @@ def _build_item(row: Sequence, classification: Classification, today: date) -> D
         "target": target_display(classification.tags, classification.region),
         "period_end": period_end or "",
         "deadline": deadline.isoformat() if deadline else "",
-        "deadline_short": deadline_short,
-        "deadline_display": deadline_display,
-        "days_left": days_left,
-        "label": label,
         "posted": posted.isoformat() if posted else "",
-        "sort_bucket": sort_bucket,
+        "posted_known": posted_known.isoformat() if posted_known else "",
+        "quoted_tail": quoted_tail or "",
         # 개정 v2.2 F2: 마감 없음 버킷에서 사회적경제 정체성 공고를 앞세우는 키
         "identity_priority": 0 if _hits(
-            normalize_title(title), SSE_IDENTITY_KEYWORDS
+            clean_title, SSE_IDENTITY_KEYWORDS
         ) else 1,
+        # 개정 v2.5 (#5): 병합 대표는 사업자 신호가 있는 쪽이 먼저다
+        "has_b2b": bool(_hits(clean_title, B2B_SIGNAL_KEYWORDS)),
+        "merged_ids": [],
         "similar_count": 0,
     }
+    item.update(_deadline_fields(deadline, posted_known, quoted_tail, today))
     item.update(quotes)
     return item
 
 
-def _dedup_same_source(items: List[Dict]) -> List[Dict]:
+def _refresh_deadline(item: Dict, deadline: Optional[date], today: date) -> None:
+    """병합 그룹의 유효 마감으로 마감 필드를 다시 계산 (#3)."""
+    item["deadline"] = deadline.isoformat() if deadline else ""
+    item.update(
+        _deadline_fields(
+            deadline,
+            parse_deadline(item.get("posted_known") or ""),
+            item.get("quoted_tail") or None,
+            today,
+        )
+    )
+
+
+def _mergeable(left: Dict, right: Dict) -> bool:
+    """병합해도 되는 짝인가 (개정 v2.5 #5·#11).
+
+    판정(신청/보류/알아두세요)이 다르거나 대상 태그·지역이 다르면 다른 공고다.
+    W37 실측 결함: 같은 소스·같은 마감의 `…참가자 모집`(보류)과 `…참가기업 모집`(신청)이
+    Jaccard 0.67로 병합돼, 회원사가 신청할 수 있는 공고가 사라졌다.
+    """
+    if left["verdict"] != right["verdict"]:
+        return False
+    if tuple(left["tags"]) != tuple(right["tags"]):
+        return False
+    if (left["region"] or "") != (right["region"] or ""):
+        return False
+    return True
+
+
+def _dedup_same_source(items: List[Dict], today: date) -> List[Dict]:
     """같은 소스·같은 주 안에서 제목 유사도 ≥ DEDUP_JACCARD면 대표 1건으로 병합 (판정 ⑥).
 
-    개정 v2.2 F4: 제목이 같아도 **인정된 마감이 다르면 다른 회차**이므로 병합하지 않는다
-    (W37 실측: `산림재난방지법 시행령 일부개정령안 입법예고`가 의견 9/16·10/19 두 건).
-    병합할 때 대표는 **마감이 늦은(아직 열린) 쪽**이다. 마감 비교는 우리가 인정한
-    effective deadline(`item["deadline"]`)으로 한다 — 게시일을 마감 칸에 넣은
-    크롤러 산출물이 "다른 회차"로 위장하는 것을 막는다.
+    개정 v2.2 F4: 제목이 같아도 **인정된 마감이 다르면 다른 회차**이므로 병합하지 않는다.
+    개정 v2.5 #5: 판정·대상 태그·지역이 다르면 병합하지 않는다.
+    개정 v2.5 #3: 병합 그룹의 유효 마감은 그룹 내 non-null 마감의 **최대값**이다.
+    대표는 ①사업자 신호가 있는 쪽 ②마감이 늦은 쪽 순으로 고른다.
     """
     kept: List[Dict] = []
     kept_grams: List[frozenset] = []
@@ -838,15 +953,34 @@ def _dedup_same_source(items: List[Dict]) -> List[Dict]:
                 continue
             if jaccard(grams, other_grams) < DEDUP_JACCARD:
                 continue
+            if not _mergeable(other, item):
+                continue
             if item["deadline"] and other["deadline"] and (
                 item["deadline"] != other["deadline"]
             ):
                 # 다른 회차 — 병합하지 않는다
                 continue
+
             merged = True
-            if item["deadline"] > other["deadline"]:
+            group_deadline = max(item["deadline"], other["deadline"])
+            # 대표: 사업자 신호 → 마감 늦은 쪽
+            challenger_wins = (item["has_b2b"], item["deadline"]) > (
+                other["has_b2b"], other["deadline"]
+            )
+            if challenger_wins:
+                item["merged_ids"] = (
+                    list(other["merged_ids"]) + [other["id"]]
+                )
                 kept[index] = item
                 kept_grams[index] = grams
+                winner = item
+            else:
+                other["merged_ids"].append(item["id"])
+                winner = other
+            if group_deadline != winner["deadline"]:
+                _refresh_deadline(
+                    winner, parse_deadline(group_deadline), today
+                )
             break
         if merged:
             continue
@@ -898,6 +1032,23 @@ def _sort_notice(items: List[Dict]) -> List[Dict]:
     return sorted(items, key=lambda item: -_posted_ordinal(item))
 
 
+def week_bounds(week_str: str) -> Tuple[str, str]:
+    """주간 창을 KST 날짜 문자열 범위로 (개정 v2.5 #9).
+
+    created_at은 **KST 기준 naive ISO 문자열**로 저장된다(실측: `2026-09-12T09:46:29.074620`).
+    `DATE(created_at)`는 오프셋이 붙은 값(`2026-09-07T00:30:00+09:00`)을 UTC로 해석해
+    하루를 밀어버리므로, 문자열 범위 비교로 바꾼다. 인덱스(idx_ann_created)도 함께 산다.
+
+    Returns:
+        (창 시작 문자열, 창 끝 배타 문자열) — `created_at >= a AND created_at < b`
+    """
+    week_start, week_end = get_week_date_range(week_str)
+    end_exclusive = (
+        datetime.strptime(week_end, "%Y-%m-%d") + timedelta(days=1)
+    ).strftime("%Y-%m-%d")
+    return week_start, end_exclusive
+
+
 def compose_digest_data(
     db_path: str,
     week_str: Optional[str] = None,
@@ -905,12 +1056,14 @@ def compose_digest_data(
     warnings_out: Optional[List[str]] = None,
     exclude_urls: Optional[Set[str]] = None,
     today: Optional[date] = None,
+    stats_out: Optional[Dict] = None,
 ) -> Dict:
     """다이제스트 구조 데이터 생성 (렌더 전 단계).
 
     Returns:
         {"week", "week_start", "week_end", "period_label", "sections",
-         "council_notes", "member_news", "holds", "excluded", "opinions"}
+         "council_notes", "member_news", "holds", "excluded", "opinions",
+         "merged_ids", "date_parse_failures", "candidate_ids"}
     """
     if week_str is None:
         iso = datetime.now().isocalendar()
@@ -919,6 +1072,7 @@ def compose_digest_data(
         today = date.today()
 
     week_start, week_end = get_week_date_range(week_str)
+    range_start, range_end = week_bounds(week_str)
 
     conn = sqlite3.connect(db_path)
     cursor = conn.cursor()
@@ -934,23 +1088,30 @@ def compose_digest_data(
         SELECT id, source, title, summary, url, period_start, period_end,
                created_at, raw_data
         FROM announcements
-        WHERE DATE(created_at) BETWEEN ? AND ?{exclude_sql}
+        WHERE created_at >= ? AND created_at < ?{exclude_sql}
         ORDER BY (NULLIF(period_end, '') IS NULL),
                  NULLIF(period_end, ''),
                  created_at DESC
         """,
-        (week_start, week_end, *exclude_list),
+        (range_start, range_end, *exclude_list),
     )
     rows = cursor.fetchall()
     conn.close()
 
     survivors: List[Dict] = []
     excluded: List[Dict] = []
+    date_parse_failures = 0
+    candidate_ids: List[int] = []
 
     for row in rows:
         source, title, summary, url = row[1], row[2], row[3], row[4]
         if exclude_urls and url in exclude_urls:
             continue
+        candidate_ids.append(row[0])
+        # 개정 v2.5 (#8): 값이 있는데 못 읽은 날짜를 센다(조용한 실패 가시화)
+        for value in (row[5], row[6]):
+            if date_parse_failed(value):
+                date_parse_failures += 1
 
         classification = classify_item(title, summary, source)
         item = _build_item(row, classification, today)
@@ -959,10 +1120,16 @@ def compose_digest_data(
             excluded.append(item)
             continue
 
-        # 마감 경과는 신청 섹션에서만 배제 사유다 (판정 ④).
+        survivors.append(item)
+
+    # 개정 v2.5 (#3): **중복 병합을 먼저** 하고, 병합 그룹의 유효 마감으로 경과를 판정한다.
+    # 병합 전에 경과 행을 버리면 마감 없는 복제본이 [새 소식]으로 되살아난다.
+    survivors = _dedup_same_source(survivors, today)
+
+    kept: List[Dict] = []
+    for item in survivors:
         if (
-            classification.verdict == VERDICT_APPLY
-            and item["deadline"]
+            item["verdict"] == VERDICT_APPLY
             and item["days_left"] is not None
             and item["days_left"] < 0
         ):
@@ -970,19 +1137,17 @@ def compose_digest_data(
             item["reason"] = "마감 경과"
             excluded.append(item)
             continue
-
-        survivors.append(item)
-
-    survivors = _dedup_same_source(survivors)
+        kept.append(item)
 
     sections: Dict[str, List[Dict]] = {VERDICT_APPLY: [], VERDICT_NOTICE: []}
     holds: List[Dict] = []
     apply_candidates: List[Dict] = []
-    for item in survivors:
+    notice_candidates: List[Dict] = []
+    for item in kept:
         if item["verdict"] == VERDICT_APPLY:
             apply_candidates.append(item)
         elif item["verdict"] == VERDICT_NOTICE:
-            sections[VERDICT_NOTICE].append(item)
+            notice_candidates.append(item)
         else:
             holds.append(item)
 
@@ -1003,6 +1168,13 @@ def compose_digest_data(
         per_source[item["source"]] += 1
         selected.append(item)
 
+    sections[VERDICT_APPLY] = selected
+
+    # 개정 v2.5 (#4): 알아두세요 상한 초과분도 무기록 삭제하지 않는다.
+    sorted_notice = _sort_notice(notice_candidates)
+    sections[VERDICT_NOTICE] = sorted_notice[: SECTION_LIMITS[VERDICT_NOTICE]]
+    cap_overflow.extend(sorted_notice[SECTION_LIMITS[VERDICT_NOTICE]:])
+
     for item, reason in (
         [(item, HOLD_REASON_DIVERSITY) for item in diversity_skipped]
         + [(item, HOLD_REASON_SECTION_CAP) for item in cap_overflow]
@@ -1010,11 +1182,6 @@ def compose_digest_data(
         item["verdict"] = VERDICT_HOLD
         item["reason"] = reason
         holds.append(item)
-
-    sections[VERDICT_APPLY] = selected
-    sections[VERDICT_NOTICE] = _sort_notice(sections[VERDICT_NOTICE])[
-        : SECTION_LIMITS[VERDICT_NOTICE]
-    ]
 
     published = sections[VERDICT_APPLY] + sections[VERDICT_NOTICE]
     _mark_cross_source_similar(published)
@@ -1034,6 +1201,16 @@ def compose_digest_data(
         else f"{week_start} ~ {week_end}"
     )
 
+    merged_ids = [
+        merged_id
+        for item in survivors
+        for merged_id in item["merged_ids"]
+    ]
+
+    if stats_out is not None:
+        stats_out["date_parse_failures"] = date_parse_failures
+        stats_out["candidates"] = len(candidate_ids)
+
     return {
         "week": week_str,
         "week_start": week_start,
@@ -1045,6 +1222,9 @@ def compose_digest_data(
         "holds": holds,
         "excluded": excluded,
         "opinions": opinions,
+        "merged_ids": merged_ids,
+        "candidate_ids": candidate_ids,
+        "date_parse_failures": date_parse_failures,
     }
 
 
@@ -1063,11 +1243,28 @@ def item_line(item: Dict) -> str:
     if item["similar_count"]:
         parts.append(f"유사 항목 {item['similar_count']}")
 
-    head = item["title"]
+    # 개정 v2.5 (#2): 제목은 링크·HTML을 렌더하지 않는다 (링크는 "원문" 필드로만).
+    head = sanitize_title(item["title"])
     if item["verdict"] == VERDICT_APPLY:
         head = f"[{item['label']}] {head}"
 
     return f"{head} — " + " · ".join(parts)
+
+
+def hold_comment(item: Dict) -> str:
+    """보류 한 줄 (개정 v2.5 #13).
+
+    제목의 `|`는 전각 `｜`로 바꿔 사유 칸이 밀리지 않게 하고, `--`는 주석을 닫아버리므로
+    `—`로 바꾼다. 다른 도구가 원항목을 정확히 복원하도록 `id=<announcement id>`를 붙인다.
+    """
+    title = (
+        sanitize_title(item["title"])
+        .replace("|", "｜")
+        .replace("--", "—")
+    )
+    return "<!-- 보류: {}. {} | {} | id={} -->".format(
+        item["number"], title, item["reason"], item["id"]
+    )
 
 
 def _member_news_lines(member_news: Dict[str, List[str]]) -> List[str]:
@@ -1125,18 +1322,73 @@ def render_markdown(data: Dict) -> str:
 
     if data.get("holds"):
         for item in data["holds"]:
-            title = item["title"].replace("--", "—").replace(">", "＞")
-            lines.append(f"<!-- 보류: {item['number']}. {title} | {item['reason']} -->")
+            lines.append(hold_comment(item))
         lines.append("")
 
     return "\n".join(lines)
+
+
+def chunk_plaintext(text: str, limit: int = KAKAO_CHUNK_LIMIT) -> List[str]:
+    """평문을 한도 이하 조각으로 분할. 줄 경계를 지키고, 한 줄이 한도를 넘으면 자른다."""
+    chunks: List[str] = []
+    current: List[str] = []
+    size = 0
+    for line in text.split("\n"):
+        pieces = [line] if len(line) <= limit else [
+            line[i:i + limit] for i in range(0, len(line), limit)
+        ]
+        for piece in pieces:
+            extra = len(piece) + (1 if current else 0)
+            if size + extra > limit and current:
+                chunks.append("\n".join(current))
+                current = [piece]
+                size = len(piece)
+            else:
+                current.append(piece)
+                size += extra
+    if current:
+        chunks.append("\n".join(current))
+    return chunks or [""]
+
+
+def render_kakao_chunks(
+    data: Dict, headline: Optional[str] = None
+) -> List[str]:
+    """카톡 평문을 메시지 한도(4096자) 조각 리스트로 (개정 v2.5 #12)."""
+    return chunk_plaintext(render_kakao(data, headline))
+
+
+def kakao_file_text(data: Dict, headline: Optional[str] = None) -> str:
+    """`.kakao.txt` 파일 내용 — 조각 사이를 `---8<---`로 끊는다."""
+    separator = f"\n{KAKAO_CHUNK_SEPARATOR}\n"
+    return separator.join(render_kakao_chunks(data, headline)) + "\n"
+
+
+def refresh_kakao_headline(text: str, headline: str) -> str:
+    """`.kakao.txt`의 "이번 주 한 줄" 자리를 확정 문구로 바꾸고 다시 분할 (#12)."""
+    body = "\n".join(
+        line
+        for line in text.splitlines()
+        if line.strip() != KAKAO_CHUNK_SEPARATOR
+    )
+    replaced = []
+    done = False
+    for line in body.splitlines():
+        if not done and line.startswith(KAKAO_HEADLINE_PREFIX):
+            replaced.append(f"{KAKAO_HEADLINE_PREFIX}{headline.strip()}")
+            done = True
+            continue
+        replaced.append(line)
+    separator = f"\n{KAKAO_CHUNK_SEPARATOR}\n"
+    return separator.join(chunk_plaintext("\n".join(replaced))) + "\n"
 
 
 def render_kakao(data: Dict, headline: Optional[str] = None) -> str:
     """카톡 평문 렌더 (같은 틀, 마크다운 장식·보류 주석 없음)."""
     lines = [
         f"📋 협의회 주간 정책브리핑 {data['week']} ({data['period_label']})",
-        f"이번 주 한 줄: {headline.strip() if headline else '(확정 필요)'}",
+        KAKAO_HEADLINE_PREFIX
+        + (headline.strip() if headline else KAKAO_HEADLINE_PLACEHOLDER),
         "",
     ]
 
@@ -1174,6 +1426,7 @@ def compose_digest(
     warnings_out: Optional[List[str]] = None,
     exclude_urls: Optional[Set[str]] = None,
     today: Optional[date] = None,
+    stats_out: Optional[Dict] = None,
 ) -> str:
     """주간 정책브리핑 다이제스트 마크다운 생성 (계약 v2.1).
 
@@ -1198,6 +1451,7 @@ def compose_digest(
         warnings_out=warnings_out,
         exclude_urls=exclude_urls,
         today=today,
+        stats_out=stats_out,
     )
 
     markdown = render_markdown(data)
@@ -1208,7 +1462,7 @@ def compose_digest(
         output_path.write_text(markdown, encoding="utf-8")
         output_path.with_name(
             output_path.name.replace(".md", "") + ".kakao.txt"
-        ).write_text(render_kakao(data), encoding="utf-8")
+        ).write_text(kakao_file_text(data), encoding="utf-8")
 
     if data["opinions"] and output_path:
         opinions_path = output_path.with_name(

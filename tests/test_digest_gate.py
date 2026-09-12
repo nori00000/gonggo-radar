@@ -38,7 +38,7 @@ SAMPLE_MD = """<!-- lane: Claude opus executor -->
 
 · (면담·건의·수렴 현황 — 이번 주 기록 없음)
 
-<!-- 보류: 1. 국립새만금수목원, 지역민과 함께 만든다 | 섹션 판정 불명 -->
+<!-- 보류: 1. 국립새만금수목원, 지역민과 함께 만든다 | 섹션 판정 불명 | id=12 -->
 """
 
 PASS_CHECK = {
@@ -81,6 +81,7 @@ def test_parse_digest_numbers_items_in_document_order():
             "number": 1,
             "title": "국립새만금수목원, 지역민과 함께 만든다",
             "reason": "섹션 판정 불명",
+            "id": 12,
         }
     ]
 

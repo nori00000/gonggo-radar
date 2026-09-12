@@ -13,7 +13,13 @@
 import re
 from typing import Dict, List, Optional
 
-from alert.digest.composer import HEADING_TO_SECTION, ITEM_SECTIONS, MARKER
+from alert.digest.composer import (
+    HEADING_TO_SECTION,
+    ITEM_SECTIONS,
+    KAKAO_CHUNK_LIMIT,
+    MARKER,
+    chunk_plaintext,
+)
 
 __all__ = [
     "MARKER",
@@ -26,12 +32,16 @@ __all__ = [
     "chunk_text",
 ]
 
-TELEGRAM_LIMIT = 4096
+TELEGRAM_LIMIT = KAKAO_CHUNK_LIMIT
 
 _TITLE_RE = re.compile(r"^#\s+(.+)$")
 _HEADLINE_RE = re.compile(r"^이번 주 한 줄:\s*(.*)$")
 _PERIOD_IN_TITLE_RE = re.compile(r"\(([^()]*~[^()]*)\)\s*$")
-_HOLD_RE = re.compile(r"^<!--\s*보류:\s*(\d+)\.\s*(.*?)\s*\|\s*(.*?)\s*-->$")
+_HOLD_RE = re.compile(
+    r"^<!--\s*보류:\s*(\d+)\.\s*(.*?)\s*\|\s*(.*?)\s*"
+    r"(?:\|\s*id=(\d+)\s*)?-->$"
+)
+_LANE_RE = re.compile(r"^<!--\s*lane:")
 
 # 항목 링크 줄: 줄 전체가 마크다운 링크 하나
 _ITEM_LINK_RE = re.compile(r"^\[([^\]]+)\]\((\S+)\)$")
@@ -84,6 +94,7 @@ def parse_digest(markdown_text: str) -> Dict:
                 "number": int(matched.group(1)),
                 "title": matched.group(2),
                 "reason": matched.group(3),
+                "id": int(matched.group(4)) if matched.group(4) else None,
             })
             continue
 
@@ -180,7 +191,12 @@ def render_preview(
     markdown_text: str,
     check: Optional[Dict] = None,
 ) -> str:
-    """미리보기 본문 전체 (분할 전). 발송본 그대로 + 보류 한 줄."""
+    """미리보기 본문 전체 (분할 전).
+
+    개정 v2.5 (#7): **발송본을 그대로** 렌더한다 — 협의회에서·회원사 소식·여러 줄 해설까지
+    포함한다. 편집자가 미리보기에서 보지 못한 내용이 이메일로 나가면 승인 게이트가 거짓이 된다.
+    HTML 주석(레인 표기·보류 목록)만 걷어내고, 항목 줄에는 `제외 n` 좌표를 붙인다.
+    """
     parsed = parse_digest(markdown_text)
     check = check or {}
     check_pass = bool(check.get("pass"))
@@ -199,18 +215,29 @@ def render_preview(
         lines.append(f"검증 실패 사유: {check['reason']}")
     lines.append("")
 
-    if parsed["commentary"]:
-        lines.append(f"이번 주 한 줄: {parsed['commentary']}")
-        lines.append("")
+    pending = list(parsed["items"])
+    for raw in markdown_text.splitlines():
+        line = raw.strip()
+        if _HOLD_RE.match(line) or _LANE_RE.match(line):
+            continue
+        if line.startswith("# "):
+            # 제목은 미리보기 머리에 이미 있다
+            continue
+        if line.startswith("## "):
+            lines.append(f"■ {line[3:].strip()}")
+            continue
+        if pending and line == pending[0]["raw"]:
+            lines.append(f"{pending[0]['number']}. {line}")
+            continue
+        if pending and line == f"[원문]({pending[0]['url']})":
+            lines.append(f"   {pending[0]['url']}")
+            pending.pop(0)
+            continue
+        lines.append(line)
 
-    for section in parsed["sections"]:
-        lines.append(f"■ {section['heading']}")
-        if not section["items"]:
-            lines.append("  (항목 없음)")
-        for item in section["items"]:
-            lines.append(f"{item['number']}. {item['raw']}")
-            lines.append(f"   {item['url']}")
-        lines.append("")
+    while lines and not lines[-1]:
+        lines.pop()
+    lines.append("")
 
     if parsed["holds"]:
         lines.append(f"보류 {len(parsed['holds'])}건 (핀 n으로 승격)")
@@ -223,23 +250,5 @@ def render_preview(
 
 
 def chunk_text(text: str, limit: int = TELEGRAM_LIMIT) -> List[str]:
-    """텔레그램 한도(4096자)로 분할. 줄 경계를 지키고, 한 줄이 한도를 넘으면 자른다."""
-    chunks: List[str] = []
-    current: List[str] = []
-    size = 0
-    for line in text.split("\n"):
-        pieces = [line] if len(line) <= limit else [
-            line[i:i + limit] for i in range(0, len(line), limit)
-        ]
-        for piece in pieces:
-            extra = len(piece) + (1 if current else 0)
-            if size + extra > limit and current:
-                chunks.append("\n".join(current))
-                current = [piece]
-                size = len(piece)
-            else:
-                current.append(piece)
-                size += extra
-    if current:
-        chunks.append("\n".join(current))
-    return chunks or [""]
+    """텔레그램 한도(4096자)로 분할. 분할 규칙 정본은 composer.chunk_plaintext다 (#12)."""
+    return chunk_plaintext(text, limit)

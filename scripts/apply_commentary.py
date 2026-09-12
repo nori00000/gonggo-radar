@@ -13,6 +13,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from alert.digest import state as state_mod
+from alert.digest.composer import refresh_kakao_headline
 from alert.digest.preview import MARKER
 
 NOOP_MESSAGE = "⚠️  마커 없음 — 변경하지 않았습니다 (이미 해설이 채워졌습니다)"
@@ -25,14 +26,14 @@ def apply_commentary(markdown_text: str, commentary: str):
     return markdown_text.replace(MARKER, commentary.strip(), 1), True
 
 
-def main():
+def main(argv=None):
     parser = argparse.ArgumentParser(description="협의회 의견 확정 마커 치환")
     parser.add_argument("week", help="주차 (예: 2026-W37)")
     parser.add_argument("text", help="협의회 의견 본문")
     parser.add_argument(
         "--out-dir", default="digests", help="다이제스트 디렉토리 (기본: digests)"
     )
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
 
     commentary = args.text.strip()
     if not commentary:
@@ -53,6 +54,18 @@ def main():
 
     markdown_path.write_text(updated, encoding="utf-8")
     print(f"✓ 협의회 의견 적용: {markdown_path}")
+
+    # 개정 v2.5 (#12): 카톡 평문도 같이 확정한다 — MD만 고치면 카톡본에
+    # "(확정 필요)"가 남아 서로 다른 두 발송본이 생긴다.
+    kakao_path = markdown_path.with_name(f"{markdown_path.stem}.kakao.txt")
+    if kakao_path.exists():
+        kakao_path.write_text(
+            refresh_kakao_headline(
+                kakao_path.read_text(encoding="utf-8"), commentary
+            ),
+            encoding="utf-8",
+        )
+        print(f"✓ 카톡 평문 동기화: {kakao_path}")
 
     state_path = state_mod.state_path(args.week, args.out_dir)
     try:
