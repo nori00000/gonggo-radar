@@ -997,3 +997,252 @@ class TestIntegration:
         # "공고 안내"는 1번만 나타나야 함
         count = md.count("### 공고 안내")
         assert count == 1, f"중복 제거 실패: {count}번 나타남"
+
+
+class TestDeadUrlDrop:
+    """계약 v1.2: url_alive=false 항목 자동 제외 + dropped 기록."""
+
+    @staticmethod
+    def _seed_three(db_path):
+        """2026-W13 범위의 지원사업 항목 3건."""
+        _create_announcements_table(db_path)
+        for i in range(3):
+            _insert_one(
+                db_path,
+                source_id=f"test_{i:03d}",
+                title=f"테스트 공고 {i}",
+                url=f"https://example.com/item-{i}",
+                relevance_score=0.9 - i * 0.1,
+            )
+
+    @staticmethod
+    def _run(tmp_path, monkeypatch, db_path, dead_urls):
+        """weekly_digest.main()을 돌리고 (rc, markdown, check.json)을 돌려준다."""
+        import scripts.weekly_digest as weekly_digest
+
+        out_dir = tmp_path / "out"
+
+        monkeypatch.setattr(
+            "alert.digest.checker.check_url_alive",
+            lambda url, timeout=8: url not in dead_urls,
+        )
+        monkeypatch.setattr(
+            sys,
+            "argv",
+            [
+                "weekly_digest.py",
+                "--db", str(db_path),
+                "--week", "2026-W13",
+                "--out-dir", str(out_dir),
+                "--forms", str(tmp_path / "missing.csv"),
+            ],
+        )
+
+        rc = weekly_digest.main()
+        markdown = (out_dir / "2026-W13.md").read_text(encoding="utf-8")
+        with open(out_dir / "2026-W13.check.json", encoding="utf-8") as f:
+            check = json.load(f)
+        return rc, markdown, check
+
+    def test_one_dead_url_dropped(self, tmp_path, monkeypatch):
+        """죽은 URL 1건 포함 3건 → 산출물 2건, dropped 1, pass true."""
+        db_path = tmp_path / "wd.db"
+        self._seed_three(db_path)
+
+        dead = "https://example.com/item-1"
+        rc, markdown, check = self._run(tmp_path, monkeypatch, db_path, {dead})
+
+        assert rc == 0
+        assert check["pass"] is True
+        assert check["network_checked"] is True
+        # items = 최종 산출물에 실린 항목, dropped = 제외된 항목
+        assert len(check["items"]) == 2
+        assert all(item["url_alive"] for item in check["items"])
+        assert len(check["dropped"]) == 1
+        assert check["dropped"][0]["url"] == dead
+        assert check["dropped"][0]["title"] == "테스트 공고 1"
+
+        # 산출물에는 살아있는 2건만 남는다
+        assert dead not in markdown
+        assert "https://example.com/item-0" in markdown
+        assert "https://example.com/item-2" in markdown
+        assert markdown.count("### 테스트 공고") == 2
+
+    def test_all_dead_urls_fail(self, tmp_path, monkeypatch):
+        """전부 죽으면 pass false."""
+        db_path = tmp_path / "wd.db"
+        self._seed_three(db_path)
+
+        dead = {f"https://example.com/item-{i}" for i in range(3)}
+        rc, markdown, check = self._run(tmp_path, monkeypatch, db_path, dead)
+
+        assert rc == 1
+        assert check["pass"] is False
+        assert check["items"] == []
+        assert len(check["dropped"]) == 3
+        assert check["reason"] == "항목 없음"
+        for url in dead:
+            assert url not in markdown
+
+    def test_recompose_rounds_exhausted_fails_closed(self, tmp_path, monkeypatch):
+        """라운드를 소진해도 죽은 URL이 남으면 fail-closed."""
+        import scripts.weekly_digest as weekly_digest
+
+        db_path = tmp_path / "wd.db"
+        self._seed_three(db_path)
+
+        # 1라운드만 허용 → 제외 후 재검증할 기회가 없으므로 fail-closed여야 한다
+        monkeypatch.setattr(weekly_digest, "MAX_RECOMPOSE_ROUNDS", 1)
+
+        all_dead = {f"https://example.com/item-{i}" for i in range(3)}
+        rc, _markdown, check = self._run(tmp_path, monkeypatch, db_path, all_dead)
+
+        assert rc == 1
+        assert check["pass"] is False
+        assert "죽은 URL 반복 검출" in check["reason"]
+        assert len(check["dropped"]) == 3
+
+    def test_missing_deadline_no_longer_gates(self, tmp_path, monkeypatch):
+        """계약 v1.2: deadline_parsed는 정보 필드이므로 pass를 막지 않는다."""
+        db_path = tmp_path / "wd.db"
+        _create_announcements_table(db_path)
+        _insert_one(db_path, period_end="")
+
+        rc, _markdown, check = self._run(tmp_path, monkeypatch, db_path, set())
+
+        assert rc == 0
+        assert check["items"][0]["deadline_parsed"] is False
+        assert check["items"][0]["url_alive"] is True
+        assert check["dropped"] == []
+        assert check["pass"] is True
+
+
+class TestComposeExcludeUrls:
+    """compose_digest(exclude_urls=...) 재조립."""
+
+    def test_exclude_urls_backfills_up_to_section_limit(self, tmp_path):
+        """제외 후 섹션 상한이 남은 후보로 다시 채워진다."""
+        db_path = tmp_path / "compose.db"
+        _create_announcements_table(db_path)
+        # 지원사업 상한(5)을 넘는 6건
+        for i in range(6):
+            _insert_one(
+                db_path,
+                source_id=f"test_{i:03d}",
+                title=f"지원사업 공고 {i}",
+                url=f"https://example.com/s-{i}",
+                relevance_score=0.9 - i * 0.05,
+            )
+
+        full = compose_digest(db_path=str(db_path), week_str="2026-W13")
+        assert full.count("### 지원사업 공고") == 5
+        assert "https://example.com/s-5" not in full
+
+        trimmed = compose_digest(
+            db_path=str(db_path),
+            week_str="2026-W13",
+            exclude_urls={"https://example.com/s-0"},
+        )
+        # 제외 1건 → 다음 순위(s-5)가 채워져 여전히 상한 5건
+        assert trimmed.count("### 지원사업 공고") == 5
+        assert "https://example.com/s-0" not in trimmed
+        assert "https://example.com/s-5" in trimmed
+
+    def test_exclude_urls_never_exceeds_section_limit(self, tmp_path):
+        """제외 후에도 섹션 상한을 넘지 않는다."""
+        db_path = tmp_path / "limit.db"
+        _create_announcements_table(db_path)
+        for i in range(5):
+            _insert_one(
+                db_path,
+                source_id=f"forest_{i:03d}",
+                source="fowi",
+                title=f"산림 동향 {i}",
+                url=f"https://example.com/f-{i}",
+                relevance_score=0.9 - i * 0.05,
+            )
+
+        markdown = compose_digest(
+            db_path=str(db_path),
+            week_str="2026-W13",
+            exclude_urls={"https://example.com/f-0"},
+        )
+        # 산림 상한 3, 후보 5건 중 1건 제외 → 상한대로 3건
+        assert markdown.count("### 산림 동향") == 3
+        assert "https://example.com/f-0" not in markdown
+
+
+class TestUrlProbe:
+    """check_url_alive의 HEAD→GET 폴백과 브라우저 UA."""
+
+    @mock.patch("alert.digest.checker.requests.get")
+    @mock.patch("alert.digest.checker.requests.head")
+    def test_head_exception_then_get_200_is_alive(self, mock_head, mock_get):
+        """HEAD 예외 + GET 200 → alive."""
+        mock_head.side_effect = requests.exceptions.ConnectionError("reset by peer")
+        mock_get.return_value.status_code = 200
+
+        assert check_url_alive("https://example.com/a") is True
+        assert mock_get.called
+
+    @mock.patch("alert.digest.checker.requests.get")
+    @mock.patch("alert.digest.checker.requests.head")
+    def test_head_405_then_get_200_is_alive(self, mock_head, mock_get):
+        """HEAD 405(미지원) + GET 200 → alive (HEAD 실패만으로 dead 아님)."""
+        mock_head.return_value.status_code = 405
+        mock_get.return_value.status_code = 200
+
+        assert check_url_alive("https://example.com/b") is True
+
+    @mock.patch("alert.digest.checker.requests.get")
+    @mock.patch("alert.digest.checker.requests.head")
+    def test_head_403_then_get_200_is_alive(self, mock_head, mock_get):
+        """HEAD 403 + GET 200 → alive."""
+        mock_head.return_value.status_code = 403
+        mock_get.return_value.status_code = 200
+
+        assert check_url_alive("https://example.com/c") is True
+
+    @mock.patch("alert.digest.checker.requests.get")
+    @mock.patch("alert.digest.checker.requests.head")
+    def test_get_failure_is_dead(self, mock_head, mock_get):
+        """HEAD 실패 + GET 404 → dead."""
+        mock_head.side_effect = requests.exceptions.ConnectionError("reset")
+        mock_get.return_value.status_code = 404
+
+        assert check_url_alive("https://example.com/d") is False
+
+    @mock.patch("alert.digest.checker.requests.get")
+    @mock.patch("alert.digest.checker.requests.head")
+    def test_both_fail_is_dead(self, mock_head, mock_get):
+        """HEAD·GET 모두 예외 → dead."""
+        mock_head.side_effect = requests.exceptions.ConnectionError("reset")
+        mock_get.side_effect = requests.exceptions.ConnectionError("reset")
+
+        assert check_url_alive("https://example.com/e") is False
+
+    @mock.patch("alert.digest.checker.requests.get")
+    @mock.patch("alert.digest.checker.requests.head")
+    def test_browser_user_agent_sent(self, mock_head, mock_get):
+        """두 요청 모두 브라우저 UA를 보낸다."""
+        mock_head.side_effect = requests.exceptions.ConnectionError("reset")
+        mock_get.return_value.status_code = 200
+
+        check_url_alive("https://example.com/f")
+
+        for call in (mock_head.call_args, mock_get.call_args):
+            headers = call.kwargs["headers"]
+            assert "Mozilla/5.0" in headers["User-Agent"]
+
+    @mock.patch("alert.digest.checker.requests.get")
+    @mock.patch("alert.digest.checker.requests.head")
+    def test_get_streams_and_closes(self, mock_head, mock_get):
+        """GET은 stream으로 열고 본문을 제한적으로 읽은 뒤 닫는다."""
+        mock_head.side_effect = requests.exceptions.ConnectionError("reset")
+        response = mock_get.return_value
+        response.status_code = 200
+
+        assert check_url_alive("https://example.com/g") is True
+        assert mock_get.call_args.kwargs["stream"] is True
+        response.iter_content.assert_called_once_with(chunk_size=64 * 1024)
+        response.close.assert_called_once()

@@ -5,7 +5,7 @@ import sqlite3
 import sys
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Optional, List, Dict, Tuple
+from typing import Optional, List, Dict, Set, Tuple
 
 # 섹션 분류 기준 (categorize_item과 섹션별 SQL 쿼리가 공유하는 단일 정본)
 FOREST_SOURCES = ("forest_service", "fowi", "kofpi")
@@ -170,6 +170,7 @@ def compose_digest(
     output_path: Optional[Path] = None,
     forms_csv_path: Optional[Path] = None,
     warnings_out: Optional[List[str]] = None,
+    exclude_urls: Optional[Set[str]] = None,
 ) -> str:
     """주간 정책브리핑 다이제스트 마크다운 생성.
 
@@ -181,6 +182,8 @@ def compose_digest(
         output_path: 출력 파일 경로. None이면 반환값만 사용
         forms_csv_path: 폼 CSV 경로
         warnings_out: 경고 수집용 리스트. 주어지면 폼 로드 실패 등이 append됨
+        exclude_urls: 제외할 원문 URL 집합 (계약 v1.2: url_alive=false 항목 자동 제외).
+            제외는 조회 단계에서 적용되므로 섹션 상한이 남은 후보로 다시 채워진다.
 
     Returns:
         생성된 마크다운 텍스트
@@ -200,6 +203,14 @@ def compose_digest(
     conn.create_function("normalize_title", 1, normalize_title)
     cursor = conn.cursor()
 
+    # 계약 v1.2: 제외 URL은 조회 단계에서 뺀다. 그래야 LIMIT(섹션 상한)이
+    # 남은 후보로 다시 채워진다 = "제외 후 섹션 상한 재적용".
+    exclude_list = sorted(exclude_urls) if exclude_urls else []
+    if exclude_list:
+        exclude_sql = " AND url NOT IN (%s)" % ", ".join("?" * len(exclude_list))
+    else:
+        exclude_sql = ""
+
     # 섹션별로 독립 조회 (주간 창 양끝 포함, 중복 제거 후 섹션 상한만큼만)
     section_rows: Dict[str, List] = {}
     for section in SECTION_ORDER:
@@ -209,13 +220,19 @@ def compose_digest(
             SELECT id, source, title, summary, url, author, period_end,
                    MAX(relevance_score) AS relevance_score
             FROM announcements
-            WHERE {where_sql}
+            WHERE {where_sql}{exclude_sql}
               AND DATE(created_at) BETWEEN ? AND ?
             GROUP BY normalize_title(title)
             ORDER BY relevance_score DESC
             LIMIT ?
             """,
-            (*where_params, week_start, week_end, SECTION_LIMITS[section]),
+            (
+                *where_params,
+                *exclude_list,
+                week_start,
+                week_end,
+                SECTION_LIMITS[section],
+            ),
         )
         section_rows[section] = cursor.fetchall()
 
@@ -230,9 +247,17 @@ def compose_digest(
             item_id, source, title, summary, url, author, period_end, score = row
             normalized_title = normalize_title(title)
 
+            # 조회 단계에서 이미 걸렀지만, 호출자가 SQL을 우회해도 안전하도록 방어한다.
+            if exclude_urls and url in exclude_urls:
+                continue
+
             if normalized_title in seen_normalized_titles:
                 continue
             seen_normalized_titles.add(normalized_title)
+
+            # 제외 후 섹션 상한 재적용
+            if len(sections[section]) >= SECTION_LIMITS[section]:
+                continue
 
             sections[section].append({
                 "id": item_id,

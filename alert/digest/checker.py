@@ -35,8 +35,26 @@ def parse_period_end(period_end_str: Optional[str]) -> bool:
     return False
 
 
+# 공공기관 사이트 다수가 기본 python-requests UA를 차단하거나 HEAD를 지원하지 않는다.
+BROWSER_USER_AGENT = (
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+)
+PROBE_HEADERS = {
+    "User-Agent": BROWSER_USER_AGENT,
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7",
+}
+# 생존 확인에는 응답 본문이 필요 없다. 연결만 확인하고 최대 이만큼만 읽는다.
+MAX_PROBE_BYTES = 64 * 1024
+
+
 def check_url_alive(url: str, timeout: int = 8) -> bool:
     """URL이 접근 가능한지 확인.
+
+    HEAD를 먼저 시도하고, HEAD가 예외·405·403 등으로 실패하면 곧바로 GET으로
+    폴백한다(HEAD 실패만으로 dead 판정하지 않는다). GET은 stream으로 열어
+    본문을 최대 MAX_PROBE_BYTES만 읽고 닫는다.
 
     Args:
         url: 확인할 URL
@@ -49,18 +67,32 @@ def check_url_alive(url: str, timeout: int = 8) -> bool:
         return False
 
     try:
-        # HEAD 요청 시도
+        # 1차: HEAD (성공하면 여기서 끝. 실패는 dead 판정이 아니라 GET 폴백)
         try:
-            response = requests.head(url, timeout=timeout, allow_redirects=True)
+            response = requests.head(
+                url, timeout=timeout, allow_redirects=True, headers=PROBE_HEADERS
+            )
             if response.status_code < 400:
                 return True
         except requests.exceptions.RequestException:
-            # HEAD 실패하면 GET 시도
             pass
 
-        # GET 요청 시도
-        response = requests.get(url, timeout=timeout, allow_redirects=True)
-        return response.status_code < 400
+        # 2차: GET (본문은 최대 64KB만 읽는다)
+        response = requests.get(
+            url,
+            timeout=timeout,
+            allow_redirects=True,
+            headers=PROBE_HEADERS,
+            stream=True,
+        )
+        try:
+            if response.status_code >= 400:
+                return False
+            for _ in response.iter_content(chunk_size=MAX_PROBE_BYTES):
+                break
+            return True
+        finally:
+            response.close()
     except requests.exceptions.RequestException:
         return False
     except Exception:
@@ -87,18 +119,25 @@ def check_digest(
             reason에 기록한다.
 
     Returns:
-        {"items": [...], "pass": bool, "network_checked": bool, "reason": str} 형태의 검증 결과
+        {"items": [...], "dropped": [...], "pass": bool, "network_checked": bool,
+        "reason": str} 형태의 검증 결과.
+
+        계약 v1.2: deadline_parsed는 정보 필드이며 게이트가 아니다. url_alive=False
+        항목은 dropped에 기록되고 다이제스트에서 제외된다. pass=False 조건은
+        ①제외 후 항목 0건 ②network_checked=False ③폼 로드 실패(warnings)
+        ④체크 자체 예외 — 넷뿐이다.
     """
     markdown_path = Path(markdown_path)
     if not markdown_path.exists():
         result = {
             "items": [],
+            "dropped": [],
             "pass": False,
             "network_checked": False,
             "reason": "마크다운 파일 없음"
         }
         result = _apply_warnings(result, warnings)
-        _write_check_result(output_path, result)
+        write_check_result(output_path, result)
         return result
 
     # 마크다운에서 URL 추출
@@ -113,12 +152,13 @@ def check_digest(
     if not url_matches:
         result = {
             "items": [],
+            "dropped": [],
             "pass": False,
             "network_checked": False,
             "reason": "항목 없음"
         }
         result = _apply_warnings(result, warnings)
-        _write_check_result(output_path, result)
+        write_check_result(output_path, result)
         return result
 
     # DB에서 항목 정보 로드
@@ -126,20 +166,22 @@ def check_digest(
     cursor = conn.cursor()
 
     url_to_period_end = {}
+    url_to_title = {}
     for _, url in url_matches:
         cursor.execute(
-            "SELECT period_end FROM announcements WHERE url = ? LIMIT 1",
+            "SELECT period_end, title FROM announcements WHERE url = ? LIMIT 1",
             (url,)
         )
         row = cursor.fetchone()
         if row:
             url_to_period_end[url] = row[0]
+            url_to_title[url] = row[1]
 
     conn.close()
 
     # 각 URL 검증
     items = []
-    all_passed = True
+    dropped = []
     network_checked_count = 0
 
     for _, url in url_matches:
@@ -149,31 +191,45 @@ def check_digest(
         else:
             url_alive = check_url_alive(url)
             network_checked_count += 1
+        # 계약 v1.2: deadline_parsed는 정보 필드(게이트 아님)
         deadline_parsed = parse_period_end(period_end)
-
-        item_passed = url_alive and deadline_parsed
-        all_passed = all_passed and item_passed
 
         items.append({
             "url": url,
             "url_alive": url_alive,
             "deadline_parsed": deadline_parsed,
             "period_end": period_end,
-            "passed": item_passed,
+            "passed": url_alive,
         })
 
-    reason = "" if all_passed else "검증 실패"
+        if not url_alive:
+            dropped.append({
+                "title": url_to_title.get(url) or url,
+                "url": url,
+            })
+
+    network_checked = network_checked_count > 0
+    alive_count = len(items) - len(dropped)
+
+    if not network_checked:
+        reason = "네트워크 미검사"
+    elif alive_count == 0:
+        reason = "생존 항목 없음"
+    else:
+        reason = ""
+
     result = {
         "items": items,
-        "pass": all_passed,
+        "dropped": dropped,
+        "pass": network_checked and alive_count > 0,
         # 실제로 네트워크 검사한 URL이 0건이면 False
-        "network_checked": network_checked_count > 0,
+        "network_checked": network_checked,
         "reason": reason
     }
     result = _apply_warnings(result, warnings)
 
     # 파일 저장
-    _write_check_result(output_path, result)
+    write_check_result(output_path, result)
 
     return result
 
@@ -199,7 +255,7 @@ def _apply_warnings(result: Dict, warnings: Optional[List[str]]) -> Dict:
     return result
 
 
-def _write_check_result(output_path: Optional[Path], result: Dict) -> None:
+def write_check_result(output_path: Optional[Path], result: Dict) -> None:
     """검증 결과를 JSON 파일로 저장.
 
     Args:
