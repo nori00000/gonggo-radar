@@ -1,11 +1,11 @@
 """협의회 주간 정책브리핑 다이제스트 생성기."""
 
 import csv
+import re
 import sqlite3
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Optional, List, Dict, Tuple
-import re
 
 
 def get_week_date_range(week_str: str) -> Tuple[str, str]:

@@ -1,6 +1,5 @@
 """주간 정책브리핑 다이제스트 생성 및 발송 테스트."""
 
-import csv
 import json
 import sqlite3
 import tempfile
@@ -16,7 +15,6 @@ from alert.digest.composer import (
     get_week_date_range,
     categorize_item,
     normalize_title,
-    load_form_responses,
 )
 from alert.digest.checker import (
     check_digest,
@@ -228,7 +226,7 @@ class TestComposer:
 
     def test_compose_digest_per_section_limits(self, sample_announcements, tmp_path):
         """섹션별 항목 개수 제한."""
-        markdown = compose_digest(
+        compose_digest(
             db_path=sample_announcements,
             week_str="2026-W13",
             limit=5,
@@ -410,7 +408,7 @@ class TestChecker:
         check_path = tmp_path / "test.check.json"
         md_path.write_text("# 테스트\n\n[test](https://example.com)")
 
-        result = check_digest(
+        check_digest(
             db_path=sample_announcements,
             markdown_path=md_path,
             output_path=check_path,
@@ -518,7 +516,7 @@ class TestIntegration:
         assert "<!-- 상민 확정 필요 -->" in markdown
 
         # 2. 검증
-        result = check_digest(
+        check_digest(
             db_path=sample_announcements,
             markdown_path=md_path,
             output_path=check_path,

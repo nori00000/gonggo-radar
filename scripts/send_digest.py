@@ -4,7 +4,11 @@
 import argparse
 import html as html_module
 import json
+import re
+import smtplib
 import sys
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
 from pathlib import Path
 from typing import Tuple
 from urllib.parse import urlparse
@@ -16,7 +20,7 @@ from alert.notifiers.email_sender import EmailNotifier
 
 
 def markdown_to_html(markdown_text: str) -> str:
-    """간단한 마크다운을 HTML로 변환.
+    """간단한 마크다운을 HTML로 변환 (이스케이프 우선).
 
     Args:
         markdown_text: 마크다운 텍스트
@@ -50,55 +54,89 @@ def markdown_to_html(markdown_text: str) -> str:
             html_body += html_module.escape(line) + "\n"
             continue
 
-        # 제목
+        # 제목 처리
         if line.startswith("# "):
             html_body += f"<h1>{html_module.escape(line[2:])}</h1>"
+            continue
         elif line.startswith("## "):
             html_body += f"<h2>{html_module.escape(line[3:])}</h2>"
+            continue
         elif line.startswith("### "):
             html_body += f"<h3>{html_module.escape(line[4:])}</h3>"
-        # 링크 처리 (http/https만 허용)
-        elif "[" in line and "](" in line:
-            import re
-            def replace_link(match):
-                text = html_module.escape(match.group(1))
-                url = match.group(2)
-                # http/https 화이트리스트
-                parsed = urlparse(url)
-                if parsed.scheme not in ("http", "https"):
-                    return text
-                return f'<a href="{html_module.escape(url, quote=True)}">{text}</a>'
+            continue
 
-            line = re.sub(r"\[([^\]]+)\]\(([^)]+)\)", replace_link, line)
-            html_body += f"<p>{line}</p>"
-        # 굵은 텍스트
-        elif "**" in line:
-            import re
-            line = re.sub(
-                r"\*\*([^*]+)\*\*",
-                lambda m: f"<strong>{html_module.escape(m.group(1))}</strong>",
-                line
-            )
-            html_body += f"<p>{line}</p>"
         # 순서 없는 목록
-        elif line.startswith("- "):
+        if line.startswith("- "):
             if not in_list:
                 html_body += "<ul>"
                 in_list = True
             html_body += f"<li>{html_module.escape(line[2:])}</li>"
-        # 목록 종료
-        elif in_list and line.strip() and not line.startswith("- "):
+            continue
+
+        # 목록 종료 처리
+        if in_list and line.strip() and not line.startswith("- "):
             html_body += "</ul>"
             in_list = False
-            if line.strip() and not line.startswith(("*", "#", "[")):
-                html_body += f"<p>{html_module.escape(line)}</p>"
+
         # 빈 줄
-        elif not line.strip():
+        if not line.strip():
             continue
-        # 일반 텍스트
-        else:
-            if line.strip():
-                html_body += f"<p>{html_module.escape(line)}</p>"
+
+        # 일반 텍스트는 먼저 **전체** 이스케이프
+        escaped_line = html_module.escape(line)
+
+        # 이스케이프된 라인에서 마크업 처리
+        # **굵은텍스트** (이스케이프 후: \*\*...\*\*)
+        escaped_line = re.sub(
+            r"\*\*([^*]+)\*\*",
+            r"<strong>\1</strong>",
+            escaped_line
+        )
+
+        # [텍스트](URL) → <a href>
+        # 이스케이프 후에는 ] ( 패턴으로 처리
+        def replace_link(match):
+            text_part = match.group(1)
+            url_part = match.group(2)
+            # 이미 HTML 이스케이프됨. URL 추출 후 스킴 확인
+            # 이스케이프되지 않은 원본 URL을 재추출해야 함
+            return match.group(0)  # 이스케이프 후 링크 처리 불가, 원본 필요
+
+        # 링크는 이스케이프 전에 처리해야 함. 다시 정렬:
+        # 원본 라인에서 먼저 링크 추출 및 검증
+        link_pattern = r"\[([^\]]+)\]\(([^)]+)\)"
+        link_matches = list(re.finditer(link_pattern, line))
+
+        # 링크 부분을 placeholders로 교체
+        link_placeholders = {}
+        modified_line = line
+        for i, match in enumerate(link_matches):
+            url = match.group(2)
+            text = match.group(1)
+            parsed = urlparse(url)
+            if parsed.scheme in ("http", "https"):
+                placeholder = f"__LINK_{i}__"
+                link_placeholders[placeholder] = f'<a href="{html_module.escape(url, quote=True)}">{html_module.escape(text)}</a>'
+                modified_line = modified_line.replace(match.group(0), placeholder, 1)
+            else:
+                # javascript: 등 허용 안 함 - URL 제거, 텍스트만 남김
+                modified_line = modified_line.replace(match.group(0), html_module.escape(text), 1)
+
+        # 이제 이스케이프
+        escaped_line = html_module.escape(modified_line)
+
+        # Placeholder를 실제 링크로 교체
+        for placeholder, link_html in link_placeholders.items():
+            escaped_line = escaped_line.replace(html_module.escape(placeholder), link_html)
+
+        # **굵은텍스트** 처리 (이스케이프 후: \*\*...\*\*)
+        escaped_line = re.sub(
+            r"\*\*([^*]+)\*\*",
+            r"<strong>\1</strong>",
+            escaped_line
+        )
+
+        html_body += f"<p>{escaped_line}</p>"
 
     if in_list:
         html_body += "</ul>"
@@ -192,7 +230,6 @@ def send_digest(
         markdown_text = f.read()
 
     # 제목 추출 (첫 번째 # 제목)
-    import re
     title_match = re.search(r"^# (.+)$", markdown_text, re.MULTILINE)
     subject = title_match.group(1) if title_match else "협의회 주간 정책브리핑"
 
@@ -213,22 +250,20 @@ def send_digest(
             print("✗ 이메일 인증 정보가 설정되지 않았습니다", file=sys.stderr)
             return 2
 
-        if not notifier.recipients:
+        # --to 옵션이 지정되면 그것을 사용, 아니면 config의 모든 수신자
+        recipients = [to_email] if to_email else notifier.recipients
+
+        if not recipients:
             print("✗ 수신자가 설정되지 않았습니다", file=sys.stderr)
             return 2
 
         # HTML 본문
         html_body = markdown_to_html(markdown_text)
 
-        # EmailNotifier의 _send 메서드를 직접 사용하거나, 수동 구성
-        # 여기서는 수동 SMTP를 통해 모든 수신자에게 발송
-        from email.mime.multipart import MIMEMultipart
-        from email.mime.text import MIMEText
-        import smtplib
-
+        # 수동 SMTP를 통해 수신자에게 발송
         msg = MIMEMultipart("alternative")
         msg["From"] = notifier.sender
-        msg["To"] = ", ".join(notifier.recipients)
+        msg["To"] = ", ".join(recipients)
         msg["Subject"] = subject
 
         html_part = MIMEText(html_body, "html", "utf-8")
@@ -247,7 +282,7 @@ def send_digest(
                 server.login(notifier.sender, notifier.password)
                 server.send_message(msg)
 
-            print(f"✓ 발송 성공: {len(notifier.recipients)}명")
+            print(f"✓ 발송 성공: {len(recipients)}명")
             return 0
 
         except smtplib.SMTPException as exc:
@@ -277,21 +312,19 @@ def main():
     parser.add_argument(
         "--dry-run",
         action="store_true",
-        default=True,
-        help="드라이런 모드 (기본: True, --send로 비활성화)",
+        default=False,
+        help="드라이런 모드 (명시해야 활성화, --send보다 우선)",
     )
     parser.add_argument(
         "--send",
         action="store_true",
-        help="실제 발송 (이 플래그가 없으면 드라이런)",
+        help="실제 발송 (기본은 드라이런)",
     )
 
     args = parser.parse_args()
 
-    # --dry-run과 --send 동시 지정 시 dry-run 우선
-    dry_run = True if args.dry_run else False
-    if args.send:
-        dry_run = False
+    # --dry-run이 --send보다 우선 (명시적 안전 플래그)
+    dry_run = args.dry_run or not args.send
 
     return send_digest(
         markdown_path=args.markdown,

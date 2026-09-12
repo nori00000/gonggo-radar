@@ -62,7 +62,7 @@ def main():
     # 다이제스트 생성
     print(f"Composing digest for {week}...")
     try:
-        markdown = compose_digest(
+        compose_digest(
             db_path=args.db,
             week_str=week,
             limit=args.limit,
