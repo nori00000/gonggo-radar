@@ -13,9 +13,10 @@
 
 규칙 (우선순위):
 
-1. 소스가 **식별 필드를 선언**했으면 그 필드들의 조합이 식별자다.
-   API 가 주는 자기 ID 는 URL 보다 권위 있고, URL 이 없을 때 만들어 내는
-   상세 링크(템플릿)가 식별자가 되는 것을 막는다.
+1. 소스가 **식별 필드를 선언**했고 그 필드가 **전부** 있으면 그 조합이
+   식별자다. API 가 주는 자기 ID 는 URL 보다 권위 있고, URL 이 없을 때
+   만들어 내는 상세 링크(템플릿)가 식별자가 되는 것을 막는다.
+   하나라도 없으면 URL 로 넘어간다 - 반쪽 키는 다른 공고와 겹친다.
 2. 아니면 **정규화 URL** 이 곧 식별자다 (쿼리 정렬·세션 파라미터 제거).
 3. URL 도 식별 필드도 없으면 크롤러가 만든 ``source_id`` 를 그대로 쓴다.
 """
@@ -32,13 +33,26 @@ IDENTITY_FIELDS: Dict[str, Tuple[str, ...]] = {
     "bizinfo": ("pblancId",),
 }
 
-# 같은 페이지를 가리키면서 매번 달라지는 쿼리 파라미터. 남겨 두면 같은
-# 공고가 실행마다 새 행이 된다.
+# 제거해도 **같은 페이지**임이 알려진 파라미터만 지운다.
+#
+# 14차 게이트: ``sid`` 처럼 의미가 확인되지 않은 파라미터를 지웠더니
+# ``/boardView.do?sid=A&nttId=42`` 와 ``sid=B`` 가 한 행으로 합쳐져,
+# A 제목에 B 의 마감이 저장·전달됐다. 모르면 **남긴다** - 지우는 쪽이
+# 공고를 잃는다.
 VOLATILE_QUERY_PARAMS = frozenset({
-    "jsessionid", "phpsessid", "aspsessionid", "sessionid", "sid", "_",
-    "timestamp", "ts", "rnd", "random", "cachebust",
-    "utm_source", "utm_medium", "utm_campaign", "utm_term", "utm_content",
+    "jsessionid", "phpsessid", "_", "fbclid",
 })
+# 접두사로만 알 수 있는 추적 파라미터
+VOLATILE_QUERY_PREFIXES = ("utm_",)
+
+
+def _is_volatile(name: str) -> bool:
+    """이 쿼리 파라미터가 **페이지를 가르지 않는** 것으로 알려져 있는가."""
+    lowered = (name or "").lower()
+    return (
+        lowered in VOLATILE_QUERY_PARAMS
+        or lowered.startswith(VOLATILE_QUERY_PREFIXES)
+    )
 
 # 경로에 붙는 세션 표기 (``;jsessionid=…``)
 _PATH_SESSION = re.compile(r";jsessionid=[^/?#]*", re.I)
@@ -75,7 +89,7 @@ def normalize_url(url: Any) -> Optional[str]:
     query = sorted(
         (key, value)
         for key, value in parse_qsl(parts.query, keep_blank_values=True)
-        if key.lower() not in VOLATILE_QUERY_PARAMS
+        if not _is_volatile(key)
     )
     return urlunsplit((
         (parts.scheme or "").lower(),
@@ -122,7 +136,9 @@ def identity_key(source: str, item: Any) -> str:
     fields = IDENTITY_FIELDS.get((source or "").strip(), ())
     if fields:
         values = [clean_text(raw.get(name)) for name in fields]
-        if any(values):
+        # **전부** 있을 때만 필드 키다. 하나라도 비면 그 키는 다른 공고와
+        # 같아질 수 있으므로(``fld:번호|``) URL 로 넘어간다 (14차 게이트).
+        if all(values):
             return "fld:" + "|".join(values)
 
     normalized = normalize_url(url)

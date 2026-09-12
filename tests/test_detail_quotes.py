@@ -38,6 +38,7 @@ from alert.crawlers.detail_quotes import (
     period_from_quote,
     resolve_quote_period,
 )
+from alert.crawlers.identity import identity_key
 from alert.models import RawAnnouncement
 
 FIXTURES = Path(__file__).parent / "fixtures"
@@ -338,6 +339,16 @@ def make_announcement(source_id: str = "1") -> RawAnnouncement:
     )
 
 
+def sent_source_ids(sent: list, items: list) -> list:
+    """워커에 간 **행 식별자**를 원래 source_id 로 되돌린다 (14차 게이트).
+
+    짝짓기 키가 크롤러 source_id 이면 서로 다른 공고가 같은 값을 가질 때
+    마지막 결과가 둘 모두에 적용된다 - 그래서 식별자로 바꿨다.
+    """
+    lookup = {identity_key("stub", item): item.source_id for item in items}
+    return [lookup.get(entry["source_id"], entry["source_id"]) for entry in sent]
+
+
 def quotes_for(html: str) -> dict:
     """HTML에서 인용을 뽑는다 (자식 프로세스가 하는 일과 같다)."""
     return extract_quotes(normalize_text(html))
@@ -543,9 +554,11 @@ class TestEnrichWithQuotes:
         crawler = make_stub(fetch_detail=True)
         announcement = make_announcement()
 
+        # 워커 짝짓기 키는 **행 식별자**다 (14차 게이트)
+        key = identity_key("stub", announcement)
         with patch.object(
             crawler, "run_detail_worker",
-            fake_worker({"1": {"truncated": True, "reason": "body over"}}),
+            fake_worker({key: {"truncated": True, "reason": "body over"}}),
         ):
             crawler.enrich_with_quotes([announcement])
 
@@ -576,7 +589,7 @@ class TestExecutionLimits:
         sent: list = []
         with patch.object(crawler, "run_detail_worker", collecting_worker(sent)):
             crawler.enrich_with_quotes([done, todo])
-        assert [item["source_id"] for item in sent] == ["2"]
+        assert sent_source_ids(sent, [done, todo]) == ["2"]
 
     def test_skip_source_ids_are_not_requested(self):
         crawler = make_stub(fetch_detail=True)
@@ -585,7 +598,7 @@ class TestExecutionLimits:
         sent: list = []
         with patch.object(crawler, "run_detail_worker", collecting_worker(sent)):
             crawler.enrich_with_quotes(items, skip_source_ids={"1"})
-        assert [item["source_id"] for item in sent] == ["2"]
+        assert sent_source_ids(sent, items) == ["2"]
 
     def test_never_attempted_items_go_first(self):
         """시도 기록이 오래된 것부터, 시도 없는 것이 가장 먼저다 (게이트 #6)."""
@@ -600,7 +613,7 @@ class TestExecutionLimits:
         sent: list = []
         with patch.object(crawler, "run_detail_worker", collecting_worker(sent)):
             crawler.enrich_with_quotes(items)
-        assert [item["source_id"] for item in sent] == ["3", "1", "2", "0"]
+        assert sent_source_ids(sent, items) == ["3", "1", "2", "0"]
 
     def test_attempt_stamp_in_raw_data_also_orders(self):
         """raw_data에 남은 시도 시각도 순서에 쓰인다."""
@@ -617,7 +630,7 @@ class TestExecutionLimits:
         sent: list = []
         with patch.object(crawler, "run_detail_worker", collecting_worker(sent)):
             crawler.enrich_with_quotes([fresh, old])
-        assert [item["source_id"] for item in sent] == ["old", "fresh"]
+        assert sent_source_ids(sent, [fresh, old]) == ["old", "fresh"]
 
 
 class TestChildFetch:

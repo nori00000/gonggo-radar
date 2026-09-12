@@ -267,14 +267,16 @@ class G2bCrawler(BaseCrawler):
             source_id = f"{notice_no}-{notice_ord}" if notice_ord else notice_no
             title = clean_text(item.get("bidNtceNm"))
 
-            if not notice_no or not title:
+            # 14차 게이트: 공고번호가 없어도 **고유 입찰 URL** 이 있으면
+            # 공고를 버리지 않는다 - 식별은 그 URL 이 맡는다.
+            if not title or not (notice_no or clean_text(item.get("bidNtceUrl"))):
                 self.logger.warning(f"Item missing required fields: {item}")
                 return None
 
             # URL - 주어진 링크가 없으면 **알림 링크용**으로만 템플릿을
             # 만든다(차수 포함). 식별에는 쓰지 않는다 - 식별은 공고번호+차수다.
             url = clean_text(item.get("bidNtceUrl"))
-            url_is_template = not url
+            url_is_template = not url and bool(notice_no)
             if url_is_template:
                 url = (
                     "http://www.g2b.go.kr:8081/ep/invitation/publish/"

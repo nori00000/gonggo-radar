@@ -29,7 +29,7 @@ from alert.crawlers.identity import (
 )
 from alert.crawlers.period_extractors import g2b_period
 from alert.db import Database
-from alert.main import _finalize_periods
+from alert.main import _finalize_periods, _periods_from_raw
 from alert.models import AnalyzedAnnouncement, RawAnnouncement
 
 REPO = Path(__file__).resolve().parents[1]
@@ -61,10 +61,35 @@ class TestUrlNormalisation:
         second = normalize_url("https://example.kr/view.do?a=1&b=2")
         assert first == second == "https://example.kr/view.do?a=1&b=2"
 
-    def test_session_parameters_are_dropped(self):
-        assert normalize_url("https://x.kr/a?id=1&jsessionid=ZZ&_=99") == (
+    @pytest.mark.parametrize("noise", [
+        "jsessionid=ZZ", "JSESSIONID=ZZ", "PHPSESSID=ZZ", "_=99",
+        "fbclid=abc", "utm_source=mail", "utm_campaign=x",
+    ])
+    def test_known_session_and_tracking_parameters_are_dropped(self, noise):
+        assert normalize_url(f"https://x.kr/a?id=1&{noise}") == (
             normalize_url("https://x.kr/a?id=1")
         )
+
+    @pytest.mark.parametrize("param", [
+        "sid=A", "ts=1", "rnd=7", "sessionid=A", "aspsessionid=A",
+        "timestamp=5", "random=3", "cachebust=9",
+    ])
+    def test_unknown_parameters_are_kept(self, param):
+        """14차 게이트: 의미를 모르는 파라미터는 **남긴다**.
+
+        ``sid`` 를 지웠더니 ``/boardView.do?sid=A&nttId=42`` 와 ``sid=B`` 가
+        한 행으로 합쳐져, A 제목에 B 의 마감이 저장·전달됐다.
+        """
+        assert normalize_url(f"https://x.kr/a?id=1&{param}") != (
+            normalize_url("https://x.kr/a?id=1")
+        )
+
+    def test_sid_variants_are_separate_rows(self):
+        first = identity_key("seis", announcement(
+            "seis", "https://www.seis.or.kr/boardView.do?sid=A&nttId=42"))
+        second = identity_key("seis", announcement(
+            "seis", "https://www.seis.or.kr/boardView.do?sid=B&nttId=42"))
+        assert first != second
 
     def test_path_session_and_fragment_are_dropped(self):
         assert normalize_url("https://x.kr/a;jsessionid=ZZ?id=1#top") == (
@@ -118,6 +143,15 @@ class TestIdentityKey:
             "g2b", None, {**base, "bidNtceOrd": "01"}))
         assert (first, second) == ("fld:20260900123|00", "fld:20260900123|01")
 
+    def test_partial_declared_fields_fall_back_to_the_url(self):
+        """14차 게이트: 반쪽 필드 키(``fld:번호|``)는 다른 공고와 겹친다."""
+        first = identity_key("g2b", announcement(
+            "g2b", "https://g2b.kr/d.do?bidno=1&bidseq=00", {"bidNtceNo": "1"}))
+        second = identity_key("g2b", announcement(
+            "g2b", "https://g2b.kr/d.do?bidno=1&bidseq=01", {"bidNtceNo": "1"}))
+        assert first != second
+        assert first.startswith("url:") and second.startswith("url:")
+
     def test_missing_url_and_fields_falls_back_to_source_id(self):
         assert identity_key("manual", announcement(
             "manual", "", source_id="abc")) == "abc"
@@ -151,7 +185,7 @@ class TestEveryDbPathUsesTheSameKey:
         남아 있고 생산 경로에서는 쓰지 않는다 - 아래 테스트가 고정한다.
         """
         assert self.methods_matching("AND source_id = ?") == {
-            "_find_row", "is_duplicate",
+            "_find_row", "is_duplicate", "migrate_identity_keys",
         }
 
     def test_production_code_never_calls_is_duplicate(self):
@@ -281,6 +315,157 @@ class TestRowsNeverOverwriteEachOther:
             ("10월 공고", "2026-10-31"), ("11월 공고", "2026-11-30"),
         ]
         assert {r["source_id"] for r in rows} == {"fld:B1", "fld:B2"}
+
+
+class TestPartialIdentifiersKeepTheAnnouncement:
+    """식별 필드가 반쪽이거나 없어도 **공고를 버리지 않는다** (14차 게이트)."""
+
+    @pytest.fixture
+    def db(self, tmp_path):
+        yield Database(db_path=tmp_path / "announcements.db")
+
+    def store(self, db, announcement):
+        db.insert_announcement(
+            AnalyzedAnnouncement(
+                **_finalize_periods(announcement.source, announcement).__dict__,
+                relevance_score=0.9,
+            )
+        )
+
+    def test_g2b_without_order_splits_by_url(self, db):
+        """차수 필드가 없어도 URL 의 ``bidseq`` 가 공고를 가른다."""
+        crawler = make(G2bCrawler, "g2b")
+        for seq, close in (("00", "202610311700"), ("01", "202611301700")):
+            announcement = crawler._parse_item({
+                "bidNtceNo": "20260900123",
+                "bidNtceNm": f"용역 입찰 {seq}",
+                "bidNtceUrl": f"https://g2b.kr/detail.do?bidno=1&bidseq={seq}",
+                "bidClseDt": close,
+            }, "용역")
+            assert announcement is not None
+            self.store(db, announcement)
+
+        rows = db._conn.execute(
+            "SELECT source_id, title, period_end FROM announcements ORDER BY title"
+        ).fetchall()
+        assert [(r["title"], r["period_end"]) for r in rows] == [
+            ("용역 입찰 00", "2026-10-31"), ("용역 입찰 01", "2026-11-30"),
+        ]
+        assert len({r["source_id"] for r in rows}) == 2
+        assert all(r["source_id"].startswith("url:") for r in rows)
+
+    def test_g2b_without_a_notice_number_is_still_kept(self, db):
+        crawler = make(G2bCrawler, "g2b")
+        announcement = crawler._parse_item({
+            "bidNtceNm": "번호 없는 입찰",
+            "bidNtceUrl": "https://g2b.kr/detail.do?x=9",
+            "bidClseDt": "202610311700",
+        }, "용역")
+        assert announcement is not None
+        self.store(db, announcement)
+        row = db._conn.execute(
+            "SELECT source_id, period_end FROM announcements"
+        ).fetchone()
+        assert row["source_id"].startswith("url:")
+        assert row["period_end"] == "2026-10-31"
+
+    def test_bizinfo_without_pblanc_id_is_still_kept(self, db):
+        crawler = make(BizinfoCrawler, "bizinfo")
+        announcement = crawler._parse_item({
+            "pblancId": None,
+            "pblancNm": "ID 없는 공고",
+            "detailUrl": "https://www.bizinfo.go.kr/view.do?x=7",
+            "reqstBeginEndDe": "20261001~20261031",
+        })
+        assert announcement is not None
+        self.store(db, announcement)
+        row = db._conn.execute(
+            "SELECT source_id, url, period_end FROM announcements"
+        ).fetchone()
+        assert row["source_id"].startswith("url:")
+        assert row["url"] == "https://www.bizinfo.go.kr/view.do?x=7"
+        assert row["period_end"] == "2026-10-31"
+
+    def test_items_without_any_identifier_are_still_dropped(self, db):
+        """제목뿐인 항목은 여전히 버린다 - 식별할 수단이 없다."""
+        crawler = make(BizinfoCrawler, "bizinfo")
+        assert crawler._parse_item({"pblancNm": "제목만"}) is None
+
+
+class TestDuplicateGroupsMoveTogether:
+    """이관 충돌로 보존한 행은 **그룹 전체**가 함께 갱신된다 (14차 HIGH)."""
+
+    URL = "https://www.seis.or.kr/subPage.do?fncPbofrSn=1"
+
+    @pytest.fixture
+    def db(self, tmp_path):
+        yield Database(db_path=tmp_path / "announcements.db")
+
+    def seed(self, db, source_id, url, period_end):
+        db._conn.execute(
+            "INSERT INTO announcements (source, source_id, title, url,"
+            " raw_data, period_start, period_end, relevance_score,"
+            " created_at, updated_at)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            ("seis", source_id, "지원사업 공고", url,
+             json.dumps({"date": "2026.10.01 ~ 2026.10.31",
+                         "date_field": "li.swiper-slide p.date"},
+                        ensure_ascii=False),
+             "2026-10-01", period_end, 0.9,
+             datetime.now().isoformat(), datetime.now().isoformat()),
+        )
+        db._conn.commit()
+
+    def grouped(self, db):
+        self.seed(db, "legacy-a", self.URL, "2026-10-31")
+        self.seed(db, "legacy-b", self.URL + "&jsessionid=ZZ", "2026-10-31")
+        migrated, conflicts = db.migrate_identity_keys()
+        assert (migrated, conflicts) == (1, 1)
+        return db
+
+    def test_conflict_rows_are_linked_not_deleted(self, db):
+        self.grouped(db)
+        rows = db._conn.execute(
+            "SELECT id, source_id, duplicate_of FROM announcements ORDER BY id"
+        ).fetchall()
+        assert len(rows) == 2                       # 어느 행도 사라지지 않았다
+        assert rows[0]["duplicate_of"] is None      # 대표
+        assert rows[1]["duplicate_of"] == rows[0]["id"]
+
+    def test_retraction_clears_the_whole_group(self, db):
+        """철회된 기간이 보존 행에 남아 알림으로 나가지 않는다."""
+        self.grouped(db)
+        retracted = RawAnnouncement(
+            source="seis", source_id="ignored", title="지원사업 공고",
+            url=self.URL,
+            raw_data=json.dumps(
+                {"date": "접수기간 미정 / 교육기간 2026.10.01 ~ 2026.10.31",
+                 "date_field": "li.swiper-slide p.date"},
+                ensure_ascii=False,
+            ),
+        )
+        gated = _finalize_periods("seis", retracted)
+        assert db.overwrite_periods(gated, ("date", "date_field", "dday")) is True
+
+        rows = db._conn.execute(
+            "SELECT period_start, period_end FROM announcements"
+        ).fetchall()
+        assert [(r["period_start"], r["period_end"]) for r in rows] == [
+            (None, None), (None, None),
+        ]
+
+        # 다음 실행(빈 수집)의 재검증도 근거가 바뀌었으므로 부활시키지 않는다
+        assert db.revalidate_periods(
+            "seis", lambda raw: _periods_from_raw("seis", raw)
+        ) == 0
+        notified = db.get_unnotified()
+        assert len(notified) == 1                   # 알림은 대표만
+        assert notified[0].period_end is None
+
+    def test_duplicates_are_never_notified(self, db):
+        """보존 행은 알림 목록에 들어가지 않는다 (같은 공고를 두 번 말한다)."""
+        self.grouped(db)
+        assert len(db.get_unnotified()) == 1
 
 
 class TestG2bDeadlineValidation:

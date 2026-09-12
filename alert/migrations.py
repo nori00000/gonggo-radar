@@ -100,6 +100,15 @@ MIGRATIONS: List[Tuple[int, str, List[str]]] = [
             """
         ]
     ),
+    (
+        5,
+        "Add duplicate_of to announcements (identity migration conflicts)",
+        [
+            "ALTER TABLE announcements ADD COLUMN duplicate_of INTEGER DEFAULT NULL;",
+            "CREATE INDEX IF NOT EXISTS idx_ann_duplicate_of"
+            " ON announcements(duplicate_of);",
+        ]
+    ),
 ]
 
 

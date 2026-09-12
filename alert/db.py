@@ -344,11 +344,16 @@ class Database:
             return None
 
     def get_unnotified(self) -> List[AnalyzedAnnouncement]:
-        """Return all announcements that have not been notified yet."""
+        """Return all announcements that have not been notified yet.
+
+        이관 충돌로 보존된 중복 행(``duplicate_of``)은 **알리지 않는다** -
+        같은 공고를 두 번 말하게 된다 (14차 게이트).
+        """
         rows = self._conn.execute(
             """
             SELECT * FROM announcements
              WHERE is_notified = 0
+               AND duplicate_of IS NULL
                AND (period_end IS NULL OR period_end = '' OR period_end >= date('now'))
              ORDER BY relevance_score DESC, created_at DESC
             """
@@ -530,10 +535,16 @@ class Database:
             ``(이관한 행 수, 충돌로 남긴 행 수)``
         """
         rows = self._conn.execute(
-            _sql("SELECT id, source, source_id, url, raw_data FROM announcements")
+            _sql(
+                "SELECT id, source, source_id, url, raw_data, duplicate_of"
+                " FROM announcements ORDER BY id"
+            )
         ).fetchall()
 
+        now = datetime.now().isoformat()
+        representatives: Dict[Tuple[str, str], int] = {}
         migrated = conflicts = 0
+
         for row in rows:
             current = str(row["source_id"] or "")
             fresh = identity_key(row["source"], {
@@ -541,28 +552,68 @@ class Database:
                 "raw_data": row["raw_data"],
                 "source_id": current,
             })
-            if not fresh or fresh == current:
+            if not fresh:
                 continue
+            slot = (row["source"], fresh)
+
+            if fresh == current:
+                representatives.setdefault(slot, row["id"])
+                continue
+
+            if slot in representatives:
+                # 같은 공고를 가리키는 레거시 행이 이미 있다. **삭제하지
+                # 않는다** - 대표를 가리키게 묶어 두고(`duplicate_of`),
+                # 기간 갱신·정규화는 그룹 전체에 적용한다 (14차 게이트).
+                self._link_duplicate(row["id"], representatives[slot], now)
+                conflicts += 1
+                logging.getLogger(__name__).warning(
+                    "identity 이관 충돌: %s/%s -> %s (대표 %s 에 묶었다)",
+                    row["source"], current, fresh, representatives[slot],
+                )
+                continue
+
             try:
                 self._conn.execute(
                     _sql(
                         "UPDATE announcements SET source_id = ?, updated_at = ?"
                         " WHERE id = ?"
                     ),
-                    (fresh, datetime.now().isoformat(), row["id"]),
+                    (fresh, now, row["id"]),
                 )
             except _IntegrityError:
+                # 이번 실행에서 보지 못한 행이 이미 그 키를 쓰고 있다
+                existing = self._conn.execute(
+                    _sql(
+                        "SELECT id FROM announcements"
+                        " WHERE source = ? AND source_id = ?"
+                    ),
+                    (row["source"], fresh),
+                ).fetchone()
+                if existing is not None:
+                    self._link_duplicate(row["id"], existing["id"], now)
                 conflicts += 1
                 logging.getLogger(__name__).warning(
                     "identity 이관 충돌: %s/%s -> %s (중복을 보존한다)",
                     row["source"], current, fresh,
                 )
                 continue
+
+            representatives[slot] = row["id"]
             migrated += 1
 
-        if migrated and self._backend == "sqlite":
+        if self._backend == "sqlite":
             self._conn.commit()
         return migrated, conflicts
+
+    def _link_duplicate(self, row_id: int, representative: int, now: str) -> None:
+        """충돌로 남긴 행을 대표 행에 묶는다 (삭제하지 않는다)."""
+        self._conn.execute(
+            _sql(
+                "UPDATE announcements SET duplicate_of = ?, updated_at = ?"
+                " WHERE id = ?"
+            ),
+            (representative, now, row_id),
+        )
 
     def revalidate_periods(self, source: str, recompute) -> int:
         """저장된 행의 기간을 **raw_data 근거로 다시 산출**한다 (멱등).
@@ -696,16 +747,21 @@ class Database:
         if not period_changed and not evidence_changed:
             return False               # 같으면 updated_at 도 건드리지 않는다
 
+        # 이관 충돌로 보존된 중복 행도 **같은 값**으로 갱신한다. 대표만
+        # 고치면 보존 행에 철회된 기간이 남아 알림·브리핑에 살아남는다
+        # (14차 게이트 HIGH).
         self._conn.execute(
             _sql(
                 "UPDATE announcements SET period_start = ?, period_end = ?,"
-                " raw_data = ?, updated_at = ? WHERE id = ?"
+                " raw_data = ?, updated_at = ?"
+                " WHERE id = ? OR duplicate_of = ?"
             ),
             (
                 start,
                 end,
                 json.dumps(stored, ensure_ascii=False),
                 datetime.now().isoformat(),
+                row["id"],
                 row["id"],
             ),
         )

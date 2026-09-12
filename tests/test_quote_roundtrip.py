@@ -272,7 +272,10 @@ class TestNoQuotePagesStillGetCovered:
         for item in items:
             if database.exists(item):
                 database.merge_quote_fields(item)
-        return [entry["source_id"] for entry in sent]
+        lookup = {identity_key("stub", item): item.source_id for item in items}
+        return [
+            lookup.get(entry["source_id"], entry["source_id"]) for entry in sent
+        ]
 
     def test_two_runs_visit_every_url(self, db):
         """인용이 없어도 두 번째 실행이 **아직 안 본 5건을 먼저** 본다.

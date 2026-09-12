@@ -190,7 +190,9 @@ class BizinfoCrawler(BaseCrawler):
             # 공고가 같은 URL 로 합쳐졌다 (13차 게이트 HIGH).
             url = clean_text(item.get("detailUrl"))
 
-            if not source_id or not title:
+            # 14차 게이트: ``pblancId`` 가 없어도 **고유 상세 URL** 이 있으면
+            # 공고를 버리지 않는다 - 식별은 그 URL 이 맡는다.
+            if not title or not (source_id or clean_text(item.get("detailUrl"))):
                 self.logger.warning(f"Item missing required fields: {item}")
                 return None
 
@@ -207,7 +209,7 @@ class BizinfoCrawler(BaseCrawler):
             # URL 이 없으면 **알림 링크용**으로만 상세 URL 템플릿을 만든다.
             # 식별에는 쓰지 않는다 - 식별은 API 가 준 ``pblancId`` 다.
             payload = dict(item)
-            if not url:
+            if not url and source_id:
                 url = f"{self.DETAIL_URL_TEMPLATE}{source_id}"
                 payload["url_is_template"] = True
 
