@@ -14,7 +14,11 @@ from alert.digest import state as state_mod
 from alert.digest import preview as preview_mod
 from alert.digest.checker import check_digest, markdown_sha256
 from alert.utils.redact import redact
-from scripts.apply_commentary import apply_commentary, commentary_error
+from scripts.apply_commentary import (
+    apply_commentary,
+    apply_headline,
+    text_error,
+)
 from scripts.recheck_digest import main as recheck_main
 from scripts.send_digest import check_fail_closed, send_digest
 
@@ -858,10 +862,11 @@ def test_record_preview_clears_card_and_prunes_history():
 def test_apply_commentary_rejects_html_comment_tokens(tmp_path, monkeypatch, bad):
     md = tmp_path / "2026-W37.md"
     md.write_text(SAMPLE_MD, encoding="utf-8")
-    assert commentary_error(bad)
+    assert text_error(bad)
     monkeypatch.setattr(
         "sys.argv",
-        ["apply_commentary.py", "2026-W37", bad, "--out-dir", str(tmp_path)],
+        ["apply_commentary.py", "2026-W37", "--commentary", bad,
+         "--out-dir", str(tmp_path)],
     )
     from scripts.apply_commentary import main as commentary_main
 
@@ -869,8 +874,8 @@ def test_apply_commentary_rejects_html_comment_tokens(tmp_path, monkeypatch, bad
     assert md.read_text(encoding="utf-8") == SAMPLE_MD
 
 
-def test_commentary_error_allows_html_like_text():
-    assert commentary_error("<b>강조</b> & 인용") == ""
+def test_text_error_allows_html_like_text():
+    assert text_error("<b>강조</b> & 인용") == ""
 
 
 # ─── 크리틱 #8: 생성 실패 후 이전 미리보기 재전송 ───────────────────────
@@ -1119,7 +1124,8 @@ def test_apply_commentary_refuses_sending_week(tmp_path, monkeypatch):
     )
     monkeypatch.setattr(
         "sys.argv",
-        ["apply_commentary.py", "2026-W37", "의견", "--out-dir", str(tmp_path)],
+        ["apply_commentary.py", "2026-W37", "--commentary", "의견",
+         "--out-dir", str(tmp_path)],
     )
     # 사이클3 #6: 거부는 **본문을 쓰기 전**에 일어난다
     assert commentary_main() == 2
@@ -1598,7 +1604,8 @@ def test_apply_commentary_works_from_held(tmp_path, monkeypatch):
     )
     monkeypatch.setattr(
         "sys.argv",
-        ["apply_commentary.py", "2026-W37", "보류 후 의견", "--out-dir", str(tmp_path)],
+        ["apply_commentary.py", "2026-W37", "--commentary", "보류 후 의견",
+         "--out-dir", str(tmp_path)],
     )
     assert commentary_main() == 0
     assert preview_mod.MARKER not in md.read_text(encoding="utf-8")
@@ -1616,7 +1623,8 @@ def test_apply_commentary_refuses_while_locked(tmp_path, monkeypatch):
     try:
         monkeypatch.setattr(
             "sys.argv",
-            ["apply_commentary.py", "2026-W37", "의견", "--out-dir", str(tmp_path)],
+            ["apply_commentary.py", "2026-W37", "--commentary", "의견",
+         "--out-dir", str(tmp_path)],
         )
         assert commentary_main() == 2
         assert md.read_text(encoding="utf-8") == SAMPLE_MD
@@ -1639,7 +1647,8 @@ def test_apply_commentary_refuses_sent_week(tmp_path, monkeypatch):
     )
     monkeypatch.setattr(
         "sys.argv",
-        ["apply_commentary.py", "2026-W37", "의견", "--out-dir", str(tmp_path)],
+        ["apply_commentary.py", "2026-W37", "--commentary", "의견",
+         "--out-dir", str(tmp_path)],
     )
     assert commentary_main() == 2
     assert md.read_text(encoding="utf-8") == SAMPLE_MD
@@ -2006,3 +2015,283 @@ def test_notify_skips_preview_while_send_holds_lock(tmp_path, monkeypatch):
     assert len(sent) == 1
     assert "발송 진행 중" in sent[0]
     assert "1. [" not in sent[0]         # 미리보기 본문은 나가지 않았다
+
+
+# ══ 사이클6 #3: URL 추출 단일 함수 ══════════════════════════════════════
+@pytest.mark.parametrize("line,expected", [
+    ("참고 https://example.com/hidden 입니다", ["https://example.com/hidden"]),
+    ("[자료](https://example.com/report(1))", ["https://example.com/report(1)"]),
+    ("**원문:** [https://x/c](https://x/c)", ["https://x/c"]),
+    ("**원문:** https://raw.example/p", ["https://raw.example/p"]),
+    ("끝 https://x/y. 그리고 (https://x/z) 끝", ["https://x/y", "https://x/z"]),
+    ("문장 https://x/q), 다음", ["https://x/q"]),
+    ("링크 없음", []),
+])
+def test_body_urls_extraction(line, expected):
+    assert prune_mod.body_urls(line) == expected
+
+
+@pytest.mark.parametrize("hidden,injected", [
+    ("https://example.com/bare", "확정 의견 — 참고 https://example.com/bare"),
+    ("https://example.com/report(1)", "확정 의견 [자료](https://example.com/report(1))"),
+])
+def test_send_digest_refuses_excluded_url_in_any_form(
+    tmp_path, monkeypatch, hidden, injected
+):
+    """베어 URL·괄호 링크로 숨긴 제외 URL 도 거부된다 (사이클6 #3)."""
+    md = _write_digest(tmp_path, SAMPLE_MD.replace(preview_mod.MARKER, injected))
+    _seed_preview(md)
+    state_path = state_mod.state_path_for_markdown(md)
+    state_mod.save_state(state_path, dict(
+        state_mod.load_state(state_path, "2026-W37"), excluded_urls=[hidden]))
+    _forbid_notifier(monkeypatch, f"제외 URL({hidden})이 남았는데 발송했다")
+    assert _send(md) == 2
+
+
+# ══ 사이클6 #2: 제어 문자 fail-closed ══════════════════════════════════
+CTRL_BODY = SAMPLE_MD.replace(
+    "요약 한 줄.", "요약 한 줄.\x0b## 기타\x0b[자료](https://x/y)"
+)
+
+
+def test_control_chars_detected():
+    assert prune_mod.control_chars(CTRL_BODY) == ["\x0b"]
+    assert "\\x0b" in prune_mod.control_chars_label(CTRL_BODY)
+    assert prune_mod.control_chars(SAMPLE_MD) == []
+    assert prune_mod.control_chars("탭\t과 개행\n은 허용") == []
+    for char in "\r\v\f\x1c\x1d\x1e\x85  ":
+        assert prune_mod.control_chars(f"a{char}b") == [char]
+
+
+def test_checker_fails_on_control_chars(tmp_path, monkeypatch):
+    md = tmp_path / "2026-W37.md"
+    md.write_text(CTRL_BODY, encoding="utf-8")
+    monkeypatch.setattr(
+        "alert.digest.checker.check_url_alive", lambda url, timeout=8: True
+    )
+    result = check_digest(db_path=str(_empty_db(tmp_path)), markdown_path=md)
+    assert result["pass"] is False
+    assert "제어 문자 포함" in result["reason"]
+    assert result["item_blocks"] == 0
+
+
+def test_parsers_agree_on_control_char_body():
+    """split 과 splitlines 가 달라지던 본문 — 이제 모든 파서가 split 만 쓴다."""
+    assert prune_mod.item_block_count(CTRL_BODY) == 3
+    assert len(preview_mod.item_urls(CTRL_BODY)) == 3
+    assert len(preview_mod.parse_digest(CTRL_BODY)["items"]) == 3
+
+
+def test_send_digest_refuses_control_chars(tmp_path, monkeypatch, capsys):
+    md = _write_digest(tmp_path, CTRL_BODY.replace(preview_mod.MARKER, "확정 의견"))
+    _seed_preview(md)
+    _forbid_notifier(monkeypatch, "제어 문자 본문을 발송했다")
+    assert _send(md) == 2
+    assert "제어 문자" in capsys.readouterr().err
+
+
+def test_send_digest_refuses_rendered_count_mismatch(
+    tmp_path, monkeypatch, capsys
+):
+    """검증이 말하는 항목 수와 렌더될 항목 수가 다르면 거부 (사이클6)."""
+    annotated, _ = apply_commentary(SAMPLE_MD, "확정 의견")
+    md = _write_digest(tmp_path, annotated, dict(PASS_CHECK, item_blocks=99))
+    _seed_preview(md)
+    _forbid_notifier(monkeypatch, "항목 수가 다른데 발송했다")
+    assert _send(md) == 2
+    assert "항목 수" in capsys.readouterr().err
+
+
+# ══ 사이클6 #1: 잠금 밖 선행 검사 없음 ═════════════════════════════════
+def test_send_digest_checks_everything_inside_lock(tmp_path, monkeypatch):
+    """잠금을 남이 쥐고 있으면 **어떤 판정도 하지 않고** LockBusy 로 끝난다."""
+    md = _annotated_digest(tmp_path)
+    holder = state_mod.acquire_lock(state_mod.lock_path_for_markdown(md))
+    read_calls = []
+    real_read = Path.read_bytes
+
+    def counted(self, *args, **kwargs):
+        read_calls.append(str(self))
+        return real_read(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_bytes", counted)
+    _forbid_notifier(monkeypatch, "잠금 없이 발송을 시작했다")
+    try:
+        assert _send(md) == 2
+    finally:
+        state_mod.release_lock(holder)
+    # 잠금을 못 얻었으므로 md·check 바이트를 읽지 않았다
+    assert not [c for c in read_calls if c.endswith(".md")]
+    assert not [c for c in read_calls if c.endswith(".check.json")]
+
+
+def test_tombstone_is_checked_inside_lock(tmp_path, monkeypatch):
+    """표식을 잠금 획득 직후에 본다 — 잠금 전 검사 후 생성되는 경합이 없다."""
+    md = _annotated_digest(tmp_path)
+    tombstone = state_mod.tombstone_path_for_markdown(md)
+    real_acquire = state_mod.acquire_lock
+
+    def acquire_then_break(path, *args, **kwargs):
+        handle = real_acquire(path, *args, **kwargs)
+        # 잠금 획득과 판정 사이에 표식이 생기는 최악의 순간을 만든다
+        state_mod.write_tombstone(tombstone, "경합 중 생성", "2026-09-13T05:00:00")
+        return handle
+
+    monkeypatch.setattr("scripts.send_digest.state_mod.acquire_lock",
+                        acquire_then_break)
+    _forbid_notifier(monkeypatch, "표식이 생겼는데 발송했다")
+    assert _send(md) == 2
+
+
+# ══ 사이클6 #8: apply_commentary 플래그 인터페이스 ══════════════════════
+def _run_apply(tmp_path, *args):
+    import subprocess
+
+    return subprocess.run(
+        [sys.executable, "scripts/apply_commentary.py", "2026-W37",
+         *args, "--out-dir", str(tmp_path)],
+        capture_output=True, text=True,
+        cwd=str(Path(__file__).resolve().parent.parent),
+    )
+
+
+def test_apply_commentary_flag_interface(tmp_path):
+    md = tmp_path / "2026-W37.md"
+    md.write_text(SAMPLE_MD, encoding="utf-8")
+    proc = _run_apply(tmp_path, "--commentary", "플래그로 넣은 의견")
+    assert proc.returncode == 0, proc.stderr
+    assert "플래그로 넣은 의견" in md.read_text(encoding="utf-8")
+    assert preview_mod.MARKER not in md.read_text(encoding="utf-8")
+
+
+def test_apply_commentary_rejects_positional_and_missing_flag(tmp_path):
+    md = tmp_path / "2026-W37.md"
+    md.write_text(SAMPLE_MD, encoding="utf-8")
+    assert _run_apply(tmp_path, "위치인자").returncode == 2
+    assert _run_apply(tmp_path).returncode == 2
+    assert _run_apply(
+        tmp_path, "--commentary", "a", "--headline", "b"
+    ).returncode == 2
+    assert md.read_text(encoding="utf-8") == SAMPLE_MD
+
+
+HEADLINE_MD = """# 협의회 주간 정책브리핑 2026-W37
+
+이번 주 한 줄: <!-- 상민 확정 필요 -->
+
+## 지원사업 공고
+
+### 공고 하나
+
+**기관:** 기관
+**마감:** 미정
+**원문:** [https://example.com/a](https://example.com/a)
+
+## 협의회 의견
+
+<!-- 상민 확정 필요 -->
+"""
+
+
+def test_headline_and_commentary_target_different_markers():
+    """`--headline` 은 한 줄 줄의 마커만, `--commentary` 는 그 밖의 첫 마커만."""
+    headlined, ok = apply_headline(HEADLINE_MD, "이번 주 요지")
+    assert ok is True
+    assert "이번 주 한 줄: 이번 주 요지" in headlined
+    assert headlined.count(preview_mod.MARKER) == 1     # 협의회 의견은 그대로
+
+    commented, ok = apply_commentary(HEADLINE_MD, "협의회 의견 본문")
+    assert ok is True
+    assert "이번 주 한 줄: <!-- 상민 확정 필요 -->" in commented
+    assert "협의회 의견 본문" in commented
+
+    both, _ = apply_commentary(headlined, "협의회 의견 본문")
+    assert preview_mod.MARKER not in both
+
+
+def test_apply_headline_via_cli(tmp_path):
+    md = tmp_path / "2026-W37.md"
+    md.write_text(HEADLINE_MD, encoding="utf-8")
+    proc = _run_apply(tmp_path, "--headline", "한 줄 확정")
+    assert proc.returncode == 0, proc.stderr
+    body = md.read_text(encoding="utf-8")
+    assert "이번 주 한 줄: 한 줄 확정" in body
+    assert body.count(preview_mod.MARKER) == 1
+    # 한 줄은 본문 편집이므로 status 를 annotated 로 올리지 않는다
+    assert state_mod.load_state(
+        state_mod.state_path("2026-W37", tmp_path), "2026-W37"
+    )["status"] == "draft"
+
+
+def test_apply_commentary_rejects_control_chars(tmp_path):
+    md = tmp_path / "2026-W37.md"
+    md.write_text(SAMPLE_MD, encoding="utf-8")
+    proc = _run_apply(tmp_path, "--commentary", "의견\x0b숨김")
+    assert proc.returncode == 2
+    assert md.read_text(encoding="utf-8") == SAMPLE_MD
+
+
+# ══ 사이클6 #9: 엄격 주차 ══════════════════════════════════════════════
+@pytest.mark.parametrize("week,ok", [
+    ("2026-W01", True), ("2026-W53", True), ("2026-W37", True),
+    ("2026-W00", False), ("2026-W54", False), ("2026-W99", False),
+    ("2026-W37\n", False), ("2026-w37", False), ("26-W37", False),
+    ("", False), (None, False),
+])
+def test_valid_week(week, ok):
+    assert state_mod.valid_week(week) is ok
+
+
+def test_send_digest_refuses_non_week_filename(tmp_path, monkeypatch):
+    md = tmp_path / "digest.md"
+    md.write_text(SAMPLE_MD, encoding="utf-8")
+    _forbid_notifier(monkeypatch, "주차 이름이 아닌 파일을 발송했다")
+    assert send_digest(
+        md, dry_run=False, approved_by="1", approval_id="0" * 12
+    ) == 2
+
+
+# ══ 사이클6 #7: main() 전체 redact ══════════════════════════════════════
+def test_guarded_main_redacts_traceback(monkeypatch, capsys):
+    from scripts import send_digest as send_mod
+
+    leak = "1401666801:AAHt9Xk2mQpLzR7vNbC3dEfGhIjKlMnOpQrSt"
+
+    def boom():
+        raise RuntimeError(f"터짐 {leak}")
+
+    monkeypatch.setattr(send_mod, "main", boom)
+    assert send_mod.guarded_main() == 70
+    err = capsys.readouterr().err
+    assert leak not in err and "<redacted>" in err
+    assert "Traceback" in err
+
+
+def test_notify_guarded_main_redacts_traceback(monkeypatch, capsys):
+    from scripts import notify_digest
+
+    leak = "1401666801:AAHt9Xk2mQpLzR7vNbC3dEfGhIjKlMnOpQrSt"
+
+    def boom():
+        raise RuntimeError(f"터짐 {leak}")
+
+    monkeypatch.setattr(notify_digest, "main", boom)
+    assert notify_digest.guarded_main() == 70
+    err = capsys.readouterr().err
+    assert leak not in err and "<redacted>" in err
+
+
+def test_notify_dry_run_redacts_check_reason(tmp_path, monkeypatch, capsys):
+    """드라이런 출력도 redact 를 지난다 (사이클6 #7)."""
+    from scripts import notify_digest
+
+    leak = "1401666801:AAHt9Xk2mQpLzR7vNbC3dEfGhIjKlMnOpQrSt"
+    annotated, _ = apply_commentary(SAMPLE_MD, "확정 의견")
+    md = _write_digest(
+        tmp_path, annotated,
+        dict(PASS_CHECK, **{"pass": False, "reason": f"생존 항목 없음 {leak}"}),
+    )
+    monkeypatch.setattr("sys.argv", ["notify_digest.py", str(md), "--dry-run"])
+    assert notify_digest.main() == 0
+    out = capsys.readouterr().out
+    assert leak not in out and "<redacted>" in out

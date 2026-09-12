@@ -56,7 +56,9 @@ def parse_digest(markdown_text: str, item_sections=None) -> Dict:
     commentary_lines: List[str] = []
     in_commentary = False
 
-    for raw in markdown_text.splitlines():
+    # 사이클6 #2: splitlines 금지 — 파서마다 줄 수가 달라지면 "같은 본문, 다른 항목 수"
+    # 가 된다(\v 로 항목을 숨기던 경로). 제어 문자는 checker 가 fail-closed 로 막는다.
+    for raw in markdown_text.split("\n"):
         line = raw.strip()
 
         if line.startswith("## "):

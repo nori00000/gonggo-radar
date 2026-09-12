@@ -172,12 +172,31 @@ def check_digest(
     markdown_text = markdown_bytes.decode("utf-8")
     content_hash = markdown_sha256(markdown_bytes)
 
-    # [텍스트](URL) 형식에서 URL 추출
-    url_pattern = r'\[([^\]]+)\]\(([^)]+)\)'
-    url_matches = re.findall(url_pattern, markdown_text)
+    # 사이클6 #2: 허용되지 않은 제어 문자는 그 자체로 fail-closed.
+    # 파서마다(split vs splitlines) 줄 수가 달라져 "같은 본문, 다른 항목 수" 가 된다.
+    bad_controls = prune.control_chars(markdown_text)
+    if bad_controls:
+        result = {
+            "items": [],
+            "dropped": [],
+            "item_blocks": 0,
+            "item_sections": [],
+            "commentary_sections": [],
+            "pass": False,
+            "network_checked": False,
+            "reason": "제어 문자 포함 ({})".format(
+                prune.control_chars_label(markdown_text)),
+            "markdown_sha256": content_hash,
+        }
+        result = _apply_warnings(result, warnings)
+        write_check_result(output_path, result)
+        return result
+
+    # 사이클6 #3: URL 추출은 prune.body_urls 하나로 — 마크다운 링크·베어 URL·원문값.
+    urls = prune.body_urls(markdown_text)
 
     # 항목 0건은 fail-closed (검사한 URL이 0건이므로 network_checked=False)
-    if not url_matches:
+    if not urls:
         result = {
             "items": [],
             "dropped": [],
@@ -199,7 +218,7 @@ def check_digest(
 
     url_to_period_end = {}
     url_to_title = {}
-    for _, url in url_matches:
+    for url in urls:
         cursor.execute(
             "SELECT period_end, title FROM announcements WHERE url = ? LIMIT 1",
             (url,)
@@ -216,7 +235,7 @@ def check_digest(
     dropped = []
     network_checked_count = 0
 
-    for _, url in url_matches:
+    for url in urls:
         period_end = url_to_period_end.get(url)
         if skip_network:
             url_alive = True

@@ -24,6 +24,16 @@ from alert.digest import state as state_mod
 from alert.digest.checker import markdown_sha256
 from alert.utils.redact import redact
 
+
+def _err(message) -> None:
+    """notify 의 **모든** stderr 출력 (사이클6 #7)."""
+    print(redact(message), file=sys.stderr)
+
+
+def _out(message) -> None:
+    """notify 의 모든 stdout 출력 (드라이런 본문 포함)."""
+    print(redact(message))
+
 TOPIC_GROUP_FILE = os.path.expanduser(
     os.environ.get("TOPIC_GROUP_FILE") or "~/.config/homelab/topic-group.json"
 )
@@ -147,6 +157,9 @@ def _blocking_reason(markdown_path, week, check, current_sha, markdown_text):
         state_mod.tombstone_path_for_markdown(markdown_path))
     if broken:
         return "{} [{}]".format(state_mod.TOMBSTONE_REASON, broken)
+    if prune.control_chars(markdown_text):
+        return "본문에 제어 문자 포함 ({})".format(
+            prune.control_chars_label(markdown_text))
     recorded = (check or {}).get("markdown_sha256")
     if not recorded:
         return "검증 파일이 이 본문을 본 기록이 없습니다"
@@ -169,9 +182,15 @@ def _blocking_reason(markdown_path, week, check, current_sha, markdown_text):
         return state_mod.VERIFICATION_BROKEN_REASON
     if state.get("rebuild_failed"):
         return state_mod.REBUILD_FAILED_REASON
-    # 사이클5 #1: 제외 검사는 본문 **전체** URL 기준이다.
+    # 사이클6: 렌더될 항목 수가 검증과 다르면 승인 대상이 아니다.
+    item_sections, _ = sections_mod.resolve(check, markdown_text)
+    rendered = prune.item_block_count(markdown_text, item_sections)
+    if rendered != int((check or {}).get("item_blocks") or 0):
+        return "본문 항목 수({})와 검증 항목 수({})가 다릅니다".format(
+            rendered, (check or {}).get("item_blocks"))
+    # 사이클5 #1 · 사이클6 #3: 제외 검사는 본문 **전체** URL 기준이다.
     leftover = state_mod.excluded_still_present(
-        state, prune.body_links(markdown_text))
+        state, prune.body_urls(markdown_text))
     if leftover:
         return "{} ({}건)".format(
             state_mod.EXCLUDED_NOT_APPLIED_REASON, len(leftover))
@@ -197,7 +216,7 @@ def main():
 
     markdown_path = Path(args.markdown)
     if not markdown_path.exists():
-        print(f"✗ 파일 없음: {markdown_path}", file=sys.stderr)
+        _err(f"✗ 파일 없음: {markdown_path}")
         return 2
 
     week = state_mod.week_from_markdown(markdown_path)
@@ -210,7 +229,7 @@ def main():
         markdown_bytes = markdown_path.read_bytes()
         markdown_text = markdown_bytes.decode("utf-8")
     except (OSError, UnicodeDecodeError) as exc:
-        print(f"✗ 마크다운 읽기 실패: {redact(exc)}", file=sys.stderr)
+        _err(f"✗ 마크다운 읽기 실패: {redact(exc)}")
         return 2
     check_bytes, check = load_check(markdown_path)
     current_sha = markdown_sha256(markdown_bytes)
@@ -236,17 +255,17 @@ def main():
         approval_check_sha = current_check_sha
 
     if args.dry_run:
-        print(f"[DRY-RUN] {week} 미리보기 {len(chunks)}개 메시지")
+        _out(f"[DRY-RUN] {week} 미리보기 {len(chunks)}개 메시지")
         for chunk in chunks:
-            print("---")
-            print(chunk)
+            _out("---")
+            _out(chunk)
         return 0
 
     try:
         chat_id, thread_id = resolve_target(args.topic_key)
         token = resolve_token()
     except (RuntimeError, OSError, json.JSONDecodeError) as exc:
-        print(f"✗ 전송 대상 확인 실패: {redact(exc)}", file=sys.stderr)
+        _err(f"✗ 전송 대상 확인 실패: {redact(exc)}")
         return 2
 
     # 사이클5 #5: 발송이 진행 중이면(발송기가 flock 보유) 미리보기를 보내지 않는다.
@@ -260,8 +279,8 @@ def main():
             "⏳ 발송 진행 중 — 미리보기를 보내지 않았습니다. 끝난 뒤 `/digest 재검토`.",
         )
         if not ok:
-            print(f"✗ 발송 진행 중 안내 전송 실패: {error}", file=sys.stderr)
-        print("✗ 미리보기 생략: 발송 진행 중(잠금 보유)", file=sys.stderr)
+            _err(f"✗ 발송 진행 중 안내 전송 실패: {error}")
+        _err("✗ 미리보기 생략: 발송 진행 중(잠금 보유)")
         return 3
 
     try:
@@ -270,13 +289,12 @@ def main():
             stale_card = state_mod.card_message_id(
                 state_mod.load_state(state_path, week))
         except state_mod.StateError as exc:
-            print(f"⚠️  상태 확인 실패(미리보기는 계속 전송): {redact(exc)}",
-                  file=sys.stderr)
+            _err(f"⚠️  상태 확인 실패(미리보기는 계속 전송): {redact(exc)}")
             stale_card = None
         if stale_card:
             ok, error = clear_card(token, chat_id, stale_card)
             if not ok:
-                print(f"⚠️  이전 승인 카드 버튼 제거 실패: {error}", file=sys.stderr)
+                _err(f"⚠️  이전 승인 카드 버튼 제거 실패: {error}")
 
         message_ids = []
         for index, chunk in enumerate(chunks, start=1):
@@ -284,11 +302,10 @@ def main():
             ok, message_id, error = send_chunk(
                 token, chat_id, thread_id, redact(chunk))
             if not ok:
-                print(f"✗ 전송 실패 ({index}/{len(chunks)}): {error}",
-                      file=sys.stderr)
+                _err(f"✗ 전송 실패 ({index}/{len(chunks)}): {error}")
                 return 2
             message_ids.append(message_id)
-            print(f"✓ 전송 {index}/{len(chunks)} message_id={message_id}")
+            _out(f"✓ 전송 {index}/{len(chunks)} message_id={message_id}")
 
         # 사이클4 #2: 사람이 **본** 본문·검증으로 새 승인 세대를 발급한다.
         # 잠금을 이미 쥐고 있으므로 apply_state 로 쓴다(update_state 는 재획득 시도).
@@ -300,11 +317,10 @@ def main():
                                          approval_sha, approval_check_sha),
             )
             approval = state_mod.approval_of(new_state)
-            print("✓ 상태 기록: {} (approval={})".format(
+            _out("✓ 상태 기록: {} (approval={})".format(
                 state_path, approval.get("id") or "없음(검증 필요)"))
         except (state_mod.StateError, state_mod.TransitionError, OSError) as exc:
-            print(f"⚠️  상태 기록 실패(미리보기는 전송됨): {redact(exc)}",
-                  file=sys.stderr)
+            _err(f"⚠️  상태 기록 실패(미리보기는 전송됨): {redact(exc)}")
             return 1
     finally:
         state_mod.release_lock(handle)
@@ -312,5 +328,17 @@ def main():
     return 0
 
 
+def guarded_main():
+    """예외·traceback 까지 redact 해서 내보낸다 (사이클6 #7)."""
+    try:
+        return main()
+    except SystemExit:
+        raise
+    except BaseException:       # noqa: BLE001
+        import traceback
+        _err(traceback.format_exc())
+        return 70
+
+
 if __name__ == "__main__":
-    sys.exit(main())
+    sys.exit(guarded_main())

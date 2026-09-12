@@ -18,6 +18,7 @@ notify·보류·해설은 어떤 경우에도 sending 을 풀지 못한다.
 import fcntl
 import json
 import os
+import re
 import uuid
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -74,6 +75,14 @@ STALE_CHECK_APPROVAL_REASON = "승인 이후 검증 파일이 바뀌었습니다
 
 # 승인 세대 id 길이 (callback_data 64바이트 한도 안에 들어가야 한다)
 APPROVAL_ID_LEN = 12
+
+# 주차 형식 (사이클6 #9). ISO 주는 01~53 이다 — W00·W99 나 끝 개행을 받지 않는다.
+WEEK_RE = re.compile(r"\A\d{4}-W(0[1-9]|[1-4]\d|5[0-3])\Z")
+
+
+def valid_week(week) -> bool:
+    """엄격한 주차 형식 검사."""
+    return bool(isinstance(week, str) and WEEK_RE.match(week))
 
 
 class StateError(RuntimeError):

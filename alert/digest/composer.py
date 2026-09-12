@@ -41,6 +41,18 @@ def get_week_date_range(week_str: str) -> Tuple[str, str]:
     return week_start.strftime("%Y-%m-%d"), week_end.strftime("%Y-%m-%d")
 
 
+def strip_controls(text: str) -> str:
+    """허용되지 않은 제어 문자를 제거 (계약 W10 사이클6 #2).
+
+    DB·폼에서 들어온 제목·요약·의견에 `\v`·`\r` 같은 문자가 섞이면 파서마다
+    줄 수가 달라져 "같은 본문, 다른 항목 수" 가 된다. 저장 시점에 없앤다.
+    (검증 단계에도 fail-closed 게이트가 있다 — 여기는 애초에 만들지 않는 쪽.)
+    """
+    from alert.digest.prune import CONTROL_CHARS_RE
+
+    return CONTROL_CHARS_RE.sub("", text or "")
+
+
 def normalize_title(title: str) -> str:
     """제목 정규화: 공백 정규화 (개행·탭 제거).
 
@@ -50,7 +62,7 @@ def normalize_title(title: str) -> str:
     Returns:
         정규화된 제목
     """
-    return " ".join(title.split())
+    return " ".join(strip_controls(title).split())
 
 
 def categorize_item(source: str, title: str) -> str:
@@ -357,7 +369,7 @@ def compose_digest(
             f"# 협의회 의견 {week_str}",
             "",
         ]
-        for opinion in opinions:
+        for opinion in (strip_controls(text) for text in opinions):
             opinions_lines.append(f"- {opinion}")
             opinions_lines.append("")
 
@@ -377,9 +389,9 @@ def _format_item(item: Dict) -> List[str]:
         마크다운 줄 리스트
     """
     lines = []
-    lines.append(f"### {item['title']}")
+    lines.append(f"### {strip_controls(item['title'])}")
     lines.append("")
-    lines.append(f"**기관:** {item['author']}")
+    lines.append(f"**기관:** {strip_controls(item['author'])}")
 
     # 마감일 (없으면 명시)
     if item['period_end']:
@@ -392,7 +404,7 @@ def _format_item(item: Dict) -> List[str]:
 
     # 요약 (최대 3줄, 없으면 명시)
     if item['summary']:
-        summary = item['summary'].strip()
+        summary = strip_controls(item['summary']).strip()
         # 최대 3줄로 절단
         summary_lines = summary.split("\n")[:3]
         summary = "\n".join(summary_lines)

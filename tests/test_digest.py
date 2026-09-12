@@ -782,8 +782,8 @@ class TestSendDigest:
 
     def test_dry_run_default(self, tmp_path):
         """기본값은 dry_run (발송 안 함)."""
-        md_path = tmp_path / "digest.md"
-        body = "# 테스트\n\n완료"
+        md_path = tmp_path / "2026-W13.md"
+        body = "# 테스트\n\n## 지원사업 공고\n\n### 공고 하나\n\n**원문:** [https://example.com](https://example.com)\n"
         md_path.write_text(body)
 
         # check.json 파일은 markdown 파일 이름으로부터 자동 파생됨
@@ -822,8 +822,8 @@ class TestSendDigest:
 
     def test_main_dry_run_with_send_never_opens_smtp(self, tmp_path, monkeypatch):
         """--dry-run --send 동시 지정 시 SMTP 연결이 생성되지 않는다."""
-        md_path = tmp_path / "x.md"
-        body = "# 테스트\n\n[원문](https://example.com)"
+        md_path = tmp_path / "2026-W14.md"
+        body = "# 테스트\n\n## 지원사업 공고\n\n### 공고 하나\n\n**원문:** [https://example.com](https://example.com)\n"
         md_path.write_text(body)
         check_path = md_path.with_suffix(".check.json")
         check_path.write_text(json.dumps({
@@ -851,8 +851,8 @@ class TestSendDigest:
 
     def test_send_to_override_replaces_config_recipients(self, tmp_path, monkeypatch):
         """--to 지정 시 config 수신자 2명이 아니라 제3자에게만 발송."""
-        md_path = tmp_path / "y.md"
-        body = "# 테스트\n\n[원문](https://example.com)"
+        md_path = tmp_path / "2026-W15.md"
+        body = "# 테스트\n\n## 지원사업 공고\n\n### 공고 하나\n\n**원문:** [https://example.com](https://example.com)\n"
         md_path.write_text(body)
         check_path = md_path.with_suffix(".check.json")
         check_path.write_text(json.dumps({
