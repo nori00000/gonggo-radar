@@ -50,6 +50,9 @@ class SmartfarmCrawler(BaseCrawler):
         "/board/list.do?menuId=M110502",  # 공지사항
     ]
 
+    # 상세 페이지 경로 (목록의 boardView(nttId) 호출이 POST로 도달하는 곳)
+    VIEW_PATH = "/board/view.do"
+
     def __init__(self):
         super().__init__(source_name="smartfarm")
         if BeautifulSoup is None:
@@ -115,7 +118,7 @@ class SmartfarmCrawler(BaseCrawler):
         items = self._parse_table_board(soup)
         if items:
             self.logger.info(f"Parsed {len(items)} items using table strategy")
-            return items
+            return self._resolve_view_links(soup, items)
 
         # 전략 2: div.board_list / div.bbs_list 기반
         items = self._parse_div_board(soup)
@@ -140,6 +143,67 @@ class SmartfarmCrawler(BaseCrawler):
             "HTML structure may have changed."
         )
         return []
+
+    def _board_view_params(self, soup: "BeautifulSoup") -> dict:
+        """목록 페이지의 searchFrm 히든 필드에서 상세 URL 파라미터를 읽는다.
+
+        스마트팜코리아 목록은 상세 링크를 href에 담지 않고 POST 폼(searchFrm)으로
+        제출한다. 게시판 식별자(menuId/searchBbsId)는 이 폼의 히든 값에 있다.
+
+        Args:
+            soup: 목록 페이지 BeautifulSoup 객체
+
+        Returns:
+            {"menuId": ..., "searchBbsId": ...} 형태의 딕셔너리
+        """
+        form = soup.find("form", attrs={"name": "searchFrm"})
+        if form is None:
+            return {}
+
+        params = {}
+        for hidden in form.find_all("input", attrs={"type": "hidden"}):
+            name = hidden.get("name", "")
+            if name in ("menuId", "searchBbsId"):
+                params[name] = hidden.get("value", "")
+        return params
+
+    def _resolve_view_links(self, soup: "BeautifulSoup", items: List[dict]) -> List[dict]:
+        """href="#void" 형태의 링크를 실제 상세 URL로 변환한다.
+
+        목록의 ``onclick="boardView('4529')"`` 에서 글 번호를 뽑아
+        ``/board/view.do?menuId=...&searchNttId=...&searchBbsId=...`` 를 만든다.
+        글 번호를 못 찾으면 링크를 비워 두어 제목+게시일 해시로 식별되게 한다.
+
+        Args:
+            soup: 목록 페이지 BeautifulSoup 객체
+            items: 파싱된 게시물 딕셔너리 리스트 (제자리에서 수정)
+
+        Returns:
+            링크가 보정된 items
+        """
+        params = self._board_view_params(soup)
+
+        for item in items:
+            link = item.get("link", "")
+            if link and not link.startswith("#"):
+                continue
+
+            match = re.search(
+                r"boardView\(\s*['\"]?(\d+)", item.get("onclick", "") or ""
+            )
+            if not match:
+                item["link"] = ""
+                continue
+
+            query = {
+                "menuId": params.get("menuId", ""),
+                "searchNttId": match.group(1),
+                "searchBbsId": params.get("searchBbsId", ""),
+            }
+            query_str = "&".join(f"{k}={v}" for k, v in query.items() if v)
+            item["link"] = f"{self.VIEW_PATH}?{query_str}"
+
+        return items
 
     def _parse_table_board(self, soup: "BeautifulSoup") -> List[dict]:
         """table 기반 게시판 파싱.
@@ -194,6 +258,7 @@ class SmartfarmCrawler(BaseCrawler):
 
             # 제목 + 링크 찾기
             title_link = None
+            title_onclick = ""
             title_text = ""
 
             # title/subject 클래스 셀 우선
@@ -203,6 +268,7 @@ class SmartfarmCrawler(BaseCrawler):
                     a_tag = cell.find("a")
                     if a_tag:
                         title_link = a_tag.get("href", "")
+                        title_onclick = a_tag.get("onclick", "")
                         title_text = a_tag.get_text(strip=True)
                     break
 
@@ -212,6 +278,7 @@ class SmartfarmCrawler(BaseCrawler):
                     a_tag = cell.find("a")
                     if a_tag and a_tag.get_text(strip=True):
                         title_link = a_tag.get("href", "")
+                        title_onclick = a_tag.get("onclick", "")
                         title_text = a_tag.get_text(strip=True)
                         break
 
@@ -233,6 +300,7 @@ class SmartfarmCrawler(BaseCrawler):
             items.append({
                 "title": title_text,
                 "link": title_link or "",
+                "onclick": title_onclick,
                 "date": date_str,
                 "category": "",
             })
@@ -515,10 +583,14 @@ class SmartfarmCrawler(BaseCrawler):
             link = self._normalize_url(item.get("link", ""), base_url)
             source_id = self._extract_post_id(link)
 
-            if not source_id:
-                source_id = hashlib.md5(title.encode("utf-8")).hexdigest()[:16]
-
             date_str = self._normalize_date(item.get("date", ""))
+
+            if not source_id:
+                # 상세 URL을 못 만든 경우: 제목+게시일로 글마다 다른 ID를 만든다
+                fingerprint = f"{title}|{date_str or item.get('date', '')}"
+                source_id = hashlib.md5(
+                    fingerprint.encode("utf-8")
+                ).hexdigest()[:16]
             category = item.get("category", "").strip()
 
             raw_data = json.dumps(item, ensure_ascii=False)

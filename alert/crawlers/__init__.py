@@ -27,6 +27,10 @@ from .seis import SeisCrawler
 from .ggeea import GgeeaCrawler
 from .mois_sse import MoisSseCrawler
 from .goyang_startup import GoyangStartupCrawler
+from .kofpi import KofpiCrawler
+from .forest_press import ForestPressCrawler
+from .lawmaking import LawmakingCrawler
+from .coop import CoopCrawler
 
 __all__ = [
     "BaseCrawler",
@@ -58,4 +62,8 @@ __all__ = [
     "GgeeaCrawler",
     "MoisSseCrawler",
     "GoyangStartupCrawler",
+    "KofpiCrawler",
+    "ForestPressCrawler",
+    "LawmakingCrawler",
+    "CoopCrawler",
 ]

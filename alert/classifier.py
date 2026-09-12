@@ -1,4 +1,4 @@
-"""사업 도메인 자동 분류 -- 키워드 기반 6개 도메인 매핑."""
+"""사업 도메인 자동 분류 -- 키워드 기반 7개 도메인 매핑."""
 
 import logging
 import re
@@ -14,6 +14,7 @@ DOMAIN_KOREAN_MAP = {
     "manufacturing": "제조/굿즈",
     "public_procurement": "공공조달",
     "ai_digital": "AI/디지털",
+    "forest_social_economy": "산림형 사회적경제",
 }
 
 # Keywords per domain: primary (strong signal, weight 2) and secondary (weak signal, weight 1)
@@ -41,6 +42,16 @@ DOMAIN_KEYWORDS = {
     "ai_digital": {
         "primary": ["AI융합", "디지털전환", "인공지능"],
         "secondary": ["콘텐츠", "ICT", "데이터", "자동화", "플랫폼", "디지털"],
+    },
+    "forest_social_economy": {
+        "primary": [
+            "산림형 사회적경제", "산림형 예비사회적기업", "산림사업법인",
+            "산림복지", "산촌", "임업",
+        ],
+        "secondary": [
+            "사회적협동조합", "마을기업", "목재", "사회적기업 인증",
+            "협동조합", "사회연대경제",
+        ],
     },
 }
 

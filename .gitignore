@@ -35,6 +35,8 @@ package-lock.json
 
 # Large generated files (exploration artifacts)
 *.html
+# ...except saved HTML fixtures used by the offline crawler tests
+!tests/fixtures/*.html
 *.png
 form_info.json
 
