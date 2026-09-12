@@ -606,21 +606,48 @@ class TestComposer:
         assert len(published) == 2, [item["title"] for item in published]
         assert data["merged_ids"] == []
 
-    def test_merge_title_key_keeps_letters_and_numbers(self):
-        """병합 키는 공백(Z*)·구두점(P*)만 지운다 (사이클 11 #1)."""
-        # 로마 숫자·전각 숫자·한자·라틴 확장 전부 남는다
+    def test_merge_title_key_removes_only_whitespace(self):
+        """병합 키는 **공백만** 지운다 — 구두점·숫자·기호는 남는다 (사이클 12 #1).
+
+        구두점 하나가 금액·회차를 가른다: `1.5억원` vs `15억원`,
+        `(1·3차)` vs `(13차)`. 구두점을 지우면 서로 다른 공고가 합쳐졌다.
+        """
         for left, right in (
-            ("모집 (Ⅲ차)", "모집 (Ⅳ차)"),
-            ("모집 (３차)", "모집 (４차)"),
-            ("모집 (三次)", "모집 (四次)"),
-            ("모집 (IIIrd)", "모집 (IVth)"),
+            ("모집 (Ⅲ차)", "모집 (Ⅳ차)"),          # 로마 숫자 (Nl)
+            ("모집 (３차)", "모집 (４차)"),          # 전각 숫자 (Nd)
+            ("모집 (三次)", "모집 (四次)"),          # 한자
+            ("최대 1.5억원 지원", "최대 15억원 지원"),
+            ("모집 (1·3차)", "모집 (13차)"),
+            ("산림 공고!", "산림 공고"),
         ):
             assert merge_title_key(left) != merge_title_key(right), (left, right)
-        # 공백·구두점 차이는 같은 제목이다 (LOW #6 도 함께 닫힌다)
+        # 공백 차이만 같은 제목이다
         assert merge_title_key("사업개발비 지원사업") == merge_title_key(
             "사업개발비지원사업"
         )
-        assert merge_title_key("산림 공고!") == merge_title_key("산림공고")
+        assert merge_title_key("산림  \t공고") == merge_title_key("산림공고")
+
+    @pytest.mark.parametrize("titles", [
+        ("사회적기업 최대 1.5억원 지원사업 모집", "사회적기업 최대 15억원 지원사업 모집"),
+        ("사회적기업 지원사업 모집 (1·3차)", "사회적기업 지원사업 모집 (13차)"),
+    ])
+    def test_punctuation_difference_is_never_merged(self, tmp_path, titles):
+        """구두점만 다른 제목은 병합하지 않는다 (Codex 8차 HIGH #1)."""
+        db_path = tmp_path / f"c12_punct_{abs(hash(titles))}.db"
+        _create_announcements_table(db_path)
+        for index, title in enumerate(titles):
+            _insert_one(
+                db_path, source="seis", source_id=f"p_{index}", title=title,
+                url=f"https://example.com/p-{index}",
+                period_start="2026-09-08", period_end=None,
+                created_at=W37_CREATED_AT,
+            )
+        data = compose_digest_data(
+            str(db_path), week_str=W37, today=W37_TODAY
+        )
+        published = data["sections"][VERDICT_APPLY]
+        assert len(published) == 2, [item["title"] for item in published]
+        assert data["merged_ids"] == []
 
     def test_space_variant_duplicate_is_merged(self, tmp_path):
         """공백만 다른 같은 제목은 병합된다 (Codex 7차 LOW #6)."""
@@ -644,7 +671,7 @@ class TestComposer:
 
     @pytest.mark.parametrize("group", [
         "설명회 장소 서울", "설명회 장소: 서울", "서울 개최", "개최 장소 대전",
-        "서울에서", "서울 회장", "교육장 서울",
+        "서울에서", "서울 회장", "서울 행사장",
     ])
     def test_venue_group_without_colon_is_not_a_region(self, group):
         """콜론이 없어도 장소 문맥이면 자격 지역이 아니다 (사이클 11 #5)."""
@@ -657,10 +684,18 @@ class TestComposer:
             assert infer_region(title) is None, title
 
     def test_qualification_region_still_wins(self):
-        """장소 필터가 자격 지역을 삼키지 않는다 (사이클 11 #5)."""
+        """장소 필터가 자격 지역을 삼키지 않는다 (사이클 11 #5 + 12 #6).
+
+        Codex 8차 MEDIUM #6 재현 입력: 단독 `장` 을 장소 신호로 본 탓에
+        `[경기 사업장 보유 기업]` 의 지역 제한이 사라져 대상이 넓어졌다 —
+        자격 지역을 잃는 것은 행사 장소를 오인하는 것보다 나쁘다(오배포).
+        """
         assert infer_region("[경기] 사회적기업 지원사업 모집") == "경기"
         assert infer_region("[세종대전충청센터] 설명회 안내") == "충청"
         assert infer_region("사회적기업 지원사업 모집 [강원]") == "강원"
+        # `장` 이 자격 조건에 든 괄호는 장소가 아니다
+        assert infer_region("[경기 사업장 보유 기업] 사회적기업 지원사업 모집") == "경기"
+        assert infer_region("[강원 교육장 운영 기업] 지원사업 모집") == "강원"
 
     def test_merge_title_key_is_conservative(self):
         """병합 키는 공백·구두점만 지운다 (괄호·날짜·회차 전부 보존 — #1)."""
@@ -757,13 +792,14 @@ class TestComposer:
         assert "[상시] 임업 경영 컨설팅 참여기업 모집" in markdown
         # 게시일을 모르는 항목에 "새 소식"을 붙이지 않는다 (fail-closed)
         assert "[상시] 사회적기업 사무공간 신규 입주기업 모집 공고" in markdown
-        # 개정 v2.4 (a) 2단계: 게시일만 알면 "접수 M/D부터, 마감 원문 확인"
-        assert "접수 3/24부터, 마감 원문 확인" in markdown
-        assert "접수 10/29부터, 마감 원문 확인" in markdown
-        # 3단계: 둘 다 모르면 "마감 미정"
+        # 사이클 12 #3: 마감 근거는 DB period_end 뿐이다 —
+        # 게시일만 알면 "접수 M/D부터, 마감 미정"
+        assert "접수 3/24부터, 마감 미정" in markdown
+        assert "접수 10/29부터, 마감 미정" in markdown
+        # 둘 다 모르면 "마감 미정"
         assert "· 마감 미정" in markdown
-        # "마감 원문 확인" 단독 표기는 폐지됐다
-        assert "· 마감 원문 확인" not in markdown
+        # 텍스트에서 유도한 마감 표기는 더 이상 나오지 않는다
+        assert "원문 확인" not in markdown
 
     def test_compose_digest_expired_deadline_dropped(self, tmp_path):
         """판정 ④: 마감이 지난 신청 항목은 배제된다."""
@@ -1765,14 +1801,10 @@ class TestRulesV21:
             '"period": "2026. 9. 7. ~2026. 10. 19."}'
         )
         quotes = extract_quotes("", raw)
-        assert quotes["quote_deadline"] == "2026. 9. 7. ~2026. 10. 19."
+        # 사이클 12 #3: 마감은 인용에서 뽑지 않는다 (근거는 DB period_end 뿐)
+        assert "quote_deadline" not in quotes
         assert quotes["quote_eligibility"] == "원문 확인"
         assert quotes["quote_amount"] == "원문 확인"
-
-        kofpi_raw = (
-            '{"title": "[모집] 2026 산림분야 오픈이노베이션 참여기업 모집(~9.30)"}'
-        )
-        assert extract_quotes("", kofpi_raw)["quote_deadline"] == "~9.30"
 
         empty = extract_quotes("", "")
         assert set(empty.values()) == {"원문 확인"}
@@ -1781,7 +1813,7 @@ class TestRulesV21:
         """링크 안의 숫자가 금액·마감으로 둔갑하지 않는다."""
         raw = '{"link": "subPage.do?fncPbofrSn=8371&page=9/30", "title": "모집 공고"}'
         quotes = extract_quotes("", raw)
-        assert quotes["quote_deadline"] == "원문 확인"
+        assert "quote_deadline" not in quotes
         assert quotes["quote_amount"] == "원문 확인"
 
     def test_jaccard_merges_identical_and_keeps_distinct(self):
@@ -2192,12 +2224,17 @@ class TestFixCycle3:
 
         assert "· 마감 9/30" in markdown
         assert "[D-188]" in markdown
-        assert "· 접수 3/24부터, 마감 원문 확인" in markdown
+        assert "· 접수 3/24부터, 마감 미정" in markdown
         assert "· 마감 미정" in markdown
-        assert "· 마감 원문 확인" not in markdown
+        assert "원문 확인" not in markdown
 
-    def test_deadline_quote_fills_the_placeholder(self, tmp_path):
-        """인용 span이 있으면 "원문 확인"/"미정" 자리를 원문 문구 그대로 채운다."""
+    def test_text_derived_deadline_is_never_rendered(self, tmp_path):
+        """summary·raw_data 의 날짜는 마감으로 쓰지 않는다 (사이클 12 #3).
+
+        Codex 8차 HIGH #3: 텍스트에서 유도한 마감은 정본 대조가 검증할 수 없다 —
+        DB 를 `~9.12` 로 바꿔도 `9/30` 렌더가 그대로 통과했다. 근거는 DB
+        `period_end` 뿐이고, 모르면 "미정" 이라고 쓴다(창작 금지).
+        """
         db_path = tmp_path / "c3quote.db"
         _create_announcements_table(db_path)
         _insert_one(
@@ -2208,6 +2245,7 @@ class TestFixCycle3:
             url="https://example.com/quoted",
             period_start="2026-03-24",
             period_end=None,
+            summary="접수기간: 2026-03-24 ~2026-09-30",
             raw_data=(
                 '{"title": "산림복지전문업 플랫폼 입점 지원사업 '
                 '참가기업 모집 연장(~9.14.)"}'
@@ -2217,7 +2255,9 @@ class TestFixCycle3:
         markdown = compose_digest(
             db_path=str(db_path), week_str=W13, today=W13_TODAY
         )
-        assert "· 접수 3/24부터, 마감 ~9.14." in markdown
+        assert "· 접수 3/24부터, 마감 미정" in markdown
+        for derived in ("~9.14.", "9/30", "2026-09-30", "원문 확인"):
+            assert derived not in markdown, derived
 
     def test_notice_keeps_opinion_deadline_form(self, tmp_path):
         db_path = tmp_path / "c3notice.db"

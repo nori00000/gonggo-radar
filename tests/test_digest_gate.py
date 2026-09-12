@@ -3212,3 +3212,175 @@ def test_properly_replaced_long_link_is_not_flagged(tmp_path, monkeypatch):
     assert result["kakao_problems"] == []
     assert result["long_prose_urls"] == [url]
     assert result["pass"] is True, result["reason"]
+
+
+# ══ 사이클 12: 괄호 URL · 카톡 단일 경로 · 출현별 검증 ═════════════════
+PAREN_URL = "https://live.example/report(dead)"
+
+
+def test_bare_url_with_parentheses_is_extracted_whole(tmp_path, monkeypatch):
+    """괄호가 든 맨몸 URL 은 **전체**가 검사 대상이다 (Codex 8차 HIGH #2).
+
+    예전에는 `[^\\s"\'<>()\\[\\]]+` 로 잘라서 `…/report` 만 검사했고, 실제로 죽어 있는
+    전체 주소는 카톡에 그대로 실린 채 통과했다.
+    """
+    assert blocks_mod.bare_urls(f"참고 {PAREN_URL} 입니다") == [PAREN_URL]
+    # 괄호 밖의 끝 구두점만 떼어낸다
+    assert blocks_mod.bare_urls("참고 https://live.example/x. 끝") == [
+        "https://live.example/x"
+    ]
+    assert blocks_mod.bare_urls(f"참고 {PAREN_URL}. 끝") == [PAREN_URL]
+
+    body = SAMPLE_MD.replace(
+        "· (면담·건의·수렴 현황 — 이번 주 기록 없음)", f"· 참고 {PAREN_URL}"
+    )
+    md = tmp_path / "2026-W37.md"
+    md.write_text(body, encoding="utf-8")
+    db = _bind(md)
+    # 전체 주소는 dead, 접두(`/report`)는 alive 로 모킹한다
+    monkeypatch.setattr(
+        "alert.digest.checker.check_url_alive",
+        lambda url, timeout=8: url != PAREN_URL,
+    )
+    result = check_digest(db_path=str(db), markdown_path=md, output_path=None)
+    assert result["pass"] is False
+    assert PAREN_URL in [item["url"] for item in result["dropped"]]
+
+
+def test_kakao_first_render_equals_regeneration(tmp_path):
+    """최초 카톡본 == 재생성본 (바이트 동일 — 사이클 12 #4).
+
+    Codex 8차 MEDIUM #4: 회원사명 접두를 붙이는 별도 렌더 경로에서 길이 판정이
+    달라져, 최초 카톡만 안내 문구로 치환되고 md·미리보기·HTML·재생성본에는 URL 이
+    남았다. 카톡 파일을 만드는 경로를 md 렌더러 하나로 합쳤다.
+    """
+    from alert.digest.composer import compose_digest, kakao_file_text_from_markdown
+    from tests.test_digest import _create_announcements_table, _insert_one
+
+    long_url = "https://example.com/" + "m" * 4050
+    forms = tmp_path / "forms.csv"
+    forms.write_text(
+        "접수일,회원사,유형,내용,관련정책\n"
+        f"2026-09-10,{'회원사이름' * 6},동정,자료는 [자료]({long_url}) 입니다,\n",
+        encoding="utf-8",
+    )
+    db_path = tmp_path / "c12_kakao.db"
+    _create_announcements_table(db_path)
+    _insert_one(
+        db_path, source="kofpi", source_id="k1",
+        title="산림 지원사업 참여기업 모집 공고",
+        url="https://example.com/k1", period_end="2026-12-31",
+    )
+    out = tmp_path / "2026-W13.md"
+    markdown = compose_digest(
+        db_path=str(db_path), week_str="2026-W13", output_path=out,
+        forms_csv_path=forms,
+    )
+    first = (tmp_path / "2026-W13.kakao.txt").read_bytes()
+    regenerated = kakao_file_text_from_markdown(markdown).encode("utf-8")
+    assert first == regenerated
+
+    # 회원사명 접두 때문에 길이 판정이 갈라지지 않는다 — 모든 채널이 **같은 결정**을 한다
+    from scripts.send_digest import markdown_to_html
+    kakao = first.decode("utf-8")
+    html = markdown_to_html(markdown)
+    preview_body = preview_mod.render_preview("2026-W13", markdown, PASS_CHECK)
+    assert "https://example.com/k1" in markdown
+    for rendered in (kakao, html, preview_body):
+        assert "https://example.com/k1" in rendered
+        # 회원사 소식의 URL 은 네 채널에서 같은 처분을 받는다 (보존 or 치환)
+        assert (long_url in rendered) == (long_url in markdown), rendered[:40]
+    assert composer_mod.markdown_kakao_problems(markdown) == []
+
+    # 같은 소식이 한도를 넘기면 **모든 채널에서** 치환된다
+    huge_url = "https://example.com/" + "h" * 4200
+    huge = markdown.replace(long_url, huge_url)
+    huge_kakao = kakao_file_text_from_markdown(huge)
+    huge_html = markdown_to_html(huge)
+    for rendered in (huge_kakao, huge_html):
+        assert huge_url not in rendered
+        assert composer_mod.URL_TOO_LONG_NOTICE in rendered
+    assert composer_mod.markdown_kakao_problems(huge) == []
+
+
+REPEAT_URL = "https://example.com/repeat" + "r" * 4060
+
+
+def test_repeated_long_url_is_verified_per_occurrence(tmp_path, monkeypatch):
+    """같은 URL 이 여러 번 나와도 **출현별**로 검증한다 (Codex 8차 MEDIUM #5).
+
+    예전에는 첫 출현이 온전하면 두 번째 출현의 분절을 면제했다.
+    판정을 토큰 경계로 바꿔, 결과물에 원본에 없는 URL 토큰이 있으면 분절로 본다.
+    """
+    monkeypatch.setattr(
+        "alert.digest.checker.check_url_alive", lambda url, timeout=8: True
+    )
+    body = SAMPLE_MD.replace(
+        "· (면담·건의·수렴 현황 — 이번 주 기록 없음)",
+        f"· 참고자료 원문주소: {REPEAT_URL}\n· 다시: {REPEAT_URL}",
+    )
+    md = tmp_path / "2026-W37.md"
+    md.write_text(body, encoding="utf-8")
+    db = _bind(md)
+
+    kakao = composer_mod.kakao_file_text_from_markdown(body)
+    # 분절 조각(원본에 없는 URL 토큰)이 없다
+    assert composer_mod.markdown_kakao_problems(body) == []
+    assert all(
+        len(chunk) <= composer_mod.KAKAO_CHUNK_LIMIT
+        for chunk in kakao.split(f"\n{KAKAO_CHUNK_SEPARATOR}\n")
+    )
+    result = check_digest(db_path=str(db), markdown_path=md, output_path=None)
+    assert result["kakao_problems"] == []
+    assert result["pass"] is True, result["reason"]
+
+
+def test_shared_prefix_urls_are_not_false_positives(tmp_path, monkeypatch):
+    """접두를 공유하는 정상 URL 이 조각으로 오판되지 않는다 (사이클 12 #5)."""
+    monkeypatch.setattr(
+        "alert.digest.checker.check_url_alive", lambda url, timeout=8: True
+    )
+    prefix = "https://example.com/shared/prefix/that/is/long/enough/to/matter"
+    short = prefix + "/ok"
+    long_url = prefix + "/" + "z" * 4100
+    body = SAMPLE_MD.replace(
+        "· (면담·건의·수렴 현황 — 이번 주 기록 없음)",
+        f"· 짧은 [A]({short})\n· 긴 [B]({long_url})",
+    )
+    md = tmp_path / "2026-W37.md"
+    md.write_text(body, encoding="utf-8")
+    db = _bind(md)
+
+    kakao = composer_mod.kakao_file_text_from_markdown(body)
+    assert short in kakao                  # 짧은 URL 은 온전히 실린다
+    assert long_url not in kakao           # 긴 URL 만 치환된다
+    assert composer_mod.markdown_kakao_problems(body) == []
+    result = check_digest(db_path=str(db), markdown_path=md, output_path=None)
+    assert result["kakao_problems"] == []
+    assert result["long_prose_urls"] == [long_url]
+    assert result["pass"] is True, result["reason"]
+
+
+SPLIT_URL = "https://example.com/split" + "s" * 4200
+
+
+def test_split_url_still_fails_with_token_rule(tmp_path, monkeypatch):
+    """치환을 무력화하면 분절 조각이 잡힌다 (사이클 12 #5 — 규칙이 비지 않았다)."""
+    monkeypatch.setattr(
+        "alert.digest.checker.check_url_alive", lambda url, timeout=8: True
+    )
+    monkeypatch.setattr(
+        "alert.digest.composer.fit_prose_urls",
+        lambda text, limit=composer_mod.KAKAO_CHUNK_LIMIT: (text, []),
+    )
+    body = SAMPLE_MD.replace(
+        "· (면담·건의·수렴 현황 — 이번 주 기록 없음)",
+        f"· 참고 [자료]({SPLIT_URL}) 입니다",
+    )
+    md = tmp_path / "2026-W37.md"
+    md.write_text(body, encoding="utf-8")
+    db = _bind(md)
+    result = check_digest(db_path=str(db), markdown_path=md, output_path=None)
+    assert result["kakao_problems"], result["kakao_problems"]
+    assert any("분절" in problem for problem in result["kakao_problems"])
+    assert result["pass"] is False

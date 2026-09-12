@@ -51,10 +51,12 @@ _SCHEME_RE = re.compile(
     r"^(?:https?://" + _HOST_CHARS + r"|www\." + _HOST_CHARS + r")",
     re.IGNORECASE,
 )
-# 마크다운 문법 없이 본문에 적힌 URL (사이클 10 #3)
-_BARE_URL_RE = re.compile(
-    r"https?://" + _HOST_CHARS + r"+", re.IGNORECASE
-)
+# 맨몸 URL 의 시작 (사이클 10 #3). 끝은 _bare_url_at 이 균형 괄호로 찾는다.
+_BARE_URL_START_RE = re.compile(r"https?://", re.IGNORECASE)
+# URL 을 끊는 문자 (공백·따옴표·꺾쇠·대괄호)
+_URL_STOP_CHARS = set(" \t\n\r\"'<>[]")
+# 괄호 **밖**에 있을 때만 URL 끝에서 떼어내는 구두점
+_URL_TRAILING_PUNCT = ".,;:!?·"
 
 # 항목의 원문 링크 줄은 링크 하나로만 이루어진다.
 ORIGIN_LINK_TEXT = "원문"
@@ -203,9 +205,47 @@ def bare_urls(markdown_text: str) -> List[str]:
         # (사이클 11 #3: `[https://dead/x](https://live/y)` 의 dead 는 사람 눈에
         # 보이는 주소이고 카톡·메일에 그대로 실린다. 목적지만 검사하면 놓친다).
         masked = _mask_link_targets(line)
-        for match in _BARE_URL_RE.finditer(masked):
-            urls.append(match.group(0))
+        index = 0
+        while True:
+            match = _BARE_URL_START_RE.search(masked, index)
+            if not match:
+                break
+            url = _bare_url_at(masked, match.start())
+            index = match.start() + max(len(url), len(match.group(0)))
+            if url and has_url_scheme(url):
+                urls.append(url)
     return urls
+
+
+def _bare_url_at(text: str, start: int) -> str:
+    r"""`start` 에서 시작하는 맨몸 URL — **링크와 같은 균형 괄호 규칙** (사이클 12 #2).
+
+    열린 괄호 수만큼 닫힌 괄호까지 URL 에 포함한다. 예전에는 `[^\s"'<>()\[\]]+` 로
+    잘라서 `https://live.example/report(dead)` 의 `…/report` 만 검사했고, 실제로
+    죽어 있는 **전체 주소**는 카톡에 그대로 실린 채 통과했다(Codex 8차 HIGH #2).
+
+    끝 구두점은 **괄호 밖일 때만** 떼어낸다 — `…/report(dead)` 의 `)` 는 URL 의
+    일부이고, `…/x.` 의 `.` 는 문장 부호다.
+    """
+    depth = 0
+    index = start
+    while index < len(text):
+        char = text[index]
+        if char in _URL_STOP_CHARS:
+            break
+        if char == "(":
+            depth += 1
+        elif char == ")":
+            if depth == 0:
+                break
+            depth -= 1
+        index += 1
+    url = text[start:index]
+    while url and url[-1] in _URL_TRAILING_PUNCT:
+        if url.count("(") != url.count(")"):
+            break
+        url = url[:-1]
+    return url
 
 
 def _mask_link_targets(line: str) -> str:

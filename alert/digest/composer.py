@@ -368,9 +368,12 @@ _VENUE_CONTEXT_RE = re.compile(
     r"(?:개최\s*)?장소\s*[:：][^)\]]*|[가-힣]{2,5}에서|개최지\s*[:：][^)\]]*"
 )
 # 콜론 없는 장소 문맥 (사이클 11 #5). `[설명회 장소 서울]`·`[서울 개최]` 처럼
-# 구분 기호가 없어도 행사 장소는 자격 지역이 아니다. **괄호 그룹 안에서만** 본다 —
-# 본문 전체에 적용하면 `장` 같은 짧은 토큰이 정상 제목을 삼킨다.
-_VENUE_TOKEN_RE = re.compile(r"장소|개최|에서|회장|장")
+# 구분 기호가 없어도 행사 장소는 자격 지역이 아니다. **괄호 그룹 안에서만** 본다.
+#
+# 사이클 12 #6: 단독 `장` 을 뺐다. `[경기 사업장 보유 기업]` 처럼 **자격 조건**에
+# 들어간 `장` 을 장소 신호로 읽어 지역 제한이 사라졌다 — 자격 지역을 잃는 것은
+# 행사 장소를 지역으로 오인하는 것보다 나쁘다(대상이 넓어져 오배포가 된다).
+_VENUE_TOKEN_RE = re.compile(r"장소|개최|에서|회장|행사장")
 # 괄호 내용을 지우고 남은 알맹이가 이보다 짧으면 부호만 지우는 쪽으로 되돌린다.
 _MIN_DEDUP_KEY_CHARS = 8
 _DATE_TOKEN_RE = re.compile(
@@ -379,17 +382,6 @@ _DATE_TOKEN_RE = re.compile(
 )
 _SYMBOL_RE = re.compile(r"[^0-9A-Za-z가-힣ㄱ-ㅎㅏ-ㅣ\s]")
 
-# 인용 가능한 마감 표기 (특수한 것부터). 반환값은 원문에서 잘라낸 **문자 그대로**다.
-_QUOTE_DEADLINE_PATTERNS = (
-    r"\d{4}\s*\.\s*\d{1,2}\s*\.\s*\d{1,2}\s*\.?\s*~\s*\d{4}\s*\.\s*\d{1,2}\s*\.\s*\d{1,2}\s*\.?",
-    r"~\s*\d{4}\s*[.\-/]\s*\d{1,2}\s*[.\-/]\s*\d{1,2}\s*\.?",
-    r"\d{1,2}\s*[./]\s*\d{1,2}\s*~\s*\d{1,2}\s*[./]\s*\d{1,2}",
-    r"~\s*\d{1,2}\s*[./]\s*\d{1,2}\s*\.?",
-    r"\d{4}\s*[.\-/]\s*\d{1,2}\s*[.\-/]\s*\d{1,2}\s*까지",
-    r"\d{1,2}\s*월\s*\d{1,2}\s*일\s*까지",
-    r"연중\s*상시\s*모집",
-    r"상시\s*모집",
-)
 
 _QUOTE_ELIGIBILITY_PATTERNS = (
     r"(?:참여|신청|지원|모집)\s*(?:자격|대상)\s*[:：]\s*[^\n]{2,60}",
@@ -528,26 +520,20 @@ def _strip_tokens(text: str) -> str:
 def merge_title_key(title: str) -> str:
     """병합 판정용 **보수** 정규화 — 공백(Z*)과 구두점(P*)만 지운다 (사이클 11 #1).
 
-    판정 기준은 **unicodedata 범주**다. 문자(L*)·숫자(N*)·기호(S*)·결합문자(M*)는
-    스크립트를 가리지 않고 전부 보존한다 — 로마 숫자 `Ⅲ`(Nl)·전각 숫자 `３`(Nd)도
-    회차 정보이므로 남는다.
+    지우는 것은 **공백(Z*)뿐**이다. 구두점·숫자·기호·문자는 전부 남는다 —
+    구두점 하나가 금액·회차를 가르기 때문이다(사이클 12 #1):
+      `최대 1.5억원 지원사업` / `최대 15억원 지원사업`  → 구두점을 지우면 같은 키
+      `(1·3차)` / `(13차)`                              → 같음
+    구두점만 다른 제목은 병합하지 않고 "유사 항목" 으로 표시한다. 판단은 편집자 몫이다.
 
-    예전에는 `[^0-9A-Za-z가-힣…]` 문자 클래스로 지웠다. ASCII·한글 밖의 모든 글자가
-    사라졌고, 그래서 `… 모집 (Ⅲ차)` / `… (Ⅳ차)` 와 `(３차)` / `(４차)` 가 둘 다
-    `…모집차` 로 같아지며 서로 다른 회차가 하나로 병합됐다 —
-    유효 공고가 sections·holds 양쪽에서 사라졌다(Codex 7차 HIGH #1).
-
-    공백까지 지우므로 `사업개발비 지원사업` 과 `사업개발비지원사업` 은 같은 제목이다
-    (Codex 7차 LOW #6: 공백 변형 중복이 슬롯을 따로 차지하던 문제도 함께 닫힌다).
+    공백은 지운다 — `사업개발비 지원사업` 과 `사업개발비지원사업` 은 같은 공고이고,
+    갈라놓으면 중복이 슬롯을 두 개 차지한다(Codex 7차 LOW #6).
     병합은 이 키가 **완전히 같을 때만** 일어난다.
     """
-    kept = []
-    for char in normalize_title(title):
-        category = unicodedata.category(char)
-        if category[0] in ("Z", "P") or char.isspace():
-            continue
-        kept.append(char)
-    return "".join(kept)
+    return "".join(
+        char for char in normalize_title(title)
+        if not (char.isspace() or unicodedata.category(char)[0] == "Z")
+    )
 
 
 def dedup_key(title: str) -> str:
@@ -997,15 +983,16 @@ def _find_quote(text: str, patterns: Sequence[str]) -> Optional[str]:
 def extract_quotes(
     summary: Optional[str], raw_data: Optional[str]
 ) -> Dict[str, str]:
-    """마감·자격·금액의 인용 span (판정 ⑦).
+    """자격·금액의 인용 span (판정 ⑦).
 
     DB에서 문자 그대로 찾을 수 있을 때만 값이 들어간다. 없으면 "원문 확인".
     필드 이름은 GLM 야간 레인(V3)이 나중에 채울 자리로 예약돼 있다.
+
+    **마감은 여기서 뽑지 않는다** (사이클 12 #3). 마감의 근거는 DB `period_end` 뿐이고,
+    텍스트에서 유도한 날짜는 정본 대조가 검증할 수 없다(DB 가 바뀌어도 못 잡는다).
     """
     text = _quote_source_text(summary, raw_data)
     return {
-        "quote_deadline": _find_quote(text, _QUOTE_DEADLINE_PATTERNS)
-        or QUOTE_FALLBACK,
         "quote_eligibility": _find_quote(text, _QUOTE_ELIGIBILITY_PATTERNS)
         or QUOTE_FALLBACK,
         "quote_amount": _find_quote(text, _QUOTE_AMOUNT_PATTERNS)
@@ -1081,10 +1068,15 @@ def _parse_created_date(created_at: Optional[str]) -> Optional[date]:
 def _deadline_fields(
     deadline: Optional[date],
     posted_known: Optional[date],
-    quoted_tail: Optional[str],
     today: date,
 ) -> Dict:
-    """마감 표기 3단계 (개정 v2.4 (a)). "마감 원문 확인" 단독 표기는 폐지."""
+    """마감 표기 (사이클 12 #3: 근거는 **DB period_end 뿐**).
+
+    summary·raw_data·제목 텍스트에서 날짜를 유도하지 않는다. 인용 마감을 렌더하면
+    ①DB 가 바뀌어도 정본 대조가 잡지 못하고(근거가 정본 밖에 있다)
+    ②크롤러가 못 읽은 날짜를 다이제스트가 창작한 셈이 된다.
+    마감을 모르면 "미정" 이라고 쓰고, 사람이 원문을 본다.
+    """
     if deadline is not None:
         short = format_month_day(deadline)
         return {
@@ -1101,11 +1093,9 @@ def _deadline_fields(
         and (today - posted_known).days <= NEW_WINDOW_DAYS
     )
     if posted_known is not None:
-        display = "접수 {}부터, 마감 {}".format(
-            format_month_day(posted_known), quoted_tail or "원문 확인"
-        )
+        display = "접수 {}부터, 마감 미정".format(format_month_day(posted_known))
     else:
-        display = f"마감 {quoted_tail or '미정'}"
+        display = "마감 미정"
     return {
         "days_left": None,
         "label": LABEL_NEW if fresh else LABEL_STANDING,
@@ -1136,8 +1126,6 @@ def _build_item(row: Sequence, classification: Classification, today: date) -> D
     posted_known = _parse_created_date(period_start)
     posted = posted_known or kst_date(created_at)
     quotes = extract_quotes(summary, raw_data)
-    quoted = quotes["quote_deadline"]
-    quoted_tail = quoted if quoted != QUOTE_FALLBACK else None
     clean_title = normalize_title(title)
 
     item = {
@@ -1159,7 +1147,6 @@ def _build_item(row: Sequence, classification: Classification, today: date) -> D
         "deadline": deadline.isoformat() if deadline else "",
         "posted": posted.isoformat() if posted else "",
         "posted_known": posted_known.isoformat() if posted_known else "",
-        "quoted_tail": quoted_tail or "",
         # 개정 v2.2 F2: 마감 없음 버킷에서 사회적경제 정체성 공고를 앞세우는 키
         "identity_priority": 0 if _hits(
             clean_title, SSE_IDENTITY_KEYWORDS
@@ -1170,12 +1157,12 @@ def _build_item(row: Sequence, classification: Classification, today: date) -> D
         # 앞 회차와 병합하지 않는다 — 만료된 마감을 상속받아 함께 배제됐다.
         "is_renewal": bool(
             deadline is None
-            and (_hits(clean_title, RENEWAL_KEYWORDS) or quoted_tail)
+            and _hits(clean_title, RENEWAL_KEYWORDS)
         ),
         "merged_ids": [],
         "similar_count": 0,
     }
-    item.update(_deadline_fields(deadline, posted_known, quoted_tail, today))
+    item.update(_deadline_fields(deadline, posted_known, today))
     item.update(quotes)
     return item
 
@@ -1187,7 +1174,6 @@ def _refresh_deadline(item: Dict, deadline: Optional[date], today: date) -> None
         _deadline_fields(
             deadline,
             parse_deadline(item.get("posted_known") or ""),
-            item.get("quoted_tail") or None,
             today,
         )
     )
@@ -1887,24 +1873,23 @@ def markdown_kakao_problems(markdown_text: str) -> List[str]:
         if len(chunk) > KAKAO_CHUNK_LIMIT
     ]
     joined = "\n".join(chunks)
-    # 사이클 11 #4: 판정을 **URL 단위**로 한다. 예전에는 출력 어딘가에 안내 문구가
-    # 하나라도 있으면 모든 긴 URL 을 면제해서, 한 줄은 치환되고 다른 줄은 분절된
-    # 상태가 통과했다. 반대로 정상 치환된 URL 이 "분절/유실" 로 걸리기도 했다.
+    # 사이클 12 #5: 판정을 **토큰 경계**로 한다 — 부분 문자열 비교를 쓰지 않는다.
+    #   ① 결과물의 URL 토큰이 원본에 없으면 그것이 **분절 조각**이다
+    #      (같은 URL 의 일부 출현만 잘린 경우도 이 규칙이 잡는다)
+    #   ② 원본 URL 은 온전히 실렸거나 치환됐어야 한다
+    # 접두를 공유하는 정상 URL 이 조각으로 오판되던 문제(앞 60자 비교)도 사라진다.
     _, replaced = fit_prose_urls(markdown_text)
     replaced_urls = set(replaced)
-    for url in dict.fromkeys(blocks_mod.body_urls(markdown_text)):
-        if url in joined:
-            continue                       # ① 온전히 실렸다
-        if url in replaced_urls and _no_fragment(url, joined):
-            continue                       # ② 안내 문구로 치환됐다 (조각 없음)
-        problems.append(f"URL 분절/유실: {url[:48]}…")
+    source_urls = set(blocks_mod.body_urls(markdown_text))
+    rendered_urls = set(blocks_mod.body_urls(joined))
+
+    for token in sorted(rendered_urls - source_urls):
+        problems.append(f"URL 분절: {token[:48]}…")
+    for url in sorted(source_urls):
+        if url in rendered_urls or url in replaced_urls:
+            continue
+        problems.append(f"URL 유실: {url[:48]}…")
     return problems
-
-
-def _no_fragment(url: str, rendered: str) -> bool:
-    """치환됐다면 결과물에 URL 조각이 남아 있지 않아야 한다 (사이클 11 #4)."""
-    fragment = url[:_URL_FRAGMENT_PROBE]
-    return len(fragment) < _URL_FRAGMENT_PROBE or fragment not in rendered
 
 
 def _is_item_block(block: str) -> bool:
@@ -1928,8 +1913,6 @@ def _shrink_item_block(block: str, limit: int) -> str:
 
 
 URL_TOO_LONG_NOTICE = "(URL 길이 초과 — 원문 확인)"
-# 치환된 URL 의 조각이 결과물에 남았는지 확인할 때 쓰는 접두 길이
-_URL_FRAGMENT_PROBE = 60
 
 
 def _url_too_long_block(block: str, limit: int) -> str:
@@ -2147,9 +2130,15 @@ def compose_digest(
         write_items_manifest(
             output_path, items_manifest(data, output_path.read_bytes())
         )
+        # 사이클 12 #4: 카톡 파일은 **md 를 읽는 렌더러 하나만** 쓴다.
+        # data 경로와 md 경로가 따로 있으면 회원사명 접두처럼 줄 모양이 다른 곳에서
+        # 길이 판정이 갈라져, 최초 카톡본과 재생성본·검사 대상이 달라졌다.
         output_path.with_name(
             output_path.name.replace(".md", "") + ".kakao.txt"
-        ).write_text(kakao_file_text(data), encoding="utf-8")
+        ).write_text(
+            kakao_file_text_from_markdown(output_path.read_text(encoding="utf-8")),
+            encoding="utf-8",
+        )
 
     if data["opinions"] and output_path:
         opinions_path = output_path.with_name(
