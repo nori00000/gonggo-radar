@@ -3,6 +3,7 @@
 
 import argparse
 import html as html_module
+import hmac
 import json
 import re
 import sys
@@ -15,6 +16,7 @@ from urllib.parse import urlparse
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from alert.notifiers.email_sender import EmailNotifier
+from alert.digest.checker import markdown_sha256
 from alert.digest import state as state_mod
 
 # [텍스트](URL) — URL 안의 괄호 한 단계까지 균형 있게 소비 (javascript:alert(1) 대응)
@@ -127,22 +129,14 @@ def markdown_to_html(markdown_text: str) -> str:
     return html_body
 
 
-def check_fail_closed(markdown_path: Path, check_json_path: Path) -> Tuple[bool, str]:
-    """fail-closed 조건 확인.
-
-    Args:
-        markdown_path: 마크다운 파일 경로
-        check_json_path: 검증 JSON 파일 경로
-
-    Returns:
-        (통과 여부, 실패 메시지)
-    """
-    # 마크다운에서 마커 확인
+def _check_fail_closed_bytes(
+    markdown_bytes: bytes, check_json_path: Path
+) -> Tuple[bool, str]:
+    """Check fail-closed conditions against already-read Markdown bytes."""
     try:
-        with open(markdown_path, "r", encoding="utf-8") as f:
-            markdown_text = f.read()
-    except Exception as e:
-        return False, f"마크다운 읽기 실패: {e}"
+        markdown_text = markdown_bytes.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        return False, f"마크다운 읽기 실패: {exc}"
 
     if "<!-- 상민 확정 필요 -->" in markdown_text:
         return False, "마크다운에 미확정 마커가 있습니다"
@@ -156,6 +150,14 @@ def check_fail_closed(markdown_path: Path, check_json_path: Path) -> Tuple[bool,
             check_result = json.load(f)
     except (json.JSONDecodeError, OSError) as e:
         return False, f"검증 파일 손상: {e}"
+
+    # check.json은 검증한 바로 그 마크다운 바이트에만 유효하다. 사람이 검증 후
+    # 본문을 바꾸거나 다른 주차의 결과 파일을 복사해도 발송하면 안 된다.
+    recorded_hash = check_result.get("markdown_sha256")
+    if not isinstance(recorded_hash, str):
+        return False, "검증 파일에 마크다운 SHA-256이 없음"
+    if not hmac.compare_digest(recorded_hash, markdown_sha256(markdown_bytes)):
+        return False, "마크다운이 검증 후 변경됨"
 
     # pass=false 확인
     if not check_result.get("pass", False):
@@ -176,6 +178,23 @@ def check_fail_closed(markdown_path: Path, check_json_path: Path) -> Tuple[bool,
         return False, "네트워크 검증이 실행되지 않음"
 
     return True, ""
+
+
+def check_fail_closed(markdown_path: Path, check_json_path: Path) -> Tuple[bool, str]:
+    """Read a Markdown file and check its fail-closed conditions.
+
+    Args:
+        markdown_path: 마크다운 파일 경로
+        check_json_path: 검증 JSON 파일 경로
+
+    Returns:
+        (통과 여부, 실패 메시지)
+    """
+    try:
+        markdown_bytes = markdown_path.read_bytes()
+    except OSError as e:
+        return False, f"마크다운 읽기 실패: {e}"
+    return _check_fail_closed_bytes(markdown_bytes, check_json_path)
 
 
 def send_digest(
@@ -201,17 +220,22 @@ def send_digest(
         print(f"✗ 파일 없음: {markdown_path}", file=sys.stderr)
         return 2
 
-    # Fail-closed 검증
     check_json_path = markdown_path.with_suffix(".check.json")
-    passed, msg = check_fail_closed(markdown_path, check_json_path)
+    try:
+        markdown_bytes = markdown_path.read_bytes()
+    except OSError as exc:
+        print(f"✗ 발송 거부: 마크다운 읽기 실패: {exc}", file=sys.stderr)
+        return 2
+
+    # Gate and payload use the exact same read, preventing a file replacement
+    # between validation and the email body generation from changing the send.
+    passed, msg = _check_fail_closed_bytes(markdown_bytes, check_json_path)
 
     if not passed:
         print(f"✗ 발송 거부: {msg}", file=sys.stderr)
         return 2
 
-    # 마크다운 읽기
-    with open(markdown_path, "r", encoding="utf-8") as f:
-        markdown_text = f.read()
+    markdown_text = markdown_bytes.decode("utf-8")
 
     # 제목 추출 (첫 번째 # 제목)
     title_match = re.search(r"^# (.+)$", markdown_text, re.MULTILINE)
@@ -223,7 +247,10 @@ def send_digest(
         recipients = to_email if to_email else "[config에서 설정]"
         print(f"[DRY-RUN] 발송 대상: {recipients}")
         print(f"[DRY-RUN] 제목: {subject}")
-        print(f"[DRY-RUN] 본문 길이: {len(markdown_text)} bytes (마크다운), {len(html_text)} bytes (HTML)")
+        print(
+            f"[DRY-RUN] 본문 길이: {len(markdown_text)} bytes (마크다운), "
+            f"{len(html_text)} bytes (HTML)"
+        )
         return 0
 
     # 계약 W10: status=sent 는 불변이다 — 같은 주차 재발송을 거부한다.
