@@ -272,40 +272,30 @@ class TestRuleCProvableDefects:
         assert doomed == []
 
 
-class TestCritiqueBackupIncludesWal:
-    """크리틱 #5: shutil.copy2 가 WAL을 빼먹어 최근 커밋이 누락되던 결함."""
+class TestBackupHelperIsGone:
+    """백업 헬퍼는 **제거**됐다 - 쓰기가 비활성이라 백업할 것이 없다.
 
-    def test_uncheckpointed_commit_is_in_the_backup(self, db, tmp_path):
-        """체크포인트 전 커밋이 백업에 들어 있다."""
-        conn, path = db
-        assert conn.execute("PRAGMA journal_mode").fetchone()[0] == "wal"
+    5차 크리틱에서 ``shutil.copy2`` 가 WAL을 빼먹는 문제를 SQLite backup
+    API로 고쳤고, 그 테스트는 2026-09-13 "쓰기 비활성" 판정으로 의미를
+    잃었다. 되살리려면 ``--apply`` 를 먼저 되살려야 하고, 그때는 backup
+    API 경로도 함께 복구해야 한다.
+    """
 
-        insert(conn, source_id="9999", title="체크포인트 전에 커밋된 공고",
-               url=SEIS_URL.format(sid="9999"))
+    def test_no_backup_helper_exists(self):
+        assert not hasattr(cleanup, "backup_database")
 
-        backup = tmp_path / "backup.db"
-        cleanup.backup_database(path, backup)
-
-        restored = sqlite3.connect(str(backup))
-        try:
-            titles = [
-                row[0] for row in restored.execute("SELECT title FROM announcements")
-            ]
-        finally:
-            restored.close()
-        assert "체크포인트 전에 커밋된 공고" in titles
-
-    def test_backup_is_a_usable_database(self, db, tmp_path):
-        conn, path = db
+    def test_script_never_writes(self, db):
+        """미리보기만 한다 - 조회 외 SQL을 실행하지 않는다."""
+        conn, _ = db
         insert(conn, source_id="1000", title="공고", url=SEIS_URL.format(sid="1000"))
-        backup = tmp_path / "b.db"
-        cleanup.backup_database(path, backup)
+        before = conn.execute("SELECT count(*) FROM announcements").fetchone()[0]
 
-        restored = sqlite3.connect(str(backup))
-        try:
-            assert restored.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
-        finally:
-            restored.close()
+        cleanup.find_fake_deadlines(conn)
+        cleanup.find_duplicates(conn, "seis")
+        cleanup.find_fake_starts(conn)
+
+        after = conn.execute("SELECT count(*) FROM announcements").fetchone()[0]
+        assert before == after
 
 
 class TestCritiqueSameDayReception:
@@ -871,3 +861,119 @@ class TestGate7CorrectionOrder:
         fixed_key = cleanup.row_key(rows[first], {first: None})
         assert raw_key[3] == ""          # 마감이 있다고 보면 회차가 비워진다
         assert fixed_key[3] == "1차"     # 교정 후에는 회차가 키에 들어간다
+
+
+class TestGate8RealDeadlinesSurvive:
+    """8차 게이트 #1: 교정 조건을 우회해 **정상 행**을 삭제하던 결함."""
+
+    @staticmethod
+    def two_rounds(conn, order="asc"):
+        """같은 제목·서울센터·1차, 서로 다른 정상 마감(각자 그 날 적재)."""
+        specs = [
+            dict(source_id="50", period_end="2026-09-20",
+                 created_at="2026-09-20T09:00:00", url=SEIS_URL.format(sid="50")),
+            dict(source_id="51", period_end="2026-09-30",
+                 created_at="2026-09-30T09:00:00", url=SEIS_URL.format(sid="51")),
+        ]
+        if order == "desc":
+            specs.reverse()
+        return [
+            insert(conn, title="상주기업 모집 공고",
+                   raw_data={"sub": "서울센터", "info": ["교육"], "round": "1차",
+                             "date": "2026.09.01", "posted": "2026-09-01",
+                             "date_label": "게시일"},
+                   **spec)
+            for spec in specs
+        ]
+
+    @pytest.mark.parametrize("order", ["asc", "desc"])
+    def test_ingestion_date_is_not_a_posting_date(self, db, order):
+        """적재일이 마감과 같다고 정상 마감을 지우지 않는다 (삽입 순서 무관)."""
+        conn, _ = db
+        ids = self.two_rounds(conn, order)
+
+        changes, _reasons = cleanup.find_fake_deadlines(conn)
+        assert changes == []
+
+        corrected = {row["id"]: new_end for row, new_end in changes}
+        doomed, _reasons, _canonical = cleanup.find_duplicates(
+            conn, "seis", corrected
+        )
+        assert doomed == []
+        survivors = {r["id"] for r in conn.execute("SELECT id FROM announcements")}
+        assert survivors == set(ids)
+
+    def test_posting_dates_excludes_the_ingestion_date(self):
+        """``posting_dates`` 는 적재일을 후보로 넣지 않는다."""
+        assert cleanup.posting_dates({}, "2026-09-20") == set()
+        assert cleanup.posting_dates({"posted": "2026-09-01"}, "2026-09-20") == {
+            "2026-09-01"
+        }
+
+    @pytest.mark.parametrize("label", ["제출일", "구분", "상태", "담당"])
+    def test_unknown_labels_are_left_alone(self, db, label):
+        """게시 라벨 **허용목록** 방식 - 모르는 라벨은 손대지 않는다."""
+        conn, _ = db
+        insert(conn, source_id="60", period_end="2026-09-20",
+               created_at="2026-09-12T09:00:00",
+               raw_data={"date": "2026.09.20", "date_label": label})
+
+        changes, _reasons = cleanup.find_fake_deadlines(conn)
+        assert changes == []
+
+    def test_posting_label_with_a_matching_date_is_still_corrected(self, db):
+        """게시일 라벨 + 게시일과 같은 마감은 여전히 교정한다."""
+        conn, _ = db
+        row_id = insert(conn, source_id="70", period_end="2026-09-01",
+                        created_at="2026-09-12T09:00:00",
+                        raw_data={"date": "2026.09.01", "posted": "2026-09-01",
+                                  "date_label": "게시일"})
+
+        changes, _reasons = cleanup.find_fake_deadlines(conn)
+        assert [(row["id"], new_end) for row, new_end in changes] == [(row_id, None)]
+
+
+class TestGate8ApplyIsDisabled:
+    """2026-09-13 판정: 쓰기 비활성 - 미리보기만 한다."""
+
+    SCRIPT = SCRIPT  # noqa: F821 - 모듈 상단에서 정의된 경로
+
+    def run(self, args, db_path):
+        import subprocess
+        import sys
+
+        return subprocess.run(
+            [sys.executable, str(self.SCRIPT), "--db", str(db_path), *args],
+            capture_output=True, text=True, timeout=120,
+            cwd=str(self.SCRIPT.parent.parent),
+        )
+
+    @pytest.fixture
+    def db_file(self, tmp_path):
+        import sqlite3 as sq
+
+        path = tmp_path / "announcements.db"
+        conn = sq.connect(str(path))
+        conn.execute(SCHEMA)
+        conn.commit()
+        conn.close()
+        return path
+
+    def test_apply_exits_two_and_changes_nothing(self, db_file):
+        before = db_file.read_bytes()
+        result = self.run(["--apply"], db_file)
+        assert result.returncode == 2
+        assert "experimental: 판정 티어 승인 전 비활성" in result.stderr
+        assert db_file.read_bytes() == before
+
+    def test_dry_run_still_works_and_changes_nothing(self, db_file):
+        before = db_file.read_bytes()
+        result = self.run([], db_file)
+        assert result.returncode == 0
+        assert "DRY-RUN" in result.stdout
+        assert db_file.read_bytes() == before
+
+    def test_no_backup_file_is_created(self, db_file):
+        self.run(["--apply"], db_file)
+        self.run([], db_file)
+        assert list(db_file.parent.glob("*.bak-*")) == []

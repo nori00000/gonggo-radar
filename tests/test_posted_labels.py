@@ -263,3 +263,90 @@ class TestGate7ForestPressHasNoPeriodRemnant:
         assert announcement.period_end is None
         assert json.loads(announcement.raw_data)["posted"] == "2026-09-11"
         assert announcement.summary == "요약"
+
+
+class TestGate8ConservativeLabels:
+    """8차 게이트 #2·#3·#4: 라벨 추론을 **같은 요소 안**으로 좁혔다.
+
+    환각 0이 우선이므로 라벨을 확신할 수 없으면 게시일로 돌린다 -
+    커버리지 손실은 받아들인다(조정자 판정).
+    """
+
+    @staticmethod
+    def extract(html):
+        from alert.crawlers.date_labels import extract_date_and_label
+
+        item = BeautifulSoup(html, "html.parser").find("li")
+        return extract_date_and_label(item)
+
+    def test_adjacent_label_is_not_used(self):
+        """``<span>신청기한</span><span>날짜</span>`` → 기간 NULL, posted.
+
+        인접 형제의 라벨은 쓰지 않는다 - 커버리지 손실을 감수한다.
+        """
+        value, label = self.extract(
+            "<li><span>신청기한</span><span>2026.09.30</span></li>"
+        )
+        assert label == ""
+        assert classify_date(value, label) == (None, None, "2026-09-30")
+
+    def test_range_split_across_child_elements(self):
+        """``<span>접수기간 <em>A</em> ~ <em>B</em></span>`` → A/B.
+
+        가장 짧은 요소만 고르면 라벨과 범위를 모두 잃는다 - 범위를 품은
+        요소를 우선한다.
+        """
+        value, label = self.extract(
+            "<li><span>접수기간 <em>2026.09.01</em> ~ <em>2026.09.30</em></span></li>"
+        )
+        assert label == "접수기간"
+        assert classify_date(value, label) == ("2026-09-01", "2026-09-30", None)
+
+    def test_weekday_parentheses_do_not_break_the_range(self):
+        """``접수기간 2026.09.01(화) ~ 2026.09.30(수)`` → 09-01/09-30."""
+        value, label = self.extract(
+            "<li><span>접수기간 2026.09.01(화) ~ 2026.09.30(수)</span></li>"
+        )
+        assert classify_date(value, label) == ("2026-09-01", "2026-09-30", None)
+
+    def test_direct_text_date_has_no_label(self):
+        """``<a>참여기업 모집 공고</a>2026.09.11`` → posted only.
+
+        컨테이너 직접 텍스트의 날짜는 라벨이 없다 - 제목이 라벨로
+        새어 들어오던 자리다.
+        """
+        value, label = self.extract(
+            '<li><a href="/view.do?nttId=1">참여기업 모집 공고</a>2026.09.11</li>'
+        )
+        assert label == ""
+        assert classify_date(value, label) == (None, None, "2026-09-11")
+
+    def test_same_element_label_is_used(self):
+        """같은 요소 안의 라벨은 쓴다."""
+        value, label = self.extract(
+            '<li><span class="date">신청기한 2026.09.30</span></li>'
+        )
+        assert label == "신청기한"
+        assert classify_date(value, label) == (None, "2026-09-30", None)
+
+    def test_class_names_are_not_labels(self):
+        """클래스 이름은 텍스트가 아니므로 라벨이 아니다."""
+        value, label = self.extract('<li><span class="date">2026.09.11</span></li>')
+        assert label == ""
+        assert classify_date(value, label) == (None, None, "2026-09-11")
+
+    @pytest.mark.parametrize("text,expected", [
+        ("접수기간 2026.09.01 ~ 2026.09.30", ("2026-09-01", "2026-09-30", None)),
+        ("접수기간 2026.09.01부터 2026.09.30까지", ("2026-09-01", "2026-09-30", None)),
+        ("접수기간 2026.09.01 - 2026.09.30", ("2026-09-01", "2026-09-30", None)),
+    ])
+    def test_range_separators(self, text, expected):
+        value, label = self.extract(f"<li><span>{text}</span></li>")
+        assert classify_date(value, label) == expected
+
+    def test_strip_notes_helper(self):
+        from alert.crawlers.date_labels import strip_notes
+
+        assert strip_notes("2026.09.01(화)").strip() == "2026.09.01"
+        # 숫자가 든 괄호는 남긴다 (회차 등)
+        assert "(9차)" in strip_notes("2026년도 (9차)")

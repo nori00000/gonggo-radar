@@ -42,7 +42,6 @@ import json
 import re
 import sqlite3
 import sys
-from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional, Set, Tuple
 
@@ -55,11 +54,7 @@ from alert.crawlers.dedupe_keys import (  # noqa: E402
     keys_compatible,
     normalize_title,
 )
-from alert.crawlers.date_labels import (  # noqa: E402
-    DEADLINE_ONLY_LABELS,
-    PERIOD_LABELS,
-    POSTED_LABELS,
-)
+from alert.crawlers.date_labels import POSTED_LABELS  # noqa: E402
 from alert.crawlers.detail_quotes import period_from_quote  # noqa: E402
 
 DEFAULT_DB = "alert/data/announcements.db"
@@ -465,8 +460,10 @@ def posting_dates(payload: dict, created_date: str) -> Set[str]:
         게시일로 볼 수 있는 날짜 집합
     """
     found: Set[str] = set()
-    if created_date:
-        found.add(created_date)
+    # **적재일은 게시일이 아니다** (8차 게이트 #1). 수집 시각을 게시일 후보로
+    # 넣으면 "적재일과 같은 날 마감" 인 정상 공고가 가짜 마감으로 판정된다 -
+    # 실측: 실제 마감 09-20/09-30 두 행이 각각 그 날 적재되어 둘 다 NULL이
+    # 되고, 그 뒤 규칙 B가 한 행을 삭제했다.
 
     posted = str(payload.get("posted") or "")
     for year, month, day in re.findall(
@@ -566,13 +563,13 @@ def find_fake_deadlines(
             continue
         payload = load_raw(row["raw_data"])
 
-        # **라벨이 접수 일정을 말하면 손대지 않는다** (7차 게이트 #1).
-        # "접수마감/신청기한" 라벨이 붙은 날짜는 게시일과 같은 날이어도
-        # 진짜 마감이다. 게시일 라벨이거나 라벨이 없을 때만 교정한다.
+        # **게시 라벨 허용목록** (8차 게이트 #1). 예전에는 "접수/마감 라벨을
+        # 제외" 하는 차단목록이어서 ``제출일`` 처럼 목록에 없는 라벨이
+        # 그대로 교정 대상이 됐다. 이제 라벨이 **없거나** 게시 라벨로
+        # 확인될 때만 교정한다 - 모르는 라벨은 손대지 않는다.
         label = str(payload.get("date_label") or "")
         if label and not POSTED_LABELS.search(label):
-            if PERIOD_LABELS.search(label) or DEADLINE_ONLY_LABELS.search(label):
-                continue
+            continue
 
         if payload.get("quote_period_end"):
             continue  # 상세 인용에서 온 진짜 마감
@@ -635,22 +632,6 @@ def find_fake_starts(
     return doomed, reasons
 
 
-def backup_database(db_path: Path, backup_path: Path) -> None:
-    """SQLite backup API로 백업한다 - WAL의 미체크포인트 커밋까지 포함한다.
-
-    ``shutil.copy2`` 는 ``-wal`` 파일을 빼먹으므로 최근 커밋이 백업에서
-    누락될 수 있다(Codex 크리틱 #5).
-    """
-    source = sqlite3.connect(str(db_path))
-    destination = sqlite3.connect(str(backup_path))
-    try:
-        with destination:
-            source.backup(destination)
-    finally:
-        destination.close()
-        source.close()
-
-
 def counts(conn: sqlite3.Connection) -> Dict[str, int]:
     """정리 전/후 비교용 집계 (소스별)."""
     def one(sql: str, params: tuple = ()) -> int:
@@ -691,25 +672,34 @@ def main() -> int:
         "--db", default=DEFAULT_DB,
         help=f"announcements.db 경로 (기본: {DEFAULT_DB})",
     )
-    group = parser.add_mutually_exclusive_group()
-    group.add_argument(
+    parser.add_argument(
         "--dry-run", action="store_true", default=True,
-        help="무엇을 지울지만 보여준다 (기본값)",
+        help="무엇을 지울지만 보여준다 (유일한 동작)",
     )
-    group.add_argument(
+    parser.add_argument(
         "--apply", action="store_true",
-        help="실제로 정리한다 (백업 후 실행)",
+        help=argparse.SUPPRESS,   # 비활성 - 아래에서 거부한다
     )
     args = parser.parse_args()
+
+    # **쓰기는 비활성이다** (2026-09-13 판정). 여덟 차례 게이트에서 이 판정
+    # 논리가 정상 공고를 삭제 대상으로 잡는 결함을 반복해 냈다. 미리보기는
+    # 사람이 읽을 자료로 남기고, DB 잔존 행은 composer 병합에서 다룬다.
+    if args.apply:
+        print(
+            "--apply 는 비활성입니다: experimental: 판정 티어 승인 전 비활성\n"
+            "  이 스크립트는 미리보기(dry-run)만 수행합니다. DB 잔존 행은\n"
+            "  composer 병합에서 다룹니다.",
+            file=sys.stderr,
+        )
+        return 2
 
     db_path = Path(args.db)
     if not db_path.exists():
         print(f"DB를 찾을 수 없습니다: {db_path}", file=sys.stderr)
         return 1
 
-    apply_changes = bool(args.apply)
-    mode = "APPLY" if apply_changes else "DRY-RUN"
-    print(f"=== cleanup_seis_duplicates ({mode}) ===")
+    print("=== cleanup_seis_duplicates (DRY-RUN, 쓰기 비활성) ===")
     print(f"DB: {db_path}")
     print(f"규칙 B(제목·지역·마감키): {RULE_B_SOURCE}")
     print(f"규칙 C(글번호 오매칭·URL 미해소): {', '.join(RULE_C_SOURCES)}")
@@ -770,48 +760,20 @@ def main() -> int:
     for line in start_reasons:
         print(line)
 
-    timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-    backup_path = db_path.with_name(f"{db_path.name}.bak-{timestamp}")
-
-    if apply_changes:
-        backup_database(db_path, backup_path)
-        print(f"\n백업 생성(SQLite backup API, WAL 포함): {backup_path}")
-        with conn:
-            if doomed_ids:
-                conn.executemany(
-                    "DELETE FROM announcements WHERE id = ?",
-                    [(row_id,) for row_id in sorted(doomed_ids)],
-                )
-            if deadline_changes:
-                conn.executemany(
-                    "UPDATE announcements SET period_end = ?,"
-                    " updated_at = ? WHERE id = ?",
-                    [
-                        (new_end, datetime.now().isoformat(), row["id"])
-                        for row, new_end in deadline_changes
-                    ],
-                )
-            if fake_starts:
-                conn.executemany(
-                    "UPDATE announcements SET period_start = NULL,"
-                    " updated_at = ? WHERE id = ?",
-                    [(datetime.now().isoformat(), row["id"]) for row in fake_starts],
-                )
-        print_counts("after", counts(conn))
-        print(f"\n완료. 되돌리려면: cp {backup_path} {db_path}")
-    else:
-        projected = dict(before)
-        for source, rows in duplicates.items():
-            projected[f"{source}_rows"] -= len(rows)
-        deleted_se_with_deadline = sum(
-            1 for row in duplicates.get("socialenterprise", []) if row["period_end"]
-        )
-        projected["se_rows_with_deadline"] -= len(nulled) + deleted_se_with_deadline
-        projected["coop_rows_with_start"] -= len(fake_starts)
-        projected["total_rows"] -= total_duplicates
-        print_counts("after (예상)", projected)
-        print(f"\n백업 예정 경로(미생성): {backup_path}")
-        print("실제로 정리하려면 --apply 를 붙여 다시 실행하세요.")
+    projected = dict(before)
+    for source, rows in duplicates.items():
+        projected[f"{source}_rows"] -= len(rows)
+    deleted_se_with_deadline = sum(
+        1 for row in duplicates.get("socialenterprise", []) if row["period_end"]
+    )
+    projected["se_rows_with_deadline"] -= len(nulled) + deleted_se_with_deadline
+    projected["coop_rows_with_start"] -= len(fake_starts)
+    projected["total_rows"] -= total_duplicates
+    print_counts("after (예상)", projected)
+    print(
+        "\n이 스크립트는 미리보기만 합니다 - DB를 바꾸지 않습니다.\n"
+        "  잔존 행 처리는 composer 병합 판정에 맡깁니다."
+    )
 
     conn.close()
     return 0

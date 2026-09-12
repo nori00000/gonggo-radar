@@ -29,12 +29,19 @@ PERIOD_LABELS = re.compile(r"접수|신청|모집|마감|공모|기간|일정|�
 # 단일 날짜 하나가 마감인 표현들.
 DEADLINE_ONLY_LABELS = re.compile(r"마감|기한|종료|까지")
 
-_RANGE_MARK = re.compile(r"[~∼〜]")
+# 범위 구분: ~ 계열, 공백으로 감싼 하이픈, "부터…까지"
+_RANGE_MARK = re.compile(r"[~∼〜]|\s[-–—]\s|부터")
+# 요일·괄호 주석 - 숫자가 없는 괄호는 날짜 파싱 전에 벗긴다
+# (8차 게이트 #3: "2026.09.01(화) ~ 2026.09.30(수)" 가 시작=마감=09-01 이 됐다)
+_PAREN_NOTE = re.compile(r"\([^)0-9]*\)")
 _FULL_DATE = re.compile(r"(\d{4})\s*[-./년]\s*(\d{1,2})\s*[-./월]\s*(\d{1,2})")
 # 날짜 하나 / 범위 - 범위를 **먼저** 찾는다. 첫 날짜만 집으면
 # "접수 기간 2026.09.01 ~ 2026.09.30" 의 종료일이 09-01이 된다 (7차 게이트 #3).
 _DATE_TEXT = r"\d{4}\s*[-./년]\s*\d{1,2}\s*[-./월]\s*\d{1,2}\s*일?\.?"
-_RANGE_TEXT = re.compile(rf"({_DATE_TEXT})\s*[~∼〜]\s*({_DATE_TEXT})")
+# 범위 추출 - ``~`` 계열, "부터", 공백으로 감싼 하이픈을 모두 받는다
+_RANGE_TEXT = re.compile(
+    rf"({_DATE_TEXT})\s*(?:[~∼〜]|부터|\s[-–—]\s)\s*({_DATE_TEXT})"
+)
 _SINGLE_TEXT = re.compile(_DATE_TEXT)
 
 
@@ -65,19 +72,35 @@ def normalize_date(text: str) -> Optional[str]:
     return None
 
 
+def strip_notes(text: str) -> str:
+    """요일 같은 **숫자 없는 괄호 주석**을 벗긴다.
+
+    ``2026.09.01(화) ~ 2026.09.30(수)`` 에서 ``(화)`` 를 남겨 두면 범위
+    분리가 어긋나 시작=마감=09-01 이 된다 (8차 게이트 #3).
+    """
+    return _PAREN_NOTE.sub(" ", text or "")
+
+
 def parse_period(text: str) -> Tuple[Optional[str], Optional[str]]:
     """기간 문자열을 시작일·종료일로 나눈다.
 
-    범위 표기가 없으면 단일 날짜를 시작=종료로 본다 - 호출자는
-    ``classify_date`` 를 거쳐 이 결과를 쓰는 것이 안전하다.
+    ``~`` · 공백 하이픈 · ``부터…까지`` 를 범위로 본다. 범위 표기가 없으면
+    단일 날짜를 시작=종료로 돌려주므로, 호출자는 ``classify_date`` 를 거쳐
+    쓰는 것이 안전하다.
     """
     if not text:
         return None, None
-    if _RANGE_MARK.search(text):
-        parts = _RANGE_MARK.split(text)
-        if len(parts) >= 2:
-            return normalize_date(parts[0]), normalize_date(parts[1])
-    single = normalize_date(text)
+    cleaned = strip_notes(text)
+    if _RANGE_MARK.search(cleaned):
+        parts = _RANGE_MARK.split(cleaned)
+        dates = [normalize_date(part) for part in parts]
+        dates = [date for date in dates if date]
+        if len(dates) >= 2:
+            return dates[0], dates[-1]
+        if len(dates) == 1:
+            # "2026.09.30까지" 처럼 한쪽만 있는 범위 - 종료일로 본다
+            return None, dates[0]
+    single = normalize_date(cleaned)
     return single, single
 
 
@@ -152,15 +175,21 @@ def label_for(cell, cells: Sequence, headers: Sequence[str], css_class: str = ""
 
 
 def extract_date_and_label(container) -> Tuple[str, str]:
-    """컨테이너에서 **날짜와 그 날짜의 라벨**을 뽑는다 (7차 게이트 #3).
+    """컨테이너에서 **날짜와 그 날짜의 라벨**을 뽑는다 (보수 규칙).
 
-    라벨은 **날짜가 들어 있는 가장 작은 요소** 안에서만 읽는다. 컨테이너
-    전체 텍스트에서 날짜 앞말을 잘라 쓰면 제목이 라벨로 새어 들어온다 -
-    ``<a>참여기업 모집 공고</a><span>2026.09.11</span>`` 에서 제목의 "모집"
-    을 라벨로 오인해 게시일이 접수기간이 됐다.
+    8차 게이트 #2·#3·#4로 규칙을 좁혔다. **환각 0** 이 우선이므로, 라벨을
+    확신할 수 없으면 라벨 없이(=게시일) 돌려준다 - 커버리지 손실은 받아들인다.
 
-    범위 표기를 **먼저** 찾는다. 첫 날짜만 집으면
-    ``접수 기간 2026.09.01 ~ 2026.09.30`` 의 종료일이 09-01이 된다.
+    규칙:
+
+    1. 라벨은 **날짜와 같은 요소의 텍스트 중 날짜 앞부분** 에서만 읽는다.
+       인접 형제·부모·링크 텍스트에서 추론하지 않는다.
+    2. 날짜가 컨테이너의 **직접 텍스트**에 있으면(자식 요소 안이 아니면)
+       라벨이 없는 것으로 본다 - 제목이 라벨로 새어 들어오던 자리다.
+    3. **범위를 품은 요소를 우선**한다. 가장 짧은 요소만 고르면
+       ``<span>접수기간 <em>A</em> ~ <em>B</em></span>`` 에서 라벨과 범위를
+       모두 잃는다.
+    4. 요일 괄호는 벗겨서 판단한다.
 
     Args:
         container: 목록 항목 요소 (BeautifulSoup Tag)
@@ -171,28 +200,32 @@ def extract_date_and_label(container) -> Tuple[str, str]:
     if container is None:
         return "", ""
 
-    # 날짜를 담은 **가장 작은** 요소를 찾는다
-    best = None
-    best_length = None
+    ranged: list = []
+    single: list = []
     for element in container.find_all(True):
         text = re.sub(r"\s+", " ", element.get_text(" ", strip=True))
-        if not _SINGLE_TEXT.search(text):
-            continue
-        if best_length is None or len(text) < best_length:
-            best, best_length = element, len(text)
+        cleaned = strip_notes(text)
+        if _RANGE_TEXT.search(cleaned):
+            ranged.append((len(text), element, text))
+        elif _SINGLE_TEXT.search(cleaned):
+            single.append((len(text), element, text))
 
-    if best is None:
-        text = re.sub(r"\s+", " ", container.get_text(" ", strip=True))
-        if not _SINGLE_TEXT.search(text):
-            return "", ""
-        best, best_length = container, len(text)
+    # 범위를 품은 요소가 있으면 그중 가장 짧은 것, 없으면 단일 날짜 요소
+    pool = ranged or single
+    if pool:
+        pool.sort(key=lambda item: item[0])
+        _length, _element, text = pool[0]
+        cleaned = re.sub(r"\s+", " ", strip_notes(text)).strip()
+        match = _RANGE_TEXT.search(cleaned) or _SINGLE_TEXT.search(cleaned)
+        value = match.group(0).strip()
+        # 라벨: **같은 요소 텍스트의 날짜 앞부분만**
+        label = cleaned[:match.start()].strip(" :：·-–—()[]")
+        return value, label
 
-    text = re.sub(r"\s+", " ", best.get_text(" ", strip=True))
-    match = _RANGE_TEXT.search(text) or _SINGLE_TEXT.search(text)
-    value = match.group(0).strip()
-
-    # 라벨: 날짜 앞의 말 + 클래스 이름 (그 요소 안에서만)
-    prefix = text[:match.start()].strip(" :：·-–—()[]")
-    classes = " ".join(best.get("class", []) or [])
-    label = " ".join(part for part in (prefix, classes) if part).strip()
-    return value, label
+    # 자식 요소에 날짜가 없다 = 컨테이너 직접 텍스트에 있다 -> 라벨 없음
+    text = re.sub(r"\s+", " ", container.get_text(" ", strip=True))
+    cleaned = strip_notes(text)
+    match = _RANGE_TEXT.search(cleaned) or _SINGLE_TEXT.search(cleaned)
+    if match is None:
+        return "", ""
+    return match.group(0).strip(), ""
