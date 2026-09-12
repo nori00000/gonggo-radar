@@ -173,79 +173,15 @@ def lawmaking_period(raw: Dict[str, object]) -> Period:
     return _range_only(_normalize(raw.get("period")))
 
 
-# API 가 **구조화된 접수기간 필드**를 주는 소스. HTML 을 읽어 라벨을
-# 추론하는 것과 달리, 필드 이름 자체가 의미를 선언한다(`reqstBeginEndDe`
-# = 접수 시작-종료일, `bidClseDt` = 입찰 마감일시). 그래도 값의 모양은
-# **전체 일치**로 검사하고 달력 검증을 한다.
-_BIZINFO_RANGE = re.compile(
-    r"^\s*(\d{4})-?(\d{2})-?(\d{2})\s*~\s*(\d{4})-?(\d{2})-?(\d{2})\s*$"
-)
-# ``YYYYMMDDHHMM`` 또는 ``YYYYMMDD``. **시·분까지** 달력 검증한다 -
-# ``202609309999`` 를 09-30 으로 잘라 저장하던 자리다 (13차 게이트 MEDIUM).
-_G2B_DATETIME = re.compile(r"^\s*(\d{8}|\d{12})\s*$")
-
-
-def bizinfo_period(raw: Dict[str, object]) -> Period:
-    """기업마당 - API 의 ``reqstBeginEndDe`` (``YYYYMMDD~YYYYMMDD``) 만 읽는다.
-
-    단일 날짜는 시작인지 마감인지 선언되지 않으므로 쓰지 않는다.
-
-    Args:
-        raw: API 원본 항목
-
-    Returns:
-        ``(period_start, period_end)`` - 조건을 못 채우면 ``(None, None)``
-    """
-    match = _BIZINFO_RANGE.match(_normalize(raw.get("reqstBeginEndDe")))
-    if not match:
-        return None, None
-    groups = [int(value) for value in match.groups()]
-    start = _calendar_date(*groups[:3])
-    end = _calendar_date(*groups[3:])
-    if not start or not end or end < start:
-        return None, None
-    return start, end
-
-
-def g2b_period(raw: Dict[str, object]) -> Period:
-    """나라장터 - API 의 ``bidClseDt`` (입찰 마감일시) 가 있을 때만.
-
-    시작일(``bidBeginDt``)은 마감이 함께 있을 때만 쓴다 - 시작만 있는
-    항목에서 기간을 말하면 마감을 아는 것처럼 보인다.
-
-    Args:
-        raw: API 원본 항목
-
-    Returns:
-        ``(period_start, period_end)`` - 조건을 못 채우면 ``(None, None)``
-    """
-    end = _g2b_date(raw.get("bidClseDt"))
-    if not end:
-        return None, None
-    start = _g2b_date(raw.get("bidBeginDt"))
-    if start and start > end:
-        return None, end
-    return start, end
-
-
-def _g2b_date(value: object) -> Optional[str]:
-    match = _G2B_DATETIME.match(_normalize(value))
-    if not match:
-        return None
-    digits = match.group(1)
-    fmt = "%Y%m%d" if len(digits) == 8 else "%Y%m%d%H%M"
-    try:
-        return datetime.strptime(digits, fmt).strftime("%Y-%m-%d")
-    except ValueError:
-        return None
+# 16차 게이트: bizinfo·g2b 추출기는 **등록 해제**했다. 두 소스는 회사용
+# 경로여서 협의회 브리핑과 무관하고, 그 기간을 유지하려다 식별자 설계가
+# 사이클마다 새 경합을 만들었다. 지금은 정규화가 두 소스의 기간을 비운다.
 
 
 # 기간을 만들 수 있는 소스 **전부**. 여기 없는 소스는 항상 None 이다.
 PERIOD_EXTRACTORS: Dict[str, Callable[[Dict[str, object]], Period]] = {
     "seis": seis_period,
     "lawmaking": lawmaking_period,
-    "bizinfo": bizinfo_period,
-    "g2b": g2b_period,
 }
 
 # 각 추출기가 **근거로 읽는** raw_data 키(+방증). 재수집 때 기간만 갱신하고
@@ -254,6 +190,4 @@ PERIOD_EXTRACTORS: Dict[str, Callable[[Dict[str, object]], Period]] = {
 EVIDENCE_KEYS: Dict[str, Tuple[str, ...]] = {
     "seis": ("date", "date_field", "dday"),
     "lawmaking": ("period",),
-    "bizinfo": ("reqstBeginEndDe",),
-    "g2b": ("bidBeginDt", "bidClseDt"),
 }

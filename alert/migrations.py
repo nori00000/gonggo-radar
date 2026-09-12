@@ -100,9 +100,12 @@ MIGRATIONS: List[Tuple[int, str, List[str]]] = [
             """
         ]
     ),
+    # 16차 게이트에서 식별자 이관을 폐기해 이 컬럼은 **더 이상 쓰이지 않는다**
+    # (아무 것도 값을 넣지 않는다). 이미 적용된 마이그레이션이므로 되돌리지
+    # 않고 남겨 둔다 - 스키마에서 컬럼을 빼는 것이 더 위험하다.
     (
         5,
-        "Add duplicate_of to announcements (identity migration conflicts)",
+        "Add duplicate_of to announcements (inert since gate 16)",
         [
             "ALTER TABLE announcements ADD COLUMN duplicate_of INTEGER DEFAULT NULL;",
             "CREATE INDEX IF NOT EXISTS idx_ann_duplicate_of"

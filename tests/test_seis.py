@@ -56,9 +56,11 @@ class TestSeisCrawler:
             # Empty link
             assert crawler._extract_post_id("") == ""
 
-            # Hash fallback for unrecognized pattern
+            # Hash fallback for unrecognized pattern - 접두를 붙인다
+            # (접두 없는 ID 는 옛 규칙의 행으로 판정된다)
             result = crawler._extract_post_id("https://example.com/some-page")
-            assert len(result) == 16  # MD5 hash truncated to 16 chars
+            assert result.startswith("md5:")
+            assert len(result) == len("md5:") + 16
 
     def test_normalize_url(self, mock_seis_config):
         """_normalize_url() should handle relative and absolute URLs."""

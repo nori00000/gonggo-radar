@@ -8,7 +8,6 @@ import requests
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Tuple
-from .identity import identity_key
 from ..models import RawAnnouncement
 from ..config import get_config
 from ..utils.logger import setup_logger
@@ -239,24 +238,14 @@ class BaseCrawler(abc.ABC):
             url = announcement.url or ""
             if not url or url.endswith("#void"):
                 continue
-            # DB 가 알려 준 목록은 **행 식별자**(identity_key) 기준이고,
-            # 크롤러가 만든 source_id 와 다를 수 있다 - 둘 다 본다.
-            keys = (
-                str(announcement.source_id),
-                identity_key(self.source_name, announcement),
-            )
-            if any(key in skip for key in keys):
+            if str(announcement.source_id) in skip:
                 continue
             payload = self._load_raw(announcement)
             if has_quote_keys(payload):
                 continue
             attempted = str(
                 payload.get(QUOTES_ATTEMPTED_AT)
-                or next(
-                    (self._quote_attempts[key] for key in keys
-                     if key in self._quote_attempts),
-                    "",
-                )
+                or self._quote_attempts.get(str(announcement.source_id), "")
             )
             candidates.append((attempted, announcement))
 
@@ -293,20 +282,14 @@ class BaseCrawler(abc.ABC):
         if not candidates:
             return announcements
 
-        # 짝짓기 키는 **행 식별자**다. 크롤러 source_id 는 서로 다른 공고가
-        # 같은 값을 가질 수 있어, 마지막 결과가 둘 모두에 적용됐다
-        # (14차 게이트: A 의 인용에 B 의 마감이 저장).
         items = [
-            {"source_id": identity_key(self.source_name, a), "url": a.url}
-            for a in candidates
+            {"source_id": str(a.source_id), "url": a.url} for a in candidates
         ]
         results, _timed_out = self.run_detail_worker(items)
         by_source_id = {str(r.get("source_id", "")): r for r in results}
 
         for announcement in candidates:
-            result = by_source_id.get(
-                identity_key(self.source_name, announcement)
-            )
+            result = by_source_id.get(str(announcement.source_id))
             if result is None:
                 continue  # 자식이 여기까지 오지 못했다 - 시도로 치지 않는다
             quotes = result.get("quotes") or {}

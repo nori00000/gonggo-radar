@@ -10,7 +10,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence
 
-from .crawlers.identity import identity_key, is_identity_key
+from .crawlers.identity import is_legacy_source_id
 from .models import (
     AnalyzedAnnouncement,
     ApplicationRecord,
@@ -284,10 +284,6 @@ class Database:
             Backward-compatible: ``bool(int)`` is ``True``, ``bool(None)`` is ``False``.
         """
         now = datetime.now().isoformat()
-        # 저장도 **조회와 같은 키**로 한다. 크롤러가 만든 source_id 를 그대로
-        # 넣으면, 서로 다른 공고가 같은 키로 들어가 UNIQUE 제약에 걸려
-        # 한 건이 사라지거나 남의 행을 덮어쓴다 (13차 게이트 HIGH).
-        ann.source_id = self.identity_of(ann)
         try:
             sql = _sql("""
                 INSERT INTO announcements
@@ -346,15 +342,13 @@ class Database:
     def get_unnotified(self) -> List[AnalyzedAnnouncement]:
         """Return all announcements that have not been notified yet.
 
-        보존된 중복 행(``duplicate_of``)은 같은 공고를 두 번 말하게 되므로,
         옛 규칙으로 저장된 행(``legacy``)은 아무 것도 주장할 수 없으므로
-        제외한다 (14·15차 게이트).
+        제외한다 (15차 게이트).
         """
         rows = self._conn.execute(
             """
             SELECT * FROM announcements
              WHERE is_notified = 0
-               AND duplicate_of IS NULL
                AND legacy = 0
                AND (period_end IS NULL OR period_end = '' OR period_end >= date('now'))
              ORDER BY relevance_score DESC, created_at DESC
@@ -491,18 +485,12 @@ class Database:
             self._conn.commit()
         return True
 
-    @staticmethod
-    def identity_of(announcement: RawAnnouncement) -> str:
-        """이 공고가 가리키는 **행 식별자** (저장·조회의 유일한 키).
-
-        13차 게이트: 조회는 식별자로, 저장은 크롤러 ``source_id`` 로 하던
-        불일치 때문에 서로 다른 공고가 한 행을 덮어썼다. 이제 두 경로가
-        같은 함수를 쓴다.
-        """
-        return identity_key(announcement.source, announcement)
-
     def _find_row(self, columns: str, announcement: RawAnnouncement) -> Optional[Any]:
-        """**행 식별자**로만 찾는다 - 다른 키의 행은 절대 건드리지 않는다.
+        """``(source, source_id)`` 로만 찾는다 - 저장 키와 같은 키다.
+
+        16차 게이트: URL 해시·필드 키로 행을 다시 식별하려던 설계를
+        폐기했다. 크롤러가 만든 ``source_id`` 가 유일한 키이고, 조회·저장·
+        갱신이 전부 그 키를 쓴다.
 
         Args:
             columns: 읽을 컬럼 목록 (내부 상수만 넘긴다)
@@ -513,14 +501,14 @@ class Database:
         """
         return self._conn.execute(
             _sql(
-                f"SELECT {columns}, url FROM announcements"
+                f"SELECT {columns} FROM announcements"
                 " WHERE source = ? AND source_id = ?"
             ),
-            (announcement.source, self.identity_of(announcement)),
+            (announcement.source, announcement.source_id),
         ).fetchone()
 
     def exists(self, announcement: RawAnnouncement) -> bool:
-        """이 공고가 이미 저장돼 있는가 (행 식별자 기준)."""
+        """이 공고가 이미 저장돼 있는가 (``(source, source_id)`` 기준)."""
         return self._find_row("id", announcement) is not None
 
     def mark_legacy_rows(
@@ -531,6 +519,12 @@ class Database:
         15차 게이트: 예전 ``source_id`` 를 새 식별자로 **추측해 이관**하려
         했더니, 서로 다른 공고가 같은 키로 수렴해 중복으로 묶이고 남의
         기간이 덮어써졌다. 추측이 아니라 **표시**한다:
+
+        대상은 **seis 의 접두 없는 옛 숫자 id 행**뿐이다. 12차에서 seis
+        ``source_id`` 에 공고 종류 접두를 넣었으므로(``fnc:``/``dsgn:``/
+        ``epsd:<연도>:``/``itgrd:``/``path:``), ``:`` 가 없는 seis 행은 옛
+        규칙의 행이고 새 수집과 영원히 만나지 않는다. 다른 소스의 식별자
+        형식은 바뀌지 않았으므로 건드리지 않는다.
 
         - ``legacy = 1`` 로 표시하고
         - 기간 두 필드를 NULL 로, 추출 근거를 raw_data 에서 지운다
@@ -556,7 +550,7 @@ class Database:
         now = datetime.now().isoformat()
         marked = 0
         for row in rows:
-            if is_identity_key(row["source_id"]):
+            if not is_legacy_source_id(row["source"], row["source_id"]):
                 continue
             payload = self._load_json(row["raw_data"])
             for key in (evidence_keys or {}).get(row["source"], ()):
@@ -709,33 +703,19 @@ class Database:
                 stored[key] = fresh
                 evidence_changed = True
 
-        # 대표가 이미 최신이어도 **묶인 중복 행**은 옛 값을 들고 있을 수
-        # 있다. 조기 반환하면 그 행의 기간이 기간별 조회에 남는다
-        # (15차 게이트 MEDIUM). 중복이 있으면 항상 그룹을 다시 쓴다.
-        has_duplicates = self._conn.execute(
-            _sql(
-                "SELECT 1 FROM announcements WHERE duplicate_of = ? LIMIT 1"
-            ),
-            (row["id"],),
-        ).fetchone() is not None
-        if not period_changed and not evidence_changed and not has_duplicates:
+        if not period_changed and not evidence_changed:
             return False               # 같으면 updated_at 도 건드리지 않는다
 
-        # 이관 충돌로 보존된 중복 행도 **같은 값**으로 갱신한다. 대표만
-        # 고치면 보존 행에 철회된 기간이 남아 알림·브리핑에 살아남는다
-        # (14차 게이트 HIGH).
         self._conn.execute(
             _sql(
                 "UPDATE announcements SET period_start = ?, period_end = ?,"
-                " raw_data = ?, updated_at = ?"
-                " WHERE id = ? OR duplicate_of = ?"
+                " raw_data = ?, updated_at = ? WHERE id = ?"
             ),
             (
                 start,
                 end,
                 json.dumps(stored, ensure_ascii=False),
                 datetime.now().isoformat(),
-                row["id"],
                 row["id"],
             ),
         )
@@ -1187,14 +1167,13 @@ class Database:
     def get_announcements_by_period(self, start: str, end: str) -> List[AnalyzedAnnouncement]:
         """Get announcements created within a date range.
 
-        다이제스트 후보에서도 레거시·중복 행은 뺀다 (15차 게이트).
+        다이제스트 후보에서도 레거시 행은 뺀다 (15차 게이트).
         """
         rows = self._conn.execute(
             _sql("""
             SELECT * FROM announcements
              WHERE created_at >= ? AND created_at <= ?
                AND legacy = 0
-               AND duplicate_of IS NULL
              ORDER BY relevance_score DESC, created_at DESC
             """),
             (start, end),

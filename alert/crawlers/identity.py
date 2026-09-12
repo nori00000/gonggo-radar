@@ -1,70 +1,37 @@
-"""행 식별 - **DB 한 행이 무엇인가**를 정하는 단일 함수 (13차 게이트).
+"""식별자 보조 - 텍스트 정리와 **레거시 판정**만 남는다 (16차 게이트).
 
-식별자를 크롤러마다 다르게 만들면 같은 번호를 쓰는 다른 공고가 한 행으로
-합쳐진다. 실제로 그렇게 사라졌다:
+13~15차에 걸쳐 행 식별자를 재설계했다(URL 정규화 해시, 소스별 선언 필드).
+사이클마다 새 경합이 나왔다:
 
-- SEIS ``boardId=A&nttId=42`` 와 ``boardId=B&nttId=42`` → 둘 다 ``ntt:42``
-- G2B 같은 공고번호의 ``bidNtceOrd=00/01`` (차수) → 둘 다 같은 번호
-- Bizinfo ``detailUrl`` 이 없어 URL 이 문자열 ``"None"`` 이 된 두 공고
+- URL 정규화를 넓게 잡으면 다른 페이지가 합쳐지고, 좁게 잡으면 같은 공고가
+  갈렸다
+- 필드 키와 URL 키를 함께 두니 같은 공고가 두 키로 갈려 한쪽에 철회된
+  기간이 남았고, URL 우선으로 통일하니 **URL 이 번호만 담은 API 공고**
+  (G2B 차수, Bizinfo ``detailUrl="#"``)가 합쳐졌다
 
-그래서 식별은 **이 모듈 하나**로 한다. 저장·조회·갱신 경로(``insert``,
-``exists``, ``overwrite_periods``, ``merge_quote_fields``)는 전부 여기서
-나온 키만 쓴다.
+식별자는 **크롤러가 만든 ``source_id``** 로 되돌린다. 저장·조회·갱신은
+전부 ``(source, source_id)`` 하나를 쓴다. 남은 것은 두 가지다:
 
-규칙 (우선순위) - **URL 우선**:
-
-1. **정규화 URL** 이 있으면 그것이 곧 식별자다 (쿼리 정렬·알려진 세션·추적
-   파라미터만 제거). API 소스(bizinfo·g2b)도 마찬가지다 - 상세 URL 은
-   안정적이고, 키를 두 갈래로 두면 같은 공고가 **URL 키 행과 필드 키
-   행으로 갈려** 한쪽에 철회된 기간이 남는다 (15차 게이트 HIGH).
-2. URL 이 없을 때만 소스가 선언한 식별 필드가 **전부** 있으면 그 조합.
-   하나라도 없으면 다음으로 넘어간다 - 반쪽 키는 다른 공고와 겹친다.
-3. 둘 다 없으면 크롤러가 만든 ``source_id``.
+1. ``clean_text`` - ``str(None)`` 이 만드는 문자열 ``"None"`` 차단
+   (13차에서 Bizinfo 의 서로 다른 공고가 같은 URL 을 갖던 자리)
+2. ``is_legacy_source_id`` - seis 가 **번호만** 쓰던 시절의 행 판정.
+   seis 는 공고 종류를 접두로 붙이므로(``fnc:``/``dsgn:``/``epsd:<연도>:``/
+   ``itgrd:``/``path:``), ``:`` 가 없는 seis 행이 옛 규칙의 행이다.
 """
-import hashlib
-import json
-import re
-from typing import Any, Dict, Mapping, Optional, Tuple
-from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
+from typing import Any
 
-# 소스가 선언한 식별 필드 (``raw_data`` 키). 하나라도 빠지면 다른 공고가
-# 같은 행이 된다 - G2B 차수(``bidNtceOrd``)가 그 사례다.
-# URL 이 **전혀 없을 때**만 쓰는 대체 식별 필드.
-IDENTITY_FIELDS: Dict[str, Tuple[str, ...]] = {
-    "g2b": ("bidNtceNo", "bidNtceOrd"),
-    "bizinfo": ("pblancId",),
-}
+__all__ = ["clean_text", "is_legacy_source_id"]
 
-# 제거해도 **같은 페이지**임이 알려진 파라미터만 지운다.
-#
-# 14차 게이트: ``sid`` 처럼 의미가 확인되지 않은 파라미터를 지웠더니
-# ``/boardView.do?sid=A&nttId=42`` 와 ``sid=B`` 가 한 행으로 합쳐져,
-# A 제목에 B 의 마감이 저장·전달됐다. 모르면 **남긴다** - 지우는 쪽이
-# 공고를 잃는다.
-VOLATILE_QUERY_PARAMS = frozenset({
-    "jsessionid", "phpsessid", "_", "fbclid",
-})
-# 접두사로만 알 수 있는 추적 파라미터
-VOLATILE_QUERY_PREFIXES = ("utm_",)
-
-
-def _is_volatile(name: str) -> bool:
-    """이 쿼리 파라미터가 **페이지를 가르지 않는** 것으로 알려져 있는가."""
-    lowered = (name or "").lower()
-    return (
-        lowered in VOLATILE_QUERY_PARAMS
-        or lowered.startswith(VOLATILE_QUERY_PREFIXES)
-    )
-
-# 경로에 붙는 세션 표기 (``;jsessionid=…``)
-_PATH_SESSION = re.compile(r";jsessionid=[^/?#]*", re.I)
+# 종류 접두를 쓰는 소스. 다른 소스의 ``source_id`` 형식은 건드리지 않는다.
+PREFIXED_SOURCES = ("seis",)
 
 
 def clean_text(value: Any) -> str:
     """``None`` 이 문자열 ``"None"`` 으로 새는 것을 막는다.
 
     ``str(item.get("detailUrl"))`` 은 값이 없을 때 ``"None"`` 을 만든다.
-    그 문자열이 URL 자리에 들어가면 **서로 다른 공고가 같은 URL** 을 갖는다.
+    그 문자열이 URL 자리에 들어가면 **서로 다른 공고가 같은 URL** 을 갖는다
+    (13차 게이트 HIGH).
     """
     if value is None:
         return ""
@@ -72,95 +39,21 @@ def clean_text(value: Any) -> str:
     return "" if text.lower() in ("none", "null") else text
 
 
-def normalize_url(url: Any) -> Optional[str]:
-    """비교 가능한 형태로 URL 을 정규화한다 (없으면 None).
+def is_legacy_source_id(source: str, source_id: Any) -> bool:
+    """옛 규칙(번호만)으로 저장된 행인가.
 
-    - 스킴·호스트 소문자, 조각(fragment) 제거, 끝 슬래시 제거
-    - 세션·캐시버스터 쿼리 파라미터 제거 후 **정렬**
-    """
-    text = clean_text(url)
-    if not text:
-        return None
-    try:
-        parts = urlsplit(text)
-    except ValueError:
-        return None
-
-    path = _PATH_SESSION.sub("", parts.path or "")
-    path = path.rstrip("/") or "/"
-    query = sorted(
-        (key, value)
-        for key, value in parse_qsl(parts.query, keep_blank_values=True)
-        if not _is_volatile(key)
-    )
-    return urlunsplit((
-        (parts.scheme or "").lower(),
-        (parts.netloc or "").lower(),
-        path,
-        urlencode(query),
-        "",
-    ))
-
-
-# ``identity_key`` 가 만드는 키의 접두사. 이 형식이 아닌 ``source_id`` 는
-# 옛 규칙으로 저장된 행이다 (15차 게이트: 휴리스틱 이관 대신 **표시**한다).
-IDENTITY_PREFIXES = ("url:", "fld:", "raw:")
-
-
-def is_identity_key(value: Any) -> bool:
-    """이 ``source_id`` 가 현재 식별 규칙으로 만들어진 값인가."""
-    text = clean_text(value)
-    return bool(text) and text.startswith(IDENTITY_PREFIXES)
-
-
-def _url_and_raw(item: Any) -> Tuple[Optional[str], Dict[str, Any], str]:
-    """``(url, raw_data 딕셔너리, 크롤러 source_id)`` 를 꺼낸다."""
-    if isinstance(item, Mapping):
-        url = item.get("url")
-        raw = item.get("raw_data")
-        source_id = item.get("source_id")
-    else:
-        url = getattr(item, "url", None)
-        raw = getattr(item, "raw_data", None)
-        source_id = getattr(item, "source_id", None)
-
-    if isinstance(raw, str):
-        try:
-            raw = json.loads(raw or "{}")
-        except (ValueError, TypeError):
-            raw = {}
-    if not isinstance(raw, dict):
-        raw = {}
-    return url, raw, clean_text(source_id)
-
-
-def identity_key(source: str, item: Any) -> str:
-    """이 항목이 가리키는 **DB 한 행**의 키.
+    12차에서 seis 의 ``source_id`` 에 공고 종류 접두를 넣었다 - 같은 번호를
+    쓰는 다른 종류의 공고가 한 행을 덮어쓰던 결함 때문이다. 그 전에 저장된
+    행은 접두가 없으므로 새 수집과 만나지 않는다. 추측해서 이관하지 않고
+    **표시만** 한다 (15차 게이트).
 
     Args:
         source: 소스 이름
-        item: ``RawAnnouncement`` 또는 ``{"url":…, "raw_data":…}`` 매핑
+        source_id: 저장된 식별자
 
     Returns:
-        ``url:…`` / ``fld:…`` / 크롤러 ``source_id`` / ``raw:…``
+        옛 규칙의 행이면 True
     """
-    url, raw, source_id = _url_and_raw(item)
-
-    normalized = normalize_url(url)
-    if normalized:
-        digest = hashlib.sha1(normalized.encode("utf-8")).hexdigest()[:16]
-        return f"url:{digest}"
-
-    fields = IDENTITY_FIELDS.get((source or "").strip(), ())
-    if fields:
-        values = [clean_text(raw.get(name)) for name in fields]
-        # **전부** 있을 때만 필드 키다. 하나라도 비면 그 키는 다른 공고와
-        # 같아질 수 있으므로(``fld:번호|``) 다음으로 넘어간다 (14차 게이트).
-        if all(values):
-            return "fld:" + "|".join(values)
-
-    if source_id:
-        return source_id           # 레거시·수동 입력: 크롤러가 만든 값 유지
-
-    payload = json.dumps(raw, ensure_ascii=False, sort_keys=True)
-    return "raw:" + hashlib.sha1(payload.encode("utf-8")).hexdigest()[:16]
+    if (source or "").strip() not in PREFIXED_SOURCES:
+        return False
+    return ":" not in clean_text(source_id)

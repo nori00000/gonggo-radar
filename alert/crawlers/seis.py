@@ -550,6 +550,7 @@ class SeisCrawler(BaseCrawler):
         ("ann", r"announcementId=(\d+)"),
         ("ntfy", r"notifyId=(\d+)"),
         ("ntt", r"nttId=(\d+)"),
+        ("bidx", r"[?&]bIdx=(\d+)"),
         ("artcl", r"articleId=(\d+)"),
         ("artcl", r"artclId=(\d+)"),
         ("seq", r"[?&]seq=(\d+)"),
@@ -563,6 +564,10 @@ class SeisCrawler(BaseCrawler):
     # 특정하는 데 쓰는 파라미터는 **전부** ID 에 넣는다.
     ID_QUALIFIERS = (
         r"statsYr=(\d{4})",
+        # 게시판 구분자. 같은 글번호가 게시판마다 다시 쓰이므로 이것도
+        # 빠지면 서로 다른 공고가 한 행이 된다.
+        r"bsIdx=(\d+)",
+        r"boardId=([A-Za-z0-9_-]+)",
     )
 
     def _extract_post_id(self, link: str) -> str:
@@ -585,7 +590,9 @@ class SeisCrawler(BaseCrawler):
         if path_match:
             return ":".join(["path", *qualifiers, path_match.group(1)])
 
-        return hashlib.md5(link.encode("utf-8")).hexdigest()[:16]
+        # 마지막 수단도 **접두를 붙인다** - 접두 없는 ID 는 옛 규칙의 행으로
+        # 판정되어(``identity.is_legacy_source_id``) 매번 레거시 표시된다.
+        return "md5:" + hashlib.md5(link.encode("utf-8")).hexdigest()[:16]
 
     @staticmethod
     def _post_number(source_id: str) -> int:

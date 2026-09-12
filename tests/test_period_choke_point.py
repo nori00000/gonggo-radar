@@ -34,8 +34,6 @@ from alert.crawlers.period_extractors import (
     EVIDENCE_KEYS,
     PERIOD_EXTRACTORS,
     SEIS_CARD_DATE_FIELD,
-    bizinfo_period,
-    g2b_period,
     lawmaking_period,
     seis_period,
 )
@@ -93,12 +91,15 @@ CRAWLER_CLASSES = all_crawler_classes()
 
 
 class TestOnlyTwoSourcesCanMakeAPeriod:
-    """허용목록 = 전용 추출기를 가진 소스. HTML 2곳 + 구조화 API 2곳."""
+    """허용목록 = 전용 추출기를 가진 **두 소스**뿐이다.
 
-    def test_registry_is_exactly_four(self):
-        assert set(PERIOD_EXTRACTORS) == {
-            "seis", "lawmaking", "bizinfo", "g2b",
-        }
+    16차 게이트: bizinfo·g2b 추출기는 등록을 해제했다 - 회사용 경로여서
+    협의회 브리핑과 무관하고, 그 기간을 유지하려다 식별자 설계가 사이클마다
+    새 경합을 만들었다. 두 소스의 기간은 정규화가 비운다.
+    """
+
+    def test_registry_is_exactly_two(self):
+        assert set(PERIOD_EXTRACTORS) == {"seis", "lawmaking"}
 
     def test_every_extractor_declares_its_evidence(self):
         """근거 키가 선언돼 있어야 재수집 때 근거를 교체할 수 있다."""
@@ -831,27 +832,41 @@ class TestGate11Reproductions:
             "https://www.seis.or.kr/subPage.do?dsgnPbofrSn=42": "2026-11-30",
         }
 
-    def test_legacy_row_is_matched_by_url(self, db):
-        """ID 체계가 바뀌어도 **같은 URL** 이면 같은 행이다."""
+    def test_legacy_row_goes_dark_instead_of_being_matched(self, db):
+        """옛 숫자 ID 행은 **표시**될 뿐 새 수집과 만나지 않는다 (16차).
+
+        URL 로 옛 행을 찾아 갱신하려던 설계는 서로 다른 공고를 합쳐서
+        폐기했다. 옛 행은 어둡게 두고, 재수집은 새 행을 만든다.
+        """
         url = "https://www.seis.or.kr/subPage.do?fncPbofrSn=42"
         db.insert_announcement(
             AnalyzedAnnouncement(
                 source="seis", source_id="42", title="지원사업 공고", url=url,
                 period_start="2099-01-01", period_end=PLANTED,
+                relevance_score=0.9,
                 raw_data="{}", fetched_at=datetime.now().isoformat(),
             )
         )
+        assert db.mark_legacy_rows(EVIDENCE_KEYS) == 1
+
         fresh = RawAnnouncement(
             source="seis", source_id="fnc:42", title="지원사업 공고", url=url,
-            raw_data=json.dumps({"date": "2026.09.01 ~ 2026.09.30"}),
+            raw_data=json.dumps({"date": "접수기간 2026.09.01 ~ 2026.09.30"}),
         )
-        assert db.exists(fresh) is True          # 새 행으로 갈라지지 않는다
-        assert db.overwrite_periods(_finalize_periods("seis", fresh)) is True
+        assert db.exists(fresh) is False         # 옛 행과 만나지 않는다
+        db.insert_announcement(
+            AnalyzedAnnouncement(
+                **_finalize_periods("seis", fresh).__dict__, relevance_score=0.9
+            )
+        )
         rows = db._conn.execute(
-            "SELECT source_id, period_end FROM announcements"
+            "SELECT source_id, legacy, period_end FROM announcements"
+            " ORDER BY legacy"
         ).fetchall()
-        assert len(rows) == 1
-        assert rows[0]["period_end"] is None     # 근거(라벨·출처) 없음
+        assert [(r["source_id"], r["legacy"], r["period_end"]) for r in rows] == [
+            ("fnc:42", 0, "2026-09-30"), ("42", 1, None),
+        ]
+        assert [a.source_id for a in db.get_unnotified()] == ["fnc:42"]
 
     def test_stale_seis_row_is_revalidated_and_not_notified(self, db):
         """재수집되지 않은 seis 행도 **근거를 다시 본다**."""
@@ -966,26 +981,20 @@ class TestGate12Reproductions:
             ("2026", "2026-09-30"), ("2027", "2027-11-30"),
         }
 
-    def test_same_id_with_a_different_url_is_a_different_row(self, db):
-        """ID 가 같아도 URL 이 다르면 남의 행을 덮어쓰지 않는다."""
-        db.insert_announcement(
-            AnalyzedAnnouncement(
-                source="seis", source_id="epsd:4", title="2026년 공고",
-                url="https://www.seis.or.kr/a", period_end="2026-09-30",
-                relevance_score=0.9, raw_data="{}",
-                fetched_at=datetime.now().isoformat(),
-            )
+    def test_the_id_itself_must_separate_the_announcements(self, db):
+        """행 키는 ``(source, source_id)`` 하나다 - **ID 가 갈라야 한다**.
+
+        16차: URL 로 한 번 더 가르려던 방어는 다른 공고를 합치는 부작용이
+        커서 폐기했다. 대신 seis ID 가 종류·연도를 담는다(위 테스트).
+        같은 ID 를 준다는 것은 같은 공고라고 크롤러가 말하는 것이다.
+        """
+        crawler = make(SeisCrawler)
+        assert crawler._extract_post_id(self.cert_link(2026, 4)) != (
+            crawler._extract_post_id(self.cert_link(2027, 4))
         )
-        other = RawAnnouncement(
-            source="seis", source_id="epsd:4", title="2027년 공고",
-            url="https://www.seis.or.kr/b", raw_data="{}",
-        )
-        assert db.exists(other) is False
-        assert db.overwrite_periods(other) is False
-        row = db._conn.execute(
-            "SELECT period_end FROM announcements"
-        ).fetchone()
-        assert row["period_end"] == "2026-09-30"      # 그대로다
+        assert crawler._extract_post_id(
+            "/subPage.do?fncPbofrSn=42"
+        ) != crawler._extract_post_id("/subPage.do?dsgnPbofrSn=42")
 
     def recrawl(self, db, date_text):
         """같은 공고를 새 근거로 재수집한 것처럼 처리한다."""
@@ -1067,79 +1076,6 @@ class TestGate12Reproductions:
             "seis", lambda raw: _periods_from_raw("seis", raw)
         ) == 0
         assert db.get_unnotified()[0].period_end is None
-
-
-class TestStructuredApiSources:
-    """구조화된 API 마감 필드를 주는 소스는 허용목록에 **정식 등록**한다."""
-
-    @pytest.mark.parametrize("value,expected", [
-        ("20260901~20261231", ("2026-09-01", "2026-12-31")),
-        ("2026-09-01~2026-12-31", ("2026-09-01", "2026-12-31")),
-        ("20260901 ~ 20261231", ("2026-09-01", "2026-12-31")),
-        # 단일 날짜는 시작인지 마감인지 선언되지 않았다
-        ("20260901", (None, None)),
-        # 달력에 없는 날짜 · 역전 · 잡음
-        ("20260230~20261231", (None, None)),
-        ("20261231~20260901", (None, None)),
-        ("상시모집", (None, None)),
-        ("", (None, None)),
-    ])
-    def test_bizinfo_reads_only_the_api_field(self, value, expected):
-        assert bizinfo_period({"reqstBeginEndDe": value}) == expected
-
-    def test_bizinfo_ignores_other_fields(self):
-        assert bizinfo_period({"pblancNm": "모집(~9.30)"}) == (None, None)
-
-    @pytest.mark.parametrize("raw,expected", [
-        ({"bidBeginDt": "202609010900", "bidClseDt": "202609301700"},
-         ("2026-09-01", "2026-09-30")),
-        ({"bidClseDt": "202609301700"}, (None, "2026-09-30")),
-        ({"bidClseDt": "20260930"}, (None, "2026-09-30")),
-        # 마감이 없으면 시작만으로 기간을 말하지 않는다
-        ({"bidBeginDt": "202609010900"}, (None, None)),
-        ({"bidClseDt": "20260231"}, (None, None)),
-        ({"bidClseDt": "곧"}, (None, None)),
-        ({}, (None, None)),
-    ])
-    def test_g2b_reads_only_the_api_fields(self, raw, expected):
-        assert g2b_period(raw) == expected
-
-    def test_bizinfo_stale_row_is_revalidated_from_the_api_field(self, tmp_path):
-        """기존 bizinfo 2099 행 - 근거가 있으면 API 값, 없으면 NULL."""
-        db = Database(db_path=tmp_path / "announcements.db")
-        for source_id, raw in (
-            ("with-field", {"reqstBeginEndDe": "20260901~20261231"}),
-            ("without-field", {}),
-        ):
-            db.insert_announcement(
-                AnalyzedAnnouncement(
-                    source="bizinfo", source_id=source_id, title="공고",
-                    url=f"https://www.bizinfo.go.kr/{source_id}",
-                    period_start="2099-01-01", period_end=PLANTED,
-                    relevance_score=0.9,
-                    raw_data=json.dumps(raw, ensure_ascii=False),
-                    fetched_at=datetime.now().isoformat(),
-                )
-            )
-
-        assert db.revalidate_periods(
-            "bizinfo", lambda raw: _periods_from_raw("bizinfo", raw)
-        ) == 2
-        rows = db._conn.execute(
-            "SELECT url, period_start, period_end FROM announcements"
-        ).fetchall()
-        stored = {
-            r["url"].rsplit("/", 1)[-1]: (r["period_start"], r["period_end"])
-            for r in rows
-        }
-        assert stored == {
-            "with-field": ("2026-09-01", "2026-12-31"),
-            "without-field": (None, None),
-        }
-        notified = {
-            a.url.rsplit("/", 1)[-1]: a.period_end for a in db.get_unnotified()
-        }
-        assert notified == {"with-field": "2026-12-31", "without-field": None}
 
 
 class TestStaleRowsAreOverwritten:
