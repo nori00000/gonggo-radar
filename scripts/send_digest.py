@@ -311,6 +311,29 @@ def send_digest(
         return 2
 
     lock_path = state_mod.lock_path_for_markdown(markdown_path)
+
+    # ⓪-a 잠금이 비어 있는지 **먼저** 확인하고 곧바로 놓는다.
+    # 남이 쥐고 있으면 여기서 끝난다 — 바이트도 읽지 않고 네트워크도 쓰지 않는다
+    # (발송기의 "잠금 밖 판정 0" 규율, 사이클6 #1). 판정을 하지 않으므로 규율은
+    # 그대로이고, 잠금 보유 시간만 짧아진다.
+    try:
+        state_mod.release_lock(state_mod.acquire_lock(lock_path))
+    except state_mod.LockBusy as exc:
+        _err(f"✗ 발송 거부: {exc}")
+        return 2
+    except OSError as exc:
+        _err(f"✗ 발송 거부: 잠금 생성 실패 — {exc}")
+        return 2
+
+    # ⓪-b 잠금 **밖** 1단계: URL 생존 스냅샷 (통합 2 #1 · 3 #1).
+    # 네트워크는 느리다 — URL 4개가 HEAD·GET 8초씩 걸리면 검사만 60초를 넘겨
+    # 다른 작성자의 대기 한도를 통째로 먹는다(Codex 통합 3차 MEDIUM 실측).
+    # 통합 2 에서는 이 호출이 acquire_lock **뒤**에 있었다 — 주석은 "잠금 밖" 이라고
+    # 적혀 있었고 코드는 잠금 안이었다. 보고와 코드가 갈라진 자리다.
+    snapshot = liveness_snapshot(markdown_path)
+
+    # ① 여기서부터가 진짜 잠금 구간이다. 위에서 비어 있었어도 그 사이 다른
+    # 작성자가 쥘 수 있다 — 그러면 LockBusy 로 끝난다(판정 없음).
     try:
         lock_handle = state_mod.acquire_lock(lock_path)
     except state_mod.LockBusy as exc:
@@ -319,12 +342,6 @@ def send_digest(
     except OSError as exc:
         _err(f"✗ 발송 거부: 잠금 생성 실패 — {exc}")
         return 2
-
-    # ⓪ 잠금 **밖** 1단계: URL 생존 스냅샷 (통합 2 #1).
-    # 네트워크는 느리다 — 잠금을 쥔 채 기다리면 봇·재검토가 함께 멈춘다(사이클7
-    # 크리틱 #4 와 같은 이유). 대신 "이 바이트를 봤다" 는 SHA 를 함께 담고,
-    # 잠금 안에서 바이트가 그대로인지 확인한다. 판정은 잠금 안에서만 내린다.
-    snapshot = liveness_snapshot(markdown_path)
 
     try:
         return _send_locked(

@@ -458,8 +458,12 @@ def _finish_locked(state_path, week, prepared, message_ids, item_urls,
         except (state_mod.StateError, state_mod.TransitionError,
                 OSError) as exc:
             return 1, None, f"⚠️  상태 기록 실패(안내는 전송됨): {redact(exc)}"
-        return 0, None, "✓ 상태 기록: {} (approval=없음(검증 필요))".format(
-            state_path)
+        # 통합 3 #2: 안내는 승인을 만들지도 지우지도 않는다 — 로그가 "승인 없음" 을
+        # 단정하면 그 사이 다른 미리보기가 발급한 최신 승인을 오보한다.
+        live_id = state_mod.approval_of(
+            state_mod.load_state(state_path, week)).get("id")
+        return 0, None, "✓ 안내 기록: {} (approval={})".format(
+            state_path, live_id or "없음(검증 필요)")
 
     live = state_mod.approval_of(current)
     same_generation = (

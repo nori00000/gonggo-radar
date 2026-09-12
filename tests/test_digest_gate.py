@@ -5422,3 +5422,109 @@ def test_notice_does_not_overwrite_preview_coordinates(tmp_path):
     assert state_mod.preview_urls(state) == urls
     assert state_mod.approval_of(state).get("id") == \
         state_mod.approval_of(live_b).get("id")      # B 승인도 그대로
+
+
+# ══ 통합 사이클 3: probe 는 잠금 밖에서 끝난다 ══════════════════════════
+def test_liveness_probe_finishes_before_the_lock(tmp_path, monkeypatch):
+    """URL 생존 검사는 **잠금을 쥐기 전에** 끝난다 (통합 3 #1).
+
+    Codex 통합 3차 MEDIUM 실측: 호출 순서가 `acquire_lock → probe(잠금 보유)
+    → release_lock` 이었다. URL 4개가 HEAD·GET 8초씩이면 검사만 64초 —
+    다른 작성자의 60초 대기 한도를 통째로 먹는다. 주석은 "잠금 밖" 이라고
+    적혀 있었고 코드는 잠금 안이었다.
+
+    순서를 기록해 **잠금 보유 중 네트워크 0회**를 단언한다.
+    """
+    annotated, _ = apply_headline(SAMPLE_MD, "확정 의견")
+    md = _write_digest(tmp_path, annotated)
+    _seed_preview(md)
+
+    events = []
+    held = {"count": 0}
+    real_acquire = state_mod.acquire_lock
+    real_release = state_mod.release_lock
+
+    def acquire(path, **kwargs):
+        handle = real_acquire(path, **kwargs)
+        held["count"] += 1
+        events.append("acquire")
+        return handle
+
+    def release(handle):
+        held["count"] -= 1
+        events.append("release")
+        return real_release(handle)
+
+    def probe(url, timeout=8):
+        events.append(f"probe:{held['count']}")
+        return True
+
+    monkeypatch.setattr("scripts.send_digest.state_mod.acquire_lock", acquire)
+    monkeypatch.setattr("scripts.send_digest.state_mod.release_lock", release)
+    monkeypatch.setattr("alert.digest.checker.check_url_alive", probe)
+    monkeypatch.setattr("scripts.send_digest.EmailNotifier", _OkNotifier)
+
+    assert _send(md) == 0
+
+    probes = [event for event in events if event.startswith("probe")]
+    assert probes, events
+    # ① 잠금을 쥔 채로 찍은 probe 가 하나도 없다
+    assert all(event == "probe:0" for event in probes), events
+    # ② 마지막 probe 가 **마지막 acquire 앞**에 있다 (판정 구간 진입 전에 끝났다)
+    assert events.index(probes[-1]) < len(events) - 1 - events[::-1].index("acquire")
+
+
+def test_busy_lock_skips_both_reads_and_probes(tmp_path, monkeypatch):
+    """남이 잠금을 쥐고 있으면 바이트도 읽지 않고 네트워크도 쓰지 않는다.
+
+    통합 3 에서 probe 를 잠금 앞으로 옮기면서도 계약 W10 사이클6 #1
+    ("잠금 밖 판정 0")을 지킨다 — 잠금이 비어 있는지 먼저 보고, 차 있으면
+    거기서 끝낸다.
+    """
+    md = _annotated_digest(tmp_path)
+    holder = state_mod.acquire_lock(state_mod.lock_path_for_markdown(md))
+    probes = []
+    monkeypatch.setattr("alert.digest.checker.check_url_alive",
+                        lambda url, timeout=8: probes.append(url) or True)
+    read_calls = []
+    real_read = Path.read_bytes
+
+    def counted(self, *args, **kwargs):
+        read_calls.append(str(self))
+        return real_read(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_bytes", counted)
+    _forbid_notifier(monkeypatch, "잠금 없이 발송을 시작했다")
+    try:
+        assert _send(md) == 2
+    finally:
+        state_mod.release_lock(holder)
+    assert probes == []
+    assert not [c for c in read_calls if c.endswith(".md")]
+    assert not [c for c in read_calls if c.endswith(".check.json")]
+
+
+def test_notice_log_reports_the_live_approval(tmp_path):
+    """안내 완료 로그가 최신 승인 상태를 그대로 말한다 (통합 3 #2)."""
+    from scripts import notify_digest
+
+    md = _write_digest(tmp_path)
+    state_path = state_mod.state_path_for_markdown(md)
+    live_b = state_mod.record_preview(
+        state_mod.default_state("2026-W37"), [2020], [], "sha-b", "check-b")
+    state_mod.save_state(state_path, live_b)
+    approval_b = state_mod.approval_of(live_b)["id"]
+
+    code, _drop, message = notify_digest._finish_locked(
+        state_path, "2026-W37", None, [3030], [], None)
+    assert code == 0
+    # 예전에는 이 자리에서 언제나 "approval=없음(검증 필요)" 라고 적었다 —
+    # B 의 승인이 살아 있는데도 없다고 오보했다.
+    assert approval_b in message
+    assert "없음(검증 필요)" not in message
+
+    state_mod.save_state(state_path, state_mod.clear_approval(
+        state_mod.load_state(state_path, "2026-W37")))
+    _code, _drop, message = notify_digest._finish_locked(
+        state_path, "2026-W37", None, [3031], [], None)
+    assert "없음(검증 필요)" in message       # 진짜 없을 때만 그렇게 적는다
