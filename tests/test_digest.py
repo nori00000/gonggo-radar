@@ -16,6 +16,7 @@ from alert.digest.composer import (
     MARKER,
     SECTION_HEADINGS,
     SECTION_LIMITS,
+    SOURCE_DIVERSITY_LIMIT,
     VERDICT_APPLY,
     VERDICT_EXCLUDE,
     VERDICT_HOLD,
@@ -47,6 +48,17 @@ W13_TODAY = date(2026, 3, 26)
 
 APPLY_HEADING = SECTION_HEADINGS[VERDICT_APPLY]
 NOTICE_HEADING = SECTION_HEADINGS[VERDICT_NOTICE]
+
+# 소스 다양성 상한(같은 소스 2건)에 걸리지 않게 3소스 x 2건으로 펼친 신청 후보.
+# 전부 사업자 신호(기업·업체·사업자·입점·조달)를 갖고 있어 B2C 보류에도 걸리지 않는다.
+SPREAD_APPLY_ROWS = (
+    ("kofpi", "산림분야 오픈이노베이션 참여기업 모집 공고"),
+    ("kofpi", "임산물 가공유통 지원사업 신청 안내"),
+    ("fowi", "산촌 목재 이용 설명회 참여업체 모집"),
+    ("fowi", "임업 경영 컨설팅 참여기업 모집"),
+    ("coop", "산림복지전문업 플랫폼 입점 지원사업"),
+    ("coop", "숲가꾸기 사업자 조달 계약 공모"),
+)
 
 
 @pytest.fixture
@@ -379,17 +391,10 @@ class TestComposer:
         db_path = tmp_path / "cap.db"
         _create_announcements_table(db_path)
 
-        titles = [
-            "산림분야 오픈이노베이션 참여기업 모집 공고",
-            "임산물 가공유통 지원사업 신청 안내",
-            "산촌 목재 이용 설명회 참가 신청",
-            "임업 경영 컨설팅 참여기업 모집",
-            "산림복지전문업 플랫폼 입점 지원사업",
-            "숲가꾸기 사업자 조달 계약 공모",
-        ]
-        for index, title in enumerate(titles):
+        for index, (source, title) in enumerate(SPREAD_APPLY_ROWS):
             _insert_one(
                 db_path,
+                source=source,
                 source_id=f"cap_{index}",
                 title=title,
                 url=f"https://example.com/cap-{index}",
@@ -440,8 +445,7 @@ class TestComposer:
         rows = [
             ("dup_a", "임업 경영 컨설팅 참여기업 모집 공고"),
             ("dup_b", "임업 경영 컨설팅 참여기업 모집  \t공고(~9.30)"),
-            ("uniq_1", "산촌 목재 이용 설명회 참가 신청"),
-            ("uniq_2", "숲가꾸기 사업자 조달 계약 공모"),
+            ("uniq_1", "숲가꾸기 사업자 조달 계약 공모"),
         ]
         for source_id, title in rows:
             _insert_one(
@@ -457,7 +461,7 @@ class TestComposer:
         )
         body = _section_body(markdown, APPLY_HEADING)
 
-        assert _count_items(body) == 3
+        assert _count_items(body) == 2
         assert body.count("임업 경영 컨설팅 참여기업 모집") == 1
 
     def test_compose_digest_cross_source_similar_is_annotated_not_merged(
@@ -518,7 +522,7 @@ class TestComposer:
         _insert_one(
             db_path,
             source_id="fresh",
-            title="산촌 목재 이용 설명회 참가 신청",
+            title="산촌 목재 이용 설명회 참여업체 모집",
             url="https://example.com/fresh",
             period_end=None,
             period_start="2026-03-24",
@@ -545,7 +549,7 @@ class TestComposer:
             db_path=str(db_path), week_str=W13, today=W13_TODAY
         )
 
-        assert "[새 소식] 산촌 목재 이용 설명회 참가 신청" in markdown
+        assert "[새 소식] 산촌 목재 이용 설명회 참여업체 모집" in markdown
         assert "[상시] 임업 경영 컨설팅 참여기업 모집" in markdown
         # 게시일을 모르는 항목에 "새 소식"을 붙이지 않는다 (fail-closed)
         assert "[상시] 사회적기업 사무공간 신규 입주기업 모집 공고" in markdown
@@ -1110,20 +1114,22 @@ class TestIntegration:
 class TestDeadUrlDrop:
     """계약 v1.2: url_alive=false 항목 자동 제외 + dropped 기록."""
 
-    # 같은 소스 안에서 서로 병합되지 않을 만큼 다른 제목 3건
-    SEED_TITLES = (
-        "산림분야 오픈이노베이션 참여기업 모집 공고",
-        "임산물 가공유통 지원사업 신청 안내",
-        "산촌 목재 이용 설명회 참가 신청",
+    # 소스 다양성 상한(2)에 걸리지 않도록 소스를 나눈 신청 항목 3건
+    SEED_ROWS = (
+        ("kofpi", "산림분야 오픈이노베이션 참여기업 모집 공고"),
+        ("fowi", "임산물 가공유통 지원사업 신청 안내"),
+        ("coop", "산촌 목재 이용 설명회 참여업체 모집"),
     )
+    SEED_TITLES = tuple(title for _source, title in SEED_ROWS)
 
     @classmethod
     def _seed_three(cls, db_path):
         """2026-W13 범위의 신청 항목 3건."""
         _create_announcements_table(db_path)
-        for i, title in enumerate(cls.SEED_TITLES):
+        for i, (source, title) in enumerate(cls.SEED_ROWS):
             _insert_one(
                 db_path,
+                source=source,
                 source_id=f"test_{i:03d}",
                 title=title,
                 url=f"https://example.com/item-{i}",
@@ -1235,20 +1241,12 @@ class TestDeadUrlDrop:
 class TestComposeExcludeUrls:
     """compose_digest(exclude_urls=...) 재조립."""
 
-    APPLY_TITLES = (
-        "산림분야 오픈이노베이션 참여기업 모집 공고",
-        "임산물 가공유통 지원사업 신청 안내",
-        "산촌 목재 이용 설명회 참가 신청",
-        "임업 경영 컨설팅 참여기업 모집",
-        "산림복지전문업 플랫폼 입점 지원사업",
-        "숲가꾸기 사업자 조달 계약 공모",
-    )
-
     def _seed_six(self, db_path):
         _create_announcements_table(db_path)
-        for i, title in enumerate(self.APPLY_TITLES):
+        for i, (source, title) in enumerate(SPREAD_APPLY_ROWS):
             _insert_one(
                 db_path,
+                source=source,
                 source_id=f"test_{i:03d}",
                 title=title,
                 url=f"https://example.com/s-{i}",
@@ -1546,3 +1544,233 @@ class TestRulesV21:
             title_ngrams("「2026년 배출권거래제 외부사업 등록·인증 지원」 참여자 추가모집 공고"),
             title_ngrams("2026년 배출권거래제 외부사업 등록 인증 지원 참여자 추가모집 공고(~9.7)"),
         ) >= 0.6
+
+
+class TestFixCycle1:
+    """개정 v2.2 (판단 티어 판정 F1·F2·F4)."""
+
+    # ─── F1: 사업자 모집 vs 참가자 모집 ─────────────────────────────────
+    @pytest.mark.parametrize(
+        "title",
+        [
+            "2026년「건강출산 행복가정 지원사업」사업 수시모집 공고문(숲동행-10월)",
+            "2026년 4분기 2차 국립횡성숲체원 「나눔의 숲 캠프」모집 공고",
+            "2026년 산림복지 취업아카데미 참가 모집(~9.16.)",
+        ],
+    )
+    def test_b2c_recruitment_goes_to_hold(self, title):
+        result = classify_item(title, "", "fowi")
+        assert result.verdict == VERDICT_HOLD, result
+        assert result.reason.startswith("참가자 모집(B2C)"), result
+
+    @pytest.mark.parametrize(
+        "source,title",
+        [
+            ("kofpi", "[모집] 2026 산림분야 오픈이노베이션 참여기업 모집(~9.30)"),
+            (
+                "fowi",
+                "[모집]「2026년 산림복지전문업 통합 온라인 플랫폼 입점 지원사업」"
+                "참가기업 모집 연장(~9.14.)",
+            ),
+            ("coop", "사회적협동조합 공공조달 1:1 컨설팅 참여기업 모집 공고"),
+        ],
+    )
+    def test_business_recruitment_stays_in_apply(self, source, title):
+        """사업자 신호가 하나라도 있으면 B2C 신호와 공존해도 신청하세요."""
+        result = classify_item(title, "", source)
+        assert result.verdict == VERDICT_APPLY, result
+
+    def test_b2c_hold_is_recoverable_not_excluded(self):
+        """보류는 배제가 아니다 — 미리보기 보류 목록에 남아 `핀 n`으로 복구된다."""
+        result = classify_item(
+            "2026년 4분기 국립춘천숲체원 「나눔의 숲」 캠프 모집 공고", "", "fowi"
+        )
+        assert result.verdict != VERDICT_EXCLUDE
+        assert result.tags == ("산림사업자",)
+
+    # ─── F2: 정체성 우선 정렬 + 소스 다양성 상한 ────────────────────────
+    def test_identity_announcement_survives_apply_cap(self, tmp_path):
+        """정체성 공고가 게시일 며칠 차이로 상한에서 밀려나지 않는다."""
+        db_path = tmp_path / "identity.db"
+        _create_announcements_table(db_path)
+
+        # 게시일이 더 최신인 비정체성 공고 3건 (다른 소스로 분산)
+        fresher = (
+            ("fowi", "숲체험교육사업 참여업체 정기모집 공고", "2026-03-25"),
+            ("fowi", "임산물 가공유통 지원 참여기업 모집", "2026-03-25"),
+            ("kofpi", "목재산업 시설 개선 지원사업 참여업체 모집", "2026-03-24"),
+            ("kofpi", "산촌 자원 활용 시제품 개발 지원 참여기업 모집", "2026-03-24"),
+            ("coop", "숲가꾸기 사업자 조달 계약 공모", "2026-03-24"),
+        )
+        for index, (source, title, posted) in enumerate(fresher):
+            _insert_one(
+                db_path,
+                source=source,
+                source_id=f"fresh_{index}",
+                title=title,
+                url=f"https://example.com/fresh-{index}",
+                period_end=None,
+                period_start=posted,
+            )
+
+        # 게시일이 더 이른 정체성 공고
+        _insert_one(
+            db_path,
+            source="forest_service",
+            source_id="identity_1",
+            title="2026년도 제2차 산림형 예비사회적기업 지정 계획 공고",
+            url="https://example.com/identity-1",
+            period_end=None,
+            period_start="2026-03-23",
+        )
+
+        data = compose_digest_data(
+            str(db_path), week_str=W13, today=W13_TODAY
+        )
+        published = data["sections"][VERDICT_APPLY]
+
+        assert published[0]["url"] == "https://example.com/identity-1"
+        assert published[0]["identity_priority"] == 0
+
+    def test_source_diversity_limit_pushes_overflow_to_hold(self, tmp_path):
+        """같은 소스는 신청 섹션에 최대 2건, 초과분은 보류."""
+        db_path = tmp_path / "diversity.db"
+        _create_announcements_table(db_path)
+
+        titles = (
+            "산림분야 오픈이노베이션 참여기업 모집 공고",
+            "임산물 가공유통 지원사업 참여업체 모집",
+            "목재산업 시설 개선 지원 참여기업 모집",
+            "숲가꾸기 사업자 조달 계약 공모",
+        )
+        for index, title in enumerate(titles):
+            _insert_one(
+                db_path,
+                source="kofpi",
+                source_id=f"div_{index}",
+                title=title,
+                url=f"https://example.com/div-{index}",
+                period_end=f"2026-12-2{index}",
+            )
+
+        data = compose_digest_data(
+            str(db_path), week_str=W13, today=W13_TODAY
+        )
+
+        assert len(data["sections"][VERDICT_APPLY]) == SOURCE_DIVERSITY_LIMIT
+        overflow = [
+            item
+            for item in data["holds"]
+            if item["reason"].startswith("소스 다양성 상한")
+        ]
+        assert len(overflow) == 2
+        assert [item["url"] for item in overflow] == [
+            "https://example.com/div-2",
+            "https://example.com/div-3",
+        ]
+
+    def test_diversity_overflow_appears_in_hold_comments(self, tmp_path):
+        db_path = tmp_path / "diversity_md.db"
+        _create_announcements_table(db_path)
+        for index in range(3):
+            _insert_one(
+                db_path,
+                source="kofpi",
+                source_id=f"div_{index}",
+                title=(
+                    "산림분야 오픈이노베이션 참여기업 모집 공고",
+                    "임산물 가공유통 지원사업 참여업체 모집",
+                    "목재산업 시설 개선 지원 참여기업 모집",
+                )[index],
+                url=f"https://example.com/divmd-{index}",
+                period_end=f"2026-12-2{index}",
+            )
+
+        markdown = compose_digest(
+            db_path=str(db_path), week_str=W13, today=W13_TODAY
+        )
+        assert "소스 다양성 상한(같은 소스 2건) -->" in markdown
+
+    # ─── F4: 같은 제목 다른 회차 ────────────────────────────────────────
+    def test_same_title_different_deadline_not_merged(self, tmp_path):
+        """같은 제목이라도 인정된 마감이 다르면 다른 회차 — 병합하지 않는다."""
+        db_path = tmp_path / "rounds.db"
+        _create_announcements_table(db_path)
+
+        for index, (period_end, posted) in enumerate(
+            [("2026-10-19", "2026-03-26"), ("2026-09-16", "2026-03-24")]
+        ):
+            _insert_one(
+                db_path,
+                source="lawmaking",
+                source_id=f"round_{index}",
+                title="산림재난방지법 시행령 일부개정령안 입법예고",
+                url=f"https://example.com/round-{index}",
+                period_end=period_end,
+                period_start=posted,
+            )
+
+        data = compose_digest_data(
+            str(db_path), week_str=W13, today=W13_TODAY
+        )
+        notices = data["sections"][VERDICT_NOTICE]
+
+        assert len(notices) == 2
+        assert {item["url"] for item in notices} == {
+            "https://example.com/round-0",
+            "https://example.com/round-1",
+        }
+
+    def test_same_title_same_deadline_keeps_open_representative(self, tmp_path):
+        """마감이 같으면 병합. 한쪽만 마감이 있으면 열린 쪽이 대표."""
+        db_path = tmp_path / "rep.db"
+        _create_announcements_table(db_path)
+
+        _insert_one(
+            db_path,
+            source="kofpi",
+            source_id="rep_none",
+            title="산림분야 오픈이노베이션 참여기업 모집 공고",
+            url="https://example.com/rep-none",
+            period_end=None,
+            period_start="2026-03-24",
+        )
+        _insert_one(
+            db_path,
+            source="kofpi",
+            source_id="rep_open",
+            title="산림분야 오픈이노베이션 참여기업 모집 공고(~12.20)",
+            url="https://example.com/rep-open",
+            period_end="2026-12-20",
+            period_start="2026-03-23",
+        )
+
+        data = compose_digest_data(
+            str(db_path), week_str=W13, today=W13_TODAY
+        )
+        published = data["sections"][VERDICT_APPLY]
+
+        assert len(published) == 1
+        assert published[0]["url"] == "https://example.com/rep-open"
+        assert published[0]["deadline"] == "2026-12-20"
+
+    def test_posting_date_artifact_does_not_fake_a_new_round(self, tmp_path):
+        """period_start == period_end(게시일 위장)는 "다른 회차"가 되지 못한다."""
+        db_path = tmp_path / "artifact.db"
+        _create_announcements_table(db_path)
+
+        for index, posted in enumerate(["2026-03-25", "2026-03-24"]):
+            _insert_one(
+                db_path,
+                source="fowi",
+                source_id=f"art_{index}",
+                title="숲체험교육사업 참여업체 정기모집 공고",
+                url=f"https://example.com/art-{index}",
+                period_start=posted,
+                period_end=posted,
+            )
+
+        data = compose_digest_data(
+            str(db_path), week_str=W13, today=W13_TODAY
+        )
+        assert len(data["sections"][VERDICT_APPLY]) == 1

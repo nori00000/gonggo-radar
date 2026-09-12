@@ -15,6 +15,7 @@ import json
 import re
 import sqlite3
 import sys
+from collections import Counter
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Dict, List, NamedTuple, Optional, Sequence, Set, Tuple
@@ -159,6 +160,42 @@ NOISE_KEYWORDS = (
     "선정 결과",
     "재난 대비 점검",
 )
+
+# ─── 사업자 모집 vs 참가자 모집 (개정 v2.2 F1) ───────────────────────────
+# 제목에 B2C 신호가 있고 사업자 신호가 없으면 **보류**다(배제 아님 — `핀 n` 복구 가능).
+# W37 실측: "숲동행 건강출산 지원사업 수시모집", "나눔의 숲 캠프 모집 공고"가
+# 신청하세요 5칸 중 2칸을 먹었다. 둘 다 회원사가 신청할 사업이 아니라 개인·가족 모집이다.
+B2C_SIGNAL_KEYWORDS = (
+    "참가자",
+    "참여자",
+    "참가",
+    "체험단",
+    "캠프",
+    "교실",
+    "프로그램 참여",
+    "건강",
+    "출산",
+    "가족",
+    "어린이",
+    "청소년",
+)
+B2B_SIGNAL_KEYWORDS = (
+    "기업",
+    "사업자",
+    "단체",
+    "법인",
+    "협동조합",
+    "사회적기업",
+    "마을기업",
+    "업체",
+    "공급자",
+    "입점",
+    "조달",
+    "위탁",
+)
+
+# 신청 섹션의 소스 다양성 상한 (개정 v2.2 F2). 초과분은 보류로 내려간다.
+SOURCE_DIVERSITY_LIMIT = 2
 
 # ─── 대상 태그 (판정 ①) ──────────────────────────────────────────────────
 TAG_SOCIAL_COOP = "사협"          # 사회적협동조합
@@ -431,6 +468,17 @@ def classify_item(title: str, summary: str, source: str) -> Classification:
     # 배제가 아니라 **보류**로 내려가므로 편집자가 `핀 n`으로 되살릴 수 있다(판정 ⑦).
     opportunity = _hits(title, OPPORTUNITY_KEYWORDS)
     if opportunity:
+        # 개정 v2.2 F1: 참가자 모집(B2C)은 보류. 사업자 신호가 하나라도 있으면 통과.
+        b2c = _hits(title, B2C_SIGNAL_KEYWORDS)
+        b2b = _hits(title, B2B_SIGNAL_KEYWORDS)
+        if b2c and not b2b:
+            return Classification(
+                VERDICT_HOLD,
+                f"참가자 모집(B2C): {b2c[0]}",
+                relevance + opportunity + b2c,
+                tags,
+                region,
+            )
         return Classification(
             VERDICT_APPLY,
             f"기회: {opportunity[0]}",
@@ -682,6 +730,10 @@ def _build_item(row: Sequence, classification: Classification, today: date) -> D
         "label": label,
         "posted": posted.isoformat() if posted else "",
         "sort_bucket": sort_bucket,
+        # 개정 v2.2 F2: 마감 없음 버킷에서 사회적경제 정체성 공고를 앞세우는 키
+        "identity_priority": 0 if _hits(
+            normalize_title(title), SSE_IDENTITY_KEYWORDS
+        ) else 1,
         "similar_count": 0,
     }
     item.update(quotes)
@@ -689,19 +741,35 @@ def _build_item(row: Sequence, classification: Classification, today: date) -> D
 
 
 def _dedup_same_source(items: List[Dict]) -> List[Dict]:
-    """같은 소스·같은 주 안에서 제목 유사도 ≥ DEDUP_JACCARD면 대표 1건으로 병합 (판정 ⑥)."""
+    """같은 소스·같은 주 안에서 제목 유사도 ≥ DEDUP_JACCARD면 대표 1건으로 병합 (판정 ⑥).
+
+    개정 v2.2 F4: 제목이 같아도 **인정된 마감이 다르면 다른 회차**이므로 병합하지 않는다
+    (W37 실측: `산림재난방지법 시행령 일부개정령안 입법예고`가 의견 9/16·10/19 두 건).
+    병합할 때 대표는 **마감이 늦은(아직 열린) 쪽**이다. 마감 비교는 우리가 인정한
+    effective deadline(`item["deadline"]`)으로 한다 — 게시일을 마감 칸에 넣은
+    크롤러 산출물이 "다른 회차"로 위장하는 것을 막는다.
+    """
     kept: List[Dict] = []
     kept_grams: List[frozenset] = []
     for item in items:
         grams = title_ngrams(item["title"])
-        duplicate = False
-        for other, other_grams in zip(kept, kept_grams):
+        merged = False
+        for index, (other, other_grams) in enumerate(zip(kept, kept_grams)):
             if other["source"] != item["source"]:
                 continue
-            if jaccard(grams, other_grams) >= DEDUP_JACCARD:
-                duplicate = True
-                break
-        if duplicate:
+            if jaccard(grams, other_grams) < DEDUP_JACCARD:
+                continue
+            if item["deadline"] and other["deadline"] and (
+                item["deadline"] != other["deadline"]
+            ):
+                # 다른 회차 — 병합하지 않는다
+                continue
+            merged = True
+            if item["deadline"] > other["deadline"]:
+                kept[index] = item
+                kept_grams[index] = grams
+            break
+        if merged:
             continue
         kept.append(item)
         kept_grams.append(grams)
@@ -728,12 +796,19 @@ def _posted_ordinal(item: Dict) -> int:
 
 
 def _sort_apply(items: List[Dict]) -> List[Dict]:
-    """신청하세요: 마감 있음 D-day 오름차순 → 새 소식 → 상시 (판정 ④)."""
+    """신청하세요 정렬 (판정 ④ + 개정 v2.2 F2).
+
+    ① 마감 있음 → D-day 오름차순 ② 새 소식 ③ 상시.
+    마감 없음 버킷 안에서는 **제목에 사회적경제 정체성 키워드가 있는 항목이 먼저**,
+    그다음 게시일 내림차순 — 협의회 정체성 공고(예비사회적기업 지정 계획 등)가
+    게시일 며칠 차이로 상한에서 밀려나던 것을 막는다.
+    """
     return sorted(
         items,
         key=lambda item: (
             item["sort_bucket"],
             item["deadline"] or "9999-12-31",
+            item["identity_priority"],
             -_posted_ordinal(item),
         ),
     )
@@ -823,17 +898,30 @@ def compose_digest_data(
 
     sections: Dict[str, List[Dict]] = {VERDICT_APPLY: [], VERDICT_NOTICE: []}
     holds: List[Dict] = []
+    apply_candidates: List[Dict] = []
     for item in survivors:
         if item["verdict"] == VERDICT_APPLY:
-            sections[VERDICT_APPLY].append(item)
+            apply_candidates.append(item)
         elif item["verdict"] == VERDICT_NOTICE:
             sections[VERDICT_NOTICE].append(item)
         else:
             holds.append(item)
 
-    sections[VERDICT_APPLY] = _sort_apply(sections[VERDICT_APPLY])[
-        : SECTION_LIMITS[VERDICT_APPLY]
-    ]
+    # 개정 v2.2 F2: 같은 소스가 신청 섹션을 독식하지 못하게 한다. 초과분은 보류로.
+    selected: List[Dict] = []
+    per_source: Counter = Counter()
+    for item in _sort_apply(apply_candidates):
+        if per_source[item["source"]] >= SOURCE_DIVERSITY_LIMIT:
+            item["verdict"] = VERDICT_HOLD
+            item["reason"] = (
+                f"소스 다양성 상한(같은 소스 {SOURCE_DIVERSITY_LIMIT}건)"
+            )
+            holds.append(item)
+            continue
+        per_source[item["source"]] += 1
+        selected.append(item)
+
+    sections[VERDICT_APPLY] = selected[: SECTION_LIMITS[VERDICT_APPLY]]
     sections[VERDICT_NOTICE] = _sort_notice(sections[VERDICT_NOTICE])[
         : SECTION_LIMITS[VERDICT_NOTICE]
     ]
