@@ -384,7 +384,8 @@ class TestSeisMainCards:
         link = (
             "/subPage.do?menuId=30100&tabId=certPageView&statsYr=2026&epsdNo=4"
         )
-        assert crawler._extract_post_id(link) == "epsd:4"
+        # 12차 게이트: 연도(statsYr)까지 ID 에 들어간다
+        assert crawler._extract_post_id(link) == "epsd:2026:4"
         # 같은 자리에 다른 파라미터가 와도 고유번호를 먼저 본다
         assert crawler._extract_post_id(
             "/subPage.do?menuId=30200&tabId=pbancMainView&fncPbofrSn=8371"

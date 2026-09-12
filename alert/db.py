@@ -495,22 +495,26 @@ class Database:
         Returns:
             찾은 행 또는 None
         """
+        url = (announcement.url or "").strip()
         row = self._conn.execute(
             _sql(
-                f"SELECT {columns} FROM announcements"
+                f"SELECT {columns}, url FROM announcements"
                 " WHERE source = ? AND source_id = ?"
             ),
             (announcement.source, announcement.source_id),
         ).fetchone()
         if row is not None:
-            return row
+            stored_url = (row["url"] or "").strip()
+            # 같은 ID 인데 URL 이 다르면 **다른 공고**다 - ID 체계가 특정에
+            # 실패한 경우이므로 남의 행을 덮어쓰지 않는다 (12차 게이트).
+            if not url or not stored_url or stored_url == url:
+                return row
 
-        url = (announcement.url or "").strip()
         if not url:
             return None
         return self._conn.execute(
             _sql(
-                f"SELECT {columns} FROM announcements"
+                f"SELECT {columns}, url FROM announcements"
                 " WHERE source = ? AND url = ?"
             ),
             (announcement.source, url),
@@ -565,33 +569,36 @@ class Database:
             self._conn.commit()
         return changed
 
-    def clear_periods_for_sources(self, sources: Sequence[str]) -> int:
-        """전용 추출기가 없는 소스의 기간을 **일괄 NULL** 로 만든다 (멱등).
+    def clear_periods_except(self, keep_sources: Sequence[str]) -> int:
+        """**추출기가 있는 소스를 뺀 전부**의 기간을 NULL 로 만든다 (멱등).
 
         재수집되지 않은 행(목록에서 내려간 공고)은 관문을 다시 지나지
         않으므로, 예전 실행이 심은 마감이 그대로 남아 알림·브리핑까지
-        갔다 (10차 게이트 MEDIUM). 이 소스들은 **설계상 기간을 만들 수
-        없으므로** 남아 있는 값은 전부 날조값이다 - 지우는 것이 안전하다.
+        갔다. 12차 게이트에서 정규화 범위가 허용목록과 달라 ``bizinfo``
+        같은 소스의 오염이 살아남는 것이 확인됐다 - 그래서 **허용목록의
+        여집합 전체**를 대상으로 한다. 이 소스들은 설계상 기간을 만들 수
+        없으므로 남아 있는 값은 전부 날조값이다.
 
         이미 비어 있는 행은 건드리지 않으므로 두 번째 호출은 0을 돌려준다.
 
         Args:
-            sources: 기간을 만들 수 없는 소스 이름들
+            keep_sources: 전용 추출기가 있는 소스 이름들 (건드리지 않는다)
 
         Returns:
             실제로 비운 행 수
         """
-        names = [name for name in sources if name]
-        if not names:
-            return 0
+        names = [name for name in keep_sources if name]
+        keep_clause = ""
+        if names:
+            placeholders = ", ".join("?" for _ in names)
+            keep_clause = f" AND source NOT IN ({placeholders})"
 
-        placeholders = ", ".join("?" for _ in names)
         cursor = self._conn.execute(
             _sql(
                 "UPDATE announcements SET period_start = NULL,"
                 " period_end = NULL, updated_at = ?"
-                f" WHERE source IN ({placeholders})"
-                "   AND (period_start IS NOT NULL OR period_end IS NOT NULL)"
+                " WHERE (period_start IS NOT NULL OR period_end IS NOT NULL)"
+                + keep_clause
             ),
             (datetime.now().isoformat(), *names),
         )
@@ -600,43 +607,80 @@ class Database:
             self._conn.commit()
         return affected
 
-    def overwrite_periods(self, announcement: RawAnnouncement) -> bool:
-        """저장된 행의 기간 두 필드를 **재수집 값으로 덮어쓴다** (None 포함).
+    def overwrite_periods(
+        self,
+        announcement: RawAnnouncement,
+        evidence_keys: Sequence[str] = (),
+    ) -> bool:
+        """기간과 **그 근거**를 재수집 값으로 덮어쓴다 (빈 값 포함).
 
-        재수집이 기존 오염을 지울 수 있어야 한다. 예전 구현은 새 값이
-        비어 있으면 기존 값을 지켜서, 가짜 마감이 심어진 행은 크롤러를
-        고친 뒤에도 영구히 그 마감을 말했다 (9차 게이트 MEDIUM).
+        기간만 갱신하고 ``raw_data`` 의 추출 근거를 옛 값으로 두면, 나중에
+        기존 행 재검증이 **철회된 기간을 되살린다** (12차 게이트 HIGH:
+        10월 범위 → 재수집 NULL → 다음 실행에서 10월 범위 부활). 그래서
+        근거 키는 새 수집 결과의 값으로 교체하고, 새 값이 없으면 지운다.
 
-        값은 관문(``alert.main._finalize_periods``)이 이미 정했다 - 이
-        메서드는 그 결정을 그대로 쓴다.
+        기간 값 자체는 관문(``alert.main._finalize_periods``)이 이미
+        정했다 - 이 메서드는 그 결정을 그대로 쓴다.
 
         Args:
             announcement: 관문을 지난 새 수집 결과
+            evidence_keys: 추출기가 근거로 읽는 ``raw_data`` 키들
 
         Returns:
             실제로 값이 바뀌었으면 True (같으면 건드리지 않는다)
         """
-        row = self._find_row("id, period_start, period_end", announcement)
+        row = self._find_row("id, period_start, period_end, raw_data", announcement)
         if row is None:
             return False
 
         start = announcement.period_start or None
         end = announcement.period_end or None
-        if (row["period_start"] or None) == start and (
-            row["period_end"] or None
-        ) == end:
-            return False               # 같은 값이면 updated_at 도 건드리지 않는다
+        period_changed = (
+            (row["period_start"] or None) != start
+            or (row["period_end"] or None) != end
+        )
+
+        stored = self._load_json(row["raw_data"])
+        incoming = self._load_json(announcement.raw_data)
+        evidence_changed = False
+        for key in evidence_keys:
+            fresh = incoming.get(key)
+            if fresh in (None, "", [], {}):
+                if key in stored:
+                    stored.pop(key)
+                    evidence_changed = True
+            elif stored.get(key) != fresh:
+                stored[key] = fresh
+                evidence_changed = True
+
+        if not period_changed and not evidence_changed:
+            return False               # 같으면 updated_at 도 건드리지 않는다
 
         self._conn.execute(
             _sql(
                 "UPDATE announcements SET period_start = ?, period_end = ?,"
-                " updated_at = ? WHERE id = ?"
+                " raw_data = ?, updated_at = ? WHERE id = ?"
             ),
-            (start, end, datetime.now().isoformat(), row["id"]),
+            (
+                start,
+                end,
+                json.dumps(stored, ensure_ascii=False),
+                datetime.now().isoformat(),
+                row["id"],
+            ),
         )
         if self._backend == "sqlite":
             self._conn.commit()
         return True
+
+    @staticmethod
+    def _load_json(payload: Optional[str]) -> Dict[str, Any]:
+        """``raw_data`` 를 딕셔너리로 읽는다 (못 읽으면 빈 딕셔너리)."""
+        try:
+            loaded = json.loads(payload or "{}")
+        except (ValueError, TypeError):
+            return {}
+        return loaded if isinstance(loaded, dict) else {}
 
     def get_quote_attempts(self, source: str) -> Dict[str, str]:
         """source_id -> 마지막 상세 시도 시각.

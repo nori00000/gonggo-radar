@@ -21,7 +21,7 @@ from .notifiers.email_sender import EmailNotifier
 from .utils.logger import setup_logger
 
 try:
-    from .crawlers.period_extractors import PERIOD_EXTRACTORS
+    from .crawlers.period_extractors import EVIDENCE_KEYS, PERIOD_EXTRACTORS
 except Exception as _exc:              # noqa: BLE001
     # 추출기를 못 읽어도 파이프라인은 산다 - 그때는 **모든 소스가 기간
     # 없음**이 된다(fail-closed). 없는 마감을 말하는 것보다 낫다.
@@ -29,6 +29,7 @@ except Exception as _exc:              # noqa: BLE001
         f"period extractors unavailable ({_exc}) - 모든 기간을 비운다"
     )
     PERIOD_EXTRACTORS = {}
+    EVIDENCE_KEYS = {}
 
 
 # ---------------------------------------------------------------------------
@@ -131,15 +132,6 @@ def _crawl_single(
 # ---------------------------------------------------------------------------
 # 기간 관문 (13차) - period_start/period_end 는 **여기서만** 정해진다
 # ---------------------------------------------------------------------------
-
-# 협의회 브리핑이 쓰는 소스 중 **전용 추출기가 없는** 소스. 목록에서 내려간
-# 공고는 재수집되지 않아 관문을 다시 지나지 않으므로, 예전 실행이 심은 기간이
-# 알림까지 살아남았다 (10차 게이트 MEDIUM). 파이프라인 시작에서 한 번
-# 정규화한다 - 이 소스들은 설계상 기간을 만들 수 없어 남은 값은 전부 날조다.
-COUNCIL_SOURCES_WITHOUT_EXTRACTORS = (
-    "fowi", "forest_service", "forest_press", "kofpi", "coop",
-    "socialenterprise",
-)
 
 def _finalize_periods(source: str, item: RawAnnouncement) -> RawAnnouncement:
     """DB 에 닿기 직전 기간 두 필드를 확정한다 - 저장 경로의 단일 관문.
@@ -258,16 +250,14 @@ def run_pipeline(test_mode: bool = False) -> None:
     # Initialize components
     db = Database()
 
-    # 기존 오염 정규화 (멱등) - 관문 밖에서 심긴 기간을 지운다
-    stale_sources = [
-        name for name in COUNCIL_SOURCES_WITHOUT_EXTRACTORS
-        if name not in PERIOD_EXTRACTORS
-    ]
+    # 기존 오염 정규화 (멱등) - 허용목록 **여집합 전체**의 기간을 지운다.
+    # 12차 게이트: 대상을 몇 개 소스로 좁혔더니 bizinfo 같은 소스의 오염이
+    # 살아남아 알림까지 갔다.
     try:
-        cleared = db.clear_periods_for_sources(stale_sources)
+        cleared = db.clear_periods_except(PERIOD_EXTRACTORS)
         logger.info(
             f"기간 정규화: {cleared} 행을 비웠다 "
-            f"(추출기 없는 소스 {len(stale_sources)}개)"
+            f"(추출기 있는 소스 {len(PERIOD_EXTRACTORS)}개 제외)"
         )
     except Exception as e:
         logger.error(f"기간 정규화 실패: {e}")
@@ -389,7 +379,9 @@ def run_pipeline(test_mode: bool = False) -> None:
                     # 기존 행의 기간도 **재수집 값으로 덮어쓴다** (None
                     # 포함) - 예전 실행이 심은 가짜 마감을 재수집이 지운다.
                     try:
-                        if db.overwrite_periods(raw_ann):
+                        if db.overwrite_periods(
+                            raw_ann, EVIDENCE_KEYS.get(raw_ann.source, ())
+                        ):
                             period_reset_count += 1
                     except Exception as e:
                         logger.debug(

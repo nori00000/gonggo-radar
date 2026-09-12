@@ -31,15 +31,17 @@ from alert.crawlers.forest_press import ForestPressCrawler
 from alert.crawlers.kofpi import KofpiCrawler
 from alert.crawlers.lawmaking import LawmakingCrawler
 from alert.crawlers.period_extractors import (
+    EVIDENCE_KEYS,
     PERIOD_EXTRACTORS,
     SEIS_CARD_DATE_FIELD,
+    bizinfo_period,
+    g2b_period,
     lawmaking_period,
     seis_period,
 )
 from alert.crawlers.seis import SeisCrawler
 from alert.db import Database
 from alert.main import (
-    COUNCIL_SOURCES_WITHOUT_EXTRACTORS,
     _finalize_periods,
     _import_crawlers,
     _periods_from_raw,
@@ -91,10 +93,17 @@ CRAWLER_CLASSES = all_crawler_classes()
 
 
 class TestOnlyTwoSourcesCanMakeAPeriod:
-    """허용목록은 **전용 추출기를 가진 소스 두 개**뿐이다."""
+    """허용목록 = 전용 추출기를 가진 소스. HTML 2곳 + 구조화 API 2곳."""
 
-    def test_registry_is_exactly_two(self):
-        assert set(PERIOD_EXTRACTORS) == {"seis", "lawmaking"}
+    def test_registry_is_exactly_four(self):
+        assert set(PERIOD_EXTRACTORS) == {
+            "seis", "lawmaking", "bizinfo", "g2b",
+        }
+
+    def test_every_extractor_declares_its_evidence(self):
+        """근거 키가 선언돼 있어야 재수집 때 근거를 교체할 수 있다."""
+        assert set(EVIDENCE_KEYS) == set(PERIOD_EXTRACTORS)
+        assert all(keys for keys in EVIDENCE_KEYS.values())
 
     def test_kofpi_extractor_is_retired(self):
         """제목 괄호 ``(~9.30)`` 패턴은 폐기했다 (9차 게이트 HIGH)."""
@@ -242,8 +251,8 @@ class TestTheGateSitsBeforeEveryWrite:
     def test_normalisation_runs_before_notification(self):
         """정규화는 알림 조회보다 **앞**에서 한 번 돈다."""
         source = self.pipeline_source()
-        assert source.count("clear_periods_for_sources(") == 1
-        assert source.index("clear_periods_for_sources(") < source.index(
+        assert source.count("clear_periods_except(") == 1
+        assert source.index("clear_periods_except(") < source.index(
             "db.get_unnotified("
         )
 
@@ -710,16 +719,10 @@ class TestLegacyPollutionIsNormalised:
 
     def test_stale_fowi_period_is_cleared_and_never_notified(self, db):
         self.seed(db, "fowi", PLANTED)
-        stale = [
-            name for name in COUNCIL_SOURCES_WITHOUT_EXTRACTORS
-            if name not in PERIOD_EXTRACTORS
-        ]
-        assert "fowi" in stale
-
         before = db.get_unnotified()
         assert [a.period_end for a in before] == [PLANTED]
 
-        assert db.clear_periods_for_sources(stale) == 1
+        assert db.clear_periods_except(PERIOD_EXTRACTORS) == 1
         after = db.get_unnotified()
         assert len(after) == 1
         assert (after[0].period_start, after[0].period_end) in (
@@ -728,23 +731,34 @@ class TestLegacyPollutionIsNormalised:
 
     def test_normalisation_is_idempotent(self, db):
         self.seed(db, "forest_press", PLANTED)
-        stale = list(COUNCIL_SOURCES_WITHOUT_EXTRACTORS)
-        assert db.clear_periods_for_sources(stale) == 1
-        assert db.clear_periods_for_sources(stale) == 0
+        assert db.clear_periods_except(PERIOD_EXTRACTORS) == 1
+        assert db.clear_periods_except(PERIOD_EXTRACTORS) == 0
+
+    @pytest.mark.parametrize("source", [
+        "fowi", "forest_service", "forest_press", "kofpi", "coop",
+        "socialenterprise", "bizinfo", "g2b", "rda", "semas", "manual",
+    ])
+    def test_every_source_outside_the_whitelist_is_cleared(self, db, source):
+        """12차 게이트: 정규화 범위는 **허용목록의 여집합 전체**다.
+
+        예전에는 대상이 협의회 소스 몇 개였고, 그 밖(bizinfo 등)의 기존
+        오염은 알림까지 그대로 갔다.
+        """
+        self.seed(db, source, PLANTED)
+        expected = 0 if source in PERIOD_EXTRACTORS else 1
+        assert db.clear_periods_except(PERIOD_EXTRACTORS) == expected
 
     def test_extractor_sources_are_never_touched(self, db):
-        """seis·lawmaking 행은 정규화 대상이 아니다."""
+        """추출기가 있는 소스 행은 정규화 대상이 아니다."""
         self.seed(db, "seis", "2026-09-30")
-        assert db.clear_periods_for_sources(
-            [n for n in COUNCIL_SOURCES_WITHOUT_EXTRACTORS
-             if n not in PERIOD_EXTRACTORS]
-        ) == 0
+        assert db.clear_periods_except(PERIOD_EXTRACTORS) == 0
         assert db.get_unnotified()[0].period_end == "2026-09-30"
 
-    def test_empty_source_list_is_a_no_op(self, db):
-        self.seed(db, "fowi", PLANTED)
-        assert db.clear_periods_for_sources([]) == 0
-        assert db.clear_periods_for_sources(["", None]) == 0
+    def test_empty_keep_list_clears_everything(self, db):
+        """허용목록이 비면(추출기 로드 실패) 전부 비운다 - fail-closed."""
+        self.seed(db, "seis", PLANTED)
+        assert db.clear_periods_except([]) == 1
+        assert db.clear_periods_except(["", None]) == 0
 
 
 class TestGate11Reproductions:
@@ -890,6 +904,223 @@ class TestGate11Reproductions:
             "seis", lambda raw: _periods_from_raw("seis", raw)
         ) == 1
         assert db.get_unnotified()[0].period_end is None
+
+
+class TestGate12Reproductions:
+    """12차 게이트 재현 - 연도별 ID, 철회된 기간의 부활, 정규화 범위."""
+
+    @pytest.fixture
+    def db(self, tmp_path):
+        yield Database(db_path=tmp_path / "announcements.db")
+
+    @staticmethod
+    def cert_link(year, number):
+        return (
+            f"/subPage.do?menuId=30100&tabId=certPageView"
+            f"&statsYr={year}&epsdNo={number}"
+        )
+
+    def test_certification_years_never_collide(self, db):
+        """``statsYr`` 가 다르면 같은 ``epsdNo`` 도 다른 공고다 (HIGH ①).
+
+        예전에는 둘 다 ``epsd:4`` 여서 2027 년 공고의 기간이 2026 년 공고
+        제목·URL 에 덮어써져 알림에 나갔다.
+        """
+        crawler = make(SeisCrawler)
+        first = crawler._extract_post_id(self.cert_link(2026, 4))
+        second = crawler._extract_post_id(self.cert_link(2027, 4))
+        assert (first, second) == ("epsd:2026:4", "epsd:2027:4")
+
+        for year, end in ((2026, "2026-09-30"), (2027, "2027-11-30")):
+            db.insert_announcement(
+                AnalyzedAnnouncement(
+                    source="seis",
+                    source_id=crawler._extract_post_id(self.cert_link(year, 4)),
+                    title=f"{year}년도 인증 공고",
+                    url=f"https://www.seis.or.kr{self.cert_link(year, 4)}",
+                    period_end=end, relevance_score=0.9, raw_data="{}",
+                    fetched_at=datetime.now().isoformat(),
+                )
+            )
+
+        rows = db._conn.execute(
+            "SELECT source_id, period_end FROM announcements ORDER BY source_id"
+        ).fetchall()
+        assert [(r["source_id"], r["period_end"]) for r in rows] == [
+            ("epsd:2026:4", "2026-09-30"), ("epsd:2027:4", "2027-11-30"),
+        ]
+
+    def test_same_id_with_a_different_url_is_a_different_row(self, db):
+        """ID 가 같아도 URL 이 다르면 남의 행을 덮어쓰지 않는다."""
+        db.insert_announcement(
+            AnalyzedAnnouncement(
+                source="seis", source_id="epsd:4", title="2026년 공고",
+                url="https://www.seis.or.kr/a", period_end="2026-09-30",
+                relevance_score=0.9, raw_data="{}",
+                fetched_at=datetime.now().isoformat(),
+            )
+        )
+        other = RawAnnouncement(
+            source="seis", source_id="epsd:4", title="2027년 공고",
+            url="https://www.seis.or.kr/b", raw_data="{}",
+        )
+        assert db.exists(other) is False
+        assert db.overwrite_periods(other) is False
+        row = db._conn.execute(
+            "SELECT period_end FROM announcements"
+        ).fetchone()
+        assert row["period_end"] == "2026-09-30"      # 그대로다
+
+    def recrawl(self, db, date_text):
+        """같은 공고를 새 근거로 재수집한 것처럼 처리한다."""
+        item = RawAnnouncement(
+            source="seis", source_id="fnc:1", title="지원사업 공고",
+            url="https://www.seis.or.kr/subPage.do?fncPbofrSn=1",
+            raw_data=json.dumps(
+                {"date": date_text, "date_field": SEIS_CARD_DATE_FIELD},
+                ensure_ascii=False,
+            ),
+        )
+        gated = _finalize_periods(item.source, item)
+        db.overwrite_periods(gated, EVIDENCE_KEYS.get("seis", ()))
+        return gated
+
+    def test_a_retracted_period_never_comes_back(self, db):
+        """철회된 기간이 다음 실행에서 부활하지 않는다 (HIGH ② REGRESSED).
+
+        ① 10월 범위로 수집 ② ``접수기간 미정 / 교육기간 …`` 으로 재수집하면
+        NULL ③ 그 다음 ``fetch()=[]`` 실행의 재검증에서 10월 범위가
+        되살아났다 - 기간만 갱신하고 **근거**(raw_data.date)를 남겨서다.
+        """
+        db.insert_announcement(
+            AnalyzedAnnouncement(
+                source="seis", source_id="fnc:1", title="지원사업 공고",
+                url="https://www.seis.or.kr/subPage.do?fncPbofrSn=1",
+                relevance_score=0.9, raw_data="{}",
+                fetched_at=datetime.now().isoformat(),
+            )
+        )
+
+        # ① 근거가 있는 수집 -> 기간이 생긴다
+        self.recrawl(db, "2026.10.01 ~ 2026.10.31")
+        assert db.get_unnotified()[0].period_end == "2026-10-31"
+
+        # ② 근거가 철회된 재수집 -> NULL
+        self.recrawl(db, "접수기간 미정 / 교육기간 2026.10.01 ~ 2026.10.31")
+        assert db.get_unnotified()[0].period_end is None
+        stored = json.loads(
+            db._conn.execute("SELECT raw_data FROM announcements").fetchone()[
+                "raw_data"
+            ]
+        )
+        assert stored["date"] == "접수기간 미정 / 교육기간 2026.10.01 ~ 2026.10.31"
+
+        # ③ 다음 실행(fetch()=[])의 재검증에서도 부활하지 않는다
+        assert db.revalidate_periods(
+            "seis", lambda raw: _periods_from_raw("seis", raw)
+        ) == 0
+        assert db.get_unnotified()[0].period_end is None
+
+    def test_evidence_removal_is_written_too(self, db):
+        """근거 필드가 아예 사라진 재수집도 그대로 반영된다."""
+        db.insert_announcement(
+            AnalyzedAnnouncement(
+                source="seis", source_id="fnc:1", title="공고",
+                url="https://www.seis.or.kr/subPage.do?fncPbofrSn=1",
+                relevance_score=0.9, raw_data="{}",
+                fetched_at=datetime.now().isoformat(),
+            )
+        )
+        self.recrawl(db, "2026.10.01 ~ 2026.10.31")
+
+        empty = RawAnnouncement(
+            source="seis", source_id="fnc:1", title="공고",
+            url="https://www.seis.or.kr/subPage.do?fncPbofrSn=1",
+            raw_data=json.dumps({"title": "공고"}, ensure_ascii=False),
+        )
+        db.overwrite_periods(
+            _finalize_periods("seis", empty), EVIDENCE_KEYS["seis"]
+        )
+        stored = json.loads(
+            db._conn.execute("SELECT raw_data FROM announcements").fetchone()[
+                "raw_data"
+            ]
+        )
+        assert "date" not in stored and "date_field" not in stored
+        assert db.revalidate_periods(
+            "seis", lambda raw: _periods_from_raw("seis", raw)
+        ) == 0
+        assert db.get_unnotified()[0].period_end is None
+
+
+class TestStructuredApiSources:
+    """구조화된 API 마감 필드를 주는 소스는 허용목록에 **정식 등록**한다."""
+
+    @pytest.mark.parametrize("value,expected", [
+        ("20260901~20261231", ("2026-09-01", "2026-12-31")),
+        ("2026-09-01~2026-12-31", ("2026-09-01", "2026-12-31")),
+        ("20260901 ~ 20261231", ("2026-09-01", "2026-12-31")),
+        # 단일 날짜는 시작인지 마감인지 선언되지 않았다
+        ("20260901", (None, None)),
+        # 달력에 없는 날짜 · 역전 · 잡음
+        ("20260230~20261231", (None, None)),
+        ("20261231~20260901", (None, None)),
+        ("상시모집", (None, None)),
+        ("", (None, None)),
+    ])
+    def test_bizinfo_reads_only_the_api_field(self, value, expected):
+        assert bizinfo_period({"reqstBeginEndDe": value}) == expected
+
+    def test_bizinfo_ignores_other_fields(self):
+        assert bizinfo_period({"pblancNm": "모집(~9.30)"}) == (None, None)
+
+    @pytest.mark.parametrize("raw,expected", [
+        ({"bidBeginDt": "202609010900", "bidClseDt": "202609301700"},
+         ("2026-09-01", "2026-09-30")),
+        ({"bidClseDt": "202609301700"}, (None, "2026-09-30")),
+        ({"bidClseDt": "20260930"}, (None, "2026-09-30")),
+        # 마감이 없으면 시작만으로 기간을 말하지 않는다
+        ({"bidBeginDt": "202609010900"}, (None, None)),
+        ({"bidClseDt": "20260231"}, (None, None)),
+        ({"bidClseDt": "곧"}, (None, None)),
+        ({}, (None, None)),
+    ])
+    def test_g2b_reads_only_the_api_fields(self, raw, expected):
+        assert g2b_period(raw) == expected
+
+    def test_bizinfo_stale_row_is_revalidated_from_the_api_field(self, tmp_path):
+        """기존 bizinfo 2099 행 - 근거가 있으면 API 값, 없으면 NULL."""
+        db = Database(db_path=tmp_path / "announcements.db")
+        for source_id, raw in (
+            ("with-field", {"reqstBeginEndDe": "20260901~20261231"}),
+            ("without-field", {}),
+        ):
+            db.insert_announcement(
+                AnalyzedAnnouncement(
+                    source="bizinfo", source_id=source_id, title="공고",
+                    url=f"https://www.bizinfo.go.kr/{source_id}",
+                    period_start="2099-01-01", period_end=PLANTED,
+                    relevance_score=0.9,
+                    raw_data=json.dumps(raw, ensure_ascii=False),
+                    fetched_at=datetime.now().isoformat(),
+                )
+            )
+
+        assert db.revalidate_periods(
+            "bizinfo", lambda raw: _periods_from_raw("bizinfo", raw)
+        ) == 2
+        rows = db._conn.execute(
+            "SELECT source_id, period_start, period_end FROM announcements"
+            " ORDER BY source_id"
+        ).fetchall()
+        assert [(r["source_id"], r["period_start"], r["period_end"]) for r in rows] == [
+            ("with-field", "2026-09-01", "2026-12-31"),
+            ("without-field", None, None),
+        ]
+        notified = {a.source_id: a.period_end for a in db.get_unnotified()}
+        assert notified == {
+            "with-field": "2026-12-31", "without-field": None,
+        }
 
 
 class TestStaleRowsAreOverwritten:

@@ -557,19 +557,33 @@ class SeisCrawler(BaseCrawler):
         ("no", r"[?&]no=(\d+)"),
     )
 
+    # 번호만으로는 특정되지 않는 공고가 있다. 인증 공고는 회차 번호를 해마다
+    # 다시 쓰므로 ``statsYr=2026&epsdNo=4`` 와 ``statsYr=2027&epsdNo=4`` 가
+    # 서로 다른 공고인데 ID 가 같았다 (12차 게이트 HIGH). URL 이 공고를
+    # 특정하는 데 쓰는 파라미터는 **전부** ID 에 넣는다.
+    ID_QUALIFIERS = (
+        r"statsYr=(\d{4})",
+    )
+
     def _extract_post_id(self, link: str) -> str:
-        """URL에서 ``종류:번호`` 형태의 공고 ID를 추출한다."""
+        """URL에서 ``종류[:한정자…]:번호`` 형태의 공고 ID를 추출한다."""
         if not link:
             return ""
+
+        qualifiers = []
+        for pattern in self.ID_QUALIFIERS:
+            match = re.search(pattern, link, re.I)
+            if match:
+                qualifiers.append(match.group(1))
 
         for kind, pattern in self.ID_PARAMS:
             match = re.search(pattern, link, re.I)
             if match:
-                return f"{kind}:{match.group(1)}"
+                return ":".join([kind, *qualifiers, match.group(1)])
 
         path_match = re.search(r"/(\d{3,})", link)
         if path_match:
-            return f"path:{path_match.group(1)}"
+            return ":".join(["path", *qualifiers, path_match.group(1)])
 
         return hashlib.md5(link.encode("utf-8")).hexdigest()[:16]
 
