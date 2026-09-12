@@ -31,9 +31,10 @@ BROWSER_USER_AGENT = (
 DETAIL_TIMEOUT = 10
 DETAIL_DELAY_SEC = 1.0
 # 실행시간 상한 - 상세 수집이 크롤 주기를 잡아먹지 못하게 한다
-MAX_DETAIL_REQUESTS = 15        # 소스·실행당 새 상세 요청 수
-DETAIL_BUDGET_SEC = 240.0       # 소스·실행당 총 예산
-MAX_DETAIL_BYTES = 256 * 1024   # 응답 본문 상한
+# (2026-09-13 조정자 판정: kofpi 20건 전부 훑고 698KB 상세도 읽도록 상향)
+MAX_DETAIL_REQUESTS = 20            # 소스·실행당 새 상세 요청 수
+DETAIL_BUDGET_SEC = 240.0           # 소스·실행당 총 예산
+MAX_DETAIL_BYTES = 1024 * 1024      # 응답 본문 상한 - 넘으면 자른다(거부 아님)
 
 QUOTE_DEADLINE = "quote_deadline"
 QUOTE_ELIGIBILITY = "quote_eligibility"

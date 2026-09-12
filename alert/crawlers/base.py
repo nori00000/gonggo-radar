@@ -131,10 +131,15 @@ class BaseCrawler(abc.ABC):
         """상세 페이지에서 마감/자격/금액 인용을 가져온다.
 
         브라우저 User-Agent, 10초 타임아웃, **재시도 없음**, 본문
-        256KB 상한으로 요청한다. 재시도를 하지 않는 이유는 인용 하나가
-        재시도 3회(최악 40초 이상)를 쓸 가치가 없기 때문이고, 본문 상한은
-        타임아웃보다 느리게 계속 흘려보내는 응답을 끊기 위한 것이다
-        (계약 v2.1 V2 + Codex 크리틱 #8).
+        ``MAX_DETAIL_BYTES`` 상한으로 요청한다. 재시도를 하지 않는 이유는
+        인용 하나가 재시도 3회(최악 40초 이상)를 쓸 가치가 없기 때문이고,
+        본문 상한은 타임아웃보다 느리게 계속 흘려보내는 응답을 끊기 위한
+        것이다 (계약 v2.1 V2 + Codex 크리틱 #8).
+
+        상한을 넘으면 **거부하지 않고 거기까지만 읽어 파싱한다**
+        (2026-09-13 조정자 판정). 마감 문구는 보통 본문 앞쪽에 있으므로
+        앞부분만으로도 인용을 얻을 수 있고, 못 얻으면 키가 없는 채로
+        "원문 확인" 으로 흘러간다 - 값을 지어내지는 않는다.
 
         Args:
             detail_url: 상세 페이지 URL
@@ -157,25 +162,30 @@ class BaseCrawler(abc.ABC):
 
             declared = response.headers.get("Content-Length")
             if declared and declared.isdigit() and int(declared) > MAX_DETAIL_BYTES:
-                self.logger.warning(
-                    f"Detail body too large ({declared} bytes), skipping {detail_url}"
+                self.logger.info(
+                    f"Detail body declared {declared} bytes, reading first "
+                    f"{MAX_DETAIL_BYTES} for {detail_url}"
                 )
-                return {}
 
             chunks = []
             total = 0
+            truncated = False
             for chunk in response.iter_content(chunk_size=8192):
                 if not chunk:
                     continue
+                remaining = MAX_DETAIL_BYTES - total
+                if len(chunk) >= remaining:
+                    chunks.append(chunk[:remaining])
+                    truncated = True
+                    break
                 chunks.append(chunk)
                 total += len(chunk)
-                if total > MAX_DETAIL_BYTES:
-                    self.logger.warning(
-                        f"Detail body exceeded {MAX_DETAIL_BYTES} bytes, "
-                        f"skipping {detail_url}"
-                    )
-                    return {}
             body = b"".join(chunks)
+            if truncated:
+                self.logger.warning(
+                    f"Detail body truncated at {MAX_DETAIL_BYTES} bytes "
+                    f"for {detail_url} (인용 못 찾으면 원문 확인으로 남는다)"
+                )
         except requests.RequestException as exc:
             self.logger.warning(f"Detail fetch failed for {detail_url}: {exc}")
             return {}
@@ -264,6 +274,9 @@ class BaseCrawler(abc.ABC):
 
         "상시 / 예산 소진 시" 공고는 마감을 만들지 않고 ``always_open`` 으로
         표시한다 - 게시 다음 날 만료로 처리되는 것을 막는다(크리틱 #3).
+        상세가 "상시" 라고 말하면 제목에서 뽑은 마감보다 **상세가 이긴다**
+        (2026-09-13 조정자 판정). 상충하는 경우 마감을 비우는 쪽이 살아있는
+        공고를 잃지 않는 방향이다.
         """
         start, end, always_open = apply_quote_period(quotes)
         if start:

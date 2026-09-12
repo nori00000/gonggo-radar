@@ -519,30 +519,77 @@ class TestCodexCritiqueExecutionLimits:
 
         assert mock_get.call_count == 1
 
-    def test_declared_oversize_body_is_refused(self):
-        """Content-Length가 상한을 넘으면 본문을 읽지 않는다."""
+    def test_oversize_body_is_truncated_not_refused(self):
+        """상한을 넘는 본문은 거부하지 않고 앞부분까지 읽어 파싱한다.
+
+        2026-09-13 조정자 판정: kofpi 상세 중 698KB 페이지가 있어 거부하면
+        마감을 잃는다. 마감 문구는 본문 앞쪽에 있으므로 절단해도 얻을 수 있다.
+        """
+        crawler = make_stub(fetch_detail=True)
+        head = (
+            '<div class="board_view"><table>'
+            "<tr><th>접수기간</th><td>2026.09.01 ~ 2026.09.30</td></tr>"
+            "</table>"
+        )
+        filler = "<p>" + ("가" * 2000) + "</p>"
+        body = (head + filler * 600 + "</div>").encode("utf-8")
+        assert len(body) > MAX_DETAIL_BYTES
+
+        response = MagicMock()
+        response.encoding = "utf-8"
+        response.headers = {"Content-Length": str(len(body))}
+        response.raise_for_status.return_value = None
+        response.iter_content.return_value = [
+            body[i:i + 8192] for i in range(0, len(body), 8192)
+        ]
+
+        with patch.object(crawler.session, "get", return_value=response):
+            quotes = crawler.fetch_detail_quotes("https://example.com/x")
+
+        assert quotes[QUOTE_DEADLINE] == "접수기간 2026.09.01 ~ 2026.09.30"
+        assert period_from_quote(quotes[QUOTE_DEADLINE], today=TODAY) == (
+            "2026-09-01", "2026-09-30"
+        )
+
+    def test_declared_oversize_body_is_still_read(self):
+        """Content-Length가 크다고 해서 건너뛰지 않는다 (절단 의미론)."""
         crawler = make_stub(fetch_detail=True)
         response = MagicMock()
         response.encoding = "utf-8"
-        response.headers = {"Content-Length": str(MAX_DETAIL_BYTES + 1)}
+        response.headers = {"Content-Length": str(MAX_DETAIL_BYTES * 2)}
         response.raise_for_status.return_value = None
+        response.iter_content.return_value = [
+            b"<div class='board_view'>\xec\xa0\x91\xec\x88\x98\xea\xb8\xb0\xea\xb0\x84"
+        ]
 
         with patch.object(crawler.session, "get", return_value=response):
-            assert crawler.fetch_detail_quotes("https://example.com/x") == {}
-        response.iter_content.assert_not_called()
+            crawler.fetch_detail_quotes("https://example.com/x")
+        response.iter_content.assert_called_once()
 
-    def test_streamed_oversize_body_is_cut_off(self):
-        """Content-Length를 숨기고 계속 흘려보내도 상한에서 끊는다."""
+    def test_infinite_stream_is_cut_off_at_the_cap(self):
+        """Content-Length를 숨기고 계속 흘려보내도 상한에서 끊고 돌아온다."""
         crawler = make_stub(fetch_detail=True)
+        chunk = b"x" * 8192
+        served = {"count": 0}
+
+        def endless(chunk_size=8192):
+            while True:
+                served["count"] += 1
+                if served["count"] > 10_000:      # 안전장치 - 상한이 없으면 여기서 터진다
+                    raise AssertionError("본문 상한이 동작하지 않는다")
+                yield chunk
+
         response = MagicMock()
         response.encoding = "utf-8"
         response.headers = {}
         response.raise_for_status.return_value = None
-        chunk = b"x" * 8192
-        response.iter_content.return_value = iter(lambda: chunk, None)  # 무한 스트림
+        response.iter_content.side_effect = endless
 
         with patch.object(crawler.session, "get", return_value=response):
             assert crawler.fetch_detail_quotes("https://example.com/x") == {}
+
+        # 상한(1MB)에 도달하는 데 필요한 청크 수 이상은 읽지 않는다
+        assert served["count"] <= MAX_DETAIL_BYTES // len(chunk) + 2
 
     def test_no_retries_on_detail_fetch(self):
         """상세 요청은 재시도하지 않는다 - 인용 하나에 재시도 예산을 쓰지 않는다."""
