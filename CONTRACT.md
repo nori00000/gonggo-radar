@@ -19,3 +19,8 @@
 - **실행**: 스크립트는 `sys.path` 보정으로 `venv/bin/python scripts/x.py` 그대로 실행 가능해야 함. `weekly_digest.py`는 pass=false면 exit 1.
 - **산출물**: `digests/` 는 .gitignore (생성물, 커밋 안 함).
 - **호환**: CI = Python 3.13, ruff `--select E,F,W` 통과 필수.
+
+## 개정 v1.2 (2026-09-12, W7 실데이터 판정)
+- **소스 우회 적재**: config `crawler.sources.<name>.bypass_threshold: true`인 소스(kofpi, forest_press, lawmaking, coop)는 키워드 임계값과 무관하게 DB에 적재한다(relevance_score는 계산값 유지, 없으면 0.5). 다이제스트 섹션 상한이 분량을 제어한다.
+- **팩트 게이트 재정의**: `deadline_parsed`는 정보 필드(게이트 아님). `url_alive=false` 항목은 다이제스트에서 **자동 제외**되고 check.json `dropped`에 기록된다. `pass=false` 조건은 ①제외 후 항목 0건 ②`network_checked=false` ③폼 로드 실패 ④체크 자체 예외 — 넷뿐이다.
+- **드라이런 기대**: 제외 후 항목이 남으면 pass=true, 발송은 마커 게이트만 남는다(상민 확정).

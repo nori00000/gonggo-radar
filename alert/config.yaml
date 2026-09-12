@@ -115,15 +115,19 @@ crawler:
     kofpi:
       enabled: true
       base_url: "https://www.kofpi.or.kr"
+      bypass_threshold: true
     forest_press:
       enabled: true
       base_url: "https://www.forest.go.kr"
+      bypass_threshold: true
     lawmaking:
       enabled: true
       base_url: "https://opinion.lawmaking.go.kr"
+      bypass_threshold: true
     coop:
       enabled: true
       base_url: "https://www.coop.go.kr"
+      bypass_threshold: true
 
 analyzer:
   keyword_threshold: 0.3

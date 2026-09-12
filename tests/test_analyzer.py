@@ -5,6 +5,8 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from alert.analyzer import KeywordAnalyzer, ClaudeAnalyzer
+from alert.config import SourceConfig
+from alert.main import select_for_storage
 from alert.models import RawAnnouncement, AnalyzedAnnouncement, Keyword
 
 
@@ -461,3 +463,86 @@ class TestClaudeAnalyzer:
 
                 # Should return the same announcements unchanged
                 assert results == announcements
+
+
+class TestSelectForStorage:
+    """계약 v1.2: bypass_threshold 소스의 임계값 우회 저장."""
+
+    @staticmethod
+    def _below_threshold_announcement():
+        """must_match/boost 어디에도 걸리지 않는(=score 0.0) 공고."""
+        return RawAnnouncement(
+            source="kofpi",
+            source_id="kofpi-001",
+            title="산림과학 연구개발 과제 공고",
+            url="https://www.kofpi.or.kr/notice/1",
+            summary="산림 R&D 신규 과제 안내",
+            author="한국임업진흥원",
+            category="",
+            target="",
+        )
+
+    def test_below_threshold_dropped_without_bypass(self, mock_db, mock_config):
+        """bypass가 아니면 임계값 미달 항목은 저장 대상에서 빠진다."""
+        raw = self._below_threshold_announcement()
+
+        with patch("alert.analyzer.get_config", return_value=mock_config):
+            analyzer = KeywordAnalyzer(db=mock_db)
+            assert analyzer.analyze(raw).relevance_score < 0.3
+
+            selected, bypassed = select_for_storage(
+                analyzer, [raw], SourceConfig(bypass_threshold=False)
+            )
+
+        assert bypassed is False
+        assert selected == []
+
+    def test_below_threshold_kept_when_bypass(self, mock_db, mock_config):
+        """bypass 소스면 임계값 미달 항목도 저장 대상에 포함된다."""
+        raw = self._below_threshold_announcement()
+
+        with patch("alert.analyzer.get_config", return_value=mock_config):
+            analyzer = KeywordAnalyzer(db=mock_db)
+            selected, bypassed = select_for_storage(
+                analyzer, [raw], SourceConfig(bypass_threshold=True)
+            )
+
+        assert bypassed is True
+        assert len(selected) == 1
+        assert selected[0].source_id == "kofpi-001"
+        # 계산값이 0이면 0.5로 채운다
+        assert selected[0].relevance_score == 0.5
+
+    def test_bypass_keeps_computed_score(self, mock_db, mock_config):
+        """계산값이 있으면 그대로 유지한다."""
+        raw = RawAnnouncement(
+            source="kofpi",
+            source_id="kofpi-002",
+            title="스마트팜 조경 연계 공고",
+            url="https://www.kofpi.or.kr/notice/2",
+            summary="",
+            author="",
+            category="",
+            target="",
+        )
+
+        with patch("alert.analyzer.get_config", return_value=mock_config):
+            analyzer = KeywordAnalyzer(db=mock_db)
+            computed = analyzer.analyze(raw).relevance_score
+            selected, _ = select_for_storage(
+                analyzer, [raw], SourceConfig(bypass_threshold=True)
+            )
+
+        assert computed > 0
+        assert selected[0].relevance_score == computed
+
+    def test_missing_source_config_falls_back_to_threshold(self, mock_db, mock_config):
+        """config에 소스가 없으면 기존 임계값 필터를 그대로 쓴다."""
+        raw = self._below_threshold_announcement()
+
+        with patch("alert.analyzer.get_config", return_value=mock_config):
+            analyzer = KeywordAnalyzer(db=mock_db)
+            selected, bypassed = select_for_storage(analyzer, [raw], None)
+
+        assert bypassed is False
+        assert selected == []

@@ -30,6 +30,8 @@ class SourceConfig:
     enabled: bool = True
     base_url: str = ""
     filter_keywords: list[str] = field(default_factory=list)
+    # 계약 v1.2: True면 키워드 임계값과 무관하게 DB에 적재한다.
+    bypass_threshold: bool = False
 
 
 @dataclass

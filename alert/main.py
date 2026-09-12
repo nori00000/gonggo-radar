@@ -111,6 +111,39 @@ def _crawl_single(
 # Pipeline
 # ---------------------------------------------------------------------------
 
+BYPASS_DEFAULT_SCORE = 0.5
+
+
+def select_for_storage(
+    keyword_analyzer: KeywordAnalyzer,
+    raw_announcements: List[RawAnnouncement],
+    source_cfg: Optional[Any],
+) -> Tuple[List[AnalyzedAnnouncement], bool]:
+    """키워드 분석 후 DB 저장 대상을 고른다.
+
+    계약 v1.2: `bypass_threshold: true` 소스는 키워드 임계값과 무관하게 전량
+    저장 대상이 된다. relevance_score는 계산값을 유지하되, 0이면
+    BYPASS_DEFAULT_SCORE(0.5)로 채운다.
+
+    Args:
+        keyword_analyzer: 키워드 분석기
+        raw_announcements: 중복 제거를 마친 신규 공고
+        source_cfg: 해당 소스의 SourceConfig (없으면 None)
+
+    Returns:
+        (저장 대상 목록, bypass 적용 여부)
+    """
+    if source_cfg is not None and getattr(source_cfg, "bypass_threshold", False):
+        analyzed = [keyword_analyzer.analyze(raw) for raw in raw_announcements]
+        for ann in analyzed:
+            if not ann.relevance_score:
+                ann.relevance_score = BYPASS_DEFAULT_SCORE
+        analyzed.sort(key=lambda a: a.relevance_score, reverse=True)
+        return analyzed, True
+
+    return keyword_analyzer.analyze_batch(raw_announcements), False
+
+
 def run_pipeline(test_mode: bool = False) -> None:
     """Main pipeline: crawl → analyze → notify.
 
@@ -226,13 +259,23 @@ def run_pipeline(test_mode: bool = False) -> None:
             # ---------------------------------------------------------------------------
 
             logger.info(f"{crawler_name}: Running keyword analysis on {new_count} announcements")
-            analyzed = keyword_analyzer.analyze_batch(new_raw)
+
+            source_cfg = config.crawler.sources.get(crawler_name)
+            analyzed, bypassed = select_for_storage(
+                keyword_analyzer, new_raw, source_cfg
+            )
             relevant_count = len(analyzed)
 
-            logger.info(
-                f"{crawler_name}: {relevant_count}/{new_count} passed keyword threshold "
-                f"(>= {config.analyzer.keyword_threshold})"
-            )
+            if bypassed:
+                logger.info(
+                    f"{crawler_name}: bypass_threshold=true -> {relevant_count}/{new_count} "
+                    f"kept (keyword threshold ignored)"
+                )
+            else:
+                logger.info(
+                    f"{crawler_name}: {relevant_count}/{new_count} passed keyword threshold "
+                    f"(>= {config.analyzer.keyword_threshold})"
+                )
 
             # ---------------------------------------------------------------------------
             # Stage 3: LLM analysis (Claude API or Ollama fallback, if available)

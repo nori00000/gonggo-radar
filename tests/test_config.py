@@ -58,3 +58,25 @@ class TestObsidianAuthor:
         oc = ObsidianConfig()
         assert hasattr(oc, "author")
         assert oc.author == "이상민"  # default value
+
+
+def test_source_config_bypass_threshold_default_false():
+    """SourceConfig.bypass_threshold 기본값은 False."""
+    from alert.config import SourceConfig
+
+    assert SourceConfig().bypass_threshold is False
+    assert SourceConfig(bypass_threshold=True).bypass_threshold is True
+
+
+def test_config_yaml_declares_bypass_sources():
+    """계약 v1.2: kofpi/forest_press/lawmaking/coop은 bypass_threshold=true."""
+    from pathlib import Path
+
+    import yaml
+
+    config_path = Path(__file__).resolve().parent.parent / "alert" / "config.yaml"
+    raw = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    sources = raw["crawler"]["sources"]
+
+    for name in ("kofpi", "forest_press", "lawmaking", "coop"):
+        assert sources[name].get("bypass_threshold") is True, name
