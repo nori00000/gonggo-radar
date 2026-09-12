@@ -154,7 +154,9 @@ def _refresh_kakao(markdown_path: Path) -> None:
             encoding="utf-8",
         )
     except OSError as exc:
-        print(f"⚠️  카톡 평문 재생성 실패: {exc}", file=sys.stderr)
+        # 통합 1 #4: 모든 stderr 는 redact 를 지난다 — 예외 문자열에 토큰이
+        # 섞여 launchd 로그로 새던 분기다.
+        _err(f"⚠️  카톡 평문 재생성 실패: {exc}")
 
 
 def write_failure(check_path: Path, markdown_path: Path, reason: str) -> None:

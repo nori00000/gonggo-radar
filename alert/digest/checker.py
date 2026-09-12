@@ -22,6 +22,7 @@ sections·holds 양쪽에서 사라졌다). 해소는 재조립뿐이다.
 import hashlib
 import json
 import sqlite3
+from datetime import date
 from pathlib import Path
 from typing import Dict, List, Optional
 import requests
@@ -33,7 +34,9 @@ from alert.digest.composer import (
     HEADING_TO_SECTION,
     ITEMS_JSON_SUFFIX,
     ITEMS_SCHEMA_VERSION,
+    VERDICT_APPLY,
     classify_item,
+    effective_deadline,
     fit_prose_urls,
     load_items_manifest,
     markdown_kakao_problems,
@@ -239,6 +242,36 @@ def _schema_problems(manifest: Dict) -> List[str]:
     return problems
 
 
+def today() -> date:
+    """오늘 날짜 (테스트가 갈아 끼우는 단 한 곳)."""
+    return date.today()
+
+
+def _expiry_problems(item_id: str, entry: Dict, row) -> List[str]:
+    """**오늘 기준** 마감 경과 (통합 사이클 1 #2).
+
+    compose 는 조립 시점에 마감 경과를 제외하지만, 그 뒤 날짜가 지나면 이미 만들어진
+    발송본에는 지난 마감이 그대로 남는다 — 9/12 에 조립한 `[D-1] … 마감 9/13` 을
+    9/14 에 재검토하면 예전에는 pass 였고 발송도 됐다(Codex 통합 게이트 HIGH #2).
+    죽은 정보를 보내지 않는 것은 위협 모델 ②(날조·사망 정보 무발송)의 핵심이다.
+
+    규칙은 compose 와 **같다**: 근거는 DB 기간뿐이고(effective_deadline),
+    게시일과 마감일이 같은 행은 마감 없음으로 본다. 판정 대상도 같다 —
+    신청하세요 항목만(알아두세요는 마감으로 내리지 않는다).
+
+    D-day 표기를 발송 시점에 다시 계산하지 않는다 — 항목 줄은 편집 불가 영역이고
+    (사이클 10 #2), 해소는 언제나 재조립이다.
+    """
+    if entry.get("section") != VERDICT_APPLY:
+        return []
+    deadline = effective_deadline(row[2], row[3])
+    if deadline is None or deadline >= today():
+        return []
+    return [
+        f"id={item_id} 마감 경과({deadline.isoformat()}) — 재조립 필요"
+    ]
+
+
 def _classification_problems(item_id: str, entry: Dict, row) -> List[str]:
     """대상 태그·지역·기관을 DB 행에서 재계산해 정본과 대조 (사이클 13 #2 · 14 #1).
 
@@ -273,6 +306,32 @@ def _classification_problems(item_id: str, entry: Dict, row) -> List[str]:
             f"≠ 정본 {entry.get('target')!r} — 재조립 필요"
         )
     return problems
+
+
+def recheck_manifest(
+    markdown_path,
+    markdown_bytes: bytes,
+    markdown_text: str,
+    check_result: Optional[Dict],
+    db_path: str,
+) -> List[str]:
+    """정본 재대조 — notify·발송기가 **잠금 안에서** 부르는 단일 판정 (통합 1 #1).
+
+    개수만 비교하면 번호 결속이 닫히지 않는다: items.json 의 순서만 A,B→B,A 로
+    바꿔도 개수는 같고, 미리보기의 `1=A` 와 제외 좌표의 `1=B` 가 갈렸다
+    (Codex 통합 게이트 HIGH #1). 그래서 checker 가 쓰는 **그 함수**를 그대로
+    부른다 — 재구현하면 세 경로의 판정이 또 갈라진다.
+
+    돌려주는 것은 `manifest_problems` 와 같은 문제 목록이다(비면 정합).
+    """
+    item_sections, _ = sections_mod.resolve(check_result, markdown_text)
+    return manifest_problems(
+        markdown_text,
+        markdown_bytes,
+        item_sections,
+        load_items_manifest(markdown_path),
+        db_path,
+    )
 
 
 def _db_problems(entries: Dict[str, Dict], db_path: str) -> List[str]:
@@ -314,6 +373,7 @@ def _db_problems(entries: Dict[str, Dict], db_path: str) -> List[str]:
                 # 사이클 13 #2: 표시 근거를 **DB 에서 다시 계산**해 대조한다 —
                 # summary 만 고쳐 대상 태그를 바꾸던 경로가 여기서 막힌다.
                 problems.extend(_classification_problems(item_id, entry, row))
+                problems.extend(_expiry_problems(item_id, entry, row))
                 for column, field, label in (
                     (2, "period_start", "게시일"),
                     (3, "period_end", "마감"),

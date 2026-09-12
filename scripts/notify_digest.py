@@ -17,16 +17,19 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import requests
 
 from alert.digest import preview as preview_mod
-from alert.digest.composer import load_items_manifest
 from alert.digest import prune
 from alert.digest import sections as sections_mod
 from alert.digest import state as state_mod
-from alert.digest.checker import markdown_sha256
+from alert.digest.checker import markdown_sha256, recheck_manifest
+from alert.digest.composer import load_items_manifest
 from alert.utils.redact import redact
 from alert.utils.safe_argparse import (
     RedactingArgumentParser,
     reject_secret_argv,
 )
+
+# 정본 재대조·마감 재판정이 쓰는 DB (통합 1 #1·#2). --db 로 바꿀 수 있다.
+DEFAULT_DB_PATH = "alert/data/announcements.db"
 
 
 def _err(message) -> None:
@@ -155,7 +158,8 @@ def load_check(markdown_path):
         return raw, {}
 
 
-def _blocking_reason(markdown_path, week, check, current_sha, markdown_text):
+def _blocking_reason(markdown_path, week, check, current_sha, markdown_text,
+                     markdown_bytes=b"", db_path=DEFAULT_DB_PATH):
     """미리보기를 "검증 필요" 안내로 대체해야 하는 이유. 없으면 None (사이클4 #3·#4·#6)."""
     broken = state_mod.tombstone_reason(
         state_mod.tombstone_path_for_markdown(markdown_path))
@@ -198,6 +202,13 @@ def _blocking_reason(markdown_path, week, check, current_sha, markdown_text):
     if leftover:
         return "{} ({}건)".format(
             state_mod.EXCLUDED_NOT_APPLIED_REASON, len(leftover))
+    # 통합 1 #1·#2: 승인 세대를 발급하기 전에 **checker 와 같은 정본 대조**를 한다.
+    # 번호 좌표(제외 n)가 미리보기와 같은 항목을 가리킨다는 보장은 개수가 아니라
+    # 정본 대조에서 나온다 — 순서·URL·제목·줄 동일성·DB 재계산·마감 경과까지.
+    issues = recheck_manifest(
+        markdown_path, markdown_bytes, markdown_text, check, db_path)
+    if issues:
+        return "정본 대조 실패 — {}".format(issues[0])
     return None
 
 
@@ -218,6 +229,10 @@ def main():
         description="다이제스트 미리보기를 텔레그램 협의회 토픽으로 전송"
     )
     parser.add_argument("markdown", help="다이제스트 마크다운 경로")
+    parser.add_argument(
+        "--db", default=DEFAULT_DB_PATH,
+        help=f"announcements.db 경로 (기본: {DEFAULT_DB_PATH})",
+    )
     parser.add_argument(
         "--topic-key",
         default=DEFAULT_TOPIC_KEY,
@@ -292,7 +307,7 @@ def main():
         # 사이클4 #6 · 사이클5 #2: 렌더 **전에** 이 본문·이 검증으로 승인해도 되는지 본다.
         # 차단이면 항목 미리보기를 만들지 않고 승인 세대도 발급하지 않는다.
         blocked = _blocking_reason(markdown_path, week, check, current_sha,
-                                   markdown_text)
+                                   markdown_text, markdown_bytes, args.db)
         if blocked:
             body = (
                 "🏛 협의회 주간 정책브리핑 {}\n\n⚠️ {}\n\n"
@@ -429,6 +444,14 @@ def _finish_locked(state_path, week, prepared, message_ids, item_urls,
         and live.get("sha") == prepared.get("sha")
         and live.get("check_sha") == prepared.get("check_sha")
     )
+    if not same_generation and live.get("id") != prepared.get("id"):
+        # 통합 1 #3: **다른 notify 가 발급한 최신 승인**은 건드리지 않는다.
+        # 예전에는 A 준비 → B 미리보기 완료 → A 완료 순서에서 A 가 B 의 승인을
+        # 지웠다(Codex 통합 게이트 MEDIUM). 자기 세대만 폐기한다.
+        return (2 if send_error else 1), None, (
+            "⚠️  전송 중 다른 미리보기가 승인을 갱신했습니다 — "
+            "이 회차의 기록은 버립니다(최신 승인은 그대로)")
+
     if send_error or not same_generation:
         drop_card = live.get("card_message_id")
         try:

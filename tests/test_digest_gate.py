@@ -340,6 +340,9 @@ def _write_digest(tmp_path, markdown_text=None, check=None):
     (tmp_path / "2026-W37.check.json").write_text(
         json.dumps(payload, ensure_ascii=False), encoding="utf-8"
     )
+    # 통합 1 #1: notify·발송기가 잠금 안에서 정본을 재대조한다 — 픽스처도 정본과
+    # DB 를 함께 갖춰야 "검증만 흉내낸 본문" 이 아니게 된다.
+    _bind(md)
     return md
 
 
@@ -372,10 +375,18 @@ def _approval_id(md):
     return state_mod.approval_of(state).get("id")
 
 
+def _db_for(md):
+    """그 발송본에 결속된 대조용 DB (_bind 가 만든다)."""
+    from pathlib import Path as _Path
+
+    return str(_Path(md).parent / "bound.db")
+
+
 def _send(md, **kwargs):
     """실발송 호출 — 현재 승인 세대 id 를 넘긴다 (사이클4 #2)."""
     kwargs.setdefault("approved_by", "1401666801")
     kwargs.setdefault("approval_id", _approval_id(md))
+    kwargs.setdefault("db_path", _db_for(md))
     return send_digest(md, dry_run=False, **kwargs)
 
 
@@ -392,7 +403,7 @@ def test_send_gate_rejects_markdown_changed_after_check(tmp_path):
     md = _write_digest(tmp_path, annotated)
     md.write_text(annotated + "\n사후 변경", encoding="utf-8")
 
-    assert send_digest(md, dry_run=True) == 2
+    assert send_digest(md, dry_run=True, db_path=_db_for(md)) == 2
 
 
 def test_send_gate_rejects_line_ending_change_after_check(tmp_path):
@@ -401,7 +412,7 @@ def test_send_gate_rejects_line_ending_change_after_check(tmp_path):
     md = _write_digest(tmp_path, annotated)
     md.write_bytes(annotated.replace("\n", "\r\n").encode("utf-8"))
 
-    assert send_digest(md, dry_run=True) == 2
+    assert send_digest(md, dry_run=True, db_path=_db_for(md)) == 2
 
 
 def test_send_gate_rejects_check_without_markdown_hash(tmp_path):
@@ -412,7 +423,7 @@ def test_send_gate_rejects_check_without_markdown_hash(tmp_path):
     del check["markdown_sha256"]
     check_path.write_text(json.dumps(check), encoding="utf-8")
 
-    assert send_digest(md, dry_run=True) == 2
+    assert send_digest(md, dry_run=True, db_path=_db_for(md)) == 2
 
 
 def test_send_digest_refuses_already_sent_week(tmp_path, monkeypatch):
@@ -449,7 +460,7 @@ def test_send_digest_records_state_on_success(tmp_path, monkeypatch):
     monkeypatch.setattr("scripts.send_digest.EmailNotifier", FakeNotifier)
     approval = _approval_id(md)
     assert send_digest(md, dry_run=False, approved_by="1401666801",
-                       approval_id=approval) == 0
+                       approval_id=approval, db_path=_db_for(md)) == 0
 
     state = state_mod.load_state(
         state_mod.state_path_for_markdown(md), "2026-W37"
@@ -461,13 +472,13 @@ def test_send_digest_records_state_on_success(tmp_path, monkeypatch):
 
     # 멱등: 같은 주차 두 번째 발송은 거부된다
     assert send_digest(md, dry_run=False, approved_by="1401666801",
-                       approval_id=approval) == 2
+                       approval_id=approval, db_path=_db_for(md)) == 2
 
 
 def test_send_digest_dry_run_does_not_touch_state(tmp_path):
     annotated, _ = apply_headline(SAMPLE_MD, "확정 의견")
     md = _write_digest(tmp_path, annotated)
-    assert send_digest(md, dry_run=True) == 0
+    assert send_digest(md, dry_run=True, db_path=_db_for(md)) == 0
     assert not state_mod.state_path_for_markdown(md).exists()
 
 
@@ -1277,7 +1288,7 @@ def test_notify_preview_does_not_overwrite_sent(tmp_path, monkeypatch):
         return True, 2014, ""
 
     monkeypatch.setattr(notify_digest, "send_chunk", send_chunk)
-    monkeypatch.setattr("sys.argv", ["notify_digest.py", str(md)])
+    monkeypatch.setattr("sys.argv", ["notify_digest.py", str(md), "--db", _db_for(md)])
     assert notify_digest.main() == 0
 
     state = state_mod.load_state(state_path, "2026-W37")
@@ -1921,7 +1932,7 @@ def test_notify_records_approval(tmp_path, monkeypatch):
         notify_digest, "send_chunk",
         lambda token, chat_id, thread_id, text: (True, 2014, ""),
     )
-    monkeypatch.setattr("sys.argv", ["notify_digest.py", str(md)])
+    monkeypatch.setattr("sys.argv", ["notify_digest.py", str(md), "--db", _db_for(md)])
     assert notify_digest.main() == 0
     state = state_mod.load_state(
         state_mod.state_path_for_markdown(md), "2026-W37"
@@ -1967,7 +1978,7 @@ def test_send_digest_accepts_uppercase_approval_id(tmp_path, monkeypatch):
     monkeypatch.setattr("scripts.send_digest.EmailNotifier", _OkNotifier)
     assert send_digest(
         md, dry_run=False, approved_by="1",
-        approval_id=_approval_id(md).upper(),
+        approval_id=_approval_id(md).upper(), db_path=_db_for(md),
     ) == 0
 
 
@@ -3851,7 +3862,7 @@ def test_notify_issues_no_approval_for_failed_check(
         notify_digest, "send_chunk",
         lambda token, chat, thread, text: (sent.append(text), (True, 2014, ""))[1],
     )
-    monkeypatch.setattr("sys.argv", ["notify_digest.py", str(md)])
+    monkeypatch.setattr("sys.argv", ["notify_digest.py", str(md), "--db", _db_for(md)])
     assert notify_digest.main() == 0
     assert sent and expected_block in sent[0]
     assert "1. [" not in sent[0]         # 항목 미리보기 없음
@@ -3876,7 +3887,7 @@ def test_tombstone_blocks_send_and_preview(tmp_path, monkeypatch):
 
     _forbid_notifier(monkeypatch, "tombstone 이 있는데 발송했다")
     assert _send(md) == 2
-    assert send_digest(md, dry_run=True) == 2       # 드라이런도 거부
+    assert send_digest(md, dry_run=True, db_path=_db_for(md)) == 2       # 드라이런도 거부
 
     sent = []
     monkeypatch.setattr(
@@ -3887,7 +3898,7 @@ def test_tombstone_blocks_send_and_preview(tmp_path, monkeypatch):
         notify_digest, "send_chunk",
         lambda token, chat, thread, text: (sent.append(text), (True, 2014, ""))[1],
     )
-    monkeypatch.setattr("sys.argv", ["notify_digest.py", str(md)])
+    monkeypatch.setattr("sys.argv", ["notify_digest.py", str(md), "--db", _db_for(md)])
     assert notify_digest.main() == 0
     assert "무효화 실패" in sent[0] and "1. [" not in sent[0]
 
@@ -3932,7 +3943,7 @@ def test_notify_preview_body_redacts_check_reason(tmp_path, monkeypatch):
         notify_digest, "send_chunk",
         lambda token, chat, thread, text: (sent.append(text), (True, 2014, ""))[1],
     )
-    monkeypatch.setattr("sys.argv", ["notify_digest.py", str(md)])
+    monkeypatch.setattr("sys.argv", ["notify_digest.py", str(md), "--db", _db_for(md)])
     assert notify_digest.main() == 0
     assert sent and LEAK_TOKEN not in sent[0]
     assert "<redacted>" in sent[0]
@@ -3956,7 +3967,7 @@ def test_notify_skips_preview_while_send_holds_lock(tmp_path, monkeypatch):
         notify_digest, "send_chunk",
         lambda token, chat, thread, text: (sent.append(text), (True, 2014, ""))[1],
     )
-    monkeypatch.setattr("sys.argv", ["notify_digest.py", str(md)])
+    monkeypatch.setattr("sys.argv", ["notify_digest.py", str(md), "--db", _db_for(md)])
     try:
         # 사이클8 #5: 잠금 타임아웃 종료 코드는 다섯 CLI 모두 2 다.
         assert notify_digest.main() == 2
@@ -4050,9 +4061,23 @@ def test_send_digest_refuses_control_chars(tmp_path, monkeypatch, capsys):
 def test_send_digest_refuses_rendered_count_mismatch(
     tmp_path, monkeypatch, capsys
 ):
-    """검증이 말하는 항목 수와 렌더될 항목 수가 다르면 거부 (사이클6)."""
+    """렌더될 항목 수가 정본과 다르면 거부 (사이클6 → 통합 1 #1).
+
+    근거는 check.json 의 숫자가 아니라 **정본(items.json)** 이다. 본문에서 항목
+    블록 하나를 지우면 정본(4) ≠ 본문(3) 이 되어 멈춘다.
+    """
     annotated, _ = apply_headline(SAMPLE_MD, "확정 의견")
-    md = _write_digest(tmp_path, annotated, dict(PASS_CHECK, item_blocks=99))
+    md = _write_digest(tmp_path, annotated)
+    _seed_preview(md)
+    body = md.read_text(encoding="utf-8")
+    start = body.index("<!-- item id=13 -->")
+    end = body.index("\n\n", body.index("example.com/c")) + 2
+    md.write_text(body[:start] + body[end:], encoding="utf-8")
+    composer_mod.refresh_manifest_binding(md)   # 해시만 다시 맞춘다(항목은 그대로)
+    check_path = md.with_suffix(".check.json")
+    check = json.loads(check_path.read_text(encoding="utf-8"))
+    check["markdown_sha256"] = markdown_sha256(md.read_bytes())
+    check_path.write_text(json.dumps(check, ensure_ascii=False), encoding="utf-8")
     _seed_preview(md)
     _forbid_notifier(monkeypatch, "항목 수가 다른데 발송했다")
     assert _send(md) == 2
@@ -4247,7 +4272,7 @@ def test_notify_dry_run_redacts_check_reason(tmp_path, monkeypatch, capsys):
         tmp_path, annotated,
         dict(PASS_CHECK, **{"pass": False, "reason": f"생존 항목 없음 {leak}"}),
     )
-    monkeypatch.setattr("sys.argv", ["notify_digest.py", str(md), "--dry-run"])
+    monkeypatch.setattr("sys.argv", ["notify_digest.py", str(md), "--db", _db_for(md), "--dry-run"])
     assert notify_digest.main() == 0
     out = capsys.readouterr().out
     assert leak not in out and "<redacted>" in out
@@ -4340,6 +4365,9 @@ def test_notify_reads_body_after_acquiring_lock(tmp_path, monkeypatch):
     def acquire_then_swap(path, **kwargs):
         handle = real_acquire(path, **kwargs)
         md.write_text(swapped, encoding="utf-8")
+        # 교체된 본문에도 정본을 결속한다 — 이 테스트가 보는 것은 "언제 읽는가"
+        # 이지 정본 대조가 아니다(그건 별도 테스트가 본다).
+        composer_mod.refresh_manifest_binding(md)
         check_path.write_text(json.dumps(dict(
             PASS_CHECK,
             markdown_sha256=markdown_sha256(md.read_bytes()),
@@ -4357,7 +4385,7 @@ def test_notify_reads_body_after_acquiring_lock(tmp_path, monkeypatch):
         notify_digest, "send_chunk",
         lambda token, chat, thread, text: (sent.append(text), (True, 2014, ""))[1],
     )
-    monkeypatch.setattr("sys.argv", ["notify_digest.py", str(md)])
+    monkeypatch.setattr("sys.argv", ["notify_digest.py", str(md), "--db", _db_for(md)])
     assert notify_digest.main() == 0
 
     state = state_mod.load_state(
@@ -4782,7 +4810,7 @@ def test_notify_releases_lock_during_telegram_roundtrip(tmp_path, monkeypatch):
         return True, 2013 + len(observed), ""
 
     _notify_stubs(monkeypatch, notify_digest, send_chunk)
-    monkeypatch.setattr("sys.argv", ["notify_digest.py", str(md)])
+    monkeypatch.setattr("sys.argv", ["notify_digest.py", str(md), "--db", _db_for(md)])
     assert notify_digest.main() == 0
     assert observed and all(observed)        # 전송 중 잠금은 비어 있었다
     state = state_mod.load_state(
@@ -4808,7 +4836,7 @@ def test_notify_issues_approval_before_sending(tmp_path, monkeypatch):
         return True, 2014, ""
 
     _notify_stubs(monkeypatch, notify_digest, send_chunk)
-    monkeypatch.setattr("sys.argv", ["notify_digest.py", str(md)])
+    monkeypatch.setattr("sys.argv", ["notify_digest.py", str(md), "--db", _db_for(md)])
     assert notify_digest.main() == 0
     assert seen["approval_during_send"]              # 이미 발급돼 있다
     assert seen["ids_during_send"] == []             # message_id 는 아직 없다
@@ -4838,7 +4866,7 @@ def test_notify_drops_approval_when_generation_changes_mid_send(
     monkeypatch.setattr(
         notify_digest, "clear_card",
         lambda token, chat, mid: (dropped_cards.append(mid), (True, ""))[1])
-    monkeypatch.setattr("sys.argv", ["notify_digest.py", str(md)])
+    monkeypatch.setattr("sys.argv", ["notify_digest.py", str(md), "--db", _db_for(md)])
     assert notify_digest.main() == 1
 
     state = state_mod.load_state(state_path, "2026-W37")
@@ -4856,7 +4884,7 @@ def test_notify_drops_approval_when_send_fails(tmp_path, monkeypatch):
 
     _notify_stubs(monkeypatch, notify_digest,
                   lambda token, chat, thread, text: (False, None, "API 실패"))
-    monkeypatch.setattr("sys.argv", ["notify_digest.py", str(md)])
+    monkeypatch.setattr("sys.argv", ["notify_digest.py", str(md), "--db", _db_for(md)])
     assert notify_digest.main() == 2
     state = state_mod.load_state(state_path, "2026-W37")
     assert state_mod.approval_of(state) == {}
@@ -4879,7 +4907,7 @@ def test_notify_blocked_notice_drops_old_approval(tmp_path, monkeypatch):
         monkeypatch, notify_digest,
         lambda token, chat, thread, text: (
             sent.append(text), (True, 3014, ""))[1])
-    monkeypatch.setattr("sys.argv", ["notify_digest.py", str(md)])
+    monkeypatch.setattr("sys.argv", ["notify_digest.py", str(md), "--db", _db_for(md)])
     assert notify_digest.main() == 0
 
     state = state_mod.load_state(state_path, "2026-W37")
@@ -4910,7 +4938,7 @@ def test_notify_aborts_when_blocked_and_approval_drop_fails(
             sent.append(text), (True, 3014, ""))[1])
     monkeypatch.setattr(
         "scripts.notify_digest.state_mod.update_state_locked", boom)
-    monkeypatch.setattr("sys.argv", ["notify_digest.py", str(md)])
+    monkeypatch.setattr("sys.argv", ["notify_digest.py", str(md), "--db", _db_for(md)])
     assert notify_digest.main() == 2
     assert sent == []
 
@@ -4926,7 +4954,7 @@ def test_notify_lock_timeout_exit_code_is_two(tmp_path, monkeypatch):
     monkeypatch.setenv(state_mod.LOCK_TIMEOUT_ENV, "0.2")
     _notify_stubs(monkeypatch, notify_digest,
                   lambda token, chat, thread, text: (True, 2014, ""))
-    monkeypatch.setattr("sys.argv", ["notify_digest.py", str(md)])
+    monkeypatch.setattr("sys.argv", ["notify_digest.py", str(md), "--db", _db_for(md)])
     try:
         assert notify_digest.main() == 2
     finally:
@@ -4952,7 +4980,7 @@ def test_all_cli_lock_timeouts_exit_two(tmp_path, monkeypatch):
             "weekly_digest.py", "--week", "2026-W37",
             "--out-dir", str(tmp_path), "--db", str(tmp_path / "x.db")])
         assert weekly_digest.main() == 2
-        monkeypatch.setattr("sys.argv", ["notify_digest.py", str(md)])
+        monkeypatch.setattr("sys.argv", ["notify_digest.py", str(md), "--db", _db_for(md)])
         assert notify_digest.main() == 2
         assert _run_apply(tmp_path, "--commentary", "의견").returncode == 2
     finally:
@@ -5056,3 +5084,182 @@ def test_one_parser_for_links_and_urls():
     from scripts.send_digest import markdown_to_html
     html = markdown_to_html(line)
     assert 'href="https://example.com/report(1)"' in html
+
+
+# ══ 통합 사이클 1: 정본 재대조 · 마감 재판정 · 승인 세대 보호 ═══════════
+def _swap_manifest_order(md):
+    """items.json 의 첫 두 항목 순서만 뒤집는다 (본문·개수는 그대로)."""
+    manifest = composer_mod.load_items_manifest(md)
+    manifest["items"] = ([manifest["items"][1], manifest["items"][0]]
+                         + manifest["items"][2:])
+    composer_mod.write_items_manifest(md, manifest)
+    return manifest
+
+
+def test_notify_blocks_when_manifest_order_changed(tmp_path, monkeypatch):
+    """items.json 순서만 바뀌어도 notify 는 승인을 발급하지 않는다 (통합 1 #1).
+
+    Codex 통합 게이트 HIGH #1 재현: 개수는 같으므로 예전 검사는 통과했고,
+    미리보기의 `1=A` 와 제외 좌표의 `1=B` 가 갈렸다. 번호는 사람이 승인하는
+    좌표다 — 어긋나면 승인 자체를 만들지 않는다.
+    """
+    from scripts import notify_digest
+
+    annotated, _ = apply_headline(SAMPLE_MD, "확정 의견")
+    md = _write_digest(tmp_path, annotated)
+    _swap_manifest_order(md)
+
+    sent = []
+    _notify_stubs(monkeypatch, notify_digest,
+                  lambda token, chat, thread, text: (
+                      sent.append(text), (True, 2014, ""))[1])
+    monkeypatch.setattr("sys.argv",
+                        ["notify_digest.py", str(md), "--db", _db_for(md)])
+    assert notify_digest.main() == 0
+    state = state_mod.load_state(
+        state_mod.state_path_for_markdown(md), "2026-W37")
+    assert state_mod.approval_of(state).get("id") is None      # 승인 미발급
+    assert "정본 대조 실패" in sent[0]
+    assert "1. [" not in sent[0]                               # 항목 미리보기 없음
+
+
+def test_send_refuses_when_manifest_order_changed(tmp_path, monkeypatch, capsys):
+    """발송기도 같은 대조를 잠금 안에서 다시 한다 (통합 1 #1)."""
+    annotated, _ = apply_headline(SAMPLE_MD, "확정 의견")
+    md = _write_digest(tmp_path, annotated)
+    _seed_preview(md)                      # 승인까지 정상으로 갖춘 뒤
+    _swap_manifest_order(md)               # 정본 순서만 뒤집는다
+    _forbid_notifier(monkeypatch, "번호 좌표가 어긋났는데 발송했다")
+    assert _send(md) == 2
+    err = capsys.readouterr().err
+    assert "정본 대조 실패" in err and "순서" in err
+
+
+def _past_deadline(md, db, item_id=11):
+    """DB 의 마감을 어제로 바꾸고 정본도 같이 맞춘다 (= 정상 조립 후 날짜 경과)."""
+    from datetime import date, timedelta
+
+    yesterday = (date.today() - timedelta(days=1)).isoformat()
+    conn = sqlite3.connect(db)
+    conn.execute(
+        "UPDATE announcements SET period_start = '2026-09-01', period_end = ?"
+        " WHERE id = ?", (yesterday, item_id))
+    conn.commit()
+    conn.close()
+    manifest = composer_mod.load_items_manifest(md)
+    for entry in manifest["items"]:
+        if str(entry["id"]) == str(item_id):
+            entry["period_start"] = "2026-09-01"
+            entry["period_end"] = yesterday
+    composer_mod.write_items_manifest(md, manifest)
+    return yesterday
+
+
+def test_recheck_fails_on_expired_deadline(tmp_path, monkeypatch):
+    """지난 마감은 재검토에서 pass=false 다 (통합 1 #2).
+
+    Codex 통합 게이트 HIGH #2 재현: 9/12 에 조립한 `마감 9/13` 항목을 9/14 에
+    재검토하면 예전에는 pass 였고 `[D-1]` 이 그대로 실렸다. 같은 DB 로 재조립하면
+    "마감 경과" 로 빠지는 항목이다 — 죽은 정보를 보내지 않는 것이 위협 모델 ②다.
+    """
+    _alive(monkeypatch)
+    md = tmp_path / "2026-W37.md"
+    md.write_text(SAMPLE_MD, encoding="utf-8")
+    db = _bind(md)
+    assert check_digest(db_path=str(db), markdown_path=md,
+                        output_path=None)["pass"] is True
+
+    _past_deadline(md, db)
+    result = check_digest(db_path=str(db), markdown_path=md, output_path=None)
+    assert result["pass"] is False
+    joined = " ".join(result["manifest_problems"])
+    assert "마감 경과" in joined and "재조립 필요" in joined
+
+
+def test_send_refuses_expired_deadline(tmp_path, monkeypatch, capsys):
+    """발송기도 **오늘 기준**으로 다시 판정한다 (통합 1 #2)."""
+    annotated, _ = apply_headline(SAMPLE_MD, "확정 의견")
+    md = _write_digest(tmp_path, annotated)
+    _seed_preview(md)
+    _past_deadline(md, _db_for(md))
+    _forbid_notifier(monkeypatch, "마감이 지난 항목을 발송했다")
+    assert _send(md) == 2
+    assert "마감 경과" in capsys.readouterr().err
+
+
+def test_send_refuses_when_db_period_changed_after_check(
+    tmp_path, monkeypatch, capsys
+):
+    """검증 뒤 DB 기간이 바뀌면 발송하지 않는다 (통합 1 #2 후단)."""
+    annotated, _ = apply_headline(SAMPLE_MD, "확정 의견")
+    md = _write_digest(tmp_path, annotated)
+    _seed_preview(md)
+    conn = sqlite3.connect(_db_for(md))
+    conn.execute(
+        "UPDATE announcements SET period_end = '2027-01-31' WHERE id = 11")
+    conn.commit()
+    conn.close()
+    _forbid_notifier(monkeypatch, "DB 가 바뀌었는데 발송했다")
+    assert _send(md) == 2
+    err = capsys.readouterr().err
+    assert "정본 대조 실패" in err and "마감" in err
+
+
+def test_notice_section_is_not_expired(tmp_path, monkeypatch):
+    """알아두세요 항목은 마감으로 내리지 않는다 (compose 와 같은 규칙)."""
+    _alive(monkeypatch)
+    md = tmp_path / "2026-W37.md"
+    md.write_text(SAMPLE_MD, encoding="utf-8")
+    db = _bind(md)
+    _past_deadline(md, db, item_id=14)          # 14 = 알아두세요 항목
+    result = check_digest(db_path=str(db), markdown_path=md, output_path=None)
+    assert result["pass"] is True, result["manifest_problems"]
+
+
+def test_finish_locked_keeps_another_notifys_approval(tmp_path):
+    """A 가 준비한 회차는 B 의 최신 승인을 건드리지 않는다 (통합 1 #3)."""
+    from scripts import notify_digest
+
+    md = _write_digest(tmp_path)
+    state_path = state_mod.state_path_for_markdown(md)
+    week = "2026-W37"
+
+    prepared_a = state_mod.approval_of(state_mod.record_preview(
+        state_mod.default_state(week), [], [], "sha-a", "check-a"))
+    live_b = state_mod.record_preview(
+        state_mod.default_state(week), [2020], [], "sha-b", "check-b")
+    state_mod.save_state(state_path, live_b)
+    approval_b = state_mod.approval_of(live_b)
+
+    code, drop_card, message = notify_digest._finish_locked(
+        state_path, week, prepared_a, [2030], [], None)
+
+    assert code == 1                       # 이 회차는 실패로 끝나고
+    assert drop_card is None               # 카드도 회수하지 않으며
+    assert "최신 승인은 그대로" in message
+    live = state_mod.approval_of(state_mod.load_state(state_path, week))
+    assert live.get("id") == approval_b.get("id")      # B 의 승인은 남아 있다
+    assert live.get("sha") == "sha-b"
+    assert prepared_a.get("id") != approval_b.get("id")
+
+
+def test_recheck_kakao_failure_is_redacted(tmp_path, monkeypatch, capsys):
+    """카톡 재생성 실패 메시지도 redact 를 지난다 (통합 1 #4)."""
+    import scripts.recheck_digest as recheck_mod
+
+    annotated, _ = apply_headline(SAMPLE_MD, "확정 의견")
+    md = tmp_path / "2026-W37.md"
+    md.write_text(annotated, encoding="utf-8")
+    db = _bind(md)
+    _alive(monkeypatch)
+
+    def boom(markdown_text):
+        raise OSError(f"디스크 오류 bot{LEAK_TOKEN}")
+
+    monkeypatch.setattr(recheck_mod, "kakao_file_text_from_markdown", boom)
+    monkeypatch.setattr("sys.argv",
+                        ["recheck_digest.py", str(md), "--db", str(db)])
+    recheck_mod.main()
+    err = capsys.readouterr().err
+    assert "카톡 평문 재생성 실패" in err
+    assert LEAK_TOKEN not in err

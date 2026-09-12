@@ -22,7 +22,7 @@ from alert.digest import sections as sections_mod
 from alert.digest.composer import fit_prose_urls, load_items_manifest
 from alert.digest import state as state_mod
 from alert.digest.preview import MARKER
-from alert.digest.checker import markdown_sha256
+from alert.digest.checker import markdown_sha256, recheck_manifest
 from alert.utils.redact import redact
 from alert.utils.safe_argparse import (
     RedactingArgumentParser,
@@ -257,12 +257,16 @@ def check_fail_closed(markdown_path: Path, check_json_path: Path) -> Tuple[bool,
     return _check_fail_closed_bytes(markdown_bytes, check_json_path)
 
 
+DEFAULT_DB_PATH = "alert/data/announcements.db"
+
+
 def send_digest(
     markdown_path: Path,
     to_email: str = None,
     dry_run: bool = True,
     approved_by=None,
     approval_id: str = None,
+    db_path: str = DEFAULT_DB_PATH,
 ) -> int:
     """다이제스트 발송 — **발송기가 유일한 권위**다 (계약 W10 사이클6 #1).
 
@@ -277,6 +281,7 @@ def send_digest(
         dry_run: 드라이런 모드 (기본: True) — 판정 경로는 실발송과 같다
         approved_by: 발송을 승인한 텔레그램 user_id (상태 파일에 기록)
         approval_id: 승인 카드의 세대 id (`--send` 필수)
+        db_path: 정본 재대조·마감 재판정에 쓰는 announcements.db 경로
 
     Returns:
         종료 코드 (0: 성공, 2: 거부·실패, 1: 발송 후 기록 실패)
@@ -316,6 +321,7 @@ def send_digest(
             dry_run=dry_run,
             approved_by=approved_by,
             approval_id=approval,
+            db_path=db_path,
         )
     finally:
         state_mod.release_lock(lock_handle)
@@ -334,6 +340,7 @@ def _send_locked(
     dry_run: bool,
     approved_by,
     approval_id: str,
+    db_path: str = DEFAULT_DB_PATH,
 ) -> int:
     """flock 을 쥔 상태의 전 과정 (사이클6 #1).
 
@@ -447,6 +454,16 @@ def _send_locked(
             "✗ 발송 거부: 본문의 항목 수({})와 검증의 항목 수({})가 다릅니다".format(
                 rendered_blocks, expected_blocks)
         )
+        return 2
+
+    # ⑨-2 정본 재대조 (통합 1 #1·#2) — **checker 와 같은 함수**를 잠금 안에서 다시
+    # 돌린다. 개수만 보면 items.json 의 순서만 바꾼 본문이 통과했고(번호 좌표가
+    # 미리보기와 갈렸다), 검증 뒤 DB 가 바뀐 것·오늘 기준 마감 경과도 놓쳤다.
+    # 판정은 하나뿐이어야 한다 — 여기서 재구현하지 않는다.
+    manifest_issues = recheck_manifest(
+        markdown_path, markdown_bytes, markdown_text, check_result, db_path)
+    if manifest_issues:
+        _err("✗ 발송 거부: 정본 대조 실패 — {}".format(manifest_issues[0]))
         return 2
 
     # ⑩ 제외 미반영 — 본문 **전체** URL 기준 (사이클6 #3)
@@ -600,6 +617,10 @@ def main():
         help="드라이런 모드 (명시해야 활성화, --send보다 우선)",
     )
     parser.add_argument(
+        "--db", default=DEFAULT_DB_PATH,
+        help=f"announcements.db 경로 (기본: {DEFAULT_DB_PATH})",
+    )
+    parser.add_argument(
         "--send",
         action="store_true",
         help="실제 발송 (기본은 드라이런)",
@@ -628,6 +649,7 @@ def main():
         dry_run=dry_run,
         approved_by=args.approved_by,
         approval_id=args.approval_id,
+        db_path=args.db,
         )
 
 

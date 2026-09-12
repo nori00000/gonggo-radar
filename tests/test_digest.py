@@ -1115,6 +1115,18 @@ class TestWeeklyDigestScript:
         assert "--limit" not in source
 
 
+
+def _bind_send_fixture(md_path):
+    """발송 픽스처의 정본 사슬 — items.json + 대조 DB (통합 1 #1).
+
+    통합 사이클 1 부터 발송기는 잠금 안에서 checker 와 **같은 정본 대조**를 다시
+    돌린다. 그래서 발송 픽스처도 md·check.json 만으로는 부족하다.
+    """
+    from tests.test_digest_gate import _bind
+
+    return str(_bind(md_path))
+
+
 class TestSendDigest:
     """SendDigest 테스트."""
 
@@ -1198,9 +1210,10 @@ class TestSendDigest:
             "reason": "",
             "markdown_sha256": markdown_sha256(md_path.read_bytes()),
         }))
+        db_path = _bind_send_fixture(md_path)
 
         # dry_run=True가 기본값이므로 발송 안 함
-        result = send_digest(md_path, to_email="test@example.com", dry_run=True)
+        result = send_digest(md_path, to_email="test@example.com", dry_run=True, db_path=db_path)
 
         # dry_run이므로 0 (성공)
         assert result == 0
@@ -1273,13 +1286,15 @@ class TestSendDigest:
             "reason": "",
             "markdown_sha256": markdown_sha256(md_path.read_bytes()),
         }))
+        db_path = _bind_send_fixture(md_path)
 
         smtp_mock = mock.MagicMock()
         monkeypatch.setattr("alert.notifiers.email_sender.smtplib.SMTP", smtp_mock)
         monkeypatch.setattr(
             sys,
             "argv",
-            ["send_digest.py", str(md_path), "--to", "a@b.c", "--dry-run", "--send"],
+            ["send_digest.py", str(md_path), "--to", "a@b.c",
+             "--db", db_path, "--dry-run", "--send"],
         )
 
         rc = send_digest_module.main()
@@ -1309,6 +1324,7 @@ class TestSendDigest:
             "reason": "",
             "markdown_sha256": markdown_sha256(md_path.read_bytes()),
         }))
+        db_path = _bind_send_fixture(md_path)
 
         monkeypatch.setenv("EMAIL_SENDER", "sender@x.com")
         monkeypatch.setenv("EMAIL_PASSWORD", "pw")
@@ -1349,8 +1365,11 @@ class TestSendDigest:
         )
         state_mod.save_state(state_path, seeded)
 
-        rc = send_digest(md_path, to_email="third@example.com", dry_run=False,
-                         approval_id=state_mod.approval_of(seeded)["id"])
+        rc = send_digest(
+            md_path, to_email="third@example.com", dry_run=False,
+            approval_id=state_mod.approval_of(seeded)["id"],
+            db_path=db_path,
+        )
 
         assert rc == 0
         assert sent["to"] == "third@example.com"
