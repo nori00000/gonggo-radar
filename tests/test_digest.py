@@ -20,6 +20,7 @@ from alert.digest.composer import (
 )
 from alert.digest.checker import (
     check_digest,
+    markdown_sha256,
     parse_period_end,
     check_url_alive,
 )
@@ -782,15 +783,18 @@ class TestSendDigest:
     def test_dry_run_default(self, tmp_path):
         """기본값은 dry_run (발송 안 함)."""
         md_path = tmp_path / "digest.md"
-        md_path.write_text("# 테스트\n\n완료")
+        body = "# 테스트\n\n완료"
+        md_path.write_text(body)
 
         # check.json 파일은 markdown 파일 이름으로부터 자동 파생됨
+        # 계약 W10: 검증은 그 본문의 해시를 남겨야 발송 게이트를 통과한다.
         check_path = md_path.with_suffix(".check.json")
         check_path.write_text(json.dumps({
             "items": [{"url": "https://example.com", "url_alive": True, "deadline_parsed": True, "passed": True}],
             "pass": True,
             "network_checked": True,
-            "reason": ""
+            "reason": "",
+            "md_sha256": markdown_sha256(body),
         }))
 
         # dry_run=True가 기본값이므로 발송 안 함
@@ -818,7 +822,8 @@ class TestSendDigest:
     def test_main_dry_run_with_send_never_opens_smtp(self, tmp_path, monkeypatch):
         """--dry-run --send 동시 지정 시 SMTP 연결이 생성되지 않는다."""
         md_path = tmp_path / "x.md"
-        md_path.write_text("# 테스트\n\n[원문](https://example.com)")
+        body = "# 테스트\n\n[원문](https://example.com)"
+        md_path.write_text(body)
         check_path = md_path.with_suffix(".check.json")
         check_path.write_text(json.dumps({
             "items": [{"url": "https://example.com", "url_alive": True,
@@ -826,6 +831,7 @@ class TestSendDigest:
             "pass": True,
             "network_checked": True,
             "reason": "",
+            "md_sha256": markdown_sha256(body),
         }))
 
         smtp_mock = mock.MagicMock()
@@ -844,7 +850,8 @@ class TestSendDigest:
     def test_send_to_override_replaces_config_recipients(self, tmp_path, monkeypatch):
         """--to 지정 시 config 수신자 2명이 아니라 제3자에게만 발송."""
         md_path = tmp_path / "y.md"
-        md_path.write_text("# 테스트\n\n[원문](https://example.com)")
+        body = "# 테스트\n\n[원문](https://example.com)"
+        md_path.write_text(body)
         check_path = md_path.with_suffix(".check.json")
         check_path.write_text(json.dumps({
             "items": [{"url": "https://example.com", "url_alive": True,
@@ -852,6 +859,7 @@ class TestSendDigest:
             "pass": True,
             "network_checked": True,
             "reason": "",
+            "md_sha256": markdown_sha256(body),
         }))
 
         monkeypatch.setenv("EMAIL_SENDER", "sender@x.com")
@@ -881,7 +889,8 @@ class TestSendDigest:
 
         monkeypatch.setattr("alert.notifiers.email_sender.smtplib.SMTP", FakeSMTP)
 
-        rc = send_digest(md_path, to_email="third@example.com", dry_run=False)
+        rc = send_digest(md_path, to_email="third@example.com", dry_run=False,
+                         approved_sha=markdown_sha256(body)[:8])
 
         assert rc == 0
         assert sent["to"] == "third@example.com"
