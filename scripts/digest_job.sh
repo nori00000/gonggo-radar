@@ -36,6 +36,8 @@ if [ ! -f "${MD}" ]; then
 fi
 
 NOTIFY_RC=0
-"${PY}" scripts/notify_digest.py "${MD}" || NOTIFY_RC=$?
+# 통합 2·3: notify 도 정본 대조·URL 생존을 본다 — **생성과 같은 DB**를 넘긴다
+# (GONGGO_DB 로 경로를 바꿔 쓰는 운영에서 두 단계가 다른 DB 를 보면 안 된다).
+"${PY}" scripts/notify_digest.py "${MD}" --db "${DB}" || NOTIFY_RC=$?
 echo "notify_digest exit=${NOTIFY_RC}"
 exit "${NOTIFY_RC}"
