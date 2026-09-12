@@ -8,7 +8,7 @@ import os
 import sqlite3
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Sequence
 
 from .models import (
     AnalyzedAnnouncement,
@@ -486,6 +486,41 @@ class Database:
         if self._backend == "sqlite":
             self._conn.commit()
         return True
+
+    def clear_periods_for_sources(self, sources: Sequence[str]) -> int:
+        """전용 추출기가 없는 소스의 기간을 **일괄 NULL** 로 만든다 (멱등).
+
+        재수집되지 않은 행(목록에서 내려간 공고)은 관문을 다시 지나지
+        않으므로, 예전 실행이 심은 마감이 그대로 남아 알림·브리핑까지
+        갔다 (10차 게이트 MEDIUM). 이 소스들은 **설계상 기간을 만들 수
+        없으므로** 남아 있는 값은 전부 날조값이다 - 지우는 것이 안전하다.
+
+        이미 비어 있는 행은 건드리지 않으므로 두 번째 호출은 0을 돌려준다.
+
+        Args:
+            sources: 기간을 만들 수 없는 소스 이름들
+
+        Returns:
+            실제로 비운 행 수
+        """
+        names = [name for name in sources if name]
+        if not names:
+            return 0
+
+        placeholders = ", ".join("?" for _ in names)
+        cursor = self._conn.execute(
+            _sql(
+                "UPDATE announcements SET period_start = NULL,"
+                " period_end = NULL, updated_at = ?"
+                f" WHERE source IN ({placeholders})"
+                "   AND (period_start IS NOT NULL OR period_end IS NOT NULL)"
+            ),
+            (datetime.now().isoformat(), *names),
+        )
+        affected = cursor.rowcount or 0
+        if self._backend == "sqlite":
+            self._conn.commit()
+        return affected
 
     def overwrite_periods(self, announcement: RawAnnouncement) -> bool:
         """저장된 행의 기간 두 필드를 **재수집 값으로 덮어쓴다** (None 포함).

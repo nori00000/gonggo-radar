@@ -38,7 +38,11 @@ from alert.crawlers.period_extractors import (
 )
 from alert.crawlers.seis import SeisCrawler
 from alert.db import Database
-from alert.main import _finalize_periods, _import_crawlers
+from alert.main import (
+    COUNCIL_SOURCES_WITHOUT_EXTRACTORS,
+    _finalize_periods,
+    _import_crawlers,
+)
 from alert.models import AnalyzedAnnouncement, RawAnnouncement
 
 REPO = Path(__file__).resolve().parents[1]
@@ -200,14 +204,30 @@ class TestTheGateSitsBeforeEveryWrite:
                      "db.insert_announcement("):
             assert gate < source.index(call), f"{call} 이 관문보다 앞에 있다"
 
-    def test_no_other_module_writes_period_columns(self):
-        """기간 컬럼을 쓰는 SQL 은 ``overwrite_periods`` 하나뿐이다."""
+    def test_only_two_known_statements_write_period_columns(self):
+        """기간 컬럼을 쓰는 SQL 은 **두 자리**뿐이다.
+
+        ``overwrite_periods``(관문 값 기록)와
+        ``clear_periods_for_sources``(기존 오염 정규화). 다른 자리가
+        생기면 이 테스트가 먼저 깨진다.
+        """
         db_source = (REPO / "alert" / "db.py").read_text(encoding="utf-8")
         writes = [
-            line for line in db_source.splitlines()
+            line.strip() for line in db_source.splitlines()
             if "UPDATE announcements SET period_start" in line
         ]
-        assert len(writes) == 1
+        assert writes == [
+            '"UPDATE announcements SET period_start = NULL,"',
+            '"UPDATE announcements SET period_start = ?, period_end = ?,"',
+        ]
+
+    def test_normalisation_runs_before_notification(self):
+        """정규화는 알림 조회보다 **앞**에서 한 번 돈다."""
+        source = self.pipeline_source()
+        assert source.count("clear_periods_for_sources(") == 1
+        assert source.index("clear_periods_for_sources(") < source.index(
+            "db.get_unnotified("
+        )
 
     def test_keyword_analysis_preserves_the_gate(self):
         """신규 저장 경로는 관문이 정한 값을 **복사**해 간다."""
@@ -523,6 +543,179 @@ class TestRealFixtures:
         assert (built[0].period_start, built[0].period_end) == (
             "2026-09-07", "2026-10-19"
         )
+
+
+class TestGate10Reproductions:
+    """10차 게이트 재현 - 구조 근거의 범위와 전체 일치."""
+
+    # HIGH ①: swiper 카드가 아닌 임의 부모의 p.tit/p.date
+    ARBITRARY_PARENT = (
+        '<div><p class="tit"><a href="/view.do?nttId=1">교육 안내</a></p>'
+        '<p class="date">2026.10.01 ~ 2026.10.31</p></div>'
+    )
+
+    def test_arbitrary_parent_is_not_a_card(self):
+        """임의 부모는 카드가 아니다 - 항목 자체가 안 나온다.
+
+        예전에는 ``p.tit`` 전부를 훑고 부모를 카드로 삼아, swiper 카드가
+        아닌 ``<div>`` 의 ``p.date`` 도 카드 출처 표시를 받았다.
+        """
+        crawler = make(SeisCrawler)
+        soup = BeautifulSoup(self.ARBITRARY_PARENT, "html.parser")
+        items = crawler._parse_main_cards(soup)
+        assert items == []
+
+    def test_arbitrary_parent_yields_no_period_and_no_posted(self):
+        """그 자리에서 억지로 항목을 만들어도 기간도 게시일도 없다."""
+        crawler = make(SeisCrawler)
+        soup = BeautifulSoup(
+            "<ul>" + self.ARBITRARY_PARENT + "</ul>", "html.parser"
+        )
+        # 카드 경로에서는 하나도 나오지 않는다
+        assert crawler._parse_main_cards(soup) == []
+        # 출처 표시가 없으므로 같은 텍스트로도 기간이 나오지 않는다
+        assert seis_period({"date": "2026.10.01 ~ 2026.10.31"}) == (None, None)
+
+    @pytest.mark.parametrize("value", [
+        "교육기간 2026.10.01 ~ 2026.10.31",
+        "접수기간 미정 / 교육기간 2026.10.01 ~ 2026.10.31",
+        "행사일정 2026.10.15 ~ 2026.10.31",
+        "2026.09.01부터 2026.09.30까지",
+        "2026.09.01 ~ 2026.09.300",
+        "2026.09.01 ~ 2026.09.30 / 심사기간 2026.10.01 ~ 2026.10.31",
+    ])
+    def test_structural_field_still_requires_a_whole_range(self, value):
+        """구조 근거가 있는 카드라도 필드 **전체**가 범위여야 한다."""
+        assert seis_period(
+            {"date": value, "date_field": SEIS_CARD_DATE_FIELD}
+        ) == (None, None)
+
+    def test_real_card_with_a_training_period_is_refused(self):
+        """실 카드 모양 + ``교육기간`` -> 기간 NULL (10차 HIGH 재현)."""
+        crawler = make(SeisCrawler)
+        card = (
+            '<ul><li class="swiper-slide" data-type="사업공고">'
+            '<div class="link"><div class="txt-area">'
+            '<span class="badge cate">사업공고</span>'
+            '<span class="sub">서울센터</span>'
+            '<p class="tit"><a href="subPage.do?fncPbofrSn=1">교육 안내</a></p>'
+            '<ul class="info"><li>교육</li></ul></div>'
+            '<p class="date">교육기간 2026.10.01 ~ 2026.10.31</p>'
+            "</div></li></ul>"
+        )
+        items = crawler._parse_main_cards(BeautifulSoup(card, "html.parser"))
+        assert len(items) == 1
+        assert items[0]["date_field"] == SEIS_CARD_DATE_FIELD
+        announcement = _finalize_periods(
+            "seis", crawler._to_announcement(items[0], "https://www.seis.or.kr")
+        )
+        assert (announcement.period_start, announcement.period_end) == (None, None)
+        assert json.loads(announcement.raw_data)["posted"] == "2026-10-01"
+
+    def test_notice_card_with_a_date_gets_no_provenance(self):
+        """``data-type="공지사항"`` 카드는 출처 표시를 받지 않는다."""
+        crawler = make(SeisCrawler)
+        card = (
+            '<ul><li class="swiper-slide" data-type="공지사항">'
+            '<div class="link"><div class="txt-area">'
+            '<span class="badge cate">공지사항</span>'
+            '<p class="tit"><a href="subPage.do?fncPbofrSn=2">선정결과</a></p>'
+            '</div><p class="date">2026.10.01 ~ 2026.10.31</p>'
+            "</div></li></ul>"
+        )
+        items = crawler._parse_main_cards(BeautifulSoup(card, "html.parser"))
+        assert len(items) == 1
+        assert items[0]["date_field"] == ""
+        announcement = _finalize_periods(
+            "seis", crawler._to_announcement(items[0], "https://www.seis.or.kr")
+        )
+        assert (announcement.period_start, announcement.period_end) == (None, None)
+
+    def test_nested_date_is_not_the_card_field(self):
+        """카드 안이라도 **직속이 아닌** ``p.date`` 는 출처가 아니다."""
+        crawler = make(SeisCrawler)
+        card = (
+            '<ul><li class="swiper-slide" data-type="사업공고">'
+            '<div class="link"><div class="txt-area">'
+            '<p class="tit"><a href="subPage.do?fncPbofrSn=3">공고</a></p>'
+            '<div class="deep"><p class="date">2026.10.01 ~ 2026.10.31</p></div>'
+            "</div></div></li></ul>"
+        )
+        items = crawler._parse_main_cards(BeautifulSoup(card, "html.parser"))
+        assert len(items) == 1
+        assert items[0]["date_field"] == ""
+        assert items[0]["date"] == ""
+
+    @pytest.mark.parametrize("value", [
+        # 의견접수 셀에 심사기간이 붙은 표기 (10차 HIGH 재현)
+        "2026.09.01부터 2026.09.30까지 / 심사기간 2026.10.01 ~ 2026.10.31",
+        "2026.09.01 ~ 2026.09.30 / 심사기간 2026.10.01 ~ 2026.10.31",
+        "의견제출 2026.09.01 ~ 2026.09.30",
+        "2026.09.01 ~ 2026.09.300",
+    ])
+    def test_lawmaking_requires_a_whole_range(self, value):
+        assert lawmaking_period({"period": value}) == (None, None)
+
+
+class TestLegacyPollutionIsNormalised:
+    """10차 MEDIUM - 재수집되지 않은 기존 오염은 알림까지 갔다."""
+
+    @pytest.fixture
+    def db(self, tmp_path):
+        yield Database(db_path=tmp_path / "announcements.db")
+
+    def seed(self, database, source, end, notified=0):
+        database.insert_announcement(
+            AnalyzedAnnouncement(
+                source=source,
+                source_id="1",
+                title="공고",
+                url="https://example.test/1",
+                period_start="2099-01-01",
+                period_end=end,
+                relevance_score=0.9,
+                raw_data="{}",
+                fetched_at=datetime.now().isoformat(),
+            )
+        )
+
+    def test_stale_fowi_period_is_cleared_and_never_notified(self, db):
+        self.seed(db, "fowi", PLANTED)
+        stale = [
+            name for name in COUNCIL_SOURCES_WITHOUT_EXTRACTORS
+            if name not in PERIOD_EXTRACTORS
+        ]
+        assert "fowi" in stale
+
+        before = db.get_unnotified()
+        assert [a.period_end for a in before] == [PLANTED]
+
+        assert db.clear_periods_for_sources(stale) == 1
+        after = db.get_unnotified()
+        assert len(after) == 1
+        assert (after[0].period_start, after[0].period_end) in (
+            (None, None), ("", ""),
+        )
+
+    def test_normalisation_is_idempotent(self, db):
+        self.seed(db, "forest_press", PLANTED)
+        stale = list(COUNCIL_SOURCES_WITHOUT_EXTRACTORS)
+        assert db.clear_periods_for_sources(stale) == 1
+        assert db.clear_periods_for_sources(stale) == 0
+
+    def test_extractor_sources_are_never_touched(self, db):
+        """seis·lawmaking 행은 정규화 대상이 아니다."""
+        self.seed(db, "seis", "2026-09-30")
+        assert db.clear_periods_for_sources(
+            [n for n in COUNCIL_SOURCES_WITHOUT_EXTRACTORS
+             if n not in PERIOD_EXTRACTORS]
+        ) == 0
+        assert db.get_unnotified()[0].period_end == "2026-09-30"
+
+    def test_empty_source_list_is_a_no_op(self, db):
+        self.seed(db, "fowi", PLANTED)
+        assert db.clear_periods_for_sources([]) == 0
+        assert db.clear_periods_for_sources(["", None]) == 0
 
 
 class TestStaleRowsAreOverwritten:

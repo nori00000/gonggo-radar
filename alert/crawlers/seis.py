@@ -151,6 +151,16 @@ class SeisCrawler(BaseCrawler):
             return False
         return any(p.search(href) for p in self.VIEW_LINK_PATTERNS)
 
+    # 구조 근거의 **정확한 셀렉터**: 카드(``li.swiper-slide``) 직속 또는
+    # 그 카드의 ``div.link`` 직속 ``p.date`` 만 접수기간 자리다. 실 HTML은
+    # ``li.swiper-slide > div.link > p.date`` 다 (2026-09-13 실측).
+    CARD_DATE_SELECTOR = ":scope > p.date, :scope > div.link > p.date"
+
+    # 이 카드 종류는 접수기간이 없다 - 사이트가 빈 ``p.date-temp`` 를 쓴다
+    # (픽스처·라이브 12/12 실측). 혹시 ``p.date`` 가 오더라도 D-day 방증이
+    # 없으므로 기간으로 쓰지 않는다.
+    NON_PERIOD_CARD_TYPES = ("공지사항",)
+
     def _parse_main_cards(self, soup: "BeautifulSoup") -> List[dict]:
         """메인 페이지 공고 카드를 파싱한다.
 
@@ -176,7 +186,15 @@ class SeisCrawler(BaseCrawler):
         """
         items: List[dict] = []
 
-        for tit in soup.select("p.tit"):
+        # 10차 게이트 HIGH: 예전에는 ``p.tit`` 전부를 훑고 **임의 부모**를
+        # 카드로 삼았다. 그래서 swiper 카드가 아닌 ``<div>`` 의 ``p.date`` 도
+        # 카드 출처 표시를 받아 기간이 됐다. 이제 **카드부터** 순회하고,
+        # 날짜는 그 카드 직속 자리에서만 읽는다.
+        for card in soup.select("li.swiper-slide"):
+            tit = card.select_one("p.tit")
+            if tit is None:
+                continue
+
             a_tag = tit.find("a", href=True)
             if a_tag is None:
                 continue
@@ -189,17 +207,14 @@ class SeisCrawler(BaseCrawler):
             if not title:
                 continue
 
-            card = tit.find_parent("li") or tit.find_parent("div", class_="link")
-            if card is None:
-                card = tit.parent
-
             badge = card.select_one("span.badge")
             sub = card.select_one("span.sub")
-            date_elem = card.select_one("p.date")
+            date_elem = card.select_one(self.CARD_DATE_SELECTOR)
 
+            card_type = self._clean(card.get("data-type", "") or "")
             category = self._clean(badge.get_text(strip=True)) if badge else ""
             if not category:
-                category = self._clean(card.get("data-type", "") or "")
+                category = card_type
 
             # ul.info 는 **분류**(교육/시설·공간/행사 등)와 회차·D-day가 섞여
             # 들어오는 자리다. 지역으로 오인하면 "교육" 같은 값이 지역이 되어
@@ -234,7 +249,12 @@ class SeisCrawler(BaseCrawler):
                 # ``li.swiper-slide p.date`` 에서 온 값만 접수기간으로 읽는다
                 # (근거는 ``period_extractors.SEIS_CARD_DATE_FIELD`` 주석).
                 "date_label": "",
-                "date_field": SEIS_CARD_DATE_FIELD if date_elem else "",
+                "date_field": (
+                    SEIS_CARD_DATE_FIELD
+                    if date_elem is not None
+                    and card_type not in self.NON_PERIOD_CARD_TYPES
+                    else ""
+                ),
                 "dday": dday,
                 "sub": self._clean(sub.get_text(strip=True)) if sub else "",
                 "info": info_values,

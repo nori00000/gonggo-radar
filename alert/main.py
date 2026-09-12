@@ -132,6 +132,15 @@ def _crawl_single(
 # 기간 관문 (13차) - period_start/period_end 는 **여기서만** 정해진다
 # ---------------------------------------------------------------------------
 
+# 협의회 브리핑이 쓰는 소스 중 **전용 추출기가 없는** 소스. 목록에서 내려간
+# 공고는 재수집되지 않아 관문을 다시 지나지 않으므로, 예전 실행이 심은 기간이
+# 알림까지 살아남았다 (10차 게이트 MEDIUM). 파이프라인 시작에서 한 번
+# 정규화한다 - 이 소스들은 설계상 기간을 만들 수 없어 남은 값은 전부 날조다.
+COUNCIL_SOURCES_WITHOUT_EXTRACTORS = (
+    "fowi", "forest_service", "forest_press", "kofpi", "coop",
+    "socialenterprise",
+)
+
 def _finalize_periods(source: str, item: RawAnnouncement) -> RawAnnouncement:
     """DB 에 닿기 직전 기간 두 필드를 확정한다 - 저장 경로의 단일 관문.
 
@@ -231,6 +240,20 @@ def run_pipeline(test_mode: bool = False) -> None:
 
     # Initialize components
     db = Database()
+
+    # 기존 오염 정규화 (멱등) - 관문 밖에서 심긴 기간을 지운다
+    stale_sources = [
+        name for name in COUNCIL_SOURCES_WITHOUT_EXTRACTORS
+        if name not in PERIOD_EXTRACTORS
+    ]
+    try:
+        cleared = db.clear_periods_for_sources(stale_sources)
+        logger.info(
+            f"기간 정규화: {cleared} 행을 비웠다 "
+            f"(추출기 없는 소스 {len(stale_sources)}개)"
+        )
+    except Exception as e:
+        logger.error(f"기간 정규화 실패: {e}")
     keyword_analyzer = KeywordAnalyzer(db=db)
     claude_analyzer = ClaudeAnalyzer()
     telegram = TelegramNotifier(db=db)
