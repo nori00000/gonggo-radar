@@ -5528,3 +5528,183 @@ def test_notice_log_reports_the_live_approval(tmp_path):
     _code, _drop, message = notify_digest._finish_locked(
         state_path, "2026-W37", None, [3031], [], None)
     assert "없음(검증 필요)" in message       # 진짜 없을 때만 그렇게 적는다
+
+
+# ══ V4 계약 ①②: 보류 좌표 기록 · 옛 미리보기 삭제 ═══════════════════════
+def _delete_stub(monkeypatch, notify_digest, deleted, ok=True):
+    def delete_message(token, chat_id, message_id):
+        deleted.append(message_id)
+        return (True, "") if ok else (False, "Bad Request: message can't be deleted")
+    monkeypatch.setattr(notify_digest, "delete_message", delete_message)
+
+
+def _run_notify(monkeypatch, notify_digest, md, sent=None, message_id=2014):
+    def send_chunk(token, chat, thread, text):
+        if sent is not None:
+            sent.append(text)
+        return True, message_id, ""
+    _notify_stubs(monkeypatch, notify_digest, send_chunk)
+    monkeypatch.setattr(
+        "sys.argv", ["notify_digest.py", str(md), "--db", _db_for(md)])
+    return notify_digest.main()
+
+
+def test_notify_records_hold_ids_as_pin_coordinates(tmp_path, monkeypatch):
+    """미리보기는 `핀 n` 의 좌표(보류 id, 번호 순서)를 함께 기록한다 (계약 ①)."""
+    from scripts import notify_digest
+
+    annotated, _ = apply_headline(SAMPLE_MD, "확정 의견")
+    md = _write_digest(tmp_path, annotated)
+    _delete_stub(monkeypatch, notify_digest, [])
+    assert _run_notify(monkeypatch, notify_digest, md) == 0
+
+    state = state_mod.load_state(
+        state_mod.state_path_for_markdown(md), "2026-W37")
+    # SAMPLE_MD 의 보류 주석은 한 건(id=12)이다
+    assert state["preview_holds"] == {"2014": [12]}
+    assert state_mod.preview_hold_ids(state) == [12]
+
+
+def test_notify_hold_ids_are_none_without_ids(tmp_path):
+    """id 없는 구버전 보류 주석이면 좌표를 만들지 않는다 (fail-closed)."""
+    from scripts import notify_digest
+
+    body = SAMPLE_MD.replace(" | id=12 -->", " -->")
+    assert notify_digest._hold_ids(body, None) is None
+    assert notify_digest._hold_ids(SAMPLE_MD, None) == [12]
+
+
+def test_notify_deletes_previous_preview_and_notice(tmp_path, monkeypatch):
+    """새 미리보기가 도착하면 옛 미리보기·안내를 지운다 (계약 ②)."""
+    from scripts import notify_digest
+
+    annotated, _ = apply_headline(SAMPLE_MD, "확정 의견")
+    md = _write_digest(tmp_path, annotated)
+    state_path = state_mod.state_path_for_markdown(md)
+    state_mod.save_state(state_path, dict(
+        state_mod.default_state("2026-W37"),
+        preview_message_ids=[1000],
+        preview_items={"1000": []},
+        notice_message_ids=[1001]))
+
+    deleted = []
+    _delete_stub(monkeypatch, notify_digest, deleted)
+    assert _run_notify(monkeypatch, notify_digest, md) == 0
+
+    assert deleted == [1000, 1001]
+    state = state_mod.load_state(state_path, "2026-W37")
+    assert state["superseded_message_ids"] == [1000, 1001]
+    assert state["preview_message_ids"] == [2014]       # 새 좌표만 남는다
+
+
+def test_notify_delete_failure_does_not_stop_preview(tmp_path, monkeypatch):
+    """삭제 실패는 진행을 막지 않는다 — 다만 무엇을 밀어냈는지는 기록한다 (계약 ②)."""
+    from scripts import notify_digest
+
+    annotated, _ = apply_headline(SAMPLE_MD, "확정 의견")
+    md = _write_digest(tmp_path, annotated)
+    state_path = state_mod.state_path_for_markdown(md)
+    state_mod.save_state(state_path, dict(
+        state_mod.default_state("2026-W37"), preview_message_ids=[1000]))
+
+    deleted = []
+    _delete_stub(monkeypatch, notify_digest, deleted, ok=False)
+    assert _run_notify(monkeypatch, notify_digest, md) == 0
+    assert deleted == [1000]
+    state = state_mod.load_state(state_path, "2026-W37")
+    assert state["superseded_message_ids"] == [1000]
+    assert state_mod.approval_of(state)["id"]           # 승인은 정상 발급
+
+
+def test_notify_block_notice_keeps_previous_preview(tmp_path, monkeypatch):
+    """차단 안내는 **안내만** 밀어낸다 — 미리보기를 지우면 번호 좌표가 사라진다."""
+    from scripts import notify_digest
+
+    annotated, _ = apply_headline(SAMPLE_MD, "확정 의견")
+    md = _write_digest(tmp_path, annotated,
+                       dict(PASS_CHECK, **{"pass": False, "reason": "생존 항목 없음"}))
+    state_path = state_mod.state_path_for_markdown(md)
+    state_mod.save_state(state_path, dict(
+        state_mod.default_state("2026-W37"),
+        preview_message_ids=[1000],
+        preview_items={"1000": ["https://example.com/a"]},
+        notice_message_ids=[1001]))
+
+    deleted = []
+    _delete_stub(monkeypatch, notify_digest, deleted)
+    assert _run_notify(monkeypatch, notify_digest, md, message_id=2020) == 0
+
+    assert deleted == [1001]                            # 안내만 지웠다
+    state = state_mod.load_state(state_path, "2026-W37")
+    assert state["preview_message_ids"] == [1000]       # 좌표는 그대로
+    assert state["preview_items"]["1000"] == ["https://example.com/a"]
+    assert state["notice_message_ids"] == [2020]
+
+
+def test_notify_keeps_old_preview_when_send_fails(tmp_path, monkeypatch):
+    """전송이 깨지면 아무것도 지우지 않는다 — 편집자 화면을 비워 두지 않는다."""
+    from scripts import notify_digest
+
+    annotated, _ = apply_headline(SAMPLE_MD, "확정 의견")
+    md = _write_digest(tmp_path, annotated)
+    state_path = state_mod.state_path_for_markdown(md)
+    state_mod.save_state(state_path, dict(
+        state_mod.default_state("2026-W37"), preview_message_ids=[1000]))
+
+    deleted = []
+    _delete_stub(monkeypatch, notify_digest, deleted)
+    _notify_stubs(monkeypatch, notify_digest,
+                  lambda token, chat, thread, text: (False, None, "API 실패"))
+    monkeypatch.setattr(
+        "sys.argv", ["notify_digest.py", str(md), "--db", _db_for(md)])
+    assert notify_digest.main() == 2
+
+    assert deleted == []                    # 옛 미리보기는 텔레그램에 그대로 남는다
+    state = state_mod.load_state(state_path, "2026-W37")
+    assert state["approval"] is None        # 실패한 회차의 승인은 폐기된다
+    # 번호 좌표는 승인 초안 발급(잠금 ①) 때 이미 비워졌다 — 기존 동작이며
+    # fail-closed 다: 옛 미리보기에 답장한 `제외 n`·`핀 n` 은 "최신 미리보기에
+    # 답장하세요" 로 거부된다. 지우지 않는 이유는 화면을 비우지 않기 위해서다.
+    assert state["preview_message_ids"] == []
+
+
+# ══ V4 계약 ③: 상태 스키마 (승격) ═════════════════════════════════════
+def test_pinned_ids_roundtrip(tmp_path):
+    path = tmp_path / "2026-W37.state.json"
+    state = state_mod.add_pinned_ids(state_mod.default_state("2026-W37"),
+                                     [11, 12, 11])
+    state_mod.save_state(path, state)
+    loaded = state_mod.load_state(path, "2026-W37")
+    assert state_mod.pinned_ids(loaded) == [11, 12]
+    assert state_mod.pinned_ids(state_mod.drop_pinned_ids(loaded, [11])) == [12]
+
+
+@pytest.mark.parametrize("status", ["sending", "sent"])
+def test_pin_refused_while_frozen(status):
+    """발송 중·완료 주차는 승격도 거부한다 (제외와 같은 규율)."""
+    with pytest.raises(state_mod.TransitionError):
+        state_mod.add_pinned_ids(
+            dict(state_mod.default_state("2026-W37"), status=status), [11])
+
+
+@pytest.mark.parametrize("broken", [
+    {"pinned_ids": {}},
+    {"preview_holds": []},
+    {"superseded_message_ids": "1,2"},
+])
+def test_new_state_keys_are_type_checked(tmp_path, broken):
+    """손상된 새 키는 조용히 넘어가지 않는다 (fail-closed)."""
+    path = tmp_path / "2026-W37.state.json"
+    payload = dict(state_mod.default_state("2026-W37"), **broken)
+    path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+    with pytest.raises(state_mod.StateError):
+        state_mod.load_state(path, "2026-W37")
+
+
+def test_superseded_history_is_bounded():
+    """이력은 무한히 자라지 않는다 (상태 파일이 커지면 잠금 구간이 길어진다)."""
+    state = state_mod.default_state("2026-W37")
+    state = state_mod.record_superseded(
+        state, range(state_mod.SUPERSEDED_MAX + 10))
+    assert len(state["superseded_message_ids"]) == state_mod.SUPERSEDED_MAX
+    assert state["superseded_message_ids"][-1] == state_mod.SUPERSEDED_MAX + 9

@@ -136,6 +136,20 @@ def send_chunk(token, chat_id, thread_id, text):
     return True, result.get("message_id"), ""
 
 
+def delete_message(token, chat_id, message_id):
+    """옛 미리보기·안내 삭제 (V4 계약 ②). 반환: (ok, 오류요지).
+
+    실패해도 호출자는 진행한다 — 텔레그램은 48시간이 지난 메시지나 권한이 없는
+    메시지의 삭제를 거부한다. 지우지 못한 사실은 상태(`superseded_message_ids`)에
+    남으므로, "왜 옛 미리보기가 아직 있나" 를 사후에 설명할 수 있다.
+    """
+    ok, _, error = _post(token, "deleteMessage", {
+        "chat_id": chat_id,
+        "message_id": message_id,
+    })
+    return ok, error
+
+
 def clear_card(token, chat_id, message_id):
     """이전 승인 카드의 버튼 제거 (계약 W10 크리틱 #6). 실패는 경고만."""
     ok, _, error = _post(token, "editMessageReplyMarkup", {
@@ -229,6 +243,20 @@ def _blocking_reason(markdown_path, week, check, current_sha, markdown_text,
 
 
 
+def _hold_ids(markdown_text, item_sections):
+    """발송본 보류 주석의 공고 id (번호 순서) — `핀 n` 의 좌표 (V4 계약 ①).
+
+    id 가 없는 구버전 주석은 **번호 자리를 지키려고** None 이 아니라 0 으로 둔다면
+    엉뚱한 항목을 승격시킨다. 그래서 id 가 하나라도 없으면 좌표 자체를 포기하고
+    (None) 봇이 현재 본문을 직접 파싱하는 길로 떨어진다(fail-closed).
+    """
+    holds = preview_mod.parse_digest(markdown_text, item_sections)["holds"]
+    ids = [hold.get("id") for hold in holds]
+    if any(value is None for value in ids):
+        return None
+    return [int(value) for value in ids]
+
+
 def _manifest_item_urls(markdown_path):
     """항목 정본(items.json)이 정한 번호 순서의 URL 목록. 정본이 없으면 None."""
     manifest = load_items_manifest(markdown_path)
@@ -308,6 +336,9 @@ def main():
 
     prepared = None
     stale_card = None
+    stale_previews = []
+    stale_notices = []
+    hold_ids = None
     try:
         if not markdown_path.exists():
             _err(f"✗ 파일 없음: {markdown_path}")
@@ -337,6 +368,7 @@ def main():
             ).format(week, blocked)
             chunks = [body]
             item_urls = []
+            hold_ids = None
         else:
             item_sections, _ = sections_mod.resolve(check, markdown_text)
             body = preview_mod.render_preview(week, markdown_text, check)
@@ -346,6 +378,7 @@ def main():
             item_urls = _manifest_item_urls(markdown_path)
             if item_urls is None:
                 item_urls = preview_mod.item_urls(markdown_text, item_sections)
+            hold_ids = _hold_ids(markdown_text, item_sections)
 
         if args.dry_run:
             _out(f"[DRY-RUN] {week} 미리보기 {len(chunks)}개 메시지")
@@ -361,6 +394,15 @@ def main():
             return 2
         # 이전 승인 카드의 message_id — 버튼 제거는 잠금 밖에서 한다.
         stale_card = state_mod.card_message_id(current)
+        # V4 계약 ②: 이번 전송이 밀어낼 옛 메시지들. 삭제는 **새 메시지를 보낸
+        # 뒤에** 잠금 밖에서 한다 — 먼저 지우면 전송이 깨졌을 때 편집자에게
+        # 아무것도 남지 않는다.
+        stale_previews = [
+            int(mid) for mid in (current.get("preview_message_ids") or [])
+        ]
+        stale_notices = [
+            int(mid) for mid in (current.get("notice_message_ids") or [])
+        ]
 
         if blocked:
             # 차단이면 옛 승인을 **먼저 폐기한다** (사이클7 #2 규율). 못 지우면
@@ -379,7 +421,8 @@ def main():
                 drafted = state_mod.update_state_locked(
                     state_path, week,
                     lambda cur: state_mod.record_preview(
-                        cur, [], item_urls, current_sha, current_check_sha),
+                        cur, [], item_urls, current_sha, current_check_sha,
+                        hold_ids),
                 )
             except (state_mod.StateError, state_mod.TransitionError,
                     OSError) as exc:
@@ -408,6 +451,18 @@ def main():
         message_ids.append(message_id)
         _out(f"✓ 전송 {index}/{len(chunks)} message_id={message_id}")
 
+    # V4 계약 ②: 새 메시지가 실제로 도착한 뒤에만 옛 것을 지운다.
+    # 차단 안내는 **안내만** 밀어낸다 — 미리보기를 지우면 `제외 n`·`핀 n` 의 번호
+    # 좌표가 편집자 화면에서 사라진다(승인이 폐기돼도 좌표는 남아 있어야 한다).
+    superseded = []
+    if message_ids:
+        superseded = (stale_previews + stale_notices) if prepared is not None \
+            else list(stale_notices)
+        for stale in superseded:
+            ok, error = delete_message(token, chat_id, stale)
+            if not ok:
+                _err(f"⚠️  옛 메시지 삭제 실패(진행함) message_id={stale}: {error}")
+
     # ── 잠금 ②: 준비 시점의 세대가 그대로일 때만 message_id 를 기록한다 ──
     try:
         handle = state_mod.acquire_lock(lock_path, blocking=True)
@@ -417,7 +472,8 @@ def main():
 
     try:
         rc, drop_card, message = _finish_locked(
-            state_path, week, prepared, message_ids, item_urls, send_error)
+            state_path, week, prepared, message_ids, item_urls, send_error,
+            hold_ids, superseded)
     finally:
         state_mod.release_lock(handle)
 
@@ -432,7 +488,7 @@ def main():
 
 
 def _finish_locked(state_path, week, prepared, message_ids, item_urls,
-                   send_error):
+                   send_error, hold_ids=None, superseded=()):
     """잠금 ② — **파일 IO 만** 한다. (종료 코드, 회수할 카드 id, 안내문).
 
     준비 시점(잠금 ①)에 발급한 승인 세대가 그대로일 때만 message_id 를 붙인다.
@@ -453,7 +509,9 @@ def _finish_locked(state_path, week, prepared, message_ids, item_urls,
         try:
             state_mod.update_state_locked(
                 state_path, week,
-                lambda cur: state_mod.record_notice_messages(cur, message_ids),
+                lambda cur: state_mod.record_superseded(
+                    state_mod.record_notice_messages(cur, message_ids),
+                    superseded),
             )
         except (state_mod.StateError, state_mod.TransitionError,
                 OSError) as exc:
@@ -496,8 +554,10 @@ def _finish_locked(state_path, week, prepared, message_ids, item_urls,
     try:
         state_mod.update_state_locked(
             state_path, week,
-            lambda cur: state_mod.record_preview_messages(
-                cur, message_ids, item_urls),
+            lambda cur: state_mod.record_superseded(
+                state_mod.record_preview_messages(
+                    cur, message_ids, item_urls, hold_ids),
+                superseded),
         )
     except (state_mod.StateError, state_mod.TransitionError, OSError) as exc:
         return 1, None, f"⚠️  상태 기록 실패(미리보기는 전송됨): {redact(exc)}"
