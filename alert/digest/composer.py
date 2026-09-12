@@ -1,10 +1,11 @@
 """협의회 주간 정책브리핑 다이제스트 생성기."""
 
+import csv
 import sqlite3
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Optional, List, Dict, Tuple
-import csv
+import re
 
 
 def get_week_date_range(week_str: str) -> Tuple[str, str]:
@@ -27,6 +28,18 @@ def get_week_date_range(week_str: str) -> Tuple[str, str]:
     week_end = week_start + timedelta(days=6)
 
     return week_start.strftime("%Y-%m-%d"), week_end.strftime("%Y-%m-%d")
+
+
+def normalize_title(title: str) -> str:
+    """제목 정규화: 공백 정규화 (개행·탭 제거).
+
+    Args:
+        title: 원본 제목
+
+    Returns:
+        정규화된 제목
+    """
+    return " ".join(title.split())
 
 
 def categorize_item(source: str, title: str) -> str:
@@ -57,37 +70,48 @@ def categorize_item(source: str, title: str) -> str:
         return "지원사업"
 
 
-def load_form_responses(forms_csv_path: Optional[Path] = None) -> Dict[str, List[str]]:
-    """forms/responses.csv에서 회원사 동정 정보 로드.
+def load_form_responses(forms_csv_path: Optional[Path] = None) -> Tuple[Dict[str, List[str]], List[str]]:
+    """forms/responses.csv에서 회원사 동정과 의견 정보 로드.
 
     Args:
         forms_csv_path: CSV 파일 경로. None이면 forms/responses.csv 시도
 
     Returns:
-        {"회원사명": ["동정내용", ...]} 형태의 딕셔너리
+        ({"회원사명": ["동정내용", ...]}, ["의견1", "의견2", ...]) 튜플
     """
     if forms_csv_path is None:
         forms_csv_path = Path("forms/responses.csv")
 
     responses = {}
+    opinions = []
+
     if not forms_csv_path.exists():
-        return responses
+        return responses, opinions
 
     try:
-        with open(forms_csv_path, "r", encoding="utf-8") as f:
+        with open(forms_csv_path, "r", encoding="utf-8-sig") as f:
             reader = csv.DictReader(f)
             for row in reader:
-                if row and "회원사" in row and "내용" in row:
-                    company = row["회원사"].strip()
-                    content = row["내용"].strip()
-                    if company and content:
-                        if company not in responses:
-                            responses[company] = []
-                        responses[company].append(content)
+                if not row:
+                    continue
+
+                item_type = row.get("유형", "").strip()
+                content = row.get("내용", "").strip()
+                company = row.get("회원사", "").strip()
+
+                if not content:
+                    continue
+
+                if item_type == "동정" and company:
+                    if company not in responses:
+                        responses[company] = []
+                    responses[company].append(content)
+                elif item_type == "의견":
+                    opinions.append(content)
     except Exception as e:
         print(f"Warning: 회원사 동정 로드 실패: {e}")
 
-    return responses
+    return responses, opinions
 
 
 def compose_digest(
@@ -95,14 +119,16 @@ def compose_digest(
     week_str: Optional[str] = None,
     limit: int = 5,
     output_path: Optional[Path] = None,
+    forms_csv_path: Optional[Path] = None,
 ) -> str:
     """주간 정책브리핑 다이제스트 마크다운 생성.
 
     Args:
         db_path: announcements.db 경로
         week_str: ISO 주 표기 (기본: 현재 주, 예: "2026-W13")
-        limit: 최대 항목 수 (기본: 5)
+        limit: 지원사업 공고 최대 항목 수 (기본: 5)
         output_path: 출력 파일 경로. None이면 반환값만 사용
+        forms_csv_path: 폼 CSV 경로
 
     Returns:
         생성된 마크다운 텍스트
@@ -120,18 +146,16 @@ def compose_digest(
     conn = sqlite3.connect(db_path)
     cursor = conn.cursor()
 
-    # 최근 7일(week_end 기준)의 항목 조회
-    seven_days_ago = datetime.fromisoformat(week_end).date() - timedelta(days=6)
-
+    # 주간 창 내의 항목 조회 (양끝 포함)
     cursor.execute(
         """
         SELECT id, source, title, summary, url, author, period_end, relevance_score
         FROM announcements
-        WHERE DATE(created_at) >= ?
+        WHERE DATE(created_at) >= ? AND DATE(created_at) <= ?
         ORDER BY relevance_score DESC
         LIMIT ?
         """,
-        (seven_days_ago.isoformat(), limit * 2)  # 버퍼로 2배 조회
+        (week_start, week_end, limit * 10)  # 버퍼로 10배 조회
     )
 
     rows = cursor.fetchall()
@@ -144,19 +168,31 @@ def compose_digest(
         "사회연대경제": [],
     }
 
+    # 중복 제거를 위해 정규화된 제목 추적
+    seen_normalized_titles = set()
+
     for row in rows:
         item_id, source, title, summary, url, author, period_end, score = row
         category = categorize_item(source, title)
 
-        # 섹션별 항목 수 제한 (limit 합산)
-        total_items = sum(len(v) for v in sections.values())
-        if total_items >= limit:
-            break
+        # 제목 정규화
+        normalized_title = normalize_title(title)
+
+        # 중복 확인
+        if normalized_title in seen_normalized_titles:
+            continue
+        seen_normalized_titles.add(normalized_title)
+
+        # 섹션별 항목 수 제한
+        section_limit = 5 if category == "지원사업" else 3
+
+        if len(sections[category]) >= section_limit:
+            continue
 
         sections[category].append({
             "id": item_id,
             "source": source,
-            "title": title,
+            "title": normalized_title,
             "summary": summary or "",
             "url": url,
             "author": author or "",
@@ -164,18 +200,17 @@ def compose_digest(
             "score": score,
         })
 
-    # 회원사 동정 로드
-    form_responses = load_form_responses()
+    # 회원사 동정 및 의견 로드
+    form_responses, opinions = load_form_responses(forms_csv_path)
 
     # 마크다운 생성
     lines = [
-        f"<!-- generated by alert.digest.composer at {datetime.now().isoformat()} -->",
-        f"<!-- lane: Codex(gpt-5.6) -->",
+        "<!-- lane: Codex(gpt-5.6) -->",
         "",
         f"# 협의회 주간 정책브리핑 {week_str}",
-        f"",
+        "",
         f"**기간:** {week_start} ~ {week_end}",
-        f"",
+        "",
     ]
 
     # 산림 정책 동향
@@ -239,6 +274,24 @@ def compose_digest(
         with open(output_path, "w", encoding="utf-8") as f:
             f.write(markdown)
 
+    # 의견 파일 저장 (별도)
+    if opinions and output_path:
+        opinions_path = output_path.with_name(
+            output_path.name.replace(".md", ".opinions.md")
+        )
+        opinions_lines = [
+            "<!-- lane: Codex(gpt-5.6) -->",
+            "",
+            f"# 협의회 의견 {week_str}",
+            "",
+        ]
+        for opinion in opinions:
+            opinions_lines.append(f"- {opinion}")
+            opinions_lines.append("")
+
+        with open(opinions_path, "w", encoding="utf-8") as f:
+            f.write("\n".join(opinions_lines))
+
     return markdown
 
 
@@ -256,15 +309,23 @@ def _format_item(item: Dict) -> List[str]:
     lines.append("")
     lines.append(f"**기관:** {item['author']}")
 
+    # 마감일 (없으면 명시)
     if item['period_end']:
         lines.append(f"**마감:** {item['period_end']}")
+    else:
+        lines.append("**마감:** 미정")
 
     lines.append(f"**원문:** [{item['url']}]({item['url']})")
     lines.append("")
 
-    # 요약 (최대 3줄)
+    # 요약 (최대 3줄, 없으면 명시)
     if item['summary']:
         summary = item['summary'].strip()
-        lines.append(f"{summary}")
+        # 최대 3줄로 절단
+        summary_lines = summary.split("\n")[:3]
+        summary = "\n".join(summary_lines)
+        lines.append(summary)
+    else:
+        lines.append("*(요약 없음)*")
 
     return lines

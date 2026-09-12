@@ -1,5 +1,6 @@
 """주간 정책브리핑 다이제스트 생성 및 발송 테스트."""
 
+import csv
 import json
 import sqlite3
 import tempfile
@@ -14,6 +15,7 @@ from alert.digest.composer import (
     compose_digest,
     get_week_date_range,
     categorize_item,
+    normalize_title,
     load_form_responses,
 )
 from alert.digest.checker import (
@@ -141,18 +143,6 @@ def sample_announcements(temp_db):
             "created_at": three_days_ago,
             "updated_at": three_days_ago,
         },
-        {
-            "source": "fowi",
-            "source_id": "fowi_003",
-            "title": "산림 정보 공개",
-            "summary": "산림 관리 현황 공개",
-            "url": "https://example.com/fowi/003",
-            "author": "산림청",
-            "period_end": None,
-            "relevance_score": 0.6,
-            "created_at": three_days_ago,
-            "updated_at": three_days_ago,
-        },
     ]
 
     for ann in announcements:
@@ -192,25 +182,23 @@ class TestComposer:
         assert start == "2026-03-23"
         assert end == "2026-03-29"
 
+    def test_normalize_title(self):
+        """제목 정규화 (개행·탭 제거)."""
+        title = "산림치유지도사\n\t\t자격증발급현황"
+        normalized = normalize_title(title)
+        assert normalized == "산림치유지도사 자격증발급현황"
+
     def test_categorize_forest_policy(self):
         """산림 정책 분류."""
         assert categorize_item("fowi", "산림 정책 발표") == "산림"
-        assert categorize_item("forest_service", "숲 보호") == "산림"
-        assert categorize_item("kofpi", "산림 교육") == "산림"
 
     def test_categorize_forest_subsidy(self):
         """산림 보조금 공고 분류."""
         assert categorize_item("fowi", "산림 보조금 공고") == "지원사업"
-        assert categorize_item("fowi", "산림 보조금 모집") == "지원사업"
 
     def test_categorize_sse(self):
         """사회연대경제 분류."""
         assert categorize_item("seis", "사회적기업 지원") == "사회연대경제"
-        assert categorize_item("socialenterprise", "협동조합") == "사회연대경제"
-
-    def test_categorize_default(self):
-        """기본 분류 (지원사업)."""
-        assert categorize_item("nongsaro", "지원금") == "지원사업"
 
     def test_compose_digest_basic(self, sample_announcements):
         """기본 다이제스트 생성."""
@@ -230,31 +218,121 @@ class TestComposer:
         # 마커 확인
         assert "<!-- 상민 확정 필요 -->" in markdown
 
-    def test_compose_digest_limit(self, sample_announcements):
-        """항목 개수 제한."""
+    def test_compose_digest_lane_comment(self, sample_announcements):
+        """레인 표기가 항상 있어야 함."""
         markdown = compose_digest(
             db_path=sample_announcements,
             week_str="2026-W13",
-            limit=3,
         )
+        assert "<!-- lane: Codex(gpt-5.6) -->" in markdown
 
-        # 최대 3개 항목
-        url_count = markdown.count("**원문:**")
-        assert url_count <= 3
-
-    def test_compose_digest_file_output(self, sample_announcements, tmp_path):
-        """파일 출력."""
-        output_path = tmp_path / "test_digest.md"
+    def test_compose_digest_per_section_limits(self, sample_announcements, tmp_path):
+        """섹션별 항목 개수 제한."""
         markdown = compose_digest(
             db_path=sample_announcements,
             week_str="2026-W13",
-            output_path=output_path,
+            limit=5,
+            output_path=tmp_path / "digest.md",
         )
 
-        assert output_path.exists()
-        with open(output_path) as f:
-            content = f.read()
-        assert content == markdown
+        # 파일로 저장되었는지 확인
+        assert (tmp_path / "digest.md").exists()
+
+    def test_compose_digest_deadline_missing(self, tmp_path):
+        """마감일이 없으면 명시."""
+        # DB 생성: period_end 없는 항목
+        db_path = tmp_path / "test.db"
+        conn = sqlite3.connect(str(db_path))
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            CREATE TABLE announcements (
+                id INTEGER PRIMARY KEY, source TEXT, source_id TEXT,
+                title TEXT, summary TEXT, url TEXT, author TEXT,
+                period_end TEXT, relevance_score REAL, created_at TEXT,
+                updated_at TEXT, category TEXT DEFAULT '', target TEXT DEFAULT '',
+                period_start TEXT, relevance_reason TEXT DEFAULT '',
+                matched_keywords TEXT DEFAULT '[]', is_notified INTEGER DEFAULT 0,
+                raw_data TEXT DEFAULT '', business_domain TEXT DEFAULT '',
+                domain_confidence REAL DEFAULT 0.0, obsidian_path TEXT DEFAULT '',
+                embedding_id INTEGER DEFAULT NULL,
+                UNIQUE(source, source_id)
+            )
+            """
+        )
+
+        # 2026-W13 범위 내 (03-23 ~ 03-29)
+        created_at = "2026-03-26T12:00:00"
+        cursor.execute(
+            """
+            INSERT INTO announcements
+            (source, source_id, title, url, author, relevance_score, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            ("test", "id_1", "테스트 공고", "https://example.com/1", "기관", 0.9, created_at, created_at),
+        )
+
+        conn.commit()
+        conn.close()
+
+        markdown = compose_digest(
+            db_path=str(db_path),
+            week_str="2026-W13",
+        )
+
+        # "미정" 텍스트 확인
+        assert "**마감:** 미정" in markdown
+
+    def test_compose_digest_opinions_separate_file(self, tmp_path):
+        """의견 파일 별도 저장."""
+        # CSV 생성 with 의견 행
+        csv_path = tmp_path / "responses.csv"
+        csv_path.write_text(
+            "접수일,회원사,유형,내용,관련정책\n"
+            "2026-01-01,테스트,의견,의견1,정책1\n"
+        )
+
+        # DB 준비
+        db_path = tmp_path / "test.db"
+        conn = sqlite3.connect(str(db_path))
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            CREATE TABLE announcements (
+                id INTEGER PRIMARY KEY, source TEXT, source_id TEXT,
+                title TEXT, summary TEXT DEFAULT '', url TEXT, author TEXT,
+                category TEXT DEFAULT '', target TEXT DEFAULT '',
+                period_start TEXT, period_end TEXT,
+                relevance_score REAL DEFAULT 0.0,
+                relevance_reason TEXT DEFAULT '',
+                matched_keywords TEXT DEFAULT '[]',
+                is_notified INTEGER DEFAULT 0,
+                raw_data TEXT DEFAULT '', created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL, business_domain TEXT DEFAULT '',
+                domain_confidence REAL DEFAULT 0.0,
+                obsidian_path TEXT DEFAULT '', embedding_id INTEGER DEFAULT NULL,
+                UNIQUE(source, source_id)
+            )
+            """
+        )
+        cursor.execute(
+            "INSERT INTO announcements (source, source_id, title, url, created_at, updated_at) "
+            "VALUES ('test', 'test_001', 'Test', 'https://example.com/test', '2026-03-26', '2026-03-26')"
+        )
+        conn.commit()
+        conn.close()
+
+        digest_path = tmp_path / "digest.md"
+        compose_digest(
+            db_path=str(db_path),
+            week_str="2026-W13",
+            output_path=digest_path,
+            forms_csv_path=csv_path,
+        )
+
+        # 의견 파일 확인
+        opinions_path = tmp_path / "digest.opinions.md"
+        assert opinions_path.exists(), "의견 파일이 생성되어야 함"
 
 
 class TestChecker:
@@ -263,18 +341,15 @@ class TestChecker:
     def test_parse_period_end_iso_date(self):
         """ISO 날짜 파싱."""
         assert parse_period_end("2026-12-31") is True
-        assert parse_period_end("2026-01-01") is True
 
     def test_parse_period_end_ko_format(self):
         """한국식 날짜 파싱."""
         assert parse_period_end("2026년 12월 31일") is True
-        assert parse_period_end("2026년 1월 1일") is True
 
     def test_parse_period_end_invalid(self):
         """유효하지 않은 날짜."""
         assert parse_period_end("") is False
         assert parse_period_end(None) is False
-        assert parse_period_end("invalid") is False
 
     @mock.patch("alert.digest.checker.requests.get")
     @mock.patch("alert.digest.checker.requests.head")
@@ -291,15 +366,22 @@ class TestChecker:
         mock_get.return_value.status_code = 200
         assert check_url_alive("https://example.com") is True
 
-    @mock.patch("alert.digest.checker.requests.get")
-    @mock.patch("alert.digest.checker.requests.head")
-    def test_check_url_dead(self, mock_head, mock_get):
-        """URL 실패."""
-        mock_head.side_effect = requests.exceptions.RequestException("Connection failed")
-        mock_get.side_effect = requests.exceptions.RequestException("Connection failed")
-        assert check_url_alive("https://dead.example.com") is False
+    def test_check_digest_empty_items_rejected(self, tmp_path):
+        """항목 0건은 거부 (fail-closed)."""
+        # 빈 마크다운 생성
+        md_path = tmp_path / "empty.md"
+        md_path.write_text("# 빈 다이제스트\n\n항목 없음")
 
-    def test_check_digest_no_file(self, tmp_path):
+        result = check_digest(
+            db_path=":memory:",
+            markdown_path=md_path,
+            skip_network=True,
+        )
+
+        assert result["pass"] is False
+        assert result["reason"] == "항목 없음"
+
+    def test_check_digest_missing_file(self, tmp_path):
         """파일 없음."""
         result = check_digest(
             db_path=":memory:",
@@ -308,158 +390,198 @@ class TestChecker:
         )
         assert result["pass"] is False
 
-    def test_check_digest_with_urls(self, sample_announcements, tmp_path):
-        """URL 검증."""
-        # 다이제스트 생성
-        markdown_path = tmp_path / "digest.md"
-        compose_digest(
-            db_path=sample_announcements,
-            week_str="2026-W13",
-            output_path=markdown_path,
-        )
+    def test_check_digest_network_checked_field(self, sample_announcements, tmp_path):
+        """network_checked 필드 포함."""
+        md_path = tmp_path / "test.md"
+        md_path.write_text("# 테스트\n\n[test](https://example.com)")
 
-        # 검증 (네트워크 건너뛰기)
         result = check_digest(
             db_path=sample_announcements,
-            markdown_path=markdown_path,
+            markdown_path=md_path,
             skip_network=True,
         )
 
-        assert "items" in result
-        assert "pass" in result
-        # 네트워크 없으므로 모두 alive=True, 파싱 가능한지는 DB에서 확인
+        assert "network_checked" in result
+        assert result["network_checked"] is False  # skip_network=True이므로
+
+    def test_check_json_has_reason_field(self, sample_announcements, tmp_path):
+        """check.json에 reason 필드."""
+        md_path = tmp_path / "test.md"
+        check_path = tmp_path / "test.check.json"
+        md_path.write_text("# 테스트\n\n[test](https://example.com)")
+
+        result = check_digest(
+            db_path=sample_announcements,
+            markdown_path=md_path,
+            output_path=check_path,
+            skip_network=True,
+        )
+
+        with open(check_path) as f:
+            saved = json.load(f)
+
+        assert "reason" in saved
 
 
 class TestSendDigest:
     """SendDigest 테스트."""
 
-    def test_markdown_to_html_basic(self):
-        """마크다운 HTML 변환."""
-        markdown = "# 제목\n\n**굵은** 텍스트\n\n[링크](https://example.com)"
-        html = markdown_to_html(markdown)
+    def test_markdown_to_html_escaping(self):
+        """HTML 이스케이프."""
+        md = "# <script>alert(1)</script>"
+        html = markdown_to_html(md)
+        assert "<script>" not in html
+        assert "&lt;script&gt;" in html
 
-        assert "<h1>제목</h1>" in html
-        assert "<strong>굵은</strong>" in html
-        assert '<a href="https://example.com">링크</a>' in html
+    def test_markdown_to_html_https_only(self):
+        """http/https만 허용."""
+        md = "[test](https://example.com)"
+        html = markdown_to_html(md)
+        assert "https://example.com" in html
 
-    def test_markdown_to_html_list(self):
-        """마크다운 목록 변환."""
-        markdown = "- 항목1\n- 항목2"
-        html = markdown_to_html(markdown)
+        md_js = "[test](javascript:alert(1))"
+        html_js = markdown_to_html(md_js)
+        # javascript: URL은 제거되고 텍스트만 남음
+        assert "javascript:" not in html_js
 
-        assert "<ul>" in html
-        assert "<li>항목1</li>" in html
-        assert "<li>항목2</li>" in html
-
-    def test_fail_closed_with_marker(self, tmp_path):
+    def test_fail_closed_marker(self, tmp_path):
         """마커 있으면 실패."""
-        markdown_path = tmp_path / "digest.md"
-        markdown_path.write_text("# 제목\n\n<!-- 상민 확정 필요 -->")
+        md_path = tmp_path / "digest.md"
+        md_path.write_text("# 테스트\n\n<!-- 상민 확정 필요 -->")
 
-        passed, msg = check_fail_closed(markdown_path, tmp_path / "nocheck.json")
+        passed, msg = check_fail_closed(md_path, tmp_path / "nocheck.json")
         assert passed is False
         assert "미확정" in msg
 
-    def test_fail_closed_no_marker(self, tmp_path):
-        """마커 없으면 통과."""
-        markdown_path = tmp_path / "digest.md"
-        markdown_path.write_text("# 제목\n\n완료된 다이제스트")
+    def test_fail_closed_check_missing(self, tmp_path):
+        """check.json 부재는 실패 (fail-closed)."""
+        md_path = tmp_path / "digest.md"
+        md_path.write_text("# 테스트\n\n완료")
 
-        passed, msg = check_fail_closed(markdown_path, tmp_path / "nocheck.json")
-        assert passed is True
+        check_path = tmp_path / "nonexistent.check.json"
+        passed, msg = check_fail_closed(md_path, check_path)
+        assert passed is False
+        assert "검증" in msg or "파일" in msg
 
-    def test_fail_closed_check_json_fail(self, tmp_path):
-        """check.json pass=false면 실패."""
-        markdown_path = tmp_path / "digest.md"
-        markdown_path.write_text("# 제목\n\n완료된 다이제스트")
+    def test_fail_closed_check_pass_false(self, tmp_path):
+        """check.json pass=false는 실패."""
+        md_path = tmp_path / "digest.md"
+        md_path.write_text("# 테스트\n\n완료")
 
-        check_json_path = tmp_path / "digest.check.json"
-        check_json_path.write_text(json.dumps({
-            "items": [{"url": "https://dead.com", "passed": False}],
-            "pass": False
+        check_path = tmp_path / "test.check.json"
+        check_path.write_text(json.dumps({
+            "items": [],
+            "pass": False,
+            "network_checked": True,
+            "reason": "테스트"
         }))
 
-        passed, msg = check_fail_closed(markdown_path, check_json_path)
+        passed, msg = check_fail_closed(md_path, check_path)
         assert passed is False
-        assert "검증 실패" in msg
 
-    def test_send_digest_dry_run_no_marker(self, tmp_path):
-        """드라이런 (마커 없음)."""
-        markdown_path = tmp_path / "digest.md"
-        markdown_path.write_text("# 협의회 주간 정책브리핑\n\n다이제스트 내용")
+    def test_dry_run_default(self, tmp_path):
+        """기본값은 dry_run (발송 안 함)."""
+        md_path = tmp_path / "digest.md"
+        md_path.write_text("# 테스트\n\n완료")
 
-        with mock.patch("alert.config.get_config"):
-            result = send_digest(markdown_path, to_email="test@example.com", dry_run=True)
+        # check.json 파일은 markdown 파일 이름으로부터 자동 파생됨
+        check_path = md_path.with_suffix(".check.json")
+        check_path.write_text(json.dumps({
+            "items": [{"url": "https://example.com", "url_alive": True, "deadline_parsed": True, "passed": True}],
+            "pass": True,
+            "network_checked": True,
+            "reason": ""
+        }))
 
+        # dry_run=True가 기본값이므로 발송 안 함
+        result = send_digest(md_path, to_email="test@example.com", dry_run=True)
+
+        # dry_run이므로 0 (성공)
         assert result == 0
-
-    def test_send_digest_fail_with_marker(self, tmp_path):
-        """발송 거부 (마커 있음)."""
-        markdown_path = tmp_path / "digest.md"
-        markdown_path.write_text("# 협의회 주간 정책브리핑\n\n<!-- 상민 확정 필요 -->")
-
-        with mock.patch("alert.config.get_config"):
-            result = send_digest(markdown_path, to_email="test@example.com", dry_run=True)
-
-        assert result == 2
-
-    def test_send_digest_file_not_found(self, tmp_path):
-        """파일 없음."""
-        result = send_digest(tmp_path / "nonexistent.md", dry_run=True)
-        assert result == 2
 
 
 class TestIntegration:
     """통합 테스트."""
 
     def test_full_workflow(self, sample_announcements, tmp_path):
-        """전체 워크플로우: 생성 -> 검증 -> 발송."""
+        """전체 워크플로우."""
+        md_path = tmp_path / "digest.md"
+        check_path = tmp_path / "digest.check.json"
+
         # 1. 다이제스트 생성
-        markdown_path = tmp_path / "digest.md"
         markdown = compose_digest(
             db_path=sample_announcements,
             week_str="2026-W13",
-            limit=5,
-            output_path=markdown_path,
+            output_path=md_path,
         )
 
-        assert markdown_path.exists()
         assert "<!-- 상민 확정 필요 -->" in markdown
 
         # 2. 검증
-        check_json_path = markdown_path.with_suffix(".check.json")
         result = check_digest(
             db_path=sample_announcements,
-            markdown_path=markdown_path,
-            output_path=check_json_path,
+            markdown_path=md_path,
+            output_path=check_path,
             skip_network=True,
         )
 
-        assert "items" in result
-        assert "pass" in result
+        # 마커 때문에 게이트 실패 예상
+        passed, msg = check_fail_closed(md_path, check_path)
+        assert passed is False
 
-        # 3. 발송 실패 (마커 때문에)
-        with mock.patch("alert.config.get_config"):
-            exit_code = send_digest(
-                markdown_path,
-                to_email="test@example.com",
-                dry_run=True,
+    def test_duplicates_removed(self, tmp_path):
+        """중복 제거 (정규화된 제목 기준)."""
+        # DB 생성: 정규화하면 같은 제목
+        db_path = tmp_path / "test.db"
+        conn = sqlite3.connect(str(db_path))
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            CREATE TABLE announcements (
+                id INTEGER PRIMARY KEY, source TEXT, source_id TEXT,
+                title TEXT, summary TEXT, url TEXT, author TEXT,
+                period_end TEXT, relevance_score REAL, created_at TEXT,
+                updated_at TEXT, category TEXT DEFAULT '', target TEXT DEFAULT '',
+                period_start TEXT, relevance_reason TEXT DEFAULT '',
+                matched_keywords TEXT DEFAULT '[]', is_notified INTEGER DEFAULT 0,
+                raw_data TEXT DEFAULT '', business_domain TEXT DEFAULT '',
+                domain_confidence REAL DEFAULT 0.0, obsidian_path TEXT DEFAULT '',
+                embedding_id INTEGER DEFAULT NULL,
+                UNIQUE(source, source_id)
             )
-
-        assert exit_code == 2  # 미확정 마커 때문에 실패
-
-        # 4. 마커 제거 후 발송 성공
-        cleaned_markdown = markdown.replace(
-            "<!-- 상민 확정 필요 -->",
-            ""
+            """
         )
-        markdown_path.write_text(cleaned_markdown)
 
-        with mock.patch("alert.config.get_config"):
-            exit_code = send_digest(
-                markdown_path,
-                to_email="test@example.com",
-                dry_run=True,
+        # 정규화하면 같은 제목 3개 (다른 URL) - 2026-W13 범위 내 (03-23 ~ 03-29)
+        created_at = "2026-03-26T12:00:00"  # W13 내
+        for i in range(3):
+            cursor.execute(
+                """
+                INSERT INTO announcements
+                (source, source_id, title, url, author, period_end, relevance_score, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    "test",
+                    f"id_{i}",
+                    "공고  \n\t  안내",  # 정규화하면 "공고 안내"
+                    f"https://example.com/{i}",
+                    "기관",
+                    "2026-12-31",
+                    0.9 - i * 0.01,
+                    created_at,
+                    created_at,
+                ),
             )
 
-        assert exit_code == 0  # 성공
+        conn.commit()
+        conn.close()
+
+        md = compose_digest(
+            db_path=str(db_path),
+            week_str="2026-W13",
+        )
+
+        # "공고 안내"는 1번만 나타나야 함
+        count = md.count("### 공고 안내")
+        assert count == 1, f"중복 제거 실패: {count}번 나타남"

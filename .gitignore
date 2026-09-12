@@ -42,3 +42,4 @@ form_info.json
 .pytest_cache/
 logs/
 .omc/
+digests/

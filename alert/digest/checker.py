@@ -4,8 +4,7 @@ import json
 import re
 import sqlite3
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
-from datetime import datetime
+from typing import Dict, Optional
 import requests
 
 
@@ -85,14 +84,17 @@ def check_digest(
         skip_network: 네트워크 호출 건너뛰기 (테스트용)
 
     Returns:
-        {"items": [...], "pass": bool} 형태의 검증 결과
+        {"items": [...], "pass": bool, "network_checked": bool, "reason": str} 형태의 검증 결과
     """
     markdown_path = Path(markdown_path)
     if not markdown_path.exists():
-        result = {"items": [], "pass": False, "error": "마크다운 파일 없음"}
-        if output_path:
-            with open(output_path, "w") as f:
-                json.dump(result, f, indent=2, ensure_ascii=False)
+        result = {
+            "items": [],
+            "pass": False,
+            "network_checked": False,
+            "reason": "마크다운 파일 없음"
+        }
+        _write_check_result(output_path, result)
         return result
 
     # 마크다운에서 URL 추출
@@ -103,11 +105,15 @@ def check_digest(
     url_pattern = r'\[([^\]]+)\]\(([^)]+)\)'
     url_matches = re.findall(url_pattern, markdown_text)
 
+    # 항목 0건은 fail-closed
     if not url_matches:
-        result = {"items": [], "pass": True}
-        if output_path:
-            with open(output_path, "w") as f:
-                json.dump(result, f, indent=2, ensure_ascii=False)
+        result = {
+            "items": [],
+            "pass": False,
+            "network_checked": not skip_network,
+            "reason": "항목 없음"
+        }
+        _write_check_result(output_path, result)
         return result
 
     # DB에서 항목 정보 로드
@@ -146,13 +152,31 @@ def check_digest(
             "passed": item_passed,
         })
 
-    result = {"items": items, "pass": all_passed}
+    reason = "" if all_passed else "검증 실패"
+    result = {
+        "items": items,
+        "pass": all_passed,
+        "network_checked": not skip_network,
+        "reason": reason
+    }
 
     # 파일 저장
-    if output_path:
-        output_path = Path(output_path)
-        output_path.parent.mkdir(parents=True, exist_ok=True)
-        with open(output_path, "w", encoding="utf-8") as f:
-            json.dump(result, f, indent=2, ensure_ascii=False)
+    _write_check_result(output_path, result)
 
     return result
+
+
+def _write_check_result(output_path: Optional[Path], result: Dict) -> None:
+    """검증 결과를 JSON 파일로 저장.
+
+    Args:
+        output_path: 출력 파일 경로
+        result: 검증 결과 딕셔너리
+    """
+    if not output_path:
+        return
+
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(output_path, "w", encoding="utf-8") as f:
+        json.dump(result, f, indent=2, ensure_ascii=False)
