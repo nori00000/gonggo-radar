@@ -136,6 +136,9 @@ class ForestPressCrawler(ForestServiceCrawler):
                 "author": f"산림청 {author}".strip() if author else "",
                 "category": self.DEFAULT_CATEGORY,
                 "date": date_str,
+                # 보도자료 카드의 날짜는 **게시일**이다 - 접수기간이 아니다
+                # (6차 게이트 #1). 분류가 기본값에 기대지 않게 명시한다.
+                "date_label": "게시일",
                 "summary": summary,
             })
 

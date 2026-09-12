@@ -164,7 +164,12 @@ class TestForestPressCrawler:
         assert ann.source_id == "3224171"
         assert ann.category == "정책/보도"
         assert ann.url.startswith("https://www.forest.go.kr/kfsweb/cop/bbs/selectBoardArticle.do")
-        assert ann.period_start == "2026-09-12"
+        # 보도자료의 날짜는 **게시일**이다 - 접수 시작일이 아니다
+        # (6차 게이트 #1). forest_press 는 forest_service 를 상속하므로
+        # 같은 수리가 함께 적용된다.
+        assert ann.period_start is None
+        assert ann.period_end is None
+        assert json.loads(ann.raw_data)["posted"] == "2026-09-12"
         # 보도자료에는 마감일이 없다 - 게시일을 마감일로 채우지 않는다
         assert ann.period_end is None
         assert ann.summary

@@ -5,6 +5,7 @@ import re
 from collections import OrderedDict
 from typing import List, Optional
 from .base import BaseCrawler
+from .date_labels import classify_date, header_labels, label_before, label_for
 from .dedupe_keys import group_key, normalize_title
 from ..models import RawAnnouncement
 
@@ -49,14 +50,6 @@ class SeisCrawler(BaseCrawler):
         re.compile(r"nttId=", re.I),
         re.compile(r"detail", re.I),
     ]
-
-    # 날짜 라벨 분류 (6차 게이트 #1). 목록의 날짜가 **게시일**인지
-    # **접수기간**인지 라벨로 가린다. 가리지 못하면 게시일로 본다 -
-    # 마감을 지어내지 않는 쪽이 안전하다.
-    _POSTED_LABELS = re.compile(r"게시일|작성일|등록일|등록날짜|작성날짜|공고일|게시날짜")
-    _PERIOD_LABELS = re.compile(r"접수|신청|모집|마감|공모|기간|일정")
-    # "마감" 만 말하는 라벨은 **종료일만** 준다 - 시작일을 지어내지 않는다
-    _DEADLINE_ONLY_LABELS = re.compile(r"마감")
 
     # 목록 카드의 D-day 배지 (지역/회차와 구분하기 위해 걸러낸다)
     _DDAY_RE = re.compile(r"^D-\s*(\d+|DAY|day)$|^마감$|^상시$")
@@ -402,39 +395,13 @@ class SeisCrawler(BaseCrawler):
 
     @staticmethod
     def _header_labels(table) -> List[str]:
-        """표의 컬럼 라벨(헤더 텍스트)을 순서대로 읽는다."""
-        head = table.find("thead")
-        header_row = None
-        if head is not None:
-            header_row = head.find("tr")
-        if header_row is None:
-            for row in table.find_all("tr"):
-                if row.find("th") is not None:
-                    header_row = row
-                    break
-        if header_row is None:
-            return []
-        return [
-            re.sub(r"\s+", " ", cell.get_text(strip=True))
-            for cell in header_row.find_all(["th", "td"])
-        ]
+        """표의 컬럼 라벨을 읽는다 (공용 규칙 위임)."""
+        return header_labels(table)
 
     @staticmethod
     def _label_for(cell, cells, headers: List[str], css_class: str) -> str:
-        """이 셀의 컬럼 라벨을 찾는다 (표 헤더 -> 행의 th -> class 이름)."""
-        try:
-            index = cells.index(cell)
-        except ValueError:
-            index = -1
-        if 0 <= index < len(headers) and headers[index]:
-            return headers[index]
-        # 헤더가 없으면 같은 행의 th 를 본다 (세로 표)
-        parent = getattr(cell, "parent", None)
-        if parent is not None:
-            own_header = parent.find("th")
-            if own_header is not None:
-                return re.sub(r"\s+", " ", own_header.get_text(strip=True))
-        return css_class
+        """이 셀의 컬럼 라벨을 찾는다 (공용 규칙 위임)."""
+        return label_for(cell, cells, headers, css_class)
 
     def _parse_list_board(self, soup: "BeautifulSoup") -> List[dict]:
         """div/ul 기반 게시판 파싱."""
@@ -495,7 +462,7 @@ class SeisCrawler(BaseCrawler):
                 if date_match:
                     date_str = date_match.group()
                     # 날짜 앞에 붙은 말을 라벨로 본다 ("게시일 2026.09.11")
-                    date_label = text[max(0, date_match.start() - 12):date_match.start()]
+                    date_label = label_before(text, date_match.start())
 
             items.append({
                 "title": title_text,
@@ -599,19 +566,11 @@ class SeisCrawler(BaseCrawler):
     def _classify_date(
         self, date_str: str, label: str = ""
     ) -> tuple[Optional[str], Optional[str], Optional[str]]:
-        """목록의 날짜가 **접수기간**인지 **게시일**인지 가른다 (6차 게이트 #1).
+        """목록의 날짜가 **접수기간**인지 **게시일**인지 가른다.
 
-        게시일을 ``period_start``/``period_end`` 에 넣으면 브리핑이 게시
-        다음 날 만료된 공고를 말하거나, 존재하지 않는 접수기간을 말한다.
-        실측: 목록 HTML의 ``게시일=2026.09.11`` 이
-        ``period_start=period_end=2026-09-11`` 로 저장됐다.
-
-        판정 순서:
-
-        1. 라벨이 게시일/작성일/등록일 → **게시일** (기간 아님)
-        2. 값에 범위 표기(``~``)가 있으면 → 접수기간
-        3. 라벨이 접수/신청/모집/마감/기간 → 접수기간
-        4. 그 밖의 단일 날짜 → **게시일** (모르면 마감을 만들지 않는다)
+        판정은 공용 규칙(``alert/crawlers/date_labels.classify_date``)에
+        위임한다 - 같은 결함이 여섯 크롤러에 있었으므로 규칙이 한 곳에
+        있어야 사본끼리 갈라지지 않는다 (6차 게이트 #1).
 
         Args:
             date_str: 목록에서 읽은 날짜 문자열
@@ -620,27 +579,7 @@ class SeisCrawler(BaseCrawler):
         Returns:
             ``(period_start, period_end, posted)``
         """
-        text = (date_str or "").strip()
-        if not text:
-            return None, None, None
-
-        label = (label or "").strip()
-        if label and self._POSTED_LABELS.search(label):
-            return None, None, self._normalize_date(text)
-
-        if re.search(r"[~\u223c\u301c]", text):
-            start, end = self._parse_period(text)
-            return start, end, None
-
-        if label and self._PERIOD_LABELS.search(label):
-            start, end = self._parse_period(text)
-            if self._DEADLINE_ONLY_LABELS.search(label) and start == end:
-                # "접수마감 2026.09.30" 은 마감일 하나다 (시작일 아님)
-                return None, end, None
-            return start, end, None
-
-        # 라벨이 없거나 모르는 단일 날짜는 게시일로 본다
-        return None, None, self._normalize_date(text)
+        return classify_date(date_str, label)
 
     def _parse_period(self, period_str: str) -> tuple[Optional[str], Optional[str]]:
         """기간 문자열을 시작일과 종료일로 파싱한다."""

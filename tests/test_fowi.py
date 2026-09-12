@@ -1,5 +1,6 @@
 """Tests for FowiCrawler."""
 
+import json
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -343,7 +344,11 @@ class TestFowiBoardParsing:
         assert announcement.url == (
             "https://fowi.or.kr/user/bbs/bbsView.do?bbsManageId=12&bbsId=9191"
         )
-        assert announcement.period_end == "2026-09-11"
+        # 이 게시판의 날짜는 **등록일**이다 - 마감이 아니다 (6차 게이트 #1).
+        # 이전 기대치는 게시일을 period_end 로 저장하는 결함을 고정하고 있었다.
+        assert announcement.period_end is None
+        assert announcement.period_start is None
+        assert json.loads(announcement.raw_data)["posted"] == "2026-09-11"
 
     def test_fetch_end_to_end_yields_real_announcements(self, crawler):
         """fetch()가 게시글 10건을 RawAnnouncement로 돌려준다."""

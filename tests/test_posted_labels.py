@@ -1,0 +1,192 @@
+"""목록 날짜 라벨 회귀 - 게시일을 접수기간으로 저장하지 않는다 (6차 게이트 #1).
+
+여섯 개 크롤러가 같은 템플릿을 공유해 같은 결함을 갖고 있었다:
+``단일 날짜 -> (date, date)``. 공용 규칙(``alert/crawlers/date_labels``)으로
+모았고, 여기서 **실제 목록 응답을 잘라 만든 fixture**로 파서별 회귀를 고정한다.
+
+fixture 는 라이브 목록 페이지에서 받아 잘랐다(2026-09-13):
+``nongup_gg_list.html`` · ``forest_service_list.html`` · ``ipet_list.html`` ·
+``fowi_board_list.html``.
+"""
+
+import json
+from pathlib import Path
+from unittest.mock import MagicMock, patch
+
+import pytest
+from bs4 import BeautifulSoup
+
+from alert.crawlers.date_labels import classify_date
+from alert.crawlers.forest_press import ForestPressCrawler
+from alert.crawlers.forest_service import ForestServiceCrawler
+from alert.crawlers.fowi import FowiCrawler
+from alert.crawlers.ipet import IpetCrawler
+from alert.crawlers.nongup_gg import NongupGgCrawler
+from alert.crawlers.seis import SeisCrawler
+
+FIXTURES = Path(__file__).parent / "fixtures"
+
+# (소스 이름, 크롤러, fixture, base_url, 기대 라벨, 실제 진입 파서)
+# 파서 이름을 명시한다 - "전략을 순서대로 시도" 하면 그 크롤러가 실제로 쓰지
+# 않는 폴백 전략을 검사하게 되어 회귀를 놓친다(이 테스트를 처음 짤 때 겪었다).
+CASES = [
+    ("nongup_gg", NongupGgCrawler, "nongup_gg_list.html",
+     "https://nongup.gg.go.kr", "작성일", lambda c, s: c._parse_table_board(s)),
+    ("forest_service", ForestServiceCrawler, "forest_service_list.html",
+     "https://www.forest.go.kr", "작성일", lambda c, s: c._parse_table_board(s)),
+    ("ipet", IpetCrawler, "ipet_list.html",
+     "https://www.ipet.re.kr", "등록일", lambda c, s: c._parse_table_board(s)),
+    ("fowi", FowiCrawler, "fowi_board_list.html",
+     "https://fowi.or.kr", "등록일", lambda c, s: c._parse_goview_board(s, "MNG")),
+    ("forest_press", ForestPressCrawler, "forest_press_list.html",
+     "https://www.forest.go.kr", "게시일", lambda c, s: c._parse_press_list(s)),
+]
+
+
+def make_crawler(name, cls, base_url):
+    config = MagicMock()
+    config.crawler.timeout = 10
+    config.crawler.retry_count = 1
+    config.crawler.retry_delay = 0
+    config.crawler.user_agent = "test-agent"
+    source = MagicMock()
+    source.enabled = True
+    source.base_url = base_url
+    source.fetch_detail = False
+    config.crawler.sources = {name: source}
+    with patch("alert.crawlers.base.get_config", return_value=config):
+        return cls()
+
+
+@pytest.mark.parametrize("name,cls,fixture,base_url,label,parser", CASES)
+class TestPostedLabelsAcrossCrawlers:
+    """다섯 소스 모두 목록 날짜를 게시일로 기록하고 기간은 만들지 않는다."""
+
+    def announcements(self, name, cls, fixture, base_url, parser):
+        crawler = make_crawler(name, cls, base_url)
+        soup = BeautifulSoup(
+            (FIXTURES / fixture).read_text(encoding="utf-8"), "html.parser"
+        )
+        items = parser(crawler, soup)
+        assert items, f"{name}: fixture 에서 항목을 파싱하지 못했다"
+        built = [crawler._to_announcement(item, base_url) for item in items]
+        return items, [a for a in built if a is not None]
+
+    def test_no_row_gets_a_period(self, name, cls, fixture, base_url, label, parser):
+        """게시일 라벨이 붙은 목록은 기간 필드를 만들지 않는다."""
+        _items, announcements = self.announcements(
+            name, cls, fixture, base_url, parser
+        )
+        assert announcements
+        offenders = [
+            (a.source_id, a.period_start, a.period_end)
+            for a in announcements
+            if a.period_start or a.period_end
+        ]
+        assert offenders == [], f"{name}: 기간이 생긴 행 {offenders}"
+
+    def test_posting_date_is_preserved(
+        self, name, cls, fixture, base_url, label, parser
+    ):
+        """게시일 자체는 raw_data.posted 로 남는다 - 버리지 않는다."""
+        _items, announcements = self.announcements(
+            name, cls, fixture, base_url, parser
+        )
+        posted = [json.loads(a.raw_data).get("posted") for a in announcements]
+        assert any(posted), f"{name}: posted 가 하나도 없다"
+        for value in posted:
+            if value:
+                assert len(value) == 10 and value[4] == "-", value
+
+    def test_label_is_recognised(
+        self, name, cls, fixture, base_url, label, parser
+    ):
+        """파서가 실제 응답에서 게시일 라벨을 읽어 낸다."""
+        items, _announcements = self.announcements(
+            name, cls, fixture, base_url, parser
+        )
+        labels = {str(item.get("date_label", "")) for item in items}
+        assert any(label in value for value in labels), (
+            f"{name}: 기대 라벨 {label!r} 을 찾지 못했다 (읽은 라벨 {labels})"
+        )
+
+
+class TestForestPressInheritsTheFix:
+    """forest_press 는 forest_service 의 ``_to_announcement`` 를 위임 호출한다.
+
+    자기 override 안에서 ``super()._to_announcement`` 를 부르므로 부모의
+    날짜 분류 수리가 함께 적용된다 - 클래스 속성 동일성으로는 확인할 수
+    없어 **동작**으로 확인한다.
+    """
+
+    def test_delegates_to_the_parent_classifier(self):
+        crawler = make_crawler(
+            "forest_press", ForestPressCrawler, "https://www.forest.go.kr"
+        )
+        item = {
+            "title": "산림청 보도자료",
+            "link": "/kfsweb/cop/bbs/selectBoardArticle.do?nttId=1",
+            "author": "산림청",
+            "category": "정책/보도",
+            "date": "2026.09.12",
+            "date_label": "게시일",
+        }
+        with patch(
+            "alert.crawlers.forest_service.classify_date",
+            return_value=(None, None, "2026-09-12"),
+        ) as classifier:
+            announcement = crawler._to_announcement(
+                item, "https://www.forest.go.kr"
+            )
+        classifier.assert_called_once_with("2026.09.12", "게시일")
+        assert (announcement.period_start, announcement.period_end) == (None, None)
+        assert json.loads(announcement.raw_data)["posted"] == "2026-09-12"
+
+
+class TestSeisUsesTheSharedRule:
+    """seis 도 같은 공용 규칙을 쓴다 (사본이 갈라지지 않게)."""
+
+    def test_seis_classifier_matches_the_shared_one(self):
+        crawler = make_crawler("seis", SeisCrawler, "https://www.seis.or.kr")
+        for value, label in [
+            ("2026.09.11", "게시일"),
+            ("2026.09.01 ~ 2026.09.30", "접수기간"),
+            ("2026.09.30", "접수마감"),
+            ("2026.09.11", "구분"),
+        ]:
+            assert crawler._classify_date(value, label) == classify_date(value, label)
+
+
+class TestSharedRuleContract:
+    """공용 규칙 자체의 계약."""
+
+    @pytest.mark.parametrize("label", ["게시일", "작성일", "등록일", "공고일", "게시날짜"])
+    def test_posting_labels_never_yield_a_period(self, label):
+        start, end, posted = classify_date("2026.09.11", label)
+        assert (start, end) == (None, None)
+        assert posted == "2026-09-11"
+
+    @pytest.mark.parametrize("label", ["접수기간", "신청기간", "모집기간", "공모기간"])
+    def test_period_labels_with_a_range(self, label):
+        assert classify_date("2026.09.01 ~ 2026.09.30", label) == (
+            "2026-09-01", "2026-09-30", None
+        )
+
+    def test_deadline_label_gives_only_an_end(self):
+        assert classify_date("2026.09.30", "접수마감") == (None, "2026-09-30", None)
+
+    def test_unknown_label_defaults_to_posted(self):
+        assert classify_date("2026.09.11", "구분") == (None, None, "2026-09-11")
+        assert classify_date("2026.09.11", "") == (None, None, "2026-09-11")
+
+    def test_range_without_a_label_is_a_period(self):
+        assert classify_date("2026.09.01~2026.09.30", "") == (
+            "2026-09-01", "2026-09-30", None
+        )
+
+    def test_empty_input(self):
+        assert classify_date("", "게시일") == (None, None, None)
+        assert classify_date("   ", "접수기간") == (None, None, None)
+
+    def test_unparseable_date_yields_nothing(self):
+        assert classify_date("별도 공지", "접수기간") == (None, None, None)

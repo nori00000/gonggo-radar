@@ -4,6 +4,7 @@ import json
 import re
 from typing import List, Optional
 from .base import BaseCrawler
+from .date_labels import classify_date, header_labels, label_before, label_for
 from ..models import RawAnnouncement
 
 try:
@@ -133,6 +134,8 @@ class NongupGgCrawler(BaseCrawler):
         if table is None:
             return []
 
+        headers = header_labels(table)
+
         tbody = table.find("tbody") or table
         rows = tbody.find_all("tr")
 
@@ -140,6 +143,7 @@ class NongupGgCrawler(BaseCrawler):
             cells = row.find_all("td")
             if len(cells) < 2:
                 continue
+            date_label = ""
 
             title_link = None
             title_text = ""
@@ -164,6 +168,7 @@ class NongupGgCrawler(BaseCrawler):
 
                 elif any(kw in css_class for kw in ["date", "period", "term"]):
                     date_str = cell.get_text(strip=True)
+                    date_label = label_for(cell, cells, headers, css_class)
 
             if not title_text:
                 for cell in cells:
@@ -181,6 +186,9 @@ class NongupGgCrawler(BaseCrawler):
                     cell_text = cell.get_text(strip=True)
                     if re.search(r"\d{4}[-./]\d{1,2}[-./]\d{1,2}", cell_text):
                         date_str = cell_text
+                        # 표 헤더에서 컬럼 라벨을 읽는다 - "게시일" 이면
+                        # 기간이 아니다 (6차 게이트 #1)
+                        date_label = label_for(cell, cells, headers, "")
                         break
 
             items.append({
@@ -189,6 +197,7 @@ class NongupGgCrawler(BaseCrawler):
                 "author": author,
                 "category": category,
                 "date": date_str,
+                "date_label": date_label,
             })
 
         return items
@@ -238,17 +247,20 @@ class NongupGgCrawler(BaseCrawler):
                 category = cat_elem.get_text(strip=True)
 
             date_str = ""
+            date_label = ""
             date_elem = item_elem.find(
                 ["span", "em", "div"],
                 class_=re.compile(r"date|period|term|time", re.I)
             )
             if date_elem:
                 date_str = date_elem.get_text(strip=True)
+                date_label = " ".join(date_elem.get("class", []) or [])
             else:
-                text = item_elem.get_text()
+                text = item_elem.get_text(" ", strip=True)
                 date_match = re.search(r"\d{4}[-./]\d{1,2}[-./]\d{1,2}", text)
                 if date_match:
                     date_str = date_match.group()
+                    date_label = label_before(text, date_match.start())
 
             items.append({
                 "title": title_text,
@@ -256,6 +268,7 @@ class NongupGgCrawler(BaseCrawler):
                 "author": author,
                 "category": category,
                 "date": date_str,
+                "date_label": date_label,
             })
 
         return items
@@ -385,10 +398,16 @@ class NongupGgCrawler(BaseCrawler):
             author = item.get("author", "").strip()
             category = item.get("category", "").strip()
 
-            date_str = item.get("date", "").strip()
-            period_start, period_end = self._parse_period(date_str)
+            # 목록의 날짜는 라벨로 가린다 - 게시일을 기간으로 쓰지 않는다
+            # (6차 게이트 #1, 공용 규칙 alert/crawlers/date_labels.py)
+            period_start, period_end, posted = classify_date(
+                item.get("date", ""), item.get("date_label", "")
+            )
 
-            raw_data = json.dumps(item, ensure_ascii=False)
+            payload = dict(item)
+            if posted:
+                payload["posted"] = posted
+            raw_data = json.dumps(payload, ensure_ascii=False)
 
             return RawAnnouncement(
                 source="nongup_gg",
