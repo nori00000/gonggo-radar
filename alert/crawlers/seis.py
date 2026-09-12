@@ -2,6 +2,7 @@
 import hashlib
 import json
 import re
+from collections import OrderedDict
 from typing import List, Optional
 from .base import BaseCrawler
 from ..models import RawAnnouncement
@@ -34,6 +35,24 @@ class SeisCrawler(BaseCrawler):
         "/subPage.do?menuId=30400",    # 통합사업신청
     ]
 
+    # 상세 페이지로 가는 링크 판별 패턴
+    VIEW_LINK_PATTERNS = [
+        re.compile(r"pbancMainView", re.I),
+        re.compile(r"fncPbofrSn=", re.I),
+        re.compile(r"dsgnPbofrSn=", re.I),
+        re.compile(r"tabId=view", re.I),
+        re.compile(r"tabId=certPageView", re.I),
+        re.compile(r"itgrdAplyPbancSn=", re.I),
+        re.compile(r"boardView", re.I),
+        re.compile(r"view\.do", re.I),
+        re.compile(r"nttId=", re.I),
+        re.compile(r"detail", re.I),
+    ]
+
+    # 목록 카드의 D-day 배지 (지역/회차와 구분하기 위해 걸러낸다)
+    _DDAY_RE = re.compile(r"^D-\s*(\d+|DAY|day)$|^마감$|^상시$")
+    _ROUND_RE = re.compile(r"(\d+)\s*차")
+
     def __init__(self):
         super().__init__(source_name="seis")
         if BeautifulSoup is None:
@@ -64,7 +83,7 @@ class SeisCrawler(BaseCrawler):
                         announcements.append(announcement)
                 break
 
-        return announcements
+        return self.enrich_with_quotes(announcements)
 
     def _fetch_board_listing(self, url: str) -> List[dict]:
         """공고 목록 페이지를 파싱하여 공고 목록을 추출한다."""
@@ -77,29 +96,181 @@ class SeisCrawler(BaseCrawler):
         soup = BeautifulSoup(response.text, "html.parser")
         items: List[dict] = []
 
-        # 전략 1: table 기반 게시판
+        # 전략 1: 메인 페이지 공고 카드(li.swiper-slide > p.tit)
+        # 카드에는 분류/지역/회차/접수기간이 함께 있어 중복 판별과 마감 추출이 된다.
+        items = self._parse_main_cards(soup)
+        if items:
+            self.logger.info(f"Parsed {len(items)} items using card strategy")
+            return self._dedupe_items(items)
+
+        # 전략 2: table 기반 게시판
         items = self._parse_table_board(soup)
         if items:
             self.logger.info(f"Parsed {len(items)} items using table strategy")
-            return items
+            return self._dedupe_items(items)
 
-        # 전략 2: div/ul 기반 게시판
+        # 전략 3: div/ul 기반 게시판
         items = self._parse_list_board(soup)
         if items:
             self.logger.info(f"Parsed {len(items)} items using list strategy")
-            return items
+            return self._dedupe_items(items)
 
-        # 전략 3: 범용 링크 추출
+        # 전략 4: 범용 링크 추출
         items = self._parse_generic_links(soup)
         if items:
             self.logger.info(f"Parsed {len(items)} items using generic link strategy")
-            return items
+            return self._dedupe_items(items)
 
         self.logger.warning(
             f"Could not parse board listing from {url}. "
             "HTML structure may have changed."
         )
         return []
+
+    @staticmethod
+    def _clean(text: str) -> str:
+        """공백/개행/&nbsp; 를 한 칸으로 정리한다."""
+        if not text:
+            return ""
+        return re.sub(r"\s+", " ", text.replace("\xa0", " ")).strip()
+
+    def _is_view_link(self, href: str) -> bool:
+        """상세 페이지로 가는 링크인지 판별한다."""
+        if not href:
+            return False
+        return any(p.search(href) for p in self.VIEW_LINK_PATTERNS)
+
+    def _parse_main_cards(self, soup: "BeautifulSoup") -> List[dict]:
+        """메인 페이지 공고 카드를 파싱한다.
+
+        카드 구조::
+
+            <li class="swiper-slide" data-type="재정지원">
+              <span class="badge cate">재정지원</span>
+              <span class="sub">사회보험료 지원 사업</span>
+              <p class="tit"><a href="subPage.do?...&fncPbofrSn=8371">제목</a></p>
+              <ul class="info"><li>경기도</li><li>2026년도 (9차)</li><li>D-109</li></ul>
+              <p class="date">2026.09.01 ~ 2026.12.31</p>
+            </li>
+
+        기존 범용 링크 추출은 제목과 링크만 봤기 때문에 같은 공고의 회차별
+        링크를 각각 별건으로 적재했다(2026-09-12 실측: 동일 공고 9행).
+        카드 단위로 읽으면 지역/회차/접수기간이 함께 잡혀 중복 판별이 된다.
+
+        Args:
+            soup: 목록 페이지 BeautifulSoup 객체
+
+        Returns:
+            공고 딕셔너리 리스트
+        """
+        items: List[dict] = []
+
+        for tit in soup.select("p.tit"):
+            a_tag = tit.find("a", href=True)
+            if a_tag is None:
+                continue
+
+            href = a_tag.get("href", "")
+            if not self._is_view_link(href):
+                continue
+
+            title = self._clean(a_tag.get_text(strip=True))
+            if not title:
+                continue
+
+            card = tit.find_parent("li") or tit.find_parent("div", class_="link")
+            if card is None:
+                card = tit.parent
+
+            badge = card.select_one("span.badge")
+            sub = card.select_one("span.sub")
+            date_elem = card.select_one("p.date")
+
+            category = self._clean(badge.get_text(strip=True)) if badge else ""
+            if not category:
+                category = self._clean(card.get("data-type", "") or "")
+
+            region = ""
+            round_label = ""
+            for info in card.select("ul.info li"):
+                value = self._clean(info.get_text(strip=True))
+                if not value or self._DDAY_RE.match(value):
+                    continue
+                if self._ROUND_RE.search(value):
+                    round_label = round_label or value
+                    continue
+                if not region:
+                    region = value
+
+            items.append({
+                "title": title,
+                "link": href,
+                "author": "",
+                "category": category,
+                "date": self._clean(date_elem.get_text(strip=True)) if date_elem else "",
+                "region": region,
+                "round": round_label,
+                "program": self._clean(sub.get_text(strip=True)) if sub else "",
+            })
+
+        return items
+
+    @staticmethod
+    def _normalize_title(title: str) -> str:
+        """중복 판별용 제목 정규화 - 공백과 구분기호를 없앤다."""
+        return re.sub(r"[\s·.,()\[\]{}「」『』\-~/]+", "", title or "")
+
+    def _canonical_rank(self, item: dict) -> tuple:
+        """같은 공고 묶음에서 대표를 고르는 순위 - 최신 회차가 이긴다."""
+        round_match = self._ROUND_RE.search(item.get("round", "") or "")
+        round_no = int(round_match.group(1)) if round_match else -1
+        post_id = self._extract_post_id(item.get("link", ""))
+        post_no = int(post_id) if post_id.isdigit() else -1
+        return (item.get("date", "") or "", round_no, post_no)
+
+    def _dedupe_items(self, items: List[dict]) -> List[dict]:
+        """같은 공고의 복수 링크를 1건으로 합친다 (계약 v2.1 판정 6-①).
+
+        SEIS 메인은 회차마다 별개 링크(``fncPbofrSn``)를 나열하므로 제목과
+        지역이 같으면 한 공고로 본다. 대표는 접수 시작일이 가장 늦고 회차
+        번호가 가장 큰 항목(= 현재 진행 회차)이며, 병합된 나머지 링크의
+        ID와 회차는 감사할 수 있도록 ``merged_source_ids`` 에 남긴다.
+
+        Args:
+            items: 파싱된 공고 딕셔너리 리스트
+
+        Returns:
+            공고당 1건으로 정리된 리스트 (입력 순서 유지)
+        """
+        groups: "OrderedDict[tuple, List[dict]]" = OrderedDict()
+        for item in items:
+            key = (
+                self._normalize_title(item.get("title", "")),
+                item.get("region", "") or "",
+            )
+            groups.setdefault(key, []).append(item)
+
+        deduped: List[dict] = []
+        for group in groups.values():
+            canonical = max(group, key=self._canonical_rank)
+            if len(group) > 1:
+                canonical = dict(canonical)
+                canonical["merged_count"] = len(group)
+                canonical["merged_source_ids"] = [
+                    self._extract_post_id(other.get("link", ""))
+                    for other in group
+                    if other.get("link", "") != canonical.get("link", "")
+                ]
+                canonical["merged_rounds"] = [
+                    other.get("round", "") for other in group if other.get("round", "")
+                ]
+                self.logger.info(
+                    f"Merged {len(group)} duplicate links into one announcement: "
+                    f"{canonical.get('title', '')[:40]}"
+                )
+            deduped.append(canonical)
+
+        return deduped
 
     def _parse_table_board(self, soup: "BeautifulSoup") -> List[dict]:
         """table 기반 게시판 파싱."""
@@ -261,27 +432,14 @@ class SeisCrawler(BaseCrawler):
         items = []
         seen_links = set()
 
-        view_patterns = [
-            re.compile(r"pbancMainView", re.I),
-            re.compile(r"fncPbofrSn=", re.I),
-            re.compile(r"tabId=view", re.I),
-            re.compile(r"tabId=certPageView", re.I),
-            re.compile(r"itgrdAplyPbancSn=", re.I),
-            re.compile(r"boardView", re.I),
-            re.compile(r"view\.do", re.I),
-            re.compile(r"nttId=", re.I),
-            re.compile(r"detail", re.I),
-        ]
-
         for a_tag in soup.find_all("a", href=True):
             href = a_tag.get("href", "")
-            title_text = a_tag.get_text(strip=True)
+            title_text = self._clean(a_tag.get_text(strip=True))
 
             if not title_text or len(title_text) < 5:
                 continue
 
-            is_view_link = any(p.search(href) for p in view_patterns)
-            if not is_view_link:
+            if not self._is_view_link(href):
                 continue
 
             if href in seen_links:
@@ -303,11 +461,15 @@ class SeisCrawler(BaseCrawler):
         if not link:
             return ""
 
+        # 공고 종류별 고유 ID를 먼저 본다. 범용 파라미터(seq/idx/no)는 반드시
+        # ?/& 뒤에서만 인정한다 - 그렇지 않으면 "epsdNo=4" 가 "no=4" 로 잡히는
+        # 접두사 오매칭이 생겨 서로 다른 공고가 같은 ID를 쓰게 된다.
         id_params = [
-            r"fncPbofrSn=(\d+)", r"itgrdAplyPbancSn=(\d+)",
+            r"fncPbofrSn=(\d+)", r"dsgnPbofrSn=(\d+)",
+            r"itgrdAplyPbancSn=(\d+)", r"epsdNo=(\d+)",
             r"announcementId=(\d+)", r"notifyId=(\d+)", r"nttId=(\d+)",
-            r"seq=(\d+)", r"idx=(\d+)", r"no=(\d+)",
             r"articleId=(\d+)", r"artclId=(\d+)",
+            r"[?&]seq=(\d+)", r"[?&]idx=(\d+)", r"[?&]no=(\d+)",
         ]
         for pattern in id_params:
             match = re.search(pattern, link, re.I)

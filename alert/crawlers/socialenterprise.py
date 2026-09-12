@@ -66,7 +66,7 @@ class SocialenterpriseCrawler(BaseCrawler):
                     announcement = self._to_announcement(item, base_url)
                     if announcement:
                         announcements.append(announcement)
-                return announcements
+                return self.enrich_with_quotes(announcements)
 
         # 전략 2: 폴백 - 게시판 페이지 HTML 파싱
         for board_path in self.BOARD_PATHS:
@@ -86,7 +86,7 @@ class SocialenterpriseCrawler(BaseCrawler):
                         announcements.append(announcement)
                 break
 
-        return announcements
+        return self.enrich_with_quotes(announcements)
 
     def _fetch_ajax_board(
         self, url: str, config: dict, base_url: str

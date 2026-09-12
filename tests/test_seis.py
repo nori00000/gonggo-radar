@@ -1,11 +1,16 @@
 """Tests for SeisCrawler (사회적기업포털 SEIS)."""
 
+import json
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
+from bs4 import BeautifulSoup
 
 from alert.crawlers.seis import SeisCrawler
 from alert.models import RawAnnouncement
+
+FIXTURES = Path(__file__).parent / "fixtures"
 
 
 class TestSeisCrawler:
@@ -208,3 +213,152 @@ class TestSeisCrawler:
             start, end = crawler._parse_period("")
             assert start is None
             assert end is None
+
+
+class TestSeisMainCards:
+    """메인 페이지 공고 카드 파싱 + 복수 링크 병합 (계약 v2.1 판정 6-①).
+
+    2026-09-12 실측: 같은 경기도 사회보험료 지원사업이 회차별 링크
+    ``fncPbofrSn=8339,8364..8371`` 로 9행 적재되어 브리핑을 잠식했다.
+    """
+
+    @pytest.fixture
+    def crawler(self):
+        config = MagicMock()
+        config.crawler.timeout = 10
+        config.crawler.retry_count = 1
+        config.crawler.retry_delay = 0
+        config.crawler.user_agent = "test-agent"
+
+        source = MagicMock()
+        source.enabled = True
+        source.base_url = "https://www.seis.or.kr"
+        config.crawler.sources = {"seis": source}
+
+        with patch("alert.crawlers.base.get_config", return_value=config):
+            yield SeisCrawler()
+
+    @pytest.fixture
+    def soup(self):
+        return BeautifulSoup(
+            (FIXTURES / "seis_main_cards.html").read_text(encoding="utf-8"),
+            "html.parser",
+        )
+
+    def test_parse_main_cards_reads_card_metadata(self, crawler, soup):
+        """카드에서 제목/링크/분류/지역/회차/접수기간을 함께 읽는다."""
+        items = crawler._parse_main_cards(soup)
+        assert len(items) == 22
+
+        card = next(i for i in items if "fncPbofrSn=8371" in i["link"])
+        assert card["title"] == "2026년 경기도 사회적기업 사회보험료 지원사업 참여기업 모집 공고"
+        assert card["category"] == "재정지원"
+        assert card["region"] == "경기도"
+        assert card["round"] == "2026년도 (9차)"
+        assert card["date"] == "2026.09.01 ~ 2026.12.31"
+        assert card["program"] == "사회보험료 지원 사업"
+        # D-day 배지는 지역으로 오인되지 않는다
+        assert not card["region"].startswith("D-")
+
+    def test_duplicate_rounds_collapse_to_one_item(self, crawler, soup):
+        """같은 제목·지역의 회차별 링크 9건이 1건으로 합쳐진다."""
+        items = crawler._parse_main_cards(soup)
+        duplicates = [
+            i for i in items
+            if i["title"].startswith("2026년 경기도 사회적기업 사회보험료")
+        ]
+        assert len(duplicates) == 9
+
+        deduped = crawler._dedupe_items(items)
+        assert len(deduped) == 14
+
+        merged = [
+            i for i in deduped
+            if i["title"].startswith("2026년 경기도 사회적기업 사회보험료")
+        ]
+        assert len(merged) == 1
+        assert merged[0]["merged_count"] == 9
+
+    def test_canonical_item_is_the_current_round(self, crawler, soup):
+        """대표는 접수 시작일이 가장 늦은 최신 회차(9차)다."""
+        deduped = crawler._dedupe_items(crawler._parse_main_cards(soup))
+        merged = next(
+            i for i in deduped
+            if i["title"].startswith("2026년 경기도 사회적기업 사회보험료")
+        )
+
+        announcement = crawler._to_announcement(merged, "https://www.seis.or.kr")
+        assert announcement is not None
+        assert announcement.source_id == "8371"
+        assert announcement.url == (
+            "https://www.seis.or.kr/subPage.do"
+            "?menuId=30200&tabId=pbancMainView&fncPbofrSn=8371"
+        )
+        assert announcement.period_start == "2026-09-01"
+        assert announcement.period_end == "2026-12-31"
+        assert announcement.author == "한국사회적기업진흥원"
+
+    def test_merged_links_are_auditable(self, crawler, soup):
+        """병합된 나머지 링크 ID와 회차가 raw_data에 남는다."""
+        deduped = crawler._dedupe_items(crawler._parse_main_cards(soup))
+        merged = next(
+            i for i in deduped
+            if i["title"].startswith("2026년 경기도 사회적기업 사회보험료")
+        )
+        announcement = crawler._to_announcement(merged, "https://www.seis.or.kr")
+        payload = json.loads(announcement.raw_data)
+
+        assert payload["merged_count"] == 9
+        assert payload["merged_source_ids"] == [
+            "8370", "8369", "8368", "8367", "8366", "8365", "8364", "8339"
+        ]
+        assert len(payload["merged_rounds"]) == 9
+
+    def test_distinct_regions_stay_separate(self, crawler, soup):
+        """제목이 달라도 지역이 다른 지정공모는 병합하지 않는다."""
+        deduped = crawler._dedupe_items(crawler._parse_main_cards(soup))
+        regions = {
+            i["region"] for i in deduped if i["title"].endswith("지정공모")
+        }
+        assert {"서울특별시", "광주광역시", "전라남도", "경상북도", "산림청"} <= regions
+
+    def test_every_card_item_has_a_deadline(self, crawler, soup):
+        """카드 파싱은 접수기간을 채운다 - 마감 NULL 문제 해소 (판정 4)."""
+        deduped = crawler._dedupe_items(crawler._parse_main_cards(soup))
+        announcements = [
+            crawler._to_announcement(i, "https://www.seis.or.kr") for i in deduped
+        ]
+        assert announcements
+        assert all(a.period_end for a in announcements)
+
+    def test_source_ids_are_unique_and_stable(self, crawler, soup):
+        """source_id는 URL의 공고 고유번호이며 배치 내에서 충돌하지 않는다."""
+        deduped = crawler._dedupe_items(crawler._parse_main_cards(soup))
+        ids = [
+            crawler._to_announcement(i, "https://www.seis.or.kr").source_id
+            for i in deduped
+        ]
+        assert len(ids) == len(set(ids))
+        assert "8371" in ids
+        # 인·지정 공모는 dsgnPbofrSn 을 쓴다 (예전에는 MD5 해시로 떨어졌다)
+        assert "8322" in ids
+
+    def test_epsd_no_is_not_matched_as_generic_no_param(self, crawler):
+        """"epsdNo=4" 가 범용 "no=" 패턴에 걸려 다른 공고와 충돌하지 않는다."""
+        link = (
+            "/subPage.do?menuId=30100&tabId=certPageView&statsYr=2026&epsdNo=4"
+        )
+        assert crawler._extract_post_id(link) == "4"
+        # 같은 자리에 다른 파라미터가 와도 고유번호를 먼저 본다
+        assert crawler._extract_post_id(
+            "/subPage.do?menuId=30200&tabId=pbancMainView&fncPbofrSn=8371"
+        ) == "8371"
+        assert crawler._extract_post_id(
+            "/subPage.do?menuId=30100&tabId=certPageView&dsgnPbofrSn=8322"
+        ) == "8322"
+
+    def test_normalize_title_ignores_spacing_noise(self, crawler):
+        """제목 정규화는 공백·구분기호 차이를 무시한다."""
+        assert crawler._normalize_title("2026년  경기도 사회적기업 (모집)") == \
+            crawler._normalize_title("2026년 경기도 사회적기업 모집")
+

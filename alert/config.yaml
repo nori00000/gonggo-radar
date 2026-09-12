@@ -70,6 +70,7 @@ crawler:
     socialenterprise:
       enabled: true
       base_url: "https://www.socialenterprise.or.kr"
+      fetch_detail: true
     ekr:
       enabled: true
       base_url: "https://www.ekr.or.kr"
@@ -104,6 +105,7 @@ crawler:
     seis:
       enabled: true
       base_url: "https://www.seis.or.kr"
+      fetch_detail: true
     ggeea:
       enabled: true
       base_url: "https://www.ggeea.or.kr"
@@ -117,6 +119,7 @@ crawler:
       enabled: true
       base_url: "https://www.kofpi.or.kr"
       bypass_threshold: true
+      fetch_detail: true
     forest_press:
       enabled: true
       base_url: "https://www.forest.go.kr"
@@ -125,10 +128,12 @@ crawler:
       enabled: true
       base_url: "https://opinion.lawmaking.go.kr"
       bypass_threshold: true
+      fetch_detail: true
     coop:
       enabled: true
       base_url: "https://www.coop.go.kr"
       bypass_threshold: true
+      fetch_detail: true
 
 analyzer:
   keyword_threshold: 0.3

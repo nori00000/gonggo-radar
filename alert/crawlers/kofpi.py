@@ -76,7 +76,7 @@ class KofpiCrawler(BaseCrawler):
                 if announcement:
                     announcements.append(announcement)
 
-        return announcements
+        return self.enrich_with_quotes(announcements)
 
     def parse_list(
         self,

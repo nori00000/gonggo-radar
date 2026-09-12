@@ -32,6 +32,8 @@ class SourceConfig:
     filter_keywords: list[str] = field(default_factory=list)
     # 계약 v1.2: True면 키워드 임계값과 무관하게 DB에 적재한다.
     bypass_threshold: bool = False
+    # 계약 v2.1 V2: True면 상세 페이지에서 마감/자격/금액 인용을 추출한다.
+    fetch_detail: bool = False
 
 
 @dataclass

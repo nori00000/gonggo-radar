@@ -68,7 +68,7 @@ class LawmakingCrawler(BaseCrawler):
             announcement = self._to_announcement(item, base_url)
             if announcement:
                 announcements.append(announcement)
-        return announcements
+        return self.enrich_with_quotes(announcements)
 
     def parse_list(self, soup: "BeautifulSoup") -> List[dict]:
         """입법예고 목록 테이블을 파싱한다.
