@@ -15,6 +15,9 @@ import pytest
 from alert.crawlers.base import BaseCrawler
 from alert.crawlers.detail_quotes import (
     ALWAYS_OPEN,
+    DETAIL_REQUEST_DEADLINE,
+    DETAIL_TRUNCATED,
+    EARLY_CLOSE,
     MAX_DETAIL_BYTES,
     MAX_DETAIL_REQUESTS,
     QUOTE_AMOUNT,
@@ -23,9 +26,12 @@ from alert.crawlers.detail_quotes import (
     extract_quotes,
     flatten,
     has_quote_keys,
+    complete_html_prefix,
     is_always_open,
+    is_early_close,
     normalize_text,
     period_from_quote,
+    resolve_period,
 )
 from alert.models import RawAnnouncement
 
@@ -139,11 +145,11 @@ class TestCodexCritiqueTableBoundary:
     def text(self):
         return normalize_text(self.REPRO)
 
-    def test_row_boundary_becomes_a_newline(self, text):
-        """셀·행이 끝나는 자리에 줄바꿈이 남는다."""
-        assert text.splitlines() == [
-            "접수기간", "상시 (예산 소진 시 마감)", "작성일", "2026.09.11",
-        ]
+    def test_boundaries_separate_the_cells(self, text):
+        """셀·행 경계가 값들을 갈라 놓는다 (평탄화하면 원문 순서 그대로)."""
+        assert flatten(text) == "접수기간 상시 (예산 소진 시 마감) 작성일 2026.09.11"
+        # 경계 표시는 원문 공백과 겹치지 않는 사용자 영역 문자여야 한다
+        assert "\ue000" in text or "\ue001" in text
 
     def test_quote_stops_before_the_next_row(self, text):
         """인용이 다음 행(작성일/게시일)까지 넘어가지 않는다."""
@@ -381,11 +387,10 @@ class TestEnrichWithQuotes:
         assert announcement.period_start == "2026-09-07"
         assert announcement.period_end == "2026-09-30"
 
-    def test_always_open_clears_the_deadline(self):
-        """"상시" 공고는 마감을 비우고 always_open 으로 표시한다 (크리틱 #3)."""
+    def test_always_open_is_flagged_without_inventing_a_deadline(self):
+        """"상시" 인용은 마감을 만들지 않고 always_open 으로 표시한다."""
         crawler = make_stub(fetch_detail=True)
         announcement = make_announcement()
-        announcement.period_end = "2026-09-11"   # 예전에 잘못 들어간 값
         html = (
             '<div class="board_view"><table>'
             "<tr><th>접수기간</th><td>상시 (예산 소진 시 마감)</td></tr>"
@@ -398,7 +403,46 @@ class TestEnrichWithQuotes:
         payload = json.loads(announcement.raw_data)
         assert payload[ALWAYS_OPEN] is True
         assert "quote_period_end" not in payload
-        assert announcement.period_end is None
+        assert announcement.period_end is None      # 게시일을 끌어오지 않는다
+
+    def test_explicit_deadline_survives_an_always_open_detail(self):
+        """제목에서 확정된 마감은 상세의 "상시" 문구에 지워지지 않는다.
+
+        Codex 재검토 #9: KOFPI 제목 ``마감 변경 모집(~2026.10.31)`` 이
+        상세 ``모집기간 상시`` 때문에 NULL이 되어 살아있는 공고를 잃었다.
+        """
+        crawler = make_stub(fetch_detail=True)
+        announcement = make_announcement()
+        announcement.period_end = "2026-10-31"      # 제목에서 뽑은 마감
+        html = (
+            '<div class="board_view"><table>'
+            "<tr><th>모집기간</th><td>상시</td></tr></table></div>"
+        )
+
+        with patch.object(crawler.session, "get", return_value=fake_response(html)):
+            crawler.enrich_with_quotes([announcement])
+
+        payload = json.loads(announcement.raw_data)
+        assert announcement.period_end == "2026-10-31"   # 명시된 날짜가 이긴다
+        assert payload[ALWAYS_OPEN] is True              # 상시 표시는 남긴다
+
+    def test_early_close_keeps_the_deadline(self):
+        """"예산 소진 시 조기마감" 은 마감이 있는 공고다 (재검토 #9)."""
+        crawler = make_stub(fetch_detail=True)
+        announcement = make_announcement()
+        html = (
+            '<div class="board_view"><table><tr><th>접수기간</th>'
+            "<td>2026.09.01 ~ 2026.09.30 (예산 소진 시 조기마감)</td>"
+            "</tr></table></div>"
+        )
+
+        with patch.object(crawler.session, "get", return_value=fake_response(html)):
+            crawler.enrich_with_quotes([announcement])
+
+        payload = json.loads(announcement.raw_data)
+        assert announcement.period_end == "2026-09-30"
+        assert payload[EARLY_CLOSE] is True
+        assert ALWAYS_OPEN not in payload
 
     def test_rate_limited_to_one_request_per_second(self):
         """두 번째 건부터 1초 대기한다."""
@@ -479,16 +523,21 @@ class TestCodexCritiqueExecutionLimits:
         crawler = make_stub(fetch_detail=True)
         items = [make_announcement(str(i)) for i in range(5)]
 
-        # 두 번째 확인 시점에 예산을 초과한 것처럼 시간을 흘린다
-        clock = iter([0.0, 0.0, 10_000.0, 10_000.0, 10_000.0])
+        # 호출마다 100초씩 흘려 두 번째 항목 차례에 예산을 넘긴다
+        ticks = {"now": 0.0}
+
+        def clock():
+            ticks["now"] += 100.0
+            return ticks["now"]
+
         with patch.object(
             crawler.session, "get", return_value=fake_response("<html>x</html>")
         ) as mock_get:
             with patch("alert.crawlers.base.time.sleep"):
-                with patch("alert.crawlers.base.time.monotonic", lambda: next(clock)):
+                with patch("alert.crawlers.base.time.monotonic", clock):
                     crawler.enrich_with_quotes(items)
 
-        assert mock_get.call_count == 1
+        assert 1 <= mock_get.call_count < len(items)
 
     def test_items_that_already_have_quotes_are_skipped(self):
         """이미 인용이 있는 항목은 다시 요청하지 않는다."""
@@ -601,3 +650,274 @@ class TestCodexCritiqueExecutionLimits:
         ) as mock_get:
             assert crawler.fetch_detail_quotes("https://example.com/x") == {}
         assert mock_get.call_count == 1
+
+
+class TestCodexReviewReadDeadline:
+    """재검토 #8(NOT FIXED): 읽는 도중 시간 검사가 없어 단일 요청이 1,152초.
+
+    재현: 8KB를 9초마다 흘려보내는 스트림. ``requests`` 의 timeout은 청크
+    사이 간격만 보므로 걸리지 않는다 - 청크마다 벽시계를 봐야 한다.
+    """
+
+    def _slow_stream(self, seconds_per_chunk: float, chunks: int = 200):
+        """청크마다 시간이 흐르는 가짜 스트림과 시계를 만든다."""
+        clock = {"now": 0.0}
+
+        def monotonic():
+            return clock["now"]
+
+        def iter_content(chunk_size=8192):
+            for _ in range(chunks):
+                clock["now"] += seconds_per_chunk
+                yield b"x" * 8192
+
+        return monotonic, iter_content, clock
+
+    def test_slow_stream_gives_up_within_the_request_deadline(self):
+        """8KB/9초 스트림은 요청 상한(30초) 안에서 포기한다."""
+        crawler = make_stub(fetch_detail=True)
+        monotonic, iter_content, clock = self._slow_stream(9.0)
+
+        response = MagicMock()
+        response.encoding = "utf-8"
+        response.headers = {}
+        response.raise_for_status.return_value = None
+        response.iter_content.side_effect = iter_content
+
+        with patch.object(crawler.session, "get", return_value=response):
+            with patch("alert.crawlers.base.time.monotonic", monotonic):
+                crawler.fetch_detail_quotes("https://example.com/slow")
+
+        # 상한을 넘긴 직후 멈춘다 - 한 청크 이상 초과하지 않는다
+        assert clock["now"] <= DETAIL_REQUEST_DEADLINE + 9.0
+
+    def test_source_budget_bounds_a_single_read(self):
+        """남은 소스 예산이 요청 상한보다 짧으면 그 예산이 먼저 걸린다."""
+        crawler = make_stub(fetch_detail=True)
+        monotonic, iter_content, clock = self._slow_stream(9.0)
+
+        response = MagicMock()
+        response.encoding = "utf-8"
+        response.headers = {}
+        response.raise_for_status.return_value = None
+        response.iter_content.side_effect = iter_content
+
+        with patch.object(crawler.session, "get", return_value=response):
+            with patch("alert.crawlers.base.time.monotonic", monotonic):
+                crawler.fetch_detail_quotes("https://example.com/slow", deadline=10.0)
+
+        assert clock["now"] <= 10.0 + 9.0
+
+    def test_whole_source_run_stays_inside_the_budget(self):
+        """느린 상세가 여러 건이어도 소스 예산 안에서 끝난다."""
+        crawler = make_stub(fetch_detail=True)
+        items = [make_announcement(str(i)) for i in range(30)]
+        monotonic, iter_content, clock = self._slow_stream(9.0)
+
+        response = MagicMock()
+        response.encoding = "utf-8"
+        response.headers = {}
+        response.raise_for_status.return_value = None
+        response.iter_content.side_effect = iter_content
+
+        with patch.object(crawler.session, "get", return_value=response):
+            with patch("alert.crawlers.base.time.sleep"):
+                with patch("alert.crawlers.base.time.monotonic", monotonic):
+                    crawler.enrich_with_quotes(items)
+
+        # 예산(240초) + 마지막 요청의 상한(30초) + 청크 하나를 넘지 않는다
+        assert clock["now"] <= 240.0 + DETAIL_REQUEST_DEADLINE + 9.0
+
+
+class TestCodexReviewCellInternals:
+    """재검토 #7: 셀 경계와 셀 **안쪽** 블록 경계를 혼동하던 결함."""
+
+    ROUNDS_TD = (
+        '<div class="board_view"><table><tr><th>접수기간</th><td>'
+        "<div>1차 2026.08.01~2026.08.31</div>"
+        "<div>2026.09.01~2026.09.30</div>"
+        "</td></tr></table></div>"
+    )
+
+    def test_rounds_inside_one_cell_are_all_quoted(self):
+        """한 셀 안의 div 로 나뉜 회차는 모두 인용에 들어간다."""
+        quotes = extract_quotes(normalize_text(self.ROUNDS_TD))
+        assert "2026.08.01" in quotes[QUOTE_DEADLINE]
+        assert "2026.09.30" in quotes[QUOTE_DEADLINE]
+
+    def test_div_and_span_give_the_same_period(self):
+        """div 로 감싸든 span 으로 감싸든 같은 마감이 나와야 한다."""
+        div_quotes = extract_quotes(normalize_text(self.ROUNDS_TD))
+        span_html = self.ROUNDS_TD.replace("<div>", "<span>").replace("</div>", "</span>")
+        span_quotes = extract_quotes(normalize_text(span_html))
+
+        div_period = period_from_quote(div_quotes[QUOTE_DEADLINE], today=TODAY)
+        span_period = period_from_quote(span_quotes[QUOTE_DEADLINE], today=TODAY)
+        assert div_period == span_period == ("2026-09-01", "2026-09-30")
+
+    def test_empty_cell_does_not_absorb_the_next_row(self):
+        """빈 마감 셀은 다음 행의 날짜를 흡수하지 않는다."""
+        html = (
+            '<div class="board_view"><table>'
+            "<tr><th>접수기간</th><td></td></tr>"
+            "<tr><td>2026.09.11</td><td>작성일</td></tr>"
+            "</table></div>"
+        )
+        assert extract_quotes(normalize_text(html)) == {}
+
+
+class TestCodexReviewTruncation:
+    """재검토 #8: 1MB 절단이 날짜를 조작하던 결함."""
+
+    def test_partial_date_is_discarded(self):
+        """``2026.09.30`` 이 ``2026.09.3`` 으로 잘려도 09-03을 만들지 않는다."""
+        html = (
+            '<div class="board_view"><table><tr><th>접수기간</th>'
+            "<td>2026.09.01 ~ 2026.09.3"
+        )
+        trimmed = complete_html_prefix(html)
+        quotes = extract_quotes(normalize_text(trimmed))
+        start, end = period_from_quote(quotes.get(QUOTE_DEADLINE, ""), today=TODAY)
+        assert end != "2026-09-03"
+
+    def test_cut_inside_an_attribute_does_not_leak(self):
+        """속성 중간에서 잘린 조각이 본문 마감으로 추출되지 않는다."""
+        html = (
+            '<div class="board_view"><p>본문</p>'
+            '<div title="접수기간 2026.09.30'
+        )
+        trimmed = complete_html_prefix(html)
+        assert "접수기간" not in trimmed
+        assert extract_quotes(normalize_text(trimmed)) == {}
+
+    def test_complete_prefix_keeps_finished_markup(self):
+        html = '<div class="board_view"><p>접수기간 2026.09.30까지</p></div><span'
+        trimmed = complete_html_prefix(html)
+        assert trimmed.endswith("</div>")
+
+    def test_no_close_bracket_yields_nothing(self):
+        assert complete_html_prefix("2026.09.3") == ""
+        assert complete_html_prefix("") == ""
+
+    def test_truncated_flag_is_recorded(self):
+        """절단된 응답은 raw_data에 표시를 남긴다."""
+        crawler = make_stub(fetch_detail=True)
+        announcement = make_announcement()
+        head = (
+            '<div class="board_view"><table><tr><th>접수기간</th>'
+            "<td>2026.09.01 ~ 2026.09.30</td></tr></table>"
+        )
+        body = (head + "<p>" + "가" * 2000 + "</p>" * 1).encode("utf-8")
+        body = head.encode("utf-8") + ("<p>" + "가" * 400_000 + "</p>").encode("utf-8")
+        assert len(body) > MAX_DETAIL_BYTES
+
+        response = MagicMock()
+        response.encoding = "utf-8"
+        response.headers = {}
+        response.raise_for_status.return_value = None
+        response.iter_content.return_value = [
+            body[i:i + 8192] for i in range(0, len(body), 8192)
+        ]
+
+        with patch.object(crawler.session, "get", return_value=response):
+            crawler.enrich_with_quotes([announcement])
+
+        payload = json.loads(announcement.raw_data)
+        assert payload[DETAIL_TRUNCATED] is True
+        assert payload["quote_period_end"] == "2026-09-30"
+
+
+class TestCodexReviewRoundSelection:
+    """재검토 #12: 회차 선택과 까지/부터 판정의 잔여 결함."""
+
+    @pytest.mark.parametrize("quote,expected", [
+        # 짧은 날짜에도 연도를 물려줘 2차가 선택된다 (예전엔 지난 1차)
+        ("모집기간 1차 2026.08.01~8.31 2차 9.01~9.30", ("2026-09-01", "2026-09-30")),
+        # 본문 순서가 2차 -> 1차 여도 결과는 같다 (모두 지났으면 가장 늦은 종료)
+        ("모집기간 2차 2026.02.01~2.28 1차 2026.01.01~1.31", ("2026-02-01", "2026-02-28")),
+        ("모집기간 1차 2026.01.01~1.31 2차 2026.02.01~2.28", ("2026-02-01", "2026-02-28")),
+        # 연도가 뒤에만 있어도 앞 날짜를 되돌려 받는다
+        ("접수기간 12.20~2027.1.10", ("2026-12-20", "2027-01-10")),
+        ("접수기간 2026.12.20 ~ 1.10", ("2026-12-20", "2027-01-10")),
+    ])
+    def test_round_and_year_resolution(self, quote, expected):
+        assert period_from_quote(quote, today=TODAY) == expected
+
+    def test_kkaji_is_an_end_even_when_ihu_follows(self):
+        """"09.30까지, 이후 접수불가" 의 "이후" 를 시작 신호로 오인하지 않는다."""
+        assert period_from_quote(
+            "접수기간 2026.09.30까지, 이후 접수불가", today=TODAY
+        ) == (None, "2026-09-30")
+
+    def test_end_only_allows_a_none_start(self):
+        start, end = period_from_quote("마감: 2026.09.30", today=TODAY)
+        assert start is None and end == "2026-09-30"
+
+
+class TestResolvePeriodPriority:
+    """재검토 #9: 명시된 날짜가 "상시" 보다 우선한다."""
+
+    @pytest.mark.parametrize("quote,expected", [
+        ("모집기간 상시", (None, None, True, False)),
+        ("모집기간 수시 모집", (None, None, True, False)),
+        ("접수기간 2026.09.01 ~ 2026.09.30 (예산 소진 시 조기마감)",
+         ("2026-09-01", "2026-09-30", False, True)),
+        ("접수기간 2026.09.01부터 상시 (예산 소진 시 마감)",
+         ("2026-09-01", None, True, False)),
+    ])
+    def test_resolution(self, quote, expected):
+        assert resolve_period(quote, today=TODAY) == expected
+
+    def test_early_close_detector(self):
+        assert is_early_close("예산 소진 시 조기마감") is True
+        assert is_early_close("선착순 접수") is True
+        assert is_early_close("접수기간 2026.09.30까지") is False
+
+    def test_always_open_detector_excludes_early_close_wording(self):
+        """"예산 소진" 만으로는 상시가 아니다 - 마감이 있는 공고다."""
+        assert is_always_open("예산 소진 시 조기마감") is False
+        assert is_always_open("상시 모집") is True
+
+
+class TestCodexReviewBudgetStarvation:
+    """재검토 #11: 요청 상한 때문에 목록 뒤쪽이 영구히 미수집되던 결함."""
+
+    def test_quoted_ids_from_db_free_the_budget(self):
+        """DB에서 받은 "이미 인용 있음" 목록은 예산을 쓰지 않는다."""
+        crawler = make_stub(fetch_detail=True)
+        items = [make_announcement(str(i)) for i in range(MAX_DETAIL_REQUESTS + 5)]
+        already = {str(i) for i in range(MAX_DETAIL_REQUESTS)}
+        crawler.set_quoted_source_ids(already)
+
+        with patch.object(
+            crawler.session, "get", return_value=fake_response("<html>x</html>")
+        ) as mock_get:
+            with patch("alert.crawlers.base.time.sleep"):
+                crawler.enrich_with_quotes(items)
+
+        requested = [call[0][0] for call in mock_get.call_args_list]
+        assert len(requested) == 5
+        # 정확히 뒤쪽 5건만 요청한다
+        assert [url.rsplit("/", 1)[-1] for url in requested] == [
+            str(i) for i in range(MAX_DETAIL_REQUESTS, MAX_DETAIL_REQUESTS + 5)
+        ]
+
+    def test_two_runs_cover_a_list_longer_than_the_cap(self):
+        """상한보다 긴 목록도 두 번 실행하면 전부 수집된다."""
+        total = MAX_DETAIL_REQUESTS + 5
+        seen: set = set()
+
+        for _ in range(2):
+            crawler = make_stub(fetch_detail=True)
+            crawler.set_quoted_source_ids(seen)
+            items = [make_announcement(str(i)) for i in range(total)]
+            with patch.object(
+                crawler.session, "get", return_value=fake_response("<html>x</html>")
+            ) as mock_get:
+                with patch("alert.crawlers.base.time.sleep"):
+                    crawler.enrich_with_quotes(items)
+            for call in mock_get.call_args_list:
+                seen.add(call[0][0].rsplit("/", 1)[-1])
+
+        assert seen == {str(i) for i in range(total)}
+

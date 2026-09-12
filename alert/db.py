@@ -363,6 +363,31 @@ class Database:
         ).fetchone()
         return row is not None
 
+    def get_quoted_source_ids(self, source: str) -> set:
+        """이미 상세 인용을 받은 공고의 source_id 집합.
+
+        크롤러가 상세 요청 예산을 이미 채운 항목에 낭비하지 않도록 알려
+        준다(Codex 재검토 #11). 이것이 없으면 목록이 요청 상한보다 길 때
+        뒤쪽 항목이 매 실행 영구히 미수집으로 남는다.
+
+        Args:
+            source: 크롤러 소스 이름
+
+        Returns:
+            ``raw_data`` 에 인용 키가 들어 있는 공고의 source_id 집합
+        """
+        rows = self._conn.execute(
+            _sql(
+                "SELECT source_id FROM announcements"
+                " WHERE source = ?"
+                "   AND (raw_data LIKE '%\"quote_deadline\"%'"
+                "     OR raw_data LIKE '%\"quote_eligibility\"%'"
+                "     OR raw_data LIKE '%\"quote_amount\"%')"
+            ),
+            (source,),
+        ).fetchall()
+        return {str(row["source_id"]) for row in rows}
+
     def search_announcements(self, query: str, limit: int = 20) -> List[AnalyzedAnnouncement]:
         """Full-text search across title and summary.
 

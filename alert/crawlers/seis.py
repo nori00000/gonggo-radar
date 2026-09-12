@@ -5,6 +5,7 @@ import re
 from collections import OrderedDict
 from typing import List, Optional
 from .base import BaseCrawler
+from .dedupe_keys import group_key, normalize_title
 from ..models import RawAnnouncement
 
 try:
@@ -221,7 +222,7 @@ class SeisCrawler(BaseCrawler):
     @staticmethod
     def _normalize_title(title: str) -> str:
         """중복 판별용 제목 정규화 - 공백과 구분기호를 없앤다."""
-        return re.sub(r"[\s·.,()\[\]{}「」『』\-~/]+", "", title or "")
+        return normalize_title(title)
 
     def _canonical_rank(self, item: dict) -> tuple:
         """같은 공고 묶음에서 대표를 고르는 순위 - 최신 회차가 이긴다."""
@@ -232,18 +233,21 @@ class SeisCrawler(BaseCrawler):
         return (item.get("date", "") or "", round_no, post_no)
 
     def _group_key(self, item: dict) -> tuple:
-        """중복 판별 키 - 제목·주체·접수 종료일이 **모두** 같아야 한 공고다.
+        """중복 판별 키 - 제목·지역·접수 종료일이 **모두** 같아야 한 공고다.
 
-        접수 종료일을 키에 넣는 이유(Codex 크리틱 #4): 같은 제목의 1차·2차
-        공고는 접수기간이 다른 **별개 공고**다. 종료일이 다르면 병합하지
-        않는다. 양쪽 다 종료일이 없으면 같은 것으로 본다.
+        지역은 ``span.sub`` 와 ``ul.info`` 를 **함께** 후보로 넣어 그중
+        지역을 말하는 값을 쓴다(Codex 재검토 #4). 한쪽만 보면 사업명이 같고
+        지역만 다른 공고(서울/부산)가 한 건으로 합쳐진다.
+
+        접수 종료일을 키에 넣는 이유: 같은 제목의 1차·2차 공고는 접수기간이
+        다른 **별개 공고**다. 종료일이 다르면 병합하지 않는다.
+
+        정리 스크립트의 규칙 B도 같은 함수(``dedupe_keys.group_key``)를 쓴다.
         """
         _, period_end = self._parse_period(item.get("date", "").strip())
-        return (
-            self._normalize_title(item.get("title", "")),
-            item.get("sub", "") or "",
-            period_end or "",
-        )
+        candidates = [item.get("sub", "") or ""]
+        candidates.extend(item.get("info", []) or [])
+        return group_key(item.get("title", ""), candidates, period_end)
 
     def _dedupe_items(self, items: List[dict]) -> List[dict]:
         """같은 공고의 복수 링크를 1건으로 합친다 (계약 v2.1 판정 6-①).

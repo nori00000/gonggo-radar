@@ -89,8 +89,16 @@ def _crawl_single(
     crawler_name: str,
     CrawlerClass: Any,
     logger: logging.Logger,
+    quoted_source_ids: Optional[set] = None,
 ) -> Tuple[str, list, str]:
     """단일 크롤러 실행 (스레드에서 호출).
+
+    Args:
+        crawler_name: 소스 이름
+        CrawlerClass: 크롤러 클래스
+        logger: 로거
+        quoted_source_ids: 이미 상세 인용을 받은 공고의 source_id.
+            상세 요청 예산을 이 항목에 쓰지 않는다 (Codex 재검토 #11)
 
     Returns:
         (crawler_name, raw_announcements, status)
@@ -100,6 +108,8 @@ def _crawl_single(
         crawler = CrawlerClass()
         if not crawler.is_enabled():
             return crawler_name, [], "disabled"
+        if quoted_source_ids:
+            crawler.set_quoted_source_ids(quoted_source_ids)
         raw = crawler.safe_fetch()
         return crawler_name, raw, "success"
     except Exception as e:
@@ -193,9 +203,22 @@ def run_pipeline(test_mode: bool = False) -> None:
 
     crawl_results: Dict[str, Any] = {}
 
+    # 이미 상세 인용을 받은 공고는 상세 요청 예산을 쓰지 않는다.
+    # 이걸 넘겨 주지 않으면 목록이 요청 상한보다 긴 소스에서 뒤쪽 항목이
+    # 매 실행 영구히 미수집으로 남는다 (Codex 재검토 #11).
+    quoted_ids: Dict[str, set] = {}
+    for name in available_crawlers:
+        try:
+            quoted_ids[name] = db.get_quoted_source_ids(name)
+        except Exception as e:
+            logger.debug(f"{name}: could not load quoted source ids: {e}")
+            quoted_ids[name] = set()
+
     with ThreadPoolExecutor(max_workers=5) as pool:
         futures = {
-            pool.submit(_crawl_single, name, cls, logger): name
+            pool.submit(
+                _crawl_single, name, cls, logger, quoted_ids.get(name)
+            ): name
             for name, cls in available_crawlers.items()
         }
         for future in as_completed(futures):

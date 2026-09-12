@@ -34,12 +34,15 @@ DETAIL_DELAY_SEC = 1.0
 # (2026-09-13 조정자 판정: kofpi 20건 전부 훑고 698KB 상세도 읽도록 상향)
 MAX_DETAIL_REQUESTS = 20            # 소스·실행당 새 상세 요청 수
 DETAIL_BUDGET_SEC = 240.0           # 소스·실행당 총 예산
+DETAIL_REQUEST_DEADLINE = 30.0      # 요청 하나의 벽시계 상한 (읽는 도중에도 검사)
 MAX_DETAIL_BYTES = 1024 * 1024      # 응답 본문 상한 - 넘으면 자른다(거부 아님)
 
 QUOTE_DEADLINE = "quote_deadline"
 QUOTE_ELIGIBILITY = "quote_eligibility"
 QUOTE_AMOUNT = "quote_amount"
 ALWAYS_OPEN = "always_open"
+EARLY_CLOSE = "early_close"
+DETAIL_TRUNCATED = "detail_truncated"
 
 # 인용 최대 길이 - 항목당 2줄 브리핑에 들어갈 수 있는 상한
 MAX_QUOTE_LEN = 300
@@ -52,19 +55,32 @@ CONTENT_SELECTORS = [
     "td.content", "div#content", "div#contents",
 ]
 
-# 셀·행·블록이 끝나는 자리 - 정규화가 여기에 줄바꿈을 남긴다
-_BLOCK_END = re.compile(
-    r"(</(?:td|th|tr|li|p|div|h[1-6]|table|tbody|thead|section|article|dl|dd|dt)\s*>"
-    r"|<br\s*/?>)",
-    re.I,
+# 경계는 세 등급이다 (Codex 재검토 #7).
+#   ROW  (\n): 표의 행이 끝났다 - 값이 없으면 그 라벨은 값이 없는 것이다
+#   CELL (\r): 셀이 끝났다 - 라벨과 값이 <th>/<td> 로 갈린 경우를 위해
+#              값을 만나기 전 **한 번만** 건너뛴다
+#   INNER(\v): 셀 **안쪽** 의 div/p/br/li - 값의 일부이므로 끊지 않는다
+#              (한 셀에 1차·2차 회차가 div 로 나열되는 경우)
+_ROW_END = re.compile(r"</(?:tr|table|tbody|thead)\s*>", re.I)
+_CELL_END = re.compile(r"</(?:td|th)\s*>", re.I)
+_INNER_END = re.compile(
+    r"(</(?:div|p|li|h[1-6]|dl|dd|dt|section|article)\s*>|<br\s*/?>)", re.I
 )
+# 사용자 영역 문자를 쓴다 - 원문 HTML의 자연 공백(\n, \r\n, 탭)과 절대
+# 겹치지 않아야 경계 등급을 신뢰할 수 있다.
+_ROW_MARK, _CELL_MARK, _INNER_MARK = "\uE000", "\uE001", "\uE002"
+_MARKS = _ROW_MARK + _CELL_MARK + _INNER_MARK
+# 공백과 경계 표시를 한데 묶어 "낱말 사이" 를 뜻하는 패턴
+_GAP = r"[\s\uE000-\uE002]"
 
 # 글머리표 - 인용의 끝 경계. ※/* 는 보충설명이라 경계로 쓰지 않는다.
 _BULLET_BOUNDARY = "ㅁ□ㅇ○◦▶■●◆"
 _OPENER_CHARS = r"([【<〔「"
 
 # 같은 낱말이 잇달아 나오면 표의 다음 라벨로 본다 ("공고상태 공고상태 진행중")
-_REPEATED_TOKEN = re.compile(r"(?<![^\s])(\S{2,})\s+\1(?![^\s])")
+_REPEATED_TOKEN = re.compile(
+    rf"(?<!{_GAP[:-1]}])([^\s\uE000-\uE002]{{2,}}){_GAP}+\1(?!{_GAP[:-1]}])"
+)
 # 본문 텍스트에 이스케이프된 HTML이 그대로 실려 나오는 경우
 _LEAKED_MARKUP = re.compile(r"<\s*/?\s*[A-Za-z]")
 
@@ -90,8 +106,41 @@ _LABELS: Dict[str, List[Tuple[str, bool]]] = {
 
 
 def flatten(text: str) -> str:
-    """줄바꿈을 공백으로 바꿔 한 줄로 만든다 (인용 대조용)."""
-    return re.sub(r"\s+", " ", (text or "").replace("\n", " ")).strip()
+    """경계 표시를 공백으로 바꿔 한 줄로 만든다 (인용 대조용)."""
+    return re.sub(rf"{_GAP}+", " ", text or "").strip()
+
+
+def _collapse_boundaries(match: "re.Match") -> str:
+    """연속된 경계는 가장 강한 등급 하나로 줄인다 (ROW > CELL > INNER)."""
+    chunk = match.group(0)
+    if _ROW_MARK in chunk:
+        return _ROW_MARK
+    if _CELL_MARK in chunk:
+        return _CELL_MARK
+    return _INNER_MARK
+
+
+def complete_html_prefix(html: str) -> str:
+    """절단된 HTML에서 **완결되지 않은 꼬리**를 버린다 (Codex 재검토 #8).
+
+    1MB 상한에서 자르면 태그나 텍스트가 중간에서 끊긴다. 그대로 파싱하면
+    ``2026.09.30`` 이 ``2026.09.3`` 으로 잘려 **09-03** 이 되거나,
+    ``<div title="접수기간 …`` 처럼 속성 중간에서 끊긴 조각이 본문 텍스트로
+    새어 들어온다. 그래서 마지막 ``>`` 까지만 남긴다 - 그 뒤는 완결되지
+    않은 태그이거나 완결되지 않은 텍스트다.
+
+    Args:
+        html: 절단된 HTML 문자열
+
+    Returns:
+        마지막 완결 태그까지의 접두사. ``>`` 가 없으면 빈 문자열
+    """
+    if not html:
+        return ""
+    last_close = html.rfind(">")
+    if last_close == -1:
+        return ""
+    return html[:last_close + 1]
 
 
 def normalize_text(html: str) -> str:
@@ -109,7 +158,9 @@ def normalize_text(html: str) -> str:
     if BeautifulSoup is None or not html:
         return ""
 
-    marked = _BLOCK_END.sub(r"\1\n", html)
+    marked = _ROW_END.sub(lambda m: m.group(0) + _ROW_MARK, html)
+    marked = _CELL_END.sub(lambda m: m.group(0) + _CELL_MARK, marked)
+    marked = _INNER_END.sub(lambda m: m.group(0) + _INNER_MARK, marked)
     soup = BeautifulSoup(marked, "html.parser")
     for tag in soup(["script", "style", "noscript"]):
         tag.decompose()
@@ -123,9 +174,10 @@ def normalize_text(html: str) -> str:
         element = soup.body or soup
 
     text = element.get_text(" ", strip=False).replace("\xa0", " ")
-    text = re.sub(r"[^\S\n]+", " ", text)      # 줄바꿈은 남기고 공백만 합친다
-    text = re.sub(r" *\n[\s\n]*", "\n", text)  # 빈 줄 제거
-    return text.strip()
+    text = re.sub(r"\s+", " ", text)          # 원문의 자연 공백을 먼저 없앤다
+    # 이어진 경계는 가장 강한 등급 하나로 (주변 공백까지 흡수)
+    text = re.sub(rf" ?([{_MARKS}][{_MARKS} ]*)", _collapse_boundaries, text)
+    return text.strip(" " + _MARKS)
 
 
 def _find_label(text: str, label: str, strict: bool) -> Optional[int]:
@@ -137,7 +189,7 @@ def _find_label(text: str, label: str, strict: bool) -> Optional[int]:
         # "라벨 :" / "라벨："
         rf"{escaped}\s*[:：]",
         # th/td 라벨이 두 번 렌더되는 표 (예: "신청기간 신청기간 2026.09.01 ~")
-        rf"{escaped}\s+{escaped}",
+        rf"{escaped}{_GAP}+{escaped}",
     ]
     for pattern in contextual:
         match = re.search(pattern, text)
@@ -156,29 +208,42 @@ def _find_label(text: str, label: str, strict: bool) -> Optional[int]:
 
 
 def _cut_quote(text: str, start: int, label: str) -> str:
-    """라벨부터 **값을 한 조각 읽은 뒤 만나는 첫 경계**까지 잘라낸다.
+    """라벨부터 값이 끝나는 자리까지 잘라낸다.
 
-    라벨과 값이 다른 셀(``<th>``/``<td>``)에 있으면 그 사이에도 경계가
-    있으므로, 내용이 나오기 전의 경계는 건너뛴다. 내용을 읽은 뒤의 경계는
-    다음 행·다음 항목의 시작이므로 거기서 끊는다.
+    경계 등급별 처리 (Codex 재검토 #7):
+
+    - **글머리표**: 늘 끊는다. 라벨 바로 뒤에 오면 값이 없다는 뜻이다.
+    - **ROW**(행 끝): 값을 아직 못 읽었으면 그 라벨은 **값이 없다** - 다음
+      행의 값을 흡수하지 않도록 여기서 끝낸다. 값을 읽은 뒤면 끊는다.
+    - **CELL**(셀 끝): 라벨과 값이 ``<th>``/``<td>`` 로 갈린 경우를 위해
+      값을 만나기 전 **한 번만** 건너뛴다. 두 번째 셀 경계는 값이 없다는 뜻.
+    - **INNER**(셀 안쪽 div/p/br): 값의 일부다. 끊지 않는다 - 한 셀에
+      1차·2차가 나열되면 둘 다 인용에 들어가야 회차 선택이 동작한다.
     """
     scan_from = start + len(label)
     limit = min(len(text), start + MAX_QUOTE_LEN)
 
     end = limit
     seen_content = False
+    cells_skipped = 0
     for index in range(scan_from, limit):
         char = text[index]
         if char in _BULLET_BOUNDARY:
-            # 글머리표는 늘 끊는다 - 라벨 바로 뒤에 오면 값이 없다는 뜻이다
             end = index
             break
-        if char == "\n":
-            # 셀/행 경계는 값을 아직 못 읽었을 때만 건너뛴다
-            # (라벨과 값이 <th>/<td> 로 갈려 있는 표)
+        if char == _ROW_MARK:
+            end = index
+            break
+        if char == _CELL_MARK:
             if seen_content:
                 end = index
                 break
+            cells_skipped += 1
+            if cells_skipped > 1:
+                end = index
+                break
+            continue
+        if char == _INNER_MARK:
             continue
         if not char.isspace() and char not in "()[]:：-–—,.":
             seen_content = True
@@ -236,22 +301,42 @@ _SHORT_DATE = re.compile(r"(?<![\d:])(\d{1,2})\s*[.\-/]\s*(\d{1,2})(?![\d:])")
 
 # 두 날짜 사이에 있으면 범위로 보는 기호 (하이픈은 공백으로 감싼 경우만)
 _RANGE_SEP = re.compile(r"[~∼〜]|부터|\s[-–—]\s")
-# 날짜 뒤에 붙으면 종료일로 보는 말
-_UNTIL = re.compile(r"까지|이내|마감")
-# 날짜 뒤에 붙으면 시작일로 보는 말
+# 날짜 뒤에 붙으면 종료일로 보는 말. "마감" 은 여기서 빼고 라벨 쪽에서만
+# 본다 - "부터 … 마감" 같은 문장에서 시작일을 종료일로 뒤집던 원인이었다.
+_UNTIL = re.compile(r"까지|이내")
+# 날짜 **바로** 뒤에 붙으면 시작일로 보는 말 (좁은 창에서만 본다).
+# "09.30까지, 이후 접수불가" 의 "이후" 를 시작 신호로 오인하지 않기 위해
+# _UNTIL 을 먼저 본다 (Codex 재검토 #12).
 _FROM = re.compile(r"부터|이후|개시|시작")
 # 날짜 앞에 붙으면 종료일로 보는 라벨
 _DEADLINE_LABEL = re.compile(r"(?:마감일시|마감기한|마감일|마감)\s*[:：]?\s*$")
 # 마감이 없는 상시 공고
-_ALWAYS_OPEN = re.compile(r"상시|수시|연중|예산\s*소진|소진\s*시|별도\s*공지\s*시")
+_ALWAYS_OPEN = re.compile(r"상시|수시|연중|별도\s*공지\s*시")
+# 예산 소진 시 조기마감 - 마감일이 **있으면서** 앞당겨질 수 있다는 뜻이다.
+# 무기한 접수(상시)와 구분해야 한다 (Codex 재검토 #9).
+_EARLY_CLOSE = re.compile(r"예산\s*소진|소진\s*시|조기\s*마감|선착순")
 
-_RANGE_GAP_MAX = 12   # 두 날짜 사이 간격 상한 (넘으면 범위로 보지 않는다)
-_SIDE_WINDOW = 15     # 날짜 앞뒤에서 까지/부터/마감을 찾는 창
+_RANGE_GAP_MAX = 12    # 두 날짜 사이 간격 상한 (넘으면 범위로 보지 않는다)
+_UNTIL_WINDOW = 15     # 날짜 뒤에서 "까지/이내" 를 찾는 창
+_FROM_WINDOW = 6       # 날짜 뒤에서 "부터/이후" 를 찾는 창 (바로 붙은 경우만)
+_LABEL_WINDOW = 15     # 날짜 앞에서 "마감:" 라벨을 찾는 창
 
 
 def is_always_open(quote: str) -> bool:
-    """"상시 / 예산 소진 시" 처럼 마감이 없는 공고인지 본다."""
+    """"상시 / 수시 / 연중" 처럼 무기한 접수를 말하는지 본다.
+
+    주의: 이것만으로 마감을 지우지는 않는다. 명시된 날짜가 있으면 **날짜가
+    이긴다** (Codex 재검토 #9) - ``resolve_period`` 가 그렇게 판정한다.
+    """
     return bool(quote) and bool(_ALWAYS_OPEN.search(quote))
+
+
+def is_early_close(quote: str) -> bool:
+    """"예산 소진 시 / 조기마감 / 선착순" 처럼 마감이 앞당겨질 수 있는지 본다.
+
+    마감일이 **있는** 공고이므로 무기한 접수(상시)와 구분한다.
+    """
+    return bool(quote) and bool(_EARLY_CLOSE.search(quote))
 
 
 def _safe_iso(year: Optional[int], month: int, day: int) -> Optional[str]:
@@ -310,17 +395,63 @@ def _scan_dates(quote: str) -> List[Tuple[int, int, Optional[str], int, int]]:
     return found
 
 
-def _carry_year(start_iso: str, month: int, day: int) -> Optional[str]:
-    """연도가 생략된 종료일에 시작 연도를 물려준다 (해 넘김 처리).
+def _resolve_years(
+    dates: List[Tuple[int, int, Optional[str], int, int]]
+) -> List[Tuple[int, int, Optional[str], int, int]]:
+    """연도가 생략된 날짜에 문맥의 연도를 물려준다 (Codex 재검토 #12).
 
-    ``2026.12.20 ~ 1.10`` 처럼 종료가 시작보다 앞서면 다음 해로 본다.
+    앞에서 뒤로 한 번, 뒤에서 앞으로 한 번 훑는다:
+
+    - 앞 → 뒤: 마지막으로 본 연도를 이어받고, 월·일이 앞 날짜보다 **빠르면**
+      해가 넘어간 것으로 본다 (``2026.12.20 ~ 1.10`` → ``2027-01-10``).
+    - 뒤 → 앞: 첫 명시 연도보다 앞에 있는 날짜들(``12.20 ~ 2027.1.10`` 의
+      ``12.20``)은 뒤쪽 연도에서 되돌려 받는다.
+
+    Returns:
+        같은 모양의 리스트. 해결된 항목은 ``iso`` 가 채워진다
     """
-    start_year = int(start_iso[:4])
-    start_month, start_day = int(start_iso[5:7]), int(start_iso[8:10])
-    year = start_year
-    if (month, day) < (start_month, start_day):
-        year += 1
-    return _safe_iso(year, month, day)
+    resolved = list(dates)
+
+    # 앞 -> 뒤
+    year: Optional[int] = None
+    previous: Optional[Tuple[int, int]] = None
+    for index, (begin, finish, iso, month, day) in enumerate(resolved):
+        if iso:
+            year = int(iso[:4])
+            previous = (month, day)
+            continue
+        if year is None:
+            continue
+        candidate_year = year
+        if previous and (month, day) < previous:
+            candidate_year += 1
+        new_iso = _safe_iso(candidate_year, month, day)
+        if new_iso:
+            resolved[index] = (begin, finish, new_iso, month, day)
+            year = candidate_year
+            previous = (month, day)
+
+    # 뒤 -> 앞 (첫 명시 연도보다 앞에 있는 날짜들)
+    year = None
+    following: Optional[Tuple[int, int]] = None
+    for index in range(len(resolved) - 1, -1, -1):
+        begin, finish, iso, month, day = resolved[index]
+        if iso:
+            year = int(iso[:4])
+            following = (month, day)
+            continue
+        if year is None:
+            continue
+        candidate_year = year
+        if following and (month, day) > following:
+            candidate_year -= 1
+        new_iso = _safe_iso(candidate_year, month, day)
+        if new_iso:
+            resolved[index] = (begin, finish, new_iso, month, day)
+            year = candidate_year
+            following = (month, day)
+
+    return resolved
 
 
 def _candidates(quote: str) -> List[Tuple[int, Optional[str], Optional[str]]]:
@@ -328,7 +459,7 @@ def _candidates(quote: str) -> List[Tuple[int, Optional[str], Optional[str]]]:
 
     후보가 되는 경우만 담는다 - 날짜가 그냥 하나 떠 있으면 후보가 아니다.
     """
-    dates = _scan_dates(quote)
+    dates = _resolve_years(_scan_dates(quote))
     candidates: List[Tuple[int, Optional[str], Optional[str]]] = []
     paired: set = set()
 
@@ -340,24 +471,23 @@ def _candidates(quote: str) -> List[Tuple[int, Optional[str], Optional[str]]]:
             continue
         if not _RANGE_SEP.search(between):
             continue
-        start = first[2]
-        end = second[2]
-        if end is None and start is not None:
-            end = _carry_year(start, second[3], second[4])
-        candidates.append((first[0], start, end))
+        candidates.append((first[0], first[2], second[2]))
         paired.add(index)
         paired.add(index + 1)
 
-    # 2) 홀로 있는 날짜 - 붙어 있는 말로만 판정한다
+    # 2) 홀로 있는 날짜 - 바로 붙어 있는 말로만 판정한다.
+    #    "까지" 를 먼저 본다: "09.30까지, 이후 접수불가" 에서 "이후" 를
+    #    시작 신호로 오인하면 마감이 시작일로 저장된다 (재검토 #12).
     for index, token in enumerate(dates):
         if index in paired or token[2] is None:
             continue
-        tail = quote[token[1]:token[1] + _SIDE_WINDOW]
-        head = quote[max(0, token[0] - _SIDE_WINDOW):token[0]]
-        if _FROM.search(tail):
-            candidates.append((token[0], token[2], None))
-        elif _UNTIL.search(tail) or _DEADLINE_LABEL.search(head):
+        until_tail = quote[token[1]:token[1] + _UNTIL_WINDOW]
+        from_tail = quote[token[1]:token[1] + _FROM_WINDOW]
+        head = quote[max(0, token[0] - _LABEL_WINDOW):token[0]]
+        if _UNTIL.search(until_tail) or _DEADLINE_LABEL.search(head):
             candidates.append((token[0], None, token[2]))
+        elif _FROM.search(from_tail):
+            candidates.append((token[0], token[2], None))
 
     candidates.sort(key=lambda item: item[0])
     return candidates
@@ -370,13 +500,11 @@ def period_from_quote(
 
     보수적으로만 판단한다 - 날짜가 그냥 하나 떠 있다고 마감으로 쓰지 않는다.
     종료일로 확정하는 경우는 ①``~`` 범위의 뒤쪽 날짜 ②날짜 바로 뒤에
-    "까지/이내" ③``마감:`` 라벨 바로 뒤 뿐이다. "마감" 이 문장 아무 곳에나
-    있다는 이유로는 확정하지 않는다(Codex 크리틱 #6).
+    "까지/이내" ③``마감:`` 라벨 바로 뒤 뿐이다.
 
     회차가 여러 개면 **오늘 이후로 가장 이른 종료일**을 쓴다. 모두 지났으면
-    마지막 회차를 쓴다(Codex 크리틱 #7).
-
-    "상시 / 예산 소진 시" 가 있으면 종료일을 만들지 않는다(크리틱 #3).
+    **가장 늦은 종료일**을 쓴다 - 본문에 적힌 순서와 무관하게 판단한다
+    (Codex 재검토 #12).
 
     Args:
         quote: ``extract_quotes`` 가 낸 인용 문자열
@@ -402,29 +530,53 @@ def period_from_quote(
         (c for c in with_end if c[2] >= today_iso),
         key=lambda c: (c[2], 0 if c[1] else 1),
     )
-    chosen = upcoming[0] if upcoming else with_end[-1]
+    if upcoming:
+        chosen = upcoming[0]
+    else:
+        # 모두 지났으면 가장 늦은 종료일 (본문 순서에 의존하지 않는다)
+        chosen = max(with_end, key=lambda c: (c[2], 0 if c[1] else 1))
 
-    start, end = chosen[1], chosen[2]
-    if is_always_open(quote):
-        end = None
-    return start, end
+    return chosen[1], chosen[2]
+
+
+def resolve_period(
+    quote: str, today: Optional[date] = None
+) -> Tuple[Optional[str], Optional[str], bool, bool]:
+    """마감 인용에서 기간과 상시/조기마감 표시를 함께 판정한다.
+
+    **명시된 날짜가 상시보다 우선한다** (Codex 재검토 #9):
+
+    - 날짜로 종료일이 잡히면 그 종료일을 쓰고 ``always_open`` 은 False다.
+      "예산 소진 시 조기마감" 은 마감이 있는 공고이므로 ``early_close`` 로
+      표시하고 마감을 지우지 않는다.
+    - 종료일이 전혀 없고 "상시/수시/연중" 이 있으면 그때만 ``always_open``.
+
+    Args:
+        quote: 마감 인용
+        today: 기준일 (테스트 주입용)
+
+    Returns:
+        ``(period_start, period_end, always_open, early_close)``
+    """
+    start, end = period_from_quote(quote, today=today)
+    early_close = bool(end) and is_early_close(quote)
+    always_open = not end and is_always_open(quote)
+    return start, end, always_open, early_close
 
 
 def apply_quote_period(
     quotes: Dict[str, str], today: Optional[date] = None
-) -> Tuple[Optional[str], Optional[str], bool]:
-    """마감 인용에서 기간과 "상시" 여부를 함께 판정한다.
+) -> Tuple[Optional[str], Optional[str], bool, bool]:
+    """``extract_quotes`` 결과에서 기간·상시·조기마감을 판정한다.
 
     Args:
         quotes: ``extract_quotes`` 결과
         today: 기준일 (테스트 주입용)
 
     Returns:
-        ``(period_start, period_end, always_open)``
+        ``(period_start, period_end, always_open, early_close)``
     """
-    deadline_quote = quotes.get(QUOTE_DEADLINE, "")
-    start, end = period_from_quote(deadline_quote, today=today)
-    return start, end, is_always_open(deadline_quote)
+    return resolve_period(quotes.get(QUOTE_DEADLINE, ""), today=today)
 
 
 def has_quote_keys(payload: Dict[str, object]) -> bool:

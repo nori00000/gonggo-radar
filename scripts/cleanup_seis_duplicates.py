@@ -46,6 +46,14 @@ from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional, Set, Tuple
 
+# sys.path 보정 - 크롤러와 **같은** 중복 판별 키를 쓰기 위해 공유 모듈을 읽는다
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+from alert.crawlers.dedupe_keys import (  # noqa: E402
+    extract_region,
+    group_key,
+)
+
 DEFAULT_DB = "alert/data/announcements.db"
 
 # 규칙 B(제목·주체·종료일 병합)는 회차별 링크를 뿌리는 seis 에만 쓴다
@@ -61,16 +69,11 @@ POST_ID_PARAMS: Dict[str, Tuple[str, ...]] = {
     "smartfarm": ("searchNttId",),
 }
 
-# 중복 판별용 제목 정규화 - 크롤러의 SeisCrawler._normalize_title 과 같은 규칙
-_TITLE_NOISE = re.compile(r"[\s·.,()\[\]{}「」『』\-~/]+")
 # 기간 문자열에 범위 표기가 있으면 게시일이 아니라 원문이 말한 접수기간이다
 _RANGE_MARK = re.compile(r"[~∼〜]|부터")
 _DATE_TOKEN = re.compile(r"\d{4}\s*[.\-/년]\s*\d{1,2}\s*[.\-/월]\s*\d{1,2}")
-
-
-def normalize_title(title: str) -> str:
-    """공백·구분기호를 없앤 비교용 제목."""
-    return _TITLE_NOISE.sub("", title or "")
+# 원문이 접수를 이야기하고 있다는 신호 (날짜와 함께 있을 때만 의미가 있다)
+_RECEPTION_WORDS = re.compile(r"당일|접수|신청|모집|공모|마감")
 
 
 def load_raw(raw_data: Optional[str]) -> dict:
@@ -84,10 +87,38 @@ def load_raw(raw_data: Optional[str]) -> dict:
     return loaded if isinstance(loaded, dict) else {}
 
 
-def row_subject(row: sqlite3.Row) -> str:
-    """공고의 주체(지역·기관·사업명) - 새 파서는 ``sub``, 구 파서는 ``region``."""
+def region_candidates(row: sqlite3.Row) -> List[str]:
+    """지역 후보 문자열 - ``sub`` 와 ``info`` 를 **함께** 본다.
+
+    한쪽만 보면 사업명이 같고 지역만 다른 공고가 합쳐진다
+    (Codex 재검토 #4). 구 파서가 남긴 ``region`` 키도 후보에 넣는다.
+    """
     payload = load_raw(row["raw_data"])
-    return str(payload.get("sub") or payload.get("region") or "")
+    candidates = [str(payload.get("sub") or ""), str(payload.get("region") or "")]
+    info = payload.get("info")
+    if isinstance(info, list):
+        candidates.extend(str(value) for value in info)
+    return [value for value in candidates if value]
+
+
+def row_region(row: sqlite3.Row) -> str:
+    """이 행이 말하는 지역 (없으면 빈 문자열)."""
+    return extract_region(region_candidates(row))
+
+
+def row_key(row: sqlite3.Row) -> Tuple[str, str, str]:
+    """행의 중복 판별 키 - 크롤러와 같은 ``group_key`` 를 쓴다.
+
+    접수 종료일이 없으면 **적재 월**로 갈라 회차가 다른 공고가 합쳐지지
+    않게 한다 (Codex 재검토 #4).
+    """
+    created = str(row["created_at"] or "")
+    return group_key(
+        row["title"],
+        region_candidates(row),
+        row["period_end"] or None,
+        ingested_month=created[:7],
+    )
 
 
 def id_matches_url(source: str, source_id: str, url: str) -> bool:
@@ -154,7 +185,7 @@ def find_duplicates(
         ``(삭제 대상 행, 근거 문장, canonical 행 id 집합)``
 
     Raises:
-        RuntimeError: 어떤 묶음이든 0행이 되는 계획이 나오면 (불변식 위반)
+        RuntimeError: 어떤 키 묶음이든 0행이 되는 계획이 나오면 (불변식 위반)
     """
     rows = _fetch_rows(conn, source)
     by_source_id: Dict[str, sqlite3.Row] = {r["source_id"]: r for r in rows}
@@ -162,23 +193,42 @@ def find_duplicates(
     reasons: List[str] = []
 
     # ---------- 규칙 A (먼저, canonical 잠금) ----------
+    # 병합 기록을 **검증한 뒤에만** 믿는다: 대표와 제목·지역·기간이 같아야
+    # 한다. 예전 오병합 기록("서울 100 이 부산 101 을 병합")을 그대로
+    # 확정하면 별개 공고가 사라진다 (Codex 재검토 #5).
     canonical: Set[int] = set()
     for row in rows:
         merged = load_raw(row["raw_data"]).get("merged_source_ids") or []
         if not merged:
             continue
-        canonical.add(row["id"])
+        keeper_key = row_key(row)
+        honoured = False
         for merged_id in merged:
             victim = by_source_id.get(str(merged_id))
             if victim is None or victim["id"] == row["id"]:
                 continue
+            victim_key = row_key(victim)
+            if victim_key != keeper_key:
+                reasons.append(
+                    f"  [A?] id={victim['id']} source_id={victim['source_id']} "
+                    f"병합 기록 무시 - 대표 source_id={row['source_id']} 와 "
+                    f"제목·지역·기간이 다르다 "
+                    f"(대표 {keeper_key[1] or '지역없음'}/{keeper_key[2] or '기간없음'} "
+                    f"vs {victim_key[1] or '지역없음'}/{victim_key[2] or '기간없음'})"
+                )
+                continue
             doomed[victim["id"]] = victim
+            honoured = True
             reasons.append(
                 f"  [A] id={victim['id']} source_id={victim['source_id']} "
-                f"-> 대표 source_id={row['source_id']} 의 merged_source_ids"
+                f"-> 대표 source_id={row['source_id']} 의 merged_source_ids "
+                f"(키 일치 확인)"
             )
+        if honoured:
+            canonical.add(row["id"])
+
     # canonical 은 A가 지목했어도 지우지 않는다 (기록 충돌 시 대표 보존)
-    for row_id in canonical:
+    for row_id in list(canonical):
         if doomed.pop(row_id, None) is not None:
             reasons.append(
                 f"  [A!] id={row_id} 은 canonical 이므로 삭제 목록에서 제외 (기록 충돌)"
@@ -190,14 +240,9 @@ def find_duplicates(
     if source == RULE_B_SOURCE:
         groups: Dict[Tuple[str, str, str], List[sqlite3.Row]] = {}
         for row in survivors:
-            key = (
-                normalize_title(row["title"]),
-                row_subject(row),
-                row["period_end"] or "",
-            )
-            groups.setdefault(key, []).append(row)
+            groups.setdefault(row_key(row), []).append(row)
 
-        for (_title, subject, period_end), group in groups.items():
+        for (_title, region, deadline), group in groups.items():
             if len(group) < 2:
                 continue
             locked = [r for r in group if r["id"] in canonical]
@@ -208,17 +253,20 @@ def find_duplicates(
                 doomed[row["id"]] = row
                 reasons.append(
                     f"  [B] id={row['id']} source_id={row['source_id']} -> 대표 "
-                    f"source_id={keeper['source_id']} (제목·주체{subject or '(없음)'}"
-                    f"·종료일{period_end or '(없음)'} 동일)"
+                    f"source_id={keeper['source_id']} (제목·지역"
+                    f"{region or '(없음)'}·마감키{deadline or '(없음)'} 동일)"
                 )
     else:
-        groups_by_title: Dict[str, List[sqlite3.Row]] = {}
+        groups_by_key: Dict[Tuple[str, str, str], List[sqlite3.Row]] = {}
         for row in survivors:
-            groups_by_title.setdefault(normalize_title(row["title"]), []).append(row)
+            groups_by_key.setdefault(row_key(row), []).append(row)
 
-        for group in groups_by_title.values():
+        for group in groups_by_key.values():
             if len(group) < 2:
                 continue
+            # 규칙 C는 "글번호가 자기 URL에 없다" 는 증명 가능한 결함만 지운다.
+            # 게다가 같은 키(제목·지역·기간) 묶음 안에서만 본다 - URL 미해소는
+            # 그 자체로 중복 증거가 아니다 (Codex 재검토 #6).
             provable = [
                 r for r in group
                 if id_matches_url(source, r["source_id"], r["url"] or "")
@@ -239,7 +287,7 @@ def find_duplicates(
                 doomed[row["id"]] = row
                 reasons.append(
                     f"  [C] id={row['id']} source_id={row['source_id']} -> 대표 "
-                    f"source_id={keeper['source_id']} ({cause})"
+                    f"source_id={keeper['source_id']} ({cause}, 키 일치)"
                 )
 
     # ---------- 불변식 ----------
@@ -255,36 +303,82 @@ def _assert_invariants(
     doomed: Dict[int, sqlite3.Row],
     canonical: Set[int],
 ) -> None:
-    """canonical 생존 + 제목 묶음당 최소 1행 생존을 확인한다."""
+    """canonical 생존 + **키 묶음당** 최소 1행 생존을 확인한다.
+
+    제목만으로 검사하면 지역·기간이 다른 공고가 한 묶음으로 묶여 전멸을
+    못 잡는다 (Codex 재검토 #5).
+    """
     killed_canonical = canonical & set(doomed)
     if killed_canonical:
         raise RuntimeError(
             f"{source}: canonical 행이 삭제 목록에 있다 (id={sorted(killed_canonical)})"
         )
 
-    by_title: Dict[str, List[sqlite3.Row]] = {}
+    by_key: Dict[Tuple[str, str, str], List[sqlite3.Row]] = {}
     for row in rows:
-        by_title.setdefault(normalize_title(row["title"]), []).append(row)
-    for title, group in by_title.items():
+        by_key.setdefault(row_key(row), []).append(row)
+    for key, group in by_key.items():
         remaining = [r for r in group if r["id"] not in doomed]
         if not remaining:
+            title, region, deadline = key
             raise RuntimeError(
-                f"{source}: 제목 묶음이 전멸한다 (title={title[:40]!r}, "
+                f"{source}: 키 묶음이 전멸한다 (제목={title[:30]!r}, "
+                f"지역={region or '(없음)'}, 마감키={deadline or '(없음)'}, "
                 f"{len(group)}행 전부 삭제 대상)"
             )
 
 
-def _mentions_range(payload: dict) -> bool:
-    """raw_data 에 원문이 말한 **기간**(범위 표기)이 들어 있는지 본다."""
+def _raw_date_fields(payload: dict) -> List[str]:
+    """원문이 날짜를 말한 필드 값들."""
+    values = []
     for key in ("date", "period", "WRITE_DATE", "quote_deadline"):
         value = str(payload.get(key) or "")
-        if not value:
-            continue
+        if value:
+            values.append(value)
+    return values
+
+
+def states_reception_period(payload: dict) -> bool:
+    """원문이 **접수 기간/당일 접수를 스스로 말했는지** 본다.
+
+    Codex 재검토 #10: ``date="2026-09-15 당일 접수"`` 같은 정상 당일 접수를
+    지우면 진짜 마감을 잃는다. 반대로 ``quote_deadline="접수기간 별도 공지"``
+    처럼 **날짜가 없는** 인용은 근거가 아니다.
+
+    근거로 인정하는 경우:
+
+    - 범위 표기(``~``/부터)가 있다
+    - 날짜가 둘 이상이다
+    - 날짜가 있고 그 옆에 접수/신청/모집/당일 같은 말이 있다
+    """
+    for value in _raw_date_fields(payload):
         if _RANGE_MARK.search(value):
             return True
-        if len(_DATE_TOKEN.findall(value)) >= 2:
+        dates = _DATE_TOKEN.findall(value)
+        if len(dates) >= 2:
+            return True
+        if dates and _RECEPTION_WORDS.search(value):
             return True
     return False
+
+
+def posting_dates(payload: dict, created_date: str) -> Set[str]:
+    """이 행의 **게시일** 후보 - 단일 날짜 필드와 적재일."""
+    found: Set[str] = set()
+    if created_date:
+        found.add(created_date)
+    posted = str(payload.get("posted") or "")
+    for value in [posted] + _raw_date_fields(payload):
+        if _RANGE_MARK.search(value):
+            continue
+        matches = re.findall(
+            r"(\d{4})\s*[.\-/년]\s*(\d{1,2})\s*[.\-/월]\s*(\d{1,2})", value
+        )
+        if len(matches) != 1:
+            continue
+        year, month, day = matches[0]
+        found.add(f"{int(year):04d}-{int(month):02d}-{int(day):02d}")
+    return found
 
 
 def find_fake_deadlines(
@@ -292,16 +386,16 @@ def find_fake_deadlines(
 ) -> Tuple[List[sqlite3.Row], List[str]]:
     """socialenterprise 의 게시일=마감 행을 찾는다.
 
-    두 조건 중 하나라도 맞으면 대상이다:
+    비우는 조건 (Codex 재검토 #10):
 
-    1. ``period_end == DATE(created_at)`` 이고 raw_data에 날짜·인용 근거가 없다
-       (지시받은 조건).
-    2. ``period_start == period_end`` 이고 raw_data의 목록 날짜가 **단일
-       날짜**다 - 게시일 하나가 기간으로 해석된 지문.
+    1. ``period_end`` 가 **게시일**(단일 날짜 필드 또는 적재일)과 같다
+    2. 그러면서 원문이 접수 기간을 스스로 말하지 않았다
+       (``states_reception_period`` 가 False)
+    3. 상세 인용에서 온 마감(``quote_period_end``)이 없다
 
-    **당일 접수를 명시한 원문은 남긴다** (Codex 크리틱 #9):
-    ``raw_data.date = "2026-09-15 ~ 2026-09-15"`` 처럼 범위 표기나 날짜
-    두 개가 있으면 원문이 스스로 기간을 말한 것이므로 건드리지 않는다.
+    그래서 ``date="2026-09-15 당일 접수"`` 나 ``"09-15 ~ 09-15"`` 같은 정상
+    당일 접수는 남고, ``quote_deadline="접수기간 별도 공지"`` 처럼 날짜가
+    없는 인용만 붙어 있는 가짜 마감은 비워진다.
 
     Args:
         conn: 열린 DB 커넥션
@@ -325,23 +419,23 @@ def find_fake_deadlines(
         if row["id"] in skip_ids:
             continue
         payload = load_raw(row["raw_data"])
-        if payload.get("quote_period_end") or payload.get("quote_deadline"):
+        if payload.get("quote_period_end"):
             continue  # 상세 인용에서 온 진짜 마감
-        if _mentions_range(payload):
-            continue  # 원문이 당일 접수/기간을 명시한 행 (크리틱 #9)
+        if states_reception_period(payload):
+            continue  # 원문이 접수기간/당일 접수를 명시한 행
+        if row["period_end"] not in posting_dates(payload, row["created_date"]):
+            continue  # 게시일과 다른 마감 - 근거 없이 건드리지 않는다
 
-        if row["period_end"] == row["created_date"]:
-            doomed.append(row)
-            reasons.append(
-                f"  [지시조건] id={row['id']} period_end={row['period_end']} "
-                f"== date(created_at), 원문 기간 표기 없음"
-            )
-        elif row["period_end"] == row["period_start"]:
-            doomed.append(row)
-            reasons.append(
-                f"  [게시일지문] id={row['id']} period_start=period_end="
-                f"{row['period_end']}, 목록 날짜가 단일 날짜"
-            )
+        quote = str(payload.get("quote_deadline") or "")
+        if quote:
+            note = f"인용에 날짜 없음({quote[:24]})"
+        else:
+            note = "목록 날짜가 단일 게시일"
+        doomed.append(row)
+        reasons.append(
+            f"  [게시일] id={row['id']} period_end={row['period_end']} "
+            f"== 게시일, {note}"
+        )
     return doomed, reasons
 
 
@@ -369,7 +463,7 @@ def find_fake_starts(
         if row["id"] in skip_ids:
             continue
         payload = load_raw(row["raw_data"])
-        if payload.get("quote_period_start") or _mentions_range(payload):
+        if payload.get("quote_period_start") or states_reception_period(payload):
             continue
         doomed.append(row)
         reasons.append(
@@ -455,7 +549,7 @@ def main() -> int:
     mode = "APPLY" if apply_changes else "DRY-RUN"
     print(f"=== cleanup_seis_duplicates ({mode}) ===")
     print(f"DB: {db_path}")
-    print(f"규칙 B(제목·주체·종료일): {RULE_B_SOURCE}")
+    print(f"규칙 B(제목·지역·마감키): {RULE_B_SOURCE}")
     print(f"규칙 C(글번호 오매칭·URL 미해소): {', '.join(RULE_C_SOURCES)}")
 
     conn = sqlite3.connect(str(db_path))
