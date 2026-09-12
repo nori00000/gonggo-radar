@@ -24,3 +24,4 @@
 - **소스 우회 적재**: config `crawler.sources.<name>.bypass_threshold: true`인 소스(kofpi, forest_press, lawmaking, coop)는 키워드 임계값과 무관하게 DB에 적재한다(relevance_score는 계산값 유지, 없으면 0.5). 다이제스트 섹션 상한이 분량을 제어한다.
 - **팩트 게이트 재정의**: `deadline_parsed`는 정보 필드(게이트 아님). `url_alive=false` 항목은 다이제스트에서 **자동 제외**되고 check.json `dropped`에 기록된다. `pass=false` 조건은 ①제외 후 항목 0건 ②`network_checked=false` ③폼 로드 실패 ④체크 자체 예외 — 넷뿐이다.
 - **드라이런 기대**: 제외 후 항목이 남으면 pass=true, 발송은 마커 게이트만 남는다(상민 확정).
+- v1.2 보정(2026-09-12 저녁): bypass 소스 = kofpi, forest_press, lawmaking, coop, **fowi**. FOREST_SOURCES = forest_service, forest_press, fowi, kofpi, lawmaking. 죽은 URL 제외 후 백필+재검사 최대 3라운드(소진 시 pass=false, reason "죽은 URL 반복 검출") 채택.
