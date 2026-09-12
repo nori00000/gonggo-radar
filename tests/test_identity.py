@@ -78,6 +78,10 @@ class TestSeisSourceIdSeparatesAnnouncements:
         ("/subPage.do?statsYr=2027&epsdNo=4", "epsd:2027:4"),
         ("/boardView.do?boardId=A&nttId=42", "ntt:A:42"),
         ("/boardView.do?boardId=B&nttId=42", "ntt:B:42"),
+        # 17차 게이트: ``sid`` 도 게시판 구분자다
+        ("/boardView.do?sid=A&nttId=42", "ntt:A:42"),
+        ("/boardView.do?sid=B&nttId=42", "ntt:B:42"),
+        ("/subPage.do?bsIdx=10002&bIdx=252629", "bidx:10002:252629"),
     ])
     def test_extract_post_id(self, crawler, link, expected):
         assert crawler._extract_post_id(link) == expected
@@ -87,8 +91,9 @@ class TestSeisSourceIdSeparatesAnnouncements:
         ("/subPage.do?fncPbofrSn=42", "/subPage.do?dsgnPbofrSn=42"),
         # 같은 회차 번호, 다른 연도 (12차 게이트)
         ("/subPage.do?statsYr=2026&epsdNo=4", "/subPage.do?statsYr=2027&epsdNo=4"),
-        # 같은 글번호, 다른 게시판 (13차 게이트)
+        # 같은 글번호, 다른 게시판 (13·17차 게이트)
         ("/boardView.do?boardId=A&nttId=42", "/boardView.do?boardId=B&nttId=42"),
+        ("/boardView.do?sid=A&nttId=42", "/boardView.do?sid=B&nttId=42"),
         ("/subPage.do?bsIdx=1&bIdx=99", "/subPage.do?bsIdx=2&bIdx=99"),
     ])
     def test_same_number_in_a_different_slot_never_collides(
@@ -101,6 +106,58 @@ class TestSeisSourceIdSeparatesAnnouncements:
         for link in ("/subPage.do?fncPbofrSn=1", "/view/123456",
                      "https://example.com/some-page"):
             assert ":" in crawler._extract_post_id(link), link
+
+    # 파서별 최소 입력 - **모든 id 생성 경로**를 지난다
+    PARSER_CASES = [
+        ("main_card", "_parse_main_cards",
+         '<ul><li class="swiper-slide" data-type="사업공고">'
+         '<span class="sub">서울센터</span>'
+         '<p class="tit"><a href="subPage.do?fncPbofrSn=1">공고</a></p>'
+         '<ul class="info"><li>교육</li></ul>'
+         '<p class="date">2026.09.01 ~ 2026.09.30</p></li></ul>'),
+        ("table_with_href", "_parse_table_board",
+         '<table class="board_list"><thead><tr><th>제목</th><th>등록일</th>'
+         "</tr></thead><tbody><tr>"
+         '<td><a href="/view.do?sid=A&nttId=42">공고</a></td>'
+         "<td>2026.09.11</td></tr></tbody></table>"),
+        # 17차 MEDIUM: href 가 없는 표 제목 - 제목 MD5 경로
+        ("table_without_href", "_parse_table_board",
+         '<table class="board_list"><thead><tr><th>제목</th><th>등록일</th>'
+         "</tr></thead><tbody><tr>"
+         "<td><a>href 없는 공고</a></td>"
+         "<td>2026.09.11</td></tr></tbody></table>"),
+        ("list_board", "_parse_list_board",
+         '<ul class="board_list"><li><div>'
+         '<a href="/view.do?nttId=7">공고</a>2026.09.11</div></li></ul>'),
+        ("generic_links", "_parse_generic_links",
+         '<div><a href="/subPage.do?tabId=view&itgrdAplyPbancSn=3">'
+         "일반 링크 공고</a></div>"),
+    ]
+
+    @pytest.mark.parametrize(
+        "name,parser,html", PARSER_CASES, ids=[c[0] for c in PARSER_CASES]
+    )
+    def test_no_parser_path_produces_a_prefixless_id(
+        self, crawler, name, parser, html
+    ):
+        """어떤 파서 경로도 ``:`` 없는 ID 를 만들지 않는다 (17차 MEDIUM).
+
+        접두 없는 seis ID 는 옛 규칙의 행으로 판정되어, **새 수집이 매번
+        레거시로 표시되고 기간이 지워졌다가 다시 채워진다**.
+        """
+        from bs4 import BeautifulSoup
+
+        items = getattr(crawler, parser)(BeautifulSoup(html, "html.parser"))
+        assert items, name
+        built = [
+            crawler._to_announcement(item, "https://www.seis.or.kr")
+            for item in items
+        ]
+        built = [a for a in built if a is not None]
+        assert built, name
+        for announcement in built:
+            assert ":" in announcement.source_id, (name, announcement.source_id)
+            assert is_legacy_source_id("seis", announcement.source_id) is False
 
 
 class TestRowsNeverOverwriteEachOther:
@@ -133,6 +190,27 @@ class TestRowsNeverOverwriteEachOther:
         ).fetchall()
         assert [(r["source_id"], r["title"]) for r in rows] == [
             ("ntt:A:42", "A 공고"), ("ntt:B:42", "B 공고"),
+        ]
+
+    def test_seis_sid_variants_stay_two_rows(self, db):
+        """17차 HIGH 재현: ``sid=A/B`` + 같은 글번호 → 2행, 덮어쓰기 없음."""
+        crawler = make(SeisCrawler, "seis")
+        for sid, title in (("A", "A 공고"), ("B", "B 공고")):
+            item = {
+                "title": title,
+                "link": f"/boardView.do?sid={sid}&nttId=42",
+                "date": f"접수기간 2026.{'10' if sid == 'A' else '11'}.01"
+                        f" ~ 2026.{'10' if sid == 'A' else '11'}.30",
+                "date_field": "li.swiper-slide p.date",
+            }
+            self.store(db, crawler._to_announcement(item, "https://www.seis.or.kr"))
+
+        rows = db._conn.execute(
+            "SELECT source_id, title, period_end FROM announcements ORDER BY title"
+        ).fetchall()
+        assert [(r["source_id"], r["title"], r["period_end"]) for r in rows] == [
+            ("ntt:A:42", "A 공고", "2026-10-30"),
+            ("ntt:B:42", "B 공고", "2026-11-30"),
         ]
 
     def test_g2b_orders_keep_their_own_deadline(self, db):

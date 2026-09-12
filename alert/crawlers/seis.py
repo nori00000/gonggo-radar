@@ -562,12 +562,13 @@ class SeisCrawler(BaseCrawler):
     # 다시 쓰므로 ``statsYr=2026&epsdNo=4`` 와 ``statsYr=2027&epsdNo=4`` 가
     # 서로 다른 공고인데 ID 가 같았다 (12차 게이트 HIGH). URL 이 공고를
     # 특정하는 데 쓰는 파라미터는 **전부** ID 에 넣는다.
-    ID_QUALIFIERS = (
-        r"statsYr=(\d{4})",
-        # 게시판 구분자. 같은 글번호가 게시판마다 다시 쓰이므로 이것도
-        # 빠지면 서로 다른 공고가 한 행이 된다.
-        r"bsIdx=(\d+)",
-        r"boardId=([A-Za-z0-9_-]+)",
+    # 게시판·구분자 파라미터 후보. 같은 글번호가 구분자마다 다시 쓰이므로,
+    # URL 에 있는 것을 **전부** ID 에 넣는다. 하나라도 빠지면 서로 다른
+    # 공고가 한 행이 되어 남의 마감이 덮어써진다 (13·17차 게이트).
+    BOARD_PARAMS = ("sid", "bsIdx", "boardId")
+
+    ID_QUALIFIERS = (r"statsYr=(\d{4})",) + tuple(
+        rf"[?&]{name}=([A-Za-z0-9_-]+)" for name in BOARD_PARAMS
     )
 
     def _extract_post_id(self, link: str) -> str:
@@ -664,7 +665,12 @@ class SeisCrawler(BaseCrawler):
             source_id = self._extract_post_id(link)
 
             if not source_id:
-                source_id = hashlib.md5(title.encode("utf-8")).hexdigest()[:16]
+                # href 가 없는 항목(표 제목만 있는 행). 여기도 **접두를
+                # 붙인다** - 접두 없는 seis ID 는 옛 규칙의 행으로 판정되어
+                # 새 수집이 매번 레거시로 표시된다 (17차 게이트 MEDIUM).
+                source_id = "md5:" + hashlib.md5(
+                    title.encode("utf-8")
+                ).hexdigest()[:16]
 
             author = item.get("author", "").strip()
             category = item.get("category", "").strip()
