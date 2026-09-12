@@ -4,6 +4,7 @@ All parsing is exercised against saved HTML fixtures in tests/fixtures/,
 so these tests never touch the network.
 """
 
+import json
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -265,7 +266,29 @@ class TestCoopCrawler:
             "https://www.coop.go.kr/home/boardView.do"
             "?brd_mgrno=2&menu_no=2038&brd_no=14893"
         )
-        assert ann.period_start == "2026-09-10"
+        # 게시일은 기간 필드가 아니라 raw_data.posted 로 간다 (계약 v2.1 판정 4)
+        assert ann.period_start is None
+        assert ann.period_end is None
+        assert json.loads(ann.raw_data)["posted"] == "2026-09-10"
+
+    def test_posting_date_never_becomes_a_period(self, crawler):
+        """게시일만 있는 공지는 접수기간·마감을 만들지 않는다.
+
+        회귀: 게시일을 period_start 로 쓰면 존재하지 않는 접수기간이
+        브리핑에 표시되고, period_end 로 쓰면 판정 4의 마감 경과 제외에
+        걸려 살아있는 공고가 사라진다.
+        """
+        items = crawler.parse_list(load_fixture("coop_notice.html"))
+        announcements = [
+            crawler._to_announcement(item, "https://www.coop.go.kr")
+            for item in items
+        ]
+        assert announcements
+        assert all(a.period_start is None for a in announcements)
+        assert all(a.period_end is None for a in announcements)
+        # 게시일 자체는 보존된다 - "새 소식" 판정에 쓸 수 있어야 한다
+        posted = [json.loads(a.raw_data).get("posted") for a in announcements]
+        assert any(p for p in posted)
 
     def test_extract_brd_no(self, crawler):
         assert crawler._extract_brd_no("javascript:fView('14893')") == "14893"
