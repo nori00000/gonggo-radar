@@ -15,27 +15,46 @@
 """
 
 import json
+import logging
 import sqlite3
 import tempfile
 from pathlib import Path
 
 import pytest
 
-from alert.config import get_config, is_media_source
+from alert.config import _build_crawler_config, get_config
 from alert.council import score_item
 from alert.crawlers.media_rss import (
     LICENSE_NOTE,
+    MAX_FEED_BYTES,
     MEDIA_CATEGORY,
     SUMMARY_MAX_CHARS,
     ErounCrawler,
     KfnewsCrawler,
     LifeinCrawler,
+    MediaRssCrawler,
     SenewsCrawler,
+    article_url,
 )
 from alert.db import Database
 from alert.digest.composer import compose_digest_data
-from alert.main import _import_crawlers, apply_council_profile, select_for_storage
-from alert.models import SOURCE_KIND_MEDIA, AnalyzedAnnouncement, RawAnnouncement
+from alert.main import (
+    _import_crawlers,
+    apply_council_profile,
+    resolve_source_kind,
+    select_for_storage,
+)
+from alert.models import (
+    SOURCE_KIND_DEFAULT,
+    SOURCE_KIND_MEDIA,
+    AnalyzedAnnouncement,
+    RawAnnouncement,
+)
+from alert.notifiers.telegram_bot import (
+    MONTHLY_ONLY_NOTICE,
+    TelegramBot,
+    is_company_actionable,
+)
 
 MEDIA_SOURCES = ("lifein", "eroun", "senews", "kfnews")
 
@@ -185,7 +204,6 @@ class TestMediaConfig:
         sources = get_config().crawler.sources
         for name in MEDIA_SOURCES:
             assert sources[name].kind == SOURCE_KIND_MEDIA
-            assert is_media_source(sources[name]) is True
 
     def test_media_sources_do_not_bypass_threshold(self):
         sources = get_config().crawler.sources
@@ -213,7 +231,7 @@ class TestMediaConfig:
     def test_non_media_sources_keep_the_default_kind(self):
         sources = get_config().crawler.sources
         for name in ("mafra", "kofpi", "forest_service", "bizinfo"):
-            assert is_media_source(sources[name]) is False
+            assert sources[name].kind != SOURCE_KIND_MEDIA
 
 
 # ---------------------------------------------------------------------------
@@ -243,7 +261,7 @@ class TestCompanyPathUntouched:
     def test_select_for_storage_returns_nothing_for_media(self):
         cfg = get_config().crawler.sources["lifein"]
         selected, bypassed = select_for_storage(
-            _ExplodingAnalyzer(), [_media_raw()], cfg
+            _ExplodingAnalyzer(), [_media_raw()], cfg, SOURCE_KIND_MEDIA
         )
         assert selected == []
         assert bypassed is False
@@ -392,3 +410,410 @@ class TestWeeklyDigestUnchanged:
         data = compose_digest_data(path)
         rendered = json.dumps(data, ensure_ascii=False, default=str)
         assert "example.com/m1" not in rendered
+
+
+# ---------------------------------------------------------------------------
+# 6. 라운드 2 HIGH — 종류의 정본은 크롤러 클래스다
+# ---------------------------------------------------------------------------
+
+
+class TestKindIsDeclaredByTheCrawler:
+    """설정이 빠지거나 오타가 나도 media 는 media 로 남는다."""
+
+    def test_every_media_crawler_declares_kind(self):
+        for crawler_cls in (LifeinCrawler, ErounCrawler, SenewsCrawler, KfnewsCrawler):
+            assert crawler_cls.KIND == SOURCE_KIND_MEDIA
+        assert MediaRssCrawler.KIND == SOURCE_KIND_MEDIA
+
+    def test_kind_survives_a_missing_config_block(self):
+        """HIGH: crawler.sources 에서 소스가 통째로 빠져도 media 다."""
+        assert resolve_source_kind(LifeinCrawler, None) == SOURCE_KIND_MEDIA
+
+    def test_missing_config_block_still_keeps_items_off_the_company_path(self):
+        """설정이 없는 media 소스의 항목은 회사 분석기에 닿지 않는다."""
+        kind = resolve_source_kind(LifeinCrawler, None)
+        selected, bypassed = select_for_storage(
+            _ExplodingAnalyzer(), [_media_raw()], None, kind
+        )
+        assert (selected, bypassed) == ([], False)
+
+    def test_missing_config_block_still_lands_council_only(self):
+        """설정 없이도 협의회 매치는 council_only=1 로 적재된다."""
+        kind = resolve_source_kind(LifeinCrawler, None)
+        extras, drops, _unmatched = apply_council_profile(
+            get_config().council_profile, "lifein",
+            [_media_raw(title="산림 사회적경제 기업 이야기")], [],
+            lambda raw: AnalyzedAnnouncement(**vars(raw)), kind,
+        )
+        assert drops == []
+        assert [a.council_only for a in extras] == [1]
+
+    def test_config_may_only_confirm_the_crawler(self, caplog):
+        """설정이 다른 값을 주장하면 오류로 남기고 크롤러를 따른다."""
+        class Contradicting:
+            kind = SOURCE_KIND_DEFAULT
+
+        with caplog.at_level(logging.ERROR):
+            kind = resolve_source_kind(LifeinCrawler, Contradicting())
+        assert kind == SOURCE_KIND_MEDIA
+        assert any("크롤러를 따른다" in r.getMessage() for r in caplog.records)
+
+    def test_gonggo_crawler_stays_gonggo(self):
+        from alert.crawlers.mafra import MafraCrawler
+
+        cfg = get_config().crawler.sources["mafra"]
+        assert resolve_source_kind(MafraCrawler, cfg) == SOURCE_KIND_DEFAULT
+
+    def test_unknown_crawler_kind_is_treated_as_media(self, caplog):
+        """모르는 값은 회사 경로 **밖**으로 보낸다 (fail-closed)."""
+        class Weird:
+            KIND = "미디어"
+
+        with caplog.at_level(logging.ERROR):
+            assert resolve_source_kind(Weird, None) == SOURCE_KIND_MEDIA
+
+
+class TestConfigKindValidation:
+    """``kind`` 오타는 소스 설정을 통째로 버린다 (라운드 2 HIGH)."""
+
+    def test_misspelled_kind_drops_the_source(self, caplog):
+        with caplog.at_level(logging.ERROR):
+            cfg = _build_crawler_config(
+                {"sources": {"lifein": {"enabled": True, "kind": "Media"}}}
+            )
+        assert "lifein" not in cfg.sources
+        assert any("허용값" in r.getMessage() for r in caplog.records)
+
+    def test_valid_kinds_are_kept(self):
+        cfg = _build_crawler_config({"sources": {
+            "lifein": {"enabled": True, "kind": "media"},
+            "mafra": {"enabled": True, "kind": "gonggo"},
+            "kofpi": {"enabled": True},
+        }})
+        assert set(cfg.sources) == {"lifein", "mafra", "kofpi"}
+        assert cfg.sources["kofpi"].kind is None
+
+    def test_shipped_config_has_no_invalid_kind(self):
+        """정본 config.yaml 자체가 허용값만 쓴다 - 버려진 소스가 없다."""
+        sources = get_config().crawler.sources
+        for name in MEDIA_SOURCES + ("mafra", "kofpi"):
+            assert name in sources
+
+
+# ---------------------------------------------------------------------------
+# 7. 라운드 2 — 프로파일 밖의 media 도 관찰 원장에 남는다
+# ---------------------------------------------------------------------------
+
+
+class TestMediaObservationIsComplete:
+    """media 는 회사 행이 될 수 없으므로, 프로파일 밖이면 원장이 유일한 기록이다."""
+
+    def test_profile_off_still_records_media_drops(self):
+        class OffProfile:
+            sources = []
+            must_match = []
+            eligibility = {}
+            region = {}
+            exclude = []
+
+        extras, drops, unmatched = apply_council_profile(
+            OffProfile(), "lifein", [_media_raw(title="산림 사회적경제")], [],
+            lambda raw: AnalyzedAnnouncement(**vars(raw)), SOURCE_KIND_MEDIA,
+        )
+        assert extras == []
+        assert len(drops) == 1
+        assert len(unmatched) == 1
+
+    def test_source_absent_from_profile_still_records_media_drops(self):
+        profile = get_config().council_profile
+
+        extras, drops, _unmatched = apply_council_profile(
+            profile, "not_in_profile", [_media_raw(title="산림 사회적경제")], [],
+            lambda raw: AnalyzedAnnouncement(**vars(raw)), SOURCE_KIND_MEDIA,
+        )
+        assert extras == []
+        assert len(drops) == 1
+
+    def test_gonggo_source_outside_the_profile_records_nothing(self):
+        """공고 소스의 동작은 그대로다 - 이 완화는 media 한정이다."""
+        profile = get_config().council_profile
+
+        assert apply_council_profile(
+            profile, "not_in_profile", [_media_raw()], [],
+            lambda raw: AnalyzedAnnouncement(**vars(raw)), SOURCE_KIND_DEFAULT,
+        ) == ([], [], [])
+
+
+# ---------------------------------------------------------------------------
+# 8. 라운드 2 MEDIUM — link / guid
+# ---------------------------------------------------------------------------
+
+GUID_XML = """<?xml version="1.0" encoding="utf-8" ?>
+<rss version="2.0"><channel>
+  <title>t</title>
+  <item>
+    <title>산림 기사 하나</title>
+    <link>https://www.lifein.news/news/articleView.html?idxno=111</link>
+    <guid isPermaLink="false">urn:lifein:shared</guid>
+    <pubDate>2026-09-11 10:00:00</pubDate>
+  </item>
+  <item>
+    <title>산림 기사 둘</title>
+    <link>https://www.lifein.news/news/articleView.html?idxno=222</link>
+    <guid isPermaLink="false">urn:lifein:shared</guid>
+    <pubDate>2026-09-11 11:00:00</pubDate>
+  </item>
+  <item>
+    <title>링크가 없는 기사</title>
+    <guid isPermaLink="false">urn:lifein:nolink</guid>
+    <pubDate>2026-09-11 12:00:00</pubDate>
+  </item>
+  <item>
+    <title>permalink guid 기사</title>
+    <guid isPermaLink="true">https://www.lifein.news/news/articleView.html?idxno=333</guid>
+    <pubDate>2026-09-11 13:00:00</pubDate>
+  </item>
+  <item>
+    <title>속성 없는 guid 기사</title>
+    <guid>https://www.lifein.news/news/articleView.html?idxno=444</guid>
+    <pubDate>2026-09-11 14:00:00</pubDate>
+  </item>
+</channel></rss>
+"""
+
+
+class TestArticleUrl:
+    def test_http_and_https_pass(self):
+        assert article_url("https://a.example/1") == "https://a.example/1"
+        assert article_url("http://a.example/1") == "http://a.example/1"
+
+    def test_non_url_guid_forms_are_rejected(self):
+        for value in ("urn:uuid:1234", "tag:a.example,2026:1", "1234", "",
+                      None, "ftp://a.example/1", "https://"):
+            assert article_url(value) == ""
+
+
+class TestGuidPolicy:
+    def test_shared_non_permalink_guid_keeps_distinct_ids(self):
+        items = _crawl(LifeinCrawler(), GUID_XML)
+        by_title = {a.title: a for a in items}
+        assert by_title["산림 기사 하나"].source_id == "111"
+        assert by_title["산림 기사 둘"].source_id == "222"
+
+    def test_item_without_a_usable_url_is_skipped(self):
+        titles = [a.title for a in _crawl(LifeinCrawler(), GUID_XML)]
+        assert "링크가 없는 기사" not in titles
+
+    def test_permalink_guid_is_used_as_the_url(self):
+        by_title = {a.title: a for a in _crawl(LifeinCrawler(), GUID_XML)}
+        assert by_title["permalink guid 기사"].source_id == "333"
+
+    def test_guid_without_the_attribute_is_treated_as_a_permalink(self):
+        """RSS 2.0 기본값은 isPermaLink="true" 다."""
+        by_title = {a.title: a for a in _crawl(LifeinCrawler(), GUID_XML)}
+        assert by_title["속성 없는 guid 기사"].source_id == "444"
+
+    def test_four_of_five_items_survive(self):
+        assert len(_crawl(LifeinCrawler(), GUID_XML)) == 4
+
+
+# ---------------------------------------------------------------------------
+# 9. 라운드 2 MEDIUM — 텔레그램 /app · /apply
+# ---------------------------------------------------------------------------
+
+
+class _StubBot:
+    """명령 메서드만 빌려 쓰는 봇 - 생성자(토큰 검사)를 타지 않는다."""
+
+    def __init__(self, ann):
+        self.sent = []
+        self.db = self
+        self._ann = ann
+        self.history_calls = 0
+        self.insert_calls = 0
+
+    # TelegramBot 의 협력자 대역
+    def _send_message(self, text, parse_mode="HTML"):
+        self.sent.append(text)
+        return True
+
+    def get_announcement_by_id(self, ann_id):
+        return self._ann
+
+    def get_application_history(self, ann_id):
+        self.history_calls += 1
+        return []
+
+    def insert_application_record(self, record):
+        self.insert_calls += 1
+        return 1
+
+
+def _run_cmd(name, ann, args="1"):
+    bot = _StubBot(ann)
+    getattr(TelegramBot, name)(bot, args)
+    return bot
+
+
+class TestTelegramRefusesMonthlyOnlyRows:
+    MEDIA = AnalyzedAnnouncement(
+        source="lifein", source_id="m1", title="산림 기사",
+        url="https://example.com/m1", kind=SOURCE_KIND_MEDIA,
+    )
+    COUNCIL_ONLY = AnalyzedAnnouncement(
+        source="kofpi", source_id="c1", title="산림 공모",
+        url="https://example.com/c1", council_only=1,
+    )
+    COMPANY = AnalyzedAnnouncement(
+        source="kofpi", source_id="g1", title="산림 공모",
+        url="https://example.com/g1",
+    )
+
+    def test_predicate(self):
+        assert is_company_actionable(self.COMPANY) is True
+        assert is_company_actionable(self.MEDIA) is False
+        assert is_company_actionable(self.COUNCIL_ONLY) is False
+
+    def test_app_refuses_media(self):
+        bot = _run_cmd("cmd_app", self.MEDIA)
+        assert bot.sent == [MONTHLY_ONLY_NOTICE]
+        assert bot.history_calls == 0
+
+    def test_app_refuses_council_only(self):
+        bot = _run_cmd("cmd_app", self.COUNCIL_ONLY)
+        assert bot.sent == [MONTHLY_ONLY_NOTICE]
+
+    def test_apply_refuses_media_without_writing(self):
+        bot = _run_cmd("cmd_apply", self.MEDIA)
+        assert bot.sent == [MONTHLY_ONLY_NOTICE]
+        assert bot.insert_calls == 0
+
+    def test_apply_refuses_council_only_without_writing(self):
+        bot = _run_cmd("cmd_apply", self.COUNCIL_ONLY)
+        assert bot.sent == [MONTHLY_ONLY_NOTICE]
+        assert bot.insert_calls == 0
+
+    def test_company_row_still_works(self):
+        bot = _run_cmd("cmd_app", self.COMPANY)
+        assert bot.sent and MONTHLY_ONLY_NOTICE not in bot.sent[0]
+        assert bot.history_calls == 1
+
+    def test_row_to_announcement_carries_the_refusal_fields(self, tmp_path):
+        """DB 에서 읽어 온 행에도 kind·council_only 가 실려야 거절이 산다."""
+        db = Database(db_path=tmp_path / "t.db")
+        row_id = db.insert_announcement(AnalyzedAnnouncement(
+            source="lifein", source_id="m1", title="산림 기사",
+            url="https://example.com/m1", council_only=1,
+            kind=SOURCE_KIND_MEDIA,
+        ))
+        ann = db.get_announcement_by_id(row_id)
+        assert ann.kind == SOURCE_KIND_MEDIA
+        assert ann.council_only == 1
+        assert is_company_actionable(ann) is False
+        db.close()
+
+
+# ---------------------------------------------------------------------------
+# 10. 라운드 2 LOW — 요약 순서 · 날짜 · 피드 크기
+# ---------------------------------------------------------------------------
+
+
+class TestSummaryUnescapeOrder:
+    def test_double_escaped_markup_is_removed(self):
+        """XML 이 `&amp;lt;p&amp;gt;` 를 주면 text 는 `&lt;p&gt;` 다.
+
+        태그를 먼저 지우면 엔티티 해제 뒤에 `<p>` 가 되살아난다.
+        """
+        xml = FEED_XML.replace(
+            "지역 소식", "&amp;lt;p&amp;gt;본문 한 줄&amp;lt;/p&amp;gt;"
+        )
+        assert _crawl(LifeinCrawler(), xml)[1].summary == "본문 한 줄"
+
+    def test_entities_are_decoded(self):
+        """XML 이 `&amp;quot;` 를 주면 text 는 `&quot;` 이고, 해제는 **한 번**이다."""
+        xml = FEED_XML.replace("지역 소식", "&amp;quot;따옴표&amp;quot;")
+        assert _crawl(LifeinCrawler(), xml)[1].summary == '"따옴표"'
+
+    def test_cap_is_applied_after_unescaping(self):
+        xml = FEED_XML.replace("지역 소식", "&amp;lt;p&amp;gt;" + "다" * 500)
+        assert len(_crawl(LifeinCrawler(), xml)[1].summary) == SUMMARY_MAX_CHARS
+
+
+class TestImpossibleDates:
+    def test_calendar_impossible_date_is_emptied(self):
+        xml = FEED_XML.replace("2026-09-11 22:40:00", "2026-99-99")
+        raw = json.loads(_crawl(LifeinCrawler(), xml)[0].raw_data)
+        assert raw["posted"] == ""
+        assert raw["pubDate"] == "2026-99-99"
+
+    def test_day_out_of_range_is_emptied(self):
+        xml = FEED_XML.replace("2026-09-11 22:40:00", "2026.02.31")
+        assert json.loads(_crawl(LifeinCrawler(), xml)[0].raw_data)["posted"] == ""
+
+    def test_real_date_survives(self):
+        raw = json.loads(_crawl(LifeinCrawler(), FEED_XML)[0].raw_data)
+        assert raw["posted"] == "2026-09-11"
+
+
+class _StubResponse:
+    """requests.Response 대역 - iter_content 만 쓴다."""
+
+    def __init__(self, payload, chunk=8192, encoding="utf-8"):
+        self._payload = payload
+        self._chunk = chunk
+        self.encoding = encoding
+        self.closed = False
+        self.served = 0
+
+    def iter_content(self, size):
+        for start in range(0, len(self._payload), self._chunk):
+            piece = self._payload[start:start + self._chunk]
+            self.served += len(piece)
+            yield piece
+
+    def close(self):
+        self.closed = True
+
+
+class TestFeedSizeCap:
+    def _crawler(self, response):
+        crawler = LifeinCrawler()
+        crawler.get = lambda url, **kwargs: response
+        return crawler
+
+    def test_body_is_capped(self):
+        response = _StubResponse(b"x" * (MAX_FEED_BYTES * 2))
+        text = self._crawler(response)._fetch_rss("https://example.com/f.xml")
+        assert len(text.encode("utf-8")) == MAX_FEED_BYTES
+
+    def test_remainder_is_not_drained(self):
+        """상한에서 멈춘다 - 남은 본문을 끝까지 읽지 않는다."""
+        response = _StubResponse(b"x" * (MAX_FEED_BYTES * 4))
+        self._crawler(response)._fetch_rss("https://example.com/f.xml")
+        assert response.served < MAX_FEED_BYTES * 2
+
+    def test_response_is_closed(self):
+        response = _StubResponse(b"<rss/>")
+        self._crawler(response)._fetch_rss("https://example.com/f.xml")
+        assert response.closed is True
+
+    def test_small_feed_round_trips(self):
+        response = _StubResponse(FEED_XML.encode("utf-8"))
+        text = self._crawler(response)._fetch_rss("https://example.com/f.xml")
+        assert text == FEED_XML
+
+    def test_encoding_falls_back_to_the_xml_declaration(self):
+        response = _StubResponse(FEED_XML.encode("utf-8"), encoding=None)
+        text = self._crawler(response)._fetch_rss("https://example.com/f.xml")
+        assert "행안부" in text or "사회연대경제기본법" in text
+
+    def test_unfetchable_url_returns_none(self):
+        crawler = LifeinCrawler()
+        crawler.get = lambda url, **kwargs: None
+        assert crawler._fetch_rss("https://example.com/f.xml") is None
+
+    def test_truncated_xml_yields_no_items(self):
+        """잘린 XML 은 파서가 거부한다 - 반쪽 피드를 싣지 않는다."""
+        crawler = LifeinCrawler()
+        crawler._fetch_rss = lambda url: FEED_XML[:len(FEED_XML) // 2]
+        assert crawler.fetch() == []

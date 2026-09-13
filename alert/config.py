@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -10,7 +11,9 @@ from typing import Any, Dict, Optional
 import yaml
 from dotenv import load_dotenv
 
-from .models import SOURCE_KIND_DEFAULT, SOURCE_KIND_MEDIA
+from .models import SOURCE_KINDS
+
+logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -36,18 +39,11 @@ class SourceConfig:
     bypass_threshold: bool = False
     # 계약 v2.1 V2: True면 상세 페이지에서 마감/자격/금액 인용을 추출한다.
     fetch_detail: bool = False
-    # P1-R 계약: 소스 종류. "gonggo"(기본) | "media"(2차 미디어 RSS).
-    # media 는 회사 선택 경로에 들어가지 않는다 - select_for_storage 참조.
-    kind: str = SOURCE_KIND_DEFAULT
-
-
-def is_media_source(source_cfg: Any) -> bool:
-    """이 소스가 2차 미디어(``kind: media``)인가 — 판정의 단일 구현.
-
-    설정이 없는 소스(``None``)는 공고 소스로 본다. 문자열 비교를 여기 한
-    곳에만 두어 ``"media"`` 오타가 조용히 회사 경로를 열지 않게 한다.
-    """
-    return getattr(source_cfg, "kind", SOURCE_KIND_DEFAULT) == SOURCE_KIND_MEDIA
+    # P1-R 계약: 소스 종류의 **확인용** 선언. "gonggo" | "media" | None(미선언).
+    # 정본은 크롤러 클래스의 KIND 다 (라운드 2 HIGH) - 이 필드는 설정과
+    # 크롤러가 어긋났는지 보기 위해 있고, 없다고 해서 종류가 바뀌지 않는다.
+    # alert.main.resolve_source_kind 참조.
+    kind: Optional[str] = None
 
 
 @dataclass
@@ -240,10 +236,26 @@ class AppConfig:
 
 
 def _build_crawler_config(raw: Dict[str, Any]) -> CrawlerConfig:
+    """``crawler:`` 블록을 읽는다. ``kind`` 오타는 소스를 통째로 버린다.
+
+    라운드 2 HIGH: ``kind: Media`` 같은 오타를 조용히 기본값으로 받으면
+    설정만 보고는 그 소스가 무엇인지 알 수 없다. 알 수 없는 값은 **설정이
+    없는 것과 같게** 만들고(소스를 빼고) 오류로 남긴다 - 크롤러 클래스의
+    KIND 가 종류를 정하므로 미디어 소스는 여전히 미디어로 돈다.
+    """
     sources_raw: Dict[str, Any] = raw.pop("sources", {})
-    sources = {
-        name: SourceConfig(**vals) for name, vals in sources_raw.items()
-    }
+    sources: Dict[str, SourceConfig] = {}
+    for name, vals in sources_raw.items():
+        vals = vals or {}
+        kind = vals.get("kind")
+        if kind is not None and kind not in SOURCE_KINDS:
+            logger.error(
+                "config.yaml crawler.sources.%s: kind=%r 는 허용값 %s 이 아니다"
+                " - 이 소스 설정을 버린다",
+                name, kind, list(SOURCE_KINDS),
+            )
+            continue
+        sources[name] = SourceConfig(**vals)
     return CrawlerConfig(**raw, sources=sources)
 
 

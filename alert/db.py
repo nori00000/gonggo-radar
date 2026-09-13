@@ -188,17 +188,17 @@ _PHONE_RE = re.compile(r"0\d{1,2}[-.\s]?\d{3,4}[-.\s]?\d{4}")
 COUNCIL_RECHECK_MIN_HOURS = 24
 
 
-def _row_kind(row: Any) -> str:
-    """행의 ``kind`` — 컬럼이 없는 옛 DB·픽스처에서는 기본값.
+def _row_value(row: Any, key: str, default: Any) -> Any:
+    """행의 선택적 컬럼 — 컬럼이 없는 옛 DB·픽스처에서는 기본값.
 
     ``sqlite3.Row`` 는 없는 키에 ``IndexError`` 를 던지므로 조회 한 번을
     여기서 감싼다. 마이그레이션 전 DB 를 읽는 테스트가 실재한다.
     """
     try:
-        value = row["kind"]
+        value = row[key]
     except (KeyError, IndexError):
-        return SOURCE_KIND_DEFAULT
-    return value or SOURCE_KIND_DEFAULT
+        return default
+    return default if value is None else value
 
 
 def announcement_content_hash(announcement: RawAnnouncement) -> str:
@@ -1494,7 +1494,11 @@ class Database:
             relevance_score=row["relevance_score"] or 0.0,
             relevance_reason=row["relevance_reason"] or "",
             matched_keywords=matched_list,
-            kind=_row_kind(row),
+            # council_only·kind 는 **회사향 표면의 거절 근거**다 (텔레그램
+            # /app·/apply). 행을 객체로 바꿀 때 떨어뜨리면 그 표면이 판단
+            # 재료를 잃는다.
+            council_only=int(_row_value(row, "council_only", 0) or 0),
+            kind=_row_value(row, "kind", SOURCE_KIND_DEFAULT),
         )
 
     @staticmethod

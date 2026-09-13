@@ -136,10 +136,14 @@ crawler:
       fetch_detail: false
 
     # ── 2차 미디어 RSS (P1-R 계약) ────────────────────────────────────
-    # kind: media = **월간호 전용**. 회사 선택 경로(select_for_storage)에
-    # 들어가지 않으므로 bypass_threshold 는 의미가 없고, 그래서 false 로
-    # 못박아 둔다 - true 로 바뀌어도 회사 알림이 열리지 않지만 읽는 사람이
-    # 헷갈린다. base_url 이 곧 검증된 피드 URL 이다
+    # kind: media = **월간호 전용**. 다만 이 줄은 **확인용**이다 - 종류의
+    # 정본은 크롤러 클래스의 KIND 이고(alert/crawlers/media_rss.py), 이 줄을
+    # 지워도 media 는 media 로 돈다. 허용값은 gonggo|media 뿐이며 그 밖의
+    # 값은 설정 로딩이 소스를 통째로 버린다(라운드 2 HIGH).
+    # 회사 선택 경로(select_for_storage)에 들어가지 않으므로
+    # bypass_threshold 는 의미가 없고, 그래서 false 로 못박아 둔다 - true 로
+    # 바뀌어도 회사 알림이 열리지 않지만 읽는 사람이 헷갈린다.
+    # base_url 이 곧 검증된 피드 URL 이다
     # (results/R-monthly-sources.md §1 의 URL 그대로, 추측 금지).
     lifein:
       enabled: true

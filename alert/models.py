@@ -9,6 +9,9 @@ from typing import Optional
 # import 하지 않기 때문이다 (models 는 alert 안의 무엇도 import 하지 않는다).
 SOURCE_KIND_DEFAULT = "gonggo"
 SOURCE_KIND_MEDIA = "media"
+#: 설정에 적을 수 있는 값의 **전량**. 이 밖의 값은 오타로 보고 거절한다
+#: (라운드 2 HIGH) - "Media" 한 글자가 2차 보도를 회사 알림으로 보낸다.
+SOURCE_KINDS = (SOURCE_KIND_DEFAULT, SOURCE_KIND_MEDIA)
 
 
 @dataclass
