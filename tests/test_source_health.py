@@ -173,11 +173,14 @@ class TestProbeUrl:
         assert probe_url_for(Absolute()) == "https://rss.example.org/feed.xml"
 
     def test_real_crawlers_resolve_to_a_url(self):
-        """실제 크롤러 32종 전부에서 프로브 URL이 나온다."""
+        """실제 크롤러 36종 전부에서 프로브 URL이 나온다.
+
+        32 -> 36: 2차 미디어 RSS 4종(lifein·eroun·senews·kfnews, P1-R 계약).
+        """
         from alert.main import _import_crawlers
 
         crawlers = _import_crawlers()
-        assert len(crawlers) == 32
+        assert len(crawlers) == 36
         for name, klass in crawlers.items():
             url = probe_url_for(klass())
             assert url.startswith("http"), name

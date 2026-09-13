@@ -4,6 +4,15 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Optional
 
+# 소스 종류 (P1-R 계약). 기본은 공고 소스이고, 2차 미디어 RSS 만 다르다.
+# 여기를 정본으로 두는 이유는 config·db·main 이 모두 이 값을 보되 서로를
+# import 하지 않기 때문이다 (models 는 alert 안의 무엇도 import 하지 않는다).
+SOURCE_KIND_DEFAULT = "gonggo"
+SOURCE_KIND_MEDIA = "media"
+#: 설정에 적을 수 있는 값의 **전량**. 이 밖의 값은 오타로 보고 거절한다
+#: (라운드 2 HIGH) - "Media" 한 글자가 2차 보도를 회사 알림으로 보낸다.
+SOURCE_KINDS = (SOURCE_KIND_DEFAULT, SOURCE_KIND_MEDIA)
+
 
 @dataclass
 class RawAnnouncement:
@@ -44,6 +53,10 @@ class AnalyzedAnnouncement(RawAnnouncement):
     council_tags: Optional[str] = None
     council_match: Optional[int] = None
     council_only: int = 0
+
+    # 소스 종류 (P1-R 계약). ``media`` 는 2차 미디어 RSS 항목이고, 회사 알림
+    # 쿼리(``Database.get_unnotified``)와 회사용 기간 조회가 이 값으로 뺀다.
+    kind: str = SOURCE_KIND_DEFAULT
 
 
 @dataclass

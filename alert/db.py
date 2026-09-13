@@ -14,6 +14,7 @@ from typing import Any, Dict, List, Optional, Sequence
 
 from .crawlers.identity import is_legacy_source_id
 from .models import (
+    SOURCE_KIND_DEFAULT,
     AnalyzedAnnouncement,
     ApplicationRecord,
     Keyword,
@@ -187,6 +188,19 @@ _PHONE_RE = re.compile(r"0\d{1,2}[-.\s]?\d{3,4}[-.\s]?\d{4}")
 COUNCIL_RECHECK_MIN_HOURS = 24
 
 
+def _row_value(row: Any, key: str, default: Any) -> Any:
+    """행의 선택적 컬럼 — 컬럼이 없는 옛 DB·픽스처에서는 기본값.
+
+    ``sqlite3.Row`` 는 없는 키에 ``IndexError`` 를 던지므로 조회 한 번을
+    여기서 감싼다. 마이그레이션 전 DB 를 읽는 테스트가 실재한다.
+    """
+    try:
+        value = row[key]
+    except (KeyError, IndexError):
+        return default
+    return default if value is None else value
+
+
 def announcement_content_hash(announcement: RawAnnouncement) -> str:
     """채점에 쓰이는 네 필드의 해시 — 본문이 바뀌었는지 판정하는 값.
 
@@ -338,9 +352,10 @@ class Database:
                      target, period_start, period_end, relevance_score,
                      relevance_reason, matched_keywords, is_notified,
                      raw_data, created_at, updated_at,
-                     council_score, council_tags, council_match, council_only)
+                     council_score, council_tags, council_match, council_only,
+                     kind)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?,
-                        ?, ?, ?, ?)
+                        ?, ?, ?, ?, ?)
                 """)
             params = (
                 ann.source, ann.source_id, ann.title, ann.summary, ann.url,
@@ -352,6 +367,7 @@ class Database:
                 getattr(ann, "council_tags", None),
                 getattr(ann, "council_match", None),
                 getattr(ann, "council_only", 0) or 0,
+                getattr(ann, "kind", None) or SOURCE_KIND_DEFAULT,
             )
             if self._backend == "postgresql":
                 cur = self._conn.cursor()
@@ -390,6 +406,7 @@ class Database:
                        council_match    = COALESCE(?, council_match),
                        council_only     = CASE WHEN ? = 0 THEN 0
                                                ELSE COALESCE(council_only, 0) END,
+                       kind             = COALESCE(?, kind),
                        updated_at       = ?
                  WHERE id = ?
                 """),
@@ -401,6 +418,7 @@ class Database:
                     getattr(ann, "council_tags", None),
                     getattr(ann, "council_match", None),
                     getattr(ann, "council_only", 0) or 0,
+                    getattr(ann, "kind", None),
                     now,
                     row["id"],
                 ),
@@ -420,6 +438,11 @@ class Database:
         협의회 프로파일 **단독**으로 저장된 행(``council_only``)도 제외한다.
         회사 경로가 고르지 않은 항목이 알림으로 새면 계약 불변 조건 1이
         깨진다 (P0 계약 §A). 기존 행은 전부 0 이라 동작이 바뀌지 않는다.
+
+        2차 미디어 행(``kind='media'``)도 제외한다 (P1-R 계약). 미디어는
+        ``select_for_storage`` 에서 이미 회사 경로에 들어가지 않지만, 알림
+        쿼리에도 가드를 두어 "미디어가 회사 알림에 뜨는" 경로를 두 겹으로
+        막는다. ``COALESCE`` 는 kind 를 적은 적 없는 옛 행을 받는다.
         """
         rows = self._conn.execute(
             """
@@ -427,6 +450,7 @@ class Database:
              WHERE is_notified = 0
                AND legacy = 0
                AND council_only = 0
+               AND COALESCE(kind, 'gonggo') <> 'media'
                AND (period_end IS NULL OR period_end = '' OR period_end >= date('now'))
              ORDER BY relevance_score DESC, created_at DESC
             """
@@ -1405,6 +1429,10 @@ class Database:
         다이제스트 후보에서도 레거시 행은 뺀다 (15차 게이트).
         협의회 단독 행도 뺀다 - 이 함수는 회사용 리서치 문서의 입력이다
         (``alert/research_generator.py``).
+
+        2차 미디어 행(``kind='media'``)도 뺀다 (P1-R 계약): 주간 경로가 쓰는
+        기간 조회 헬퍼이므로 월간호 전용 소스가 여기로 새면 안 된다.
+        시그니처는 그대로다 - 부르는 쪽은 바뀌지 않는다.
         """
         rows = self._conn.execute(
             _sql("""
@@ -1412,6 +1440,7 @@ class Database:
              WHERE created_at >= ? AND created_at <= ?
                AND legacy = 0
                AND council_only = 0
+               AND COALESCE(kind, 'gonggo') <> 'media'
              ORDER BY relevance_score DESC, created_at DESC
             """),
             (start, end),
@@ -1465,6 +1494,11 @@ class Database:
             relevance_score=row["relevance_score"] or 0.0,
             relevance_reason=row["relevance_reason"] or "",
             matched_keywords=matched_list,
+            # council_only·kind 는 **회사향 표면의 거절 근거**다 (텔레그램
+            # /app·/apply). 행을 객체로 바꿀 때 떨어뜨리면 그 표면이 판단
+            # 재료를 잃는다.
+            council_only=int(_row_value(row, "council_only", 0) or 0),
+            kind=_row_value(row, "kind", SOURCE_KIND_DEFAULT),
         )
 
     @staticmethod

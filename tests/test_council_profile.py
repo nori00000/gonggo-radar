@@ -1730,9 +1730,12 @@ class TestRecheckThrottle:
         """파이프라인 1회 실행 + 선택 함수에 들어간 항목 수 기록."""
         original = main_mod.select_for_storage
 
-        def spy(analyzer, raw_items, source_cfg):
+        def spy(analyzer, raw_items, *args, **kwargs):
+            # *args 로 받는 이유: select_for_storage 는 source_kind 가 붙으며
+            # 인자가 늘었다(P1-R 라운드 2). 이 스파이는 **몇 건이 들어갔는가**
+            # 만 세므로 나머지는 그대로 넘긴다.
             sizes.append(len(raw_items))
-            return original(analyzer, raw_items, source_cfg)
+            return original(analyzer, raw_items, *args, **kwargs)
 
         with monkeypatch.context() as m:
             m.setattr(main_mod, "select_for_storage", spy)

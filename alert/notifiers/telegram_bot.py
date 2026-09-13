@@ -6,8 +6,29 @@ from typing import List, Dict, Any, Optional
 
 import requests
 
-from alert.models import AnalyzedAnnouncement, Keyword
+from alert.models import SOURCE_KIND_MEDIA, AnalyzedAnnouncement, Keyword
 from alert.utils.logger import setup_logger
+
+# 회사향 명령이 집을 수 없는 행을 만났을 때의 답 (P1-R 라운드 2).
+MONTHLY_ONLY_NOTICE = "월간호 전용 기사입니다. 신청 이력을 만들 수 없습니다."
+
+
+def is_company_actionable(ann: Any) -> bool:
+    """이 행을 회사 사용자가 **신청 대상으로** 다룰 수 있는가.
+
+    ``get_announcement_by_id`` 는 가드를 달지 않는다 - id 를 가진 쪽이 이미
+    대상을 골랐다는 계약(P0 §A) 때문이다. 그래서 거절은 **부르는 쪽**이
+    한다. 두 종류를 막는다:
+
+    * ``kind == "media"`` - 2차 보도. 신청할 공고가 아니다.
+    * ``council_only == 1`` - 회사 경로가 고르지 않은 협의회 단독 행.
+
+    둘 다 회사 알림에 뜬 적이 없는 행이라, /app 이 이력을 만들어 주면
+    보낸 적 없는 공고의 신청 이력이 생긴다.
+    """
+    if getattr(ann, "kind", None) == SOURCE_KIND_MEDIA:
+        return False
+    return not int(getattr(ann, "council_only", 0) or 0)
 
 
 class TelegramNotifier:
@@ -606,6 +627,9 @@ class TelegramBot:
         if not ann:
             self._send_message(f"공고 #{ann_id}를 찾을 수 없습니다.")
             return
+        if not is_company_actionable(ann):
+            self._send_message(MONTHLY_ONLY_NOTICE)
+            return
 
         records = self.db.get_application_history(ann_id)
 
@@ -649,6 +673,9 @@ class TelegramBot:
         ann = self.db.get_announcement_by_id(ann_id)
         if not ann:
             self._send_message(f"공고 #{ann_id}를 찾을 수 없습니다.")
+            return
+        if not is_company_actionable(ann):
+            self._send_message(MONTHLY_ONLY_NOTICE)
             return
 
         today = datetime.now().strftime("%Y-%m-%d")

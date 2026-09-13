@@ -16,7 +16,13 @@ from .config import get_config
 from .council import CouncilDrop, score_item
 from .db import Database
 from .analyzer import KeywordAnalyzer, ClaudeAnalyzer
-from .models import RawAnnouncement, AnalyzedAnnouncement
+from .models import (
+    SOURCE_KIND_DEFAULT,
+    SOURCE_KIND_MEDIA,
+    SOURCE_KINDS,
+    RawAnnouncement,
+    AnalyzedAnnouncement,
+)
 from .notifiers.telegram_bot import TelegramNotifier
 from .notifiers.email_sender import EmailNotifier
 from .utils.logger import setup_logger
@@ -80,6 +86,11 @@ def _import_crawlers() -> Dict[str, Any]:
         ("forest_press", "alert.crawlers.forest_press", "ForestPressCrawler"),
         ("lawmaking", "alert.crawlers.lawmaking", "LawmakingCrawler"),
         ("coop", "alert.crawlers.coop", "CoopCrawler"),
+        # 2차 미디어 RSS (P1-R 계약, kind: media - 월간호 전용)
+        ("lifein", "alert.crawlers.media_rss", "LifeinCrawler"),
+        ("eroun", "alert.crawlers.media_rss", "ErounCrawler"),
+        ("senews", "alert.crawlers.media_rss", "SenewsCrawler"),
+        ("kfnews", "alert.crawlers.media_rss", "KfnewsCrawler"),
     ]
 
     for name, module_path, class_name in crawler_modules:
@@ -204,10 +215,47 @@ def _periods_from_raw(
 BYPASS_DEFAULT_SCORE = 0.5
 
 
+def resolve_source_kind(crawler_cls: Any, source_cfg: Optional[Any]) -> str:
+    """소스 종류를 정한다 — **정본은 크롤러 클래스**다 (라운드 2 HIGH).
+
+    설정(``config.yaml`` 의 ``kind:``)은 확인만 한다. 소스 블록이 통째로
+    빠지거나 ``kind`` 를 안 적어도 종류는 변하지 않는다: 설정 한 줄이 없다고
+    2차 보도가 회사 알림·주간호로 새면, 그 사고는 조용하고 되돌릴 수 없다
+    (이미 보낸 뒤에 안다).
+
+    설정이 크롤러와 **다른** 값을 주장하면 오류로 남기고 크롤러를 따른다.
+
+    Args:
+        crawler_cls: 크롤러 클래스 (또는 ``KIND`` 속성을 가진 객체). None 이면 기본값.
+        source_cfg: :class:`alert.config.SourceConfig` 또는 None.
+
+    Returns:
+        ``"gonggo"`` 또는 ``"media"``.
+    """
+    logger = logging.getLogger(__name__)
+    declared = getattr(crawler_cls, "KIND", None) or SOURCE_KIND_DEFAULT
+    if declared not in SOURCE_KINDS:
+        logger.error(
+            f"크롤러 {crawler_cls!r} 의 KIND={declared!r} 를 모른다 - media 로 본다"
+        )
+        # 모르는 값은 **회사 경로 밖**으로 보낸다. 잘못 실으면 알림이 새지만,
+        # 잘못 빼면 월간호 후보 하나가 빈다 - 후자가 싸다 (fail-closed).
+        return SOURCE_KIND_MEDIA
+
+    configured = getattr(source_cfg, "kind", None)
+    if configured is not None and configured != declared:
+        logger.error(
+            f"config.yaml 의 kind={configured!r} 가 크롤러 선언 {declared!r} 과"
+            f" 다르다 - 크롤러를 따른다"
+        )
+    return declared
+
+
 def select_for_storage(
     keyword_analyzer: KeywordAnalyzer,
     raw_announcements: List[RawAnnouncement],
     source_cfg: Optional[Any],
+    source_kind: str = SOURCE_KIND_DEFAULT,
 ) -> Tuple[List[AnalyzedAnnouncement], bool]:
     """키워드 분석 후 DB 저장 대상을 고른다.
 
@@ -219,10 +267,20 @@ def select_for_storage(
         keyword_analyzer: 키워드 분석기
         raw_announcements: 중복 제거를 마친 신규 공고
         source_cfg: 해당 소스의 SourceConfig (없으면 None)
+        source_kind: resolve_source_kind 가 정한 소스 종류
+
+    P1-R 계약: `media` 소스는 **회사 경로에 한 건도 들어가지 않는다**.
+    제목에 회사 must_match 어휘("사회적기업" 등)가 있어도 마찬가지다 - 2차
+    미디어 보도는 회사가 신청할 공고가 아니다. 적재 여부는 협의회 프로파일이
+    단독으로 정한다(매치 -> council_only=1, 미매치 -> 탈락 원장). 회사 알림
+    무영향이 어휘가 아니라 **경로 분리**로 지켜지는 자리다.
 
     Returns:
         (저장 대상 목록, bypass 적용 여부)
     """
+    if source_kind == SOURCE_KIND_MEDIA:
+        return [], False
+
     if source_cfg is not None and getattr(source_cfg, "bypass_threshold", False):
         analyzed = [keyword_analyzer.analyze(raw) for raw in raw_announcements]
         for ann in analyzed:
@@ -255,6 +313,7 @@ def apply_council_profile(
     raw_items: List[RawAnnouncement],
     selected: List[AnalyzedAnnouncement],
     analyze: Any,
+    source_kind: str = SOURCE_KIND_DEFAULT,
 ) -> Tuple[List[AnalyzedAnnouncement], List[CouncilDrop]]:
     """협의회 프로파일을 적용한다 - **회사 선택 결과는 건드리지 않는다**.
 
@@ -279,6 +338,10 @@ def apply_council_profile(
         raw_items: 중복 제거를 마친 신규 원본 항목 전량.
         selected: 회사 경로(:func:`select_for_storage`)가 고른 저장 대상.
         analyze: 회사 키워드 분석 함수 (``KeywordAnalyzer.analyze``).
+        source_kind: resolve_source_kind 가 정한 소스 종류. ``media`` 는
+            프로파일이 꺼져 있어도 **관찰 원장을 남긴다** (라운드 2):
+            미디어 항목은 회사 행이 될 수 없으므로, 프로파일 밖이면
+            어디에도 기록되지 않고 사라진다 - 그 침묵이 관찰 모드의 구멍이다.
 
     Returns:
         ``(협의회 단독 저장 대상, 양쪽 탈락 관찰 레코드, 양쪽 탈락 항목)``.
@@ -288,11 +351,16 @@ def apply_council_profile(
         이미 저장된 행의 측정값을 새 판정으로 갱신해야 하기 때문이다
         (Codex 게이트 4R MEDIUM).
     """
-    if not profile or not getattr(profile, "sources", None):
-        return [], [], []
-    if source not in profile.sources:
+    in_profile = bool(
+        profile
+        and getattr(profile, "sources", None)
+        and source in profile.sources
+    )
+    if not in_profile and source_kind != SOURCE_KIND_MEDIA:
         # 협의회 소스가 아니면 측정도 탈락 기록도 하지 않는다.
         return [], [], []
+    # 프로파일 밖의 media 는 아래 루프를 그대로 탄다: score_item 이
+    # "협의회 소스 아님"(match=0)을 돌려주므로 전량이 탈락 원장으로 간다.
 
     selected_by_id = {ann.source_id: ann for ann in selected}
     extras: List[AnalyzedAnnouncement] = []
@@ -557,6 +625,10 @@ def run_pipeline(test_mode: bool = False) -> None:
             logger.info(f"{crawler_name}: Running keyword analysis on {new_count} announcements")
 
             source_cfg = config.crawler.sources.get(crawler_name)
+            # 종류의 정본은 크롤러 클래스다 - 설정이 빠져도 media 는 media.
+            source_kind = resolve_source_kind(
+                available_crawlers.get(crawler_name), source_cfg
+            )
 
             # 신규와 재평가를 **한 목록으로** 고른다 (Codex 게이트 4R HIGH).
             # 선택 경로가 둘이면 한쪽만 LLM 관문을 지나는 일이 생긴다 - 실제로
@@ -564,7 +636,7 @@ def run_pipeline(test_mode: bool = False) -> None:
             # 통계에서만 뒤에서 갈라낸다.
             recheck_keys = {(r.source, r.source_id) for r in recheck_raw}
             selected_all, bypassed = select_for_storage(
-                keyword_analyzer, new_raw + recheck_raw, source_cfg
+                keyword_analyzer, new_raw + recheck_raw, source_cfg, source_kind
             )
 
             def _is_recheck(ann: AnalyzedAnnouncement) -> bool:
@@ -655,6 +727,7 @@ def run_pipeline(test_mode: bool = False) -> None:
                 new_raw,
                 analyzed,
                 keyword_analyzer.analyze,
+                source_kind,
             )
             # 재평가분의 탈락 **레코드**는 버린다: 원장의 뜻은 "저장되지 않은
             # 항목" 이고, 이 항목들은 이미 announcements 에 있다. 대신 탈락
@@ -665,6 +738,7 @@ def run_pipeline(test_mode: bool = False) -> None:
                 recheck_raw,
                 recheck_selected,
                 keyword_analyzer.analyze,
+                source_kind,
             )
             if council_drops:
                 try:
@@ -674,6 +748,14 @@ def run_pipeline(test_mode: bool = False) -> None:
                     )
                 except Exception as e:
                     logger.error(f"{crawler_name}: 탈락 원장 기록 실패 (비치명): {e}")
+
+            # 저장 직전 소스 종류를 찍는다 - 저장 경로의 단일 관문이다
+            # (기간 관문과 같은 자리, 같은 이유: 우회 경로를 두지 않는다).
+            for ann in (
+                analyzed + council_extra + recheck_selected
+                + recheck_extra + recheck_unmatched
+            ):
+                ann.kind = source_kind
 
             for ann in analyzed:
                 row_id = db.insert_announcement(ann)
