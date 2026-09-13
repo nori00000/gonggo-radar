@@ -32,11 +32,6 @@ from alert.utils.safe_argparse import (
 )
 from scripts.weekly_digest import compose_issue
 
-# 첫째 목요일 잡이 대상으로 삼는 "직전 1개월" 을 계산할 때 쓰는 상한
-# (launchd 가 매주 목 23:00 에 깨우고, 스크립트가 1~7일에만 진행한다).
-FIRST_WEEK_LAST_DAY = 7
-
-
 def _err(message) -> None:
     print(redact(message), file=sys.stderr)
 
