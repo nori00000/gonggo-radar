@@ -4,6 +4,7 @@ import json
 import re
 from typing import List, Optional
 from .base import BaseCrawler
+from .date_labels import posted_date
 from ..models import RawAnnouncement
 
 try:
@@ -68,7 +69,7 @@ class LawmakingCrawler(BaseCrawler):
             announcement = self._to_announcement(item, base_url)
             if announcement:
                 announcements.append(announcement)
-        return announcements
+        return self.enrich_with_quotes(announcements)
 
     def parse_list(self, soup: "BeautifulSoup") -> List[dict]:
         """입법예고 목록 테이블을 파싱한다.
@@ -200,7 +201,10 @@ class LawmakingCrawler(BaseCrawler):
             if not source_id:
                 source_id = hashlib.md5(title.encode("utf-8")).hexdigest()[:16]
 
-            period_start, period_end = self._parse_period(item.get("period", ""))
+            # 기간은 크롤러가 만들지 않는다 - DB 도달 직전 관문
+            # (``alert.main._finalize_periods`` → ``lawmaking_period``)이
+            # 정한다. 목록 셀은 raw_data 증거로만 남긴다.
+            posted = posted_date(item.get("period", ""))
 
             category_parts = [
                 p for p in ["입법예고", item.get("law_type", ""), item.get("field", "")]
@@ -208,7 +212,10 @@ class LawmakingCrawler(BaseCrawler):
             ]
             category = "/".join(dict.fromkeys(category_parts))
 
-            raw_data = json.dumps(item, ensure_ascii=False)
+            payload = dict(item)
+            if posted:
+                payload["posted"] = posted
+            raw_data = json.dumps(payload, ensure_ascii=False)
 
             return RawAnnouncement(
                 source=self.source_name,
@@ -219,8 +226,8 @@ class LawmakingCrawler(BaseCrawler):
                 author=item.get("author", "").strip() or "산림청",
                 category=category,
                 target="",
-                period_start=period_start,
-                period_end=period_end,
+                period_start=None,
+                period_end=None,
                 raw_data=raw_data,
             )
 

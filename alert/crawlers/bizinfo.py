@@ -3,6 +3,7 @@ import json
 import os
 from typing import List, Optional, Dict, Any
 from .base import BaseCrawler
+from .identity import clean_text
 from ..models import RawAnnouncement
 
 
@@ -17,6 +18,13 @@ class BizinfoCrawler(BaseCrawler):
     """
 
     API_ENDPOINT = "https://www.bizinfo.go.kr/uss/rss/bizinfoApi.do"
+
+    # ``detailUrl`` 이 비어 오는 항목의 **알림 링크**를 만드는 템플릿.
+    # 식별자에는 쓰지 않는다 (식별은 API 가 준 ``pblancId``).
+    DETAIL_URL_TEMPLATE = (
+        "https://www.bizinfo.go.kr/web/lay1/bbs/S1T122C128/AS/74/view.do"
+        "?pblancId="
+    )
 
     def __init__(self):
         super().__init__(source_name="bizinfo")
@@ -176,11 +184,15 @@ class BizinfoCrawler(BaseCrawler):
         """
         try:
             # Required fields
-            source_id = str(item.get("pblancId", "")).strip()
-            title = str(item.get("pblancNm", "")).strip()
-            url = str(item.get("detailUrl", "")).strip()
+            source_id = clean_text(item.get("pblancId"))
+            title = clean_text(item.get("pblancNm"))
+            # ``str(None)`` 이 문자열 "None" 을 만들어, URL 이 없는 서로 다른
+            # 공고가 같은 URL 로 합쳐졌다 (13차 게이트 HIGH).
+            url = clean_text(item.get("detailUrl"))
 
-            if not source_id or not title:
+            # 14차 게이트: ``pblancId`` 가 없어도 **고유 상세 URL** 이 있으면
+            # 공고를 버리지 않는다 - 식별은 그 URL 이 맡는다.
+            if not title or not (source_id or clean_text(item.get("detailUrl"))):
                 self.logger.warning(f"Item missing required fields: {item}")
                 return None
 
@@ -194,8 +206,14 @@ class BizinfoCrawler(BaseCrawler):
             period_raw = str(item.get("reqstBeginEndDe", "")).strip()
             period_start, period_end = self._parse_period(period_raw)
 
-            # Store full item as raw_data
-            raw_data = json.dumps(item, ensure_ascii=False)
+            # URL 이 없으면 **알림 링크용**으로만 상세 URL 템플릿을 만든다.
+            # 식별에는 쓰지 않는다 - 식별은 API 가 준 ``pblancId`` 다.
+            payload = dict(item)
+            if not url and source_id:
+                url = f"{self.DETAIL_URL_TEMPLATE}{source_id}"
+                payload["url_is_template"] = True
+
+            raw_data = json.dumps(payload, ensure_ascii=False)
 
             announcement = RawAnnouncement(
                 source="bizinfo",

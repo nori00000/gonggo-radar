@@ -8,9 +8,16 @@ import os
 import sqlite3
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Sequence
 
-from .models import AnalyzedAnnouncement, ApplicationRecord, Keyword, ResearchDocument
+from .crawlers.identity import is_legacy_source_id
+from .models import (
+    AnalyzedAnnouncement,
+    ApplicationRecord,
+    Keyword,
+    RawAnnouncement,
+    ResearchDocument,
+)
 
 # ---------------------------------------------------------------------------
 # Backend detection
@@ -303,7 +310,12 @@ class Database:
                 self._conn.commit()
                 return cur.lastrowid
         except _IntegrityError:
-            # Duplicate (source, source_id) -- update score/reason and return existing ID.
+            # 같은 **행 식별자**가 이미 있다 = 같은 공고다. 점수·사유만
+            # 갱신한다. 행은 ``_find_row`` 로만 찾는다 - 저장 경로에도
+            # 식별 우회가 없어야 한다 (13차 게이트).
+            row = self._find_row("id", ann)
+            if row is None:
+                return None
             self._conn.execute(
                 _sql("""
                 UPDATE announcements
@@ -311,35 +323,33 @@ class Database:
                        relevance_reason = ?,
                        matched_keywords = ?,
                        updated_at       = ?
-                 WHERE source = ? AND source_id = ?
+                 WHERE id = ?
                 """),
                 (
                     ann.relevance_score,
                     ann.relevance_reason,
                     json.dumps(ann.matched_keywords, ensure_ascii=False),
                     now,
-                    ann.source,
-                    ann.source_id,
+                    row["id"],
                 ),
             )
             if self._backend == "sqlite":
                 self._conn.commit()
             if return_existing:
-                row = self._conn.execute(
-                    _sql("SELECT id FROM announcements WHERE source = ? AND source_id = ?"),
-                    (ann.source, ann.source_id),
-                ).fetchone()
-                if row:
-                    return row["id"] if isinstance(row, dict) else row[0]
-                return None
+                return row["id"]
             return None
 
     def get_unnotified(self) -> List[AnalyzedAnnouncement]:
-        """Return all announcements that have not been notified yet."""
+        """Return all announcements that have not been notified yet.
+
+        옛 규칙으로 저장된 행(``legacy``)은 아무 것도 주장할 수 없으므로
+        제외한다 (15차 게이트).
+        """
         rows = self._conn.execute(
             """
             SELECT * FROM announcements
              WHERE is_notified = 0
+               AND legacy = 0
                AND (period_end IS NULL OR period_end = '' OR period_end >= date('now'))
              ORDER BY relevance_score DESC, created_at DESC
             """
@@ -362,6 +372,389 @@ class Database:
             (source, source_id),
         ).fetchone()
         return row is not None
+
+    def get_quoted_source_ids(self, source: str) -> set:
+        """이미 상세 인용을 받은 공고의 source_id 집합.
+
+        크롤러가 상세 요청 예산을 이미 채운 항목에 낭비하지 않도록 알려
+        준다(Codex 재검토 #11). 이것이 없으면 목록이 요청 상한보다 길 때
+        뒤쪽 항목이 매 실행 영구히 미수집으로 남는다.
+
+        Args:
+            source: 크롤러 소스 이름
+
+        Returns:
+            ``raw_data`` 에 인용 키가 들어 있는 공고의 source_id 집합
+        """
+        rows = self._conn.execute(
+            _sql(
+                "SELECT source_id FROM announcements"
+                " WHERE source = ?"
+                "   AND (raw_data LIKE '%\"quote_deadline\"%'"
+                "     OR raw_data LIKE '%\"quote_eligibility\"%'"
+                "     OR raw_data LIKE '%\"quote_amount\"%')"
+            ),
+            (source,),
+        ).fetchall()
+        return {str(row["source_id"]) for row in rows}
+
+    QUOTE_FIELDS = (
+        "quote_deadline", "quote_eligibility", "quote_amount",
+        "quote_period_start", "quote_period_end",
+        "always_open", "early_close", "detail_truncated",
+        "quotes_attempted_at",
+    )
+
+    def merge_quote_fields(self, announcement: RawAnnouncement) -> bool:
+        """이미 저장된 공고에 **새로 얻은 인용**을 합쳐 넣는다.
+
+        상세 인용은 목록보다 늦게 도착한다(요청 상한 때문에 다음 실행에서
+        오기도 한다). 중복 필터가 그 공고를 걸러 버리면 인용이 영구히
+        버려진다. 그래서 인용 관련 필드만 upsert 한다.
+
+        **빈 값으로는 지우지 않는다** (4차 게이트 #7): ``{"quote_deadline": ""}``
+        같은 결과가 정상 인용을 덮어써 사라지게 했고, 자격 인용만 새로
+        들어와도 기존 마감 인용·근거·플래그가 함께 지워졌다. 이제 값이 있는
+        키만 덮어쓰고, 없는 키는 **손대지 않는다**.
+
+        인용을 못 얻은 항목도 ``quotes_attempted_at`` 만 기록해 다음 실행이
+        아직 안 본 항목을 먼저 보게 한다 (4차 게이트 #6).
+
+        Args:
+            announcement: 인용(또는 시도 기록)을 담은 새 수집 결과
+
+        Returns:
+            실제로 갱신했으면 True
+        """
+        try:
+            incoming = json.loads(announcement.raw_data or "{}")
+        except (ValueError, TypeError):
+            return False
+        if not isinstance(incoming, dict):
+            return False
+
+        fresh = {
+            key: incoming[key]
+            for key in self.QUOTE_FIELDS
+            if key in incoming and incoming[key] not in ("", None, {}, [])
+        }
+        if not fresh:
+            return False
+
+        row = self._find_row("id, raw_data", announcement)
+        if row is None:
+            return False
+
+        try:
+            stored = json.loads(row["raw_data"] or "{}")
+        except (ValueError, TypeError):
+            stored = {}
+        if not isinstance(stored, dict):
+            stored = {}
+
+        # 인용 **본문**이 새로 왔을 때만 그 계열의 파생값을 정리한다.
+        # 시도 기록만 왔다면 기존 인용을 건드리지 않는다.
+        has_new_quote = any(
+            key in fresh
+            for key in ("quote_deadline", "quote_eligibility", "quote_amount")
+        )
+        if has_new_quote and "quote_deadline" in fresh:
+            for key in ("quote_period_start", "quote_period_end",
+                        "always_open", "early_close"):
+                stored.pop(key, None)
+        stored.update(fresh)
+
+        # 기간은 **여기서 쓰지 않는다** (13차). 인용에서 뽑은
+        # ``quote_period_*`` 는 raw_data 증거로만 남고, 기간 두 필드는
+        # 관문(``alert.main._finalize_periods``)이 정한 값을
+        # ``overwrite_periods`` 가 쓴다. 예전에는 ``or row["period_end"]`` 가
+        # 기존 값을 보존해, 재수집해도 가짜 마감이 영구히 남았다
+        # (9차 게이트 MEDIUM).
+        self._conn.execute(
+            _sql(
+                "UPDATE announcements SET raw_data = ?, updated_at = ?"
+                " WHERE id = ?"
+            ),
+            (
+                json.dumps(stored, ensure_ascii=False),
+                datetime.now().isoformat(),
+                row["id"],
+            ),
+        )
+        if self._backend == "sqlite":
+            self._conn.commit()
+        return True
+
+    def _find_row(self, columns: str, announcement: RawAnnouncement) -> Optional[Any]:
+        """``(source, source_id)`` 로만 찾는다 - 저장 키와 같은 키다.
+
+        16차 게이트: URL 해시·필드 키로 행을 다시 식별하려던 설계를
+        폐기했다. 크롤러가 만든 ``source_id`` 가 유일한 키이고, 조회·저장·
+        갱신이 전부 그 키를 쓴다.
+
+        Args:
+            columns: 읽을 컬럼 목록 (내부 상수만 넘긴다)
+            announcement: 조회 기준이 되는 수집 결과
+
+        Returns:
+            찾은 행 또는 None
+        """
+        return self._conn.execute(
+            _sql(
+                f"SELECT {columns} FROM announcements"
+                " WHERE source = ? AND source_id = ?"
+            ),
+            (announcement.source, announcement.source_id),
+        ).fetchone()
+
+    def exists(self, announcement: RawAnnouncement) -> bool:
+        """이 공고가 이미 저장돼 있는가 (``(source, source_id)`` 기준)."""
+        return self._find_row("id", announcement) is not None
+
+    def mark_legacy_rows(
+        self, evidence_keys: Optional[Dict[str, Sequence[str]]] = None
+    ) -> int:
+        """옛 규칙으로 저장된 행을 **어둡게** 둔다 (멱등, 삭제 없음).
+
+        15차 게이트: 예전 ``source_id`` 를 새 식별자로 **추측해 이관**하려
+        했더니, 서로 다른 공고가 같은 키로 수렴해 중복으로 묶이고 남의
+        기간이 덮어써졌다. 추측이 아니라 **표시**한다:
+
+        대상은 **seis 의 접두 없는 옛 숫자 id 행**뿐이다. 12차에서 seis
+        ``source_id`` 에 공고 종류 접두를 넣었으므로(``fnc:``/``dsgn:``/
+        ``epsd:<연도>:``/``itgrd:``/``path:``), ``:`` 가 없는 seis 행은 옛
+        규칙의 행이고 새 수집과 영원히 만나지 않는다. 다른 소스의 식별자
+        형식은 바뀌지 않았으므로 건드리지 않는다.
+
+        - ``legacy = 1`` 로 표시하고
+        - 기간 두 필드를 NULL 로, 추출 근거를 raw_data 에서 지운다
+        - 알림·기간 조회 후보에서 제외한다
+
+        재수집되면 새 식별자로 **새 행**이 생기고 그것이 정본이 된다.
+        옛 행은 남아 있지만 아무 것도 주장하지 않는다 - 되돌릴 수 없는
+        삭제 대신 조용히 두는 쪽이 안전하다(fail-safe).
+
+        Args:
+            evidence_keys: 소스별 추출 근거 키 (``EVIDENCE_KEYS``)
+
+        Returns:
+            이번 실행에서 새로 표시한 행 수
+        """
+        rows = self._conn.execute(
+            _sql(
+                "SELECT id, source, source_id, raw_data FROM announcements"
+                " WHERE legacy = 0"
+            )
+        ).fetchall()
+
+        now = datetime.now().isoformat()
+        marked = 0
+        for row in rows:
+            if not is_legacy_source_id(row["source"], row["source_id"]):
+                continue
+            payload = self._load_json(row["raw_data"])
+            for key in (evidence_keys or {}).get(row["source"], ()):
+                payload.pop(key, None)
+            self._conn.execute(
+                _sql(
+                    "UPDATE announcements SET legacy = 1, period_start = NULL,"
+                    " period_end = NULL, raw_data = ?, updated_at = ?"
+                    " WHERE id = ?"
+                ),
+                (json.dumps(payload, ensure_ascii=False), now, row["id"]),
+            )
+            marked += 1
+
+        if marked and self._backend == "sqlite":
+            self._conn.commit()
+        if marked:
+            logging.getLogger(__name__).warning(
+                "레거시 식별자 행 %s 건을 표시했다 - 기간·알림에서 제외한다"
+                " (재수집되면 새 행이 정본)", marked,
+            )
+        return marked
+
+    def revalidate_periods(self, source: str, recompute) -> int:
+        """저장된 행의 기간을 **raw_data 근거로 다시 산출**한다 (멱등).
+
+        전용 추출기가 있는 소스라도, 목록에서 내려간 공고는 재수집되지
+        않아 관문을 다시 지나지 않는다. 그래서 예전 규칙으로 심긴 기간이
+        알림까지 살아남았다 (11차 게이트 MEDIUM). 근거가 없으면 NULL 이다.
+
+        Args:
+            source: 소스 이름
+            recompute: ``raw_data`` 문자열 -> ``(start, end)`` 순수 함수
+
+        Returns:
+            실제로 값이 바뀐 행 수
+        """
+        rows = self._conn.execute(
+            _sql(
+                "SELECT id, raw_data, period_start, period_end FROM announcements"
+                " WHERE source = ?"
+            ),
+            (source,),
+        ).fetchall()
+
+        changed = 0
+        for row in rows:
+            try:
+                start, end = recompute(row["raw_data"])
+            except Exception:                       # noqa: BLE001
+                start, end = None, None             # 근거를 못 읽으면 기간 없음
+            if (row["period_start"] or None) == (start or None) and (
+                row["period_end"] or None
+            ) == (end or None):
+                continue
+            self._conn.execute(
+                _sql(
+                    "UPDATE announcements SET period_start = ?, period_end = ?,"
+                    " updated_at = ? WHERE id = ?"
+                ),
+                (start or None, end or None, datetime.now().isoformat(), row["id"]),
+            )
+            changed += 1
+
+        if changed and self._backend == "sqlite":
+            self._conn.commit()
+        return changed
+
+    def clear_periods_except(self, keep_sources: Sequence[str]) -> int:
+        """**추출기가 있는 소스를 뺀 전부**의 기간을 NULL 로 만든다 (멱등).
+
+        재수집되지 않은 행(목록에서 내려간 공고)은 관문을 다시 지나지
+        않으므로, 예전 실행이 심은 마감이 그대로 남아 알림·브리핑까지
+        갔다. 12차 게이트에서 정규화 범위가 허용목록과 달라 ``bizinfo``
+        같은 소스의 오염이 살아남는 것이 확인됐다 - 그래서 **허용목록의
+        여집합 전체**를 대상으로 한다. 이 소스들은 설계상 기간을 만들 수
+        없으므로 남아 있는 값은 전부 날조값이다.
+
+        이미 비어 있는 행은 건드리지 않으므로 두 번째 호출은 0을 돌려준다.
+
+        Args:
+            keep_sources: 전용 추출기가 있는 소스 이름들 (건드리지 않는다)
+
+        Returns:
+            실제로 비운 행 수
+        """
+        names = [name for name in keep_sources if name]
+        keep_clause = ""
+        if names:
+            placeholders = ", ".join("?" for _ in names)
+            keep_clause = f" AND source NOT IN ({placeholders})"
+
+        cursor = self._conn.execute(
+            _sql(
+                "UPDATE announcements SET period_start = NULL,"
+                " period_end = NULL, updated_at = ?"
+                " WHERE (period_start IS NOT NULL OR period_end IS NOT NULL)"
+                + keep_clause
+            ),
+            (datetime.now().isoformat(), *names),
+        )
+        affected = cursor.rowcount or 0
+        if self._backend == "sqlite":
+            self._conn.commit()
+        return affected
+
+    def overwrite_periods(
+        self,
+        announcement: RawAnnouncement,
+        evidence_keys: Sequence[str] = (),
+    ) -> bool:
+        """기간과 **그 근거**를 재수집 값으로 덮어쓴다 (빈 값 포함).
+
+        기간만 갱신하고 ``raw_data`` 의 추출 근거를 옛 값으로 두면, 나중에
+        기존 행 재검증이 **철회된 기간을 되살린다** (12차 게이트 HIGH:
+        10월 범위 → 재수집 NULL → 다음 실행에서 10월 범위 부활). 그래서
+        근거 키는 새 수집 결과의 값으로 교체하고, 새 값이 없으면 지운다.
+
+        기간 값 자체는 관문(``alert.main._finalize_periods``)이 이미
+        정했다 - 이 메서드는 그 결정을 그대로 쓴다.
+
+        Args:
+            announcement: 관문을 지난 새 수집 결과
+            evidence_keys: 추출기가 근거로 읽는 ``raw_data`` 키들
+
+        Returns:
+            실제로 값이 바뀌었으면 True (같으면 건드리지 않는다)
+        """
+        row = self._find_row("id, period_start, period_end, raw_data", announcement)
+        if row is None:
+            return False
+
+        start = announcement.period_start or None
+        end = announcement.period_end or None
+        period_changed = (
+            (row["period_start"] or None) != start
+            or (row["period_end"] or None) != end
+        )
+
+        stored = self._load_json(row["raw_data"])
+        incoming = self._load_json(announcement.raw_data)
+        evidence_changed = False
+        for key in evidence_keys:
+            fresh = incoming.get(key)
+            if fresh in (None, "", [], {}):
+                if key in stored:
+                    stored.pop(key)
+                    evidence_changed = True
+            elif stored.get(key) != fresh:
+                stored[key] = fresh
+                evidence_changed = True
+
+        if not period_changed and not evidence_changed:
+            return False               # 같으면 updated_at 도 건드리지 않는다
+
+        self._conn.execute(
+            _sql(
+                "UPDATE announcements SET period_start = ?, period_end = ?,"
+                " raw_data = ?, updated_at = ? WHERE id = ?"
+            ),
+            (
+                start,
+                end,
+                json.dumps(stored, ensure_ascii=False),
+                datetime.now().isoformat(),
+                row["id"],
+            ),
+        )
+        if self._backend == "sqlite":
+            self._conn.commit()
+        return True
+
+    @staticmethod
+    def _load_json(payload: Optional[str]) -> Dict[str, Any]:
+        """``raw_data`` 를 딕셔너리로 읽는다 (못 읽으면 빈 딕셔너리)."""
+        try:
+            loaded = json.loads(payload or "{}")
+        except (ValueError, TypeError):
+            return {}
+        return loaded if isinstance(loaded, dict) else {}
+
+    def get_quote_attempts(self, source: str) -> Dict[str, str]:
+        """source_id -> 마지막 상세 시도 시각.
+
+        인용을 얻지 못한 항목도 시도 시각이 남으므로, 다음 실행이 **아직 안
+        본 항목부터** 볼 수 있다. 이것이 없으면 목록이 요청 상한보다 길 때
+        같은 앞쪽 20건만 영원히 다시 요청한다 (4차 게이트 #6).
+        """
+        rows = self._conn.execute(
+            _sql(
+                "SELECT source_id, raw_data FROM announcements"
+                " WHERE source = ? AND raw_data LIKE '%quotes_attempted_at%'"
+            ),
+            (source,),
+        ).fetchall()
+        attempts: Dict[str, str] = {}
+        for row in rows:
+            try:
+                payload = json.loads(row["raw_data"] or "{}")
+            except (ValueError, TypeError):
+                continue
+            if isinstance(payload, dict) and payload.get("quotes_attempted_at"):
+                attempts[str(row["source_id"])] = str(payload["quotes_attempted_at"])
+        return attempts
 
     def search_announcements(self, query: str, limit: int = 20) -> List[AnalyzedAnnouncement]:
         """Full-text search across title and summary.
@@ -772,11 +1165,15 @@ class Database:
     # ------------------------------------------------------------------
 
     def get_announcements_by_period(self, start: str, end: str) -> List[AnalyzedAnnouncement]:
-        """Get announcements created within a date range."""
+        """Get announcements created within a date range.
+
+        다이제스트 후보에서도 레거시 행은 뺀다 (15차 게이트).
+        """
         rows = self._conn.execute(
             _sql("""
             SELECT * FROM announcements
              WHERE created_at >= ? AND created_at <= ?
+               AND legacy = 0
              ORDER BY relevance_score DESC, created_at DESC
             """),
             (start, end),

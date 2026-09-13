@@ -5,6 +5,7 @@ Modes: single run, daemon, bot, test
 """
 
 import argparse
+import json
 import logging
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -18,6 +19,17 @@ from .models import RawAnnouncement, AnalyzedAnnouncement
 from .notifiers.telegram_bot import TelegramNotifier
 from .notifiers.email_sender import EmailNotifier
 from .utils.logger import setup_logger
+
+try:
+    from .crawlers.period_extractors import EVIDENCE_KEYS, PERIOD_EXTRACTORS
+except Exception as _exc:              # noqa: BLE001
+    # 추출기를 못 읽어도 파이프라인은 산다 - 그때는 **모든 소스가 기간
+    # 없음**이 된다(fail-closed). 없는 마감을 말하는 것보다 낫다.
+    logging.getLogger(__name__).error(
+        f"period extractors unavailable ({_exc}) - 모든 기간을 비운다"
+    )
+    PERIOD_EXTRACTORS = {}
+    EVIDENCE_KEYS = {}
 
 
 # ---------------------------------------------------------------------------
@@ -89,8 +101,16 @@ def _crawl_single(
     crawler_name: str,
     CrawlerClass: Any,
     logger: logging.Logger,
+    quoted_source_ids: Optional[set] = None,
 ) -> Tuple[str, list, str]:
     """단일 크롤러 실행 (스레드에서 호출).
+
+    Args:
+        crawler_name: 소스 이름
+        CrawlerClass: 크롤러 클래스
+        logger: 로거
+        quoted_source_ids: 이미 상세 인용을 받은 공고의 source_id.
+            상세 요청 예산을 이 항목에 쓰지 않는다 (Codex 재검토 #11)
 
     Returns:
         (crawler_name, raw_announcements, status)
@@ -100,11 +120,80 @@ def _crawl_single(
         crawler = CrawlerClass()
         if not crawler.is_enabled():
             return crawler_name, [], "disabled"
+        if quoted_source_ids:
+            crawler.set_quoted_source_ids(quoted_source_ids)
         raw = crawler.safe_fetch()
         return crawler_name, raw, "success"
     except Exception as e:
         logger.error(f"{crawler_name}: {e}")
         return crawler_name, [], "error"
+
+
+# ---------------------------------------------------------------------------
+# 기간 관문 (13차) - period_start/period_end 는 **여기서만** 정해진다
+# ---------------------------------------------------------------------------
+
+def _finalize_periods(source: str, item: RawAnnouncement) -> RawAnnouncement:
+    """DB 에 닿기 직전 기간 두 필드를 확정한다 - 저장 경로의 단일 관문.
+
+    크롤러가 무엇을 반환했든(하위 클래스 override, ``fetch()`` 가 직접
+    만든 객체, ``safe_fetch`` 경유 여부 무관) 이 함수가 두 필드를 **None
+    으로 리셋**한 뒤, 전용 추출기를 가진 소스만 ``raw_data`` 원문에서
+    다시 채운다.
+
+    열두 차례의 게이트에서 관문을 크롤러 쪽(베이스 클래스)에 두면 계속
+    우회됐다: 선언을 상속하거나 override 하거나, 근거 없이 만든 객체를
+    그대로 반환하면 통과했다. 그래서 관문을 **저장 직전 한 곳**에 둔다.
+
+    Args:
+        source: 저장될 소스 이름 (``announcement.source``)
+        item: 저장 대상 - **제자리에서** 고친다
+
+    Returns:
+        같은 객체 (호출 편의)
+    """
+    start, end = _periods_from_raw(source, item.raw_data)
+    item.period_start = start
+    item.period_end = end
+    return item
+
+
+def _periods_from_raw(
+    source: str, raw_data: Optional[str]
+) -> Tuple[Optional[str], Optional[str]]:
+    """``raw_data`` 원문에서 기간을 산출한다 - **근거 산출의 단일 구현**.
+
+    저장 직전 관문(``_finalize_periods``)과 기존 행 재검증
+    (``Database.revalidate_periods``)이 같은 함수를 쓴다. 두 자리가 갈리면
+    "재수집된 행" 과 "안 된 행" 의 기준이 달라진다.
+
+    Args:
+        source: 소스 이름
+        raw_data: 크롤러가 남긴 JSON 문자열
+
+    Returns:
+        ``(period_start, period_end)`` - 근거가 없으면 ``(None, None)``
+    """
+    extractor = PERIOD_EXTRACTORS.get((source or "").strip())
+    if extractor is None:
+        return None, None              # 전용 추출기가 없는 소스 = 기간 없음
+
+    try:
+        raw = json.loads(raw_data or "{}")
+    except (ValueError, TypeError):
+        return None, None
+    if not isinstance(raw, dict):
+        return None, None
+
+    try:
+        start, end = extractor(raw)
+    except Exception as exc:           # noqa: BLE001
+        logging.getLogger(__name__).error(
+            f"{source}: 기간 추출 실패 ({exc}) - 기간 없이 둔다"
+        )
+        return None, None
+
+    return start or None, end or None
 
 
 # ---------------------------------------------------------------------------
@@ -160,6 +249,39 @@ def run_pipeline(test_mode: bool = False) -> None:
 
     # Initialize components
     db = Database()
+
+    # 옛 규칙으로 저장된 행은 **표시만** 한다 (멱등, 삭제 없음).
+    # 새 식별자로 재수집되면 그 새 행이 정본이 되고, 옛 행은 기간·알림에서
+    # 빠진 채 조용히 남는다 - 추측 이관이 남의 기간을 덮어쓰는 것보다 안전하다.
+    try:
+        marked = db.mark_legacy_rows(EVIDENCE_KEYS)
+        logger.info(f"레거시 식별자 행: {marked} 건 표시 (기간·알림 제외)")
+    except Exception as e:
+        logger.error(f"레거시 표시 실패: {e}")
+
+    # 기존 오염 정규화 (멱등) - 허용목록 **여집합 전체**의 기간을 지운다.
+    # 12차 게이트: 대상을 몇 개 소스로 좁혔더니 bizinfo 같은 소스의 오염이
+    # 살아남아 알림까지 갔다.
+    try:
+        cleared = db.clear_periods_except(PERIOD_EXTRACTORS)
+        logger.info(
+            f"기간 정규화: {cleared} 행을 비웠다 "
+            f"(추출기 있는 소스 {len(PERIOD_EXTRACTORS)}개 제외)"
+        )
+    except Exception as e:
+        logger.error(f"기간 정규화 실패: {e}")
+
+    # 추출기가 있는 소스도 **기존 행의 근거를 다시 본다**. 목록에서 내려간
+    # 공고는 재수집되지 않아 관문을 다시 지나지 않는다 (11차 게이트).
+    for extractor_source in PERIOD_EXTRACTORS:
+        try:
+            fixed = db.revalidate_periods(
+                extractor_source,
+                lambda raw, name=extractor_source: _periods_from_raw(name, raw),
+            )
+            logger.info(f"기간 재검증({extractor_source}): {fixed} 행을 고쳤다")
+        except Exception as e:
+            logger.error(f"기간 재검증 실패({extractor_source}): {e}")
     keyword_analyzer = KeywordAnalyzer(db=db)
     claude_analyzer = ClaudeAnalyzer()
     telegram = TelegramNotifier(db=db)
@@ -193,9 +315,22 @@ def run_pipeline(test_mode: bool = False) -> None:
 
     crawl_results: Dict[str, Any] = {}
 
+    # 이미 상세 인용을 받은 공고는 상세 요청 예산을 쓰지 않는다.
+    # 이걸 넘겨 주지 않으면 목록이 요청 상한보다 긴 소스에서 뒤쪽 항목이
+    # 매 실행 영구히 미수집으로 남는다 (Codex 재검토 #11).
+    quoted_ids: Dict[str, set] = {}
+    for name in available_crawlers:
+        try:
+            quoted_ids[name] = db.get_quoted_source_ids(name)
+        except Exception as e:
+            logger.debug(f"{name}: could not load quoted source ids: {e}")
+            quoted_ids[name] = set()
+
     with ThreadPoolExecutor(max_workers=5) as pool:
         futures = {
-            pool.submit(_crawl_single, name, cls, logger): name
+            pool.submit(
+                _crawl_single, name, cls, logger, quoted_ids.get(name)
+            ): name
             for name, cls in available_crawlers.items()
         }
         for future in as_completed(futures):
@@ -234,16 +369,51 @@ def run_pipeline(test_mode: bool = False) -> None:
             # Filter out duplicates
             new_raw: List[RawAnnouncement] = []
             duplicate_count = 0
+            quote_merge_count = 0
+            period_reset_count = 0
 
             for raw_ann in raw_announcements:
-                if db.is_duplicate(raw_ann.source, raw_ann.source_id):
+                # ── 기간 관문 ─────────────────────────────────────────
+                # 기간 두 필드는 이 호출 뒤로만 존재한다. 신규 저장은 이
+                # 객체의 복사본을 쓰고(``KeywordAnalyzer.analyze`` 가
+                # ``__dict__`` 를 그대로 복사), 기존 행은 아래
+                # ``overwrite_periods`` 가 같은 값으로 덮어쓴다. 그래서
+                # DB 에 닿는 두 경로가 모두 이 한 호출을 지난다.
+                _finalize_periods(raw_ann.source, raw_ann)
+
+                # 같은 URL 이면 같은 공고다 - source_id 체계가 바뀐 예전
+                # 행도 새 행으로 갈라지지 않는다 (11차 게이트)
+                if db.exists(raw_ann):
                     duplicate_count += 1
+                    # 기존 행의 기간도 **재수집 값으로 덮어쓴다** (None
+                    # 포함) - 예전 실행이 심은 가짜 마감을 재수집이 지운다.
+                    try:
+                        if db.overwrite_periods(
+                            raw_ann, EVIDENCE_KEYS.get(raw_ann.source, ())
+                        ):
+                            period_reset_count += 1
+                    except Exception as e:
+                        logger.debug(
+                            f"period sync failed for {raw_ann.source_id}: {e}"
+                        )
+                    # 중복이라도 **새 인용은 살린다**. 상세 인용은 요청 상한
+                    # 때문에 다음 실행에서 도착하기도 하는데, 그때 중복
+                    # 필터가 버리면 인용이 영구히 사라진다 (최종 게이트 #6).
+                    try:
+                        if db.merge_quote_fields(raw_ann):
+                            quote_merge_count += 1
+                    except Exception as e:
+                        logger.debug(f"quote merge failed for {raw_ann.source_id}: {e}")
                     logger.debug(f"Duplicate: {raw_ann.title}")
                 else:
                     new_raw.append(raw_ann)
 
             new_count = len(new_raw)
-            logger.info(f"{crawler_name}: {new_count} new, {duplicate_count} duplicates")
+            logger.info(
+                f"{crawler_name}: {new_count} new, {duplicate_count} duplicates"
+                f"{f', {quote_merge_count} quote merges' if quote_merge_count else ''}"
+                f"{f', {period_reset_count} period resets' if period_reset_count else ''}"
+            )
 
             if new_count == 0:
                 run_stats[crawler_name] = {

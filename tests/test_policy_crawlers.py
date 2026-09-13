@@ -4,6 +4,7 @@ All parsing is exercised against saved HTML fixtures in tests/fixtures/,
 so these tests never touch the network.
 """
 
+import json
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -78,8 +79,8 @@ class TestKofpiCrawler:
         assert "입찰/공모" in first["category"]
         assert "공모" in first["category"]
 
-    def test_to_announcement_builds_detail_url_and_deadline(self, crawler):
-        """상세 URL과 제목 속 마감일(~9.30)이 반영된다."""
+    def test_to_announcement_builds_detail_url_without_a_deadline(self, crawler):
+        """상세 URL은 만들고, 제목 속 ``(~9.30)`` 은 마감으로 쓰지 않는다."""
         items = crawler.parse_list(
             load_fixture("kofpi_notice.html"), "/notice/notice_01view.do", "공지"
         )
@@ -90,18 +91,32 @@ class TestKofpiCrawler:
         assert ann.source_id == "12658"
         assert ann.url == "https://www.kofpi.or.kr/notice/notice_01view.do?bb_seq=12658"
         assert ann.author == "한국임업진흥원"
-        assert ann.period_start == "2026-09-07"
-        assert ann.period_end == "2026-09-30"
+        # 13차: 제목 괄호 추출기를 폐기했다. 게시일도, 제목 표기도 기간이
+        # 아니다 - kofpi 는 기간을 만들 수 없다 (9차 게이트 HIGH ③).
+        assert (ann.period_start, ann.period_end) == (None, None)
+        assert json.loads(ann.raw_data)["posted"] == "2026-09-07"
 
-    def test_deadline_rolls_over_to_next_year(self, crawler):
-        """게시월보다 마감월이 빠르면 다음 해로 본다."""
-        assert crawler._extract_deadline("공모 안내(~2.15)", "2026-12-01") == "2027-02-15"
-        assert crawler._extract_deadline("공모 안내(~12.15)", "2026-12-01") == "2026-12-15"
+    def test_the_title_deadline_extractor_is_retired(self, crawler):
+        """13차: 제목 마감 추출기 자체가 사라졌다."""
+        assert not hasattr(crawler, "_extract_deadline")
+        assert not hasattr(crawler, "_period_from_title")
 
-    def test_deadline_absent_returns_none(self, crawler):
-        """마감 표기가 없으면 None."""
-        assert crawler._extract_deadline("마감 표기 없는 공고", "2026-09-07") is None
-        assert crawler._extract_deadline("", "2026-09-07") is None
+    @pytest.mark.parametrize("title", [
+        "공모(~9.30)",                      # 12차까지 마감 2026-09-30
+        "2025년 사업 결과 안내(~9.30)",      # 과거 결과 공고
+        "공모 안내(~2025.9.30)",             # 명시 과거 연도
+        "공모 안내(~2027.2.30)",             # 달력에 없는 날짜
+        "공모(~9.30 접수 후 발표)",
+        "마감 표기 없는 공고",
+    ])
+    def test_no_title_pattern_becomes_a_deadline(self, crawler, title):
+        """어떤 제목 표기도 마감이 되지 않는다 (9차 게이트 HIGH ③)."""
+        ann = crawler._to_announcement(
+            {"title": title, "link": "/notice/notice_01view.do?bb_seq=1",
+             "seq": "1", "date": "2026-09-07"},
+            "https://www.kofpi.or.kr",
+        )
+        assert (ann.period_start, ann.period_end) == (None, None)
 
     def test_extract_seq_patterns(self, crawler):
         """fnGoView / bb_seq 양쪽 형태에서 seq를 추출한다."""
@@ -163,7 +178,12 @@ class TestForestPressCrawler:
         assert ann.source_id == "3224171"
         assert ann.category == "정책/보도"
         assert ann.url.startswith("https://www.forest.go.kr/kfsweb/cop/bbs/selectBoardArticle.do")
-        assert ann.period_start == "2026-09-12"
+        # 보도자료의 날짜는 **게시일**이다 - 접수 시작일이 아니다
+        # (6차 게이트 #1). forest_press 는 forest_service 를 상속하므로
+        # 같은 수리가 함께 적용된다.
+        assert ann.period_start is None
+        assert ann.period_end is None
+        assert json.loads(ann.raw_data)["posted"] == "2026-09-12"
         # 보도자료에는 마감일이 없다 - 게시일을 마감일로 채우지 않는다
         assert ann.period_end is None
         assert ann.summary
@@ -199,8 +219,10 @@ class TestLawmakingCrawler:
         assert "88388" in first["link"]
         assert "2026. 9. 7." in first["period"]
 
-    def test_to_announcement_parses_opinion_period(self, crawler):
-        """'2026. 9. 7. ~2026. 10. 19.' 형식의 예고기간을 파싱한다."""
+    def test_to_announcement_leaves_the_period_to_the_gate(self, crawler):
+        """'2026. 9. 7. ~2026. 10. 19.' 셀은 관문이 마감으로 읽는다 (13차)."""
+        from alert.main import _finalize_periods
+
         items = crawler.parse_list(load_fixture("lawmaking_list.html"))
         ann = crawler._to_announcement(items[0], "https://opinion.lawmaking.go.kr")
 
@@ -211,8 +233,11 @@ class TestLawmakingCrawler:
             "https://opinion.lawmaking.go.kr/gcom/ogLmPp/88388"
             "?isOgYn=Y&cptOfiOrgCd=1400000&opYn=Y"
         )
-        assert ann.period_start == "2026-09-07"
-        assert ann.period_end == "2026-10-19"
+        assert (ann.period_start, ann.period_end) == (None, None)
+        gated = _finalize_periods(ann.source, ann)
+        assert (gated.period_start, gated.period_end) == (
+            "2026-09-07", "2026-10-19"
+        )
         assert ann.category.startswith("입법예고")
 
     def test_normalize_date_accepts_spaced_dots(self, crawler):
@@ -265,7 +290,29 @@ class TestCoopCrawler:
             "https://www.coop.go.kr/home/boardView.do"
             "?brd_mgrno=2&menu_no=2038&brd_no=14893"
         )
-        assert ann.period_start == "2026-09-10"
+        # 게시일은 기간 필드가 아니라 raw_data.posted 로 간다 (계약 v2.1 판정 4)
+        assert ann.period_start is None
+        assert ann.period_end is None
+        assert json.loads(ann.raw_data)["posted"] == "2026-09-10"
+
+    def test_posting_date_never_becomes_a_period(self, crawler):
+        """게시일만 있는 공지는 접수기간·마감을 만들지 않는다.
+
+        회귀: 게시일을 period_start 로 쓰면 존재하지 않는 접수기간이
+        브리핑에 표시되고, period_end 로 쓰면 판정 4의 마감 경과 제외에
+        걸려 살아있는 공고가 사라진다.
+        """
+        items = crawler.parse_list(load_fixture("coop_notice.html"))
+        announcements = [
+            crawler._to_announcement(item, "https://www.coop.go.kr")
+            for item in items
+        ]
+        assert announcements
+        assert all(a.period_start is None for a in announcements)
+        assert all(a.period_end is None for a in announcements)
+        # 게시일 자체는 보존된다 - "새 소식" 판정에 쓸 수 있어야 한다
+        posted = [json.loads(a.raw_data).get("posted") for a in announcements]
+        assert any(p for p in posted)
 
     def test_extract_brd_no(self, crawler):
         assert crawler._extract_brd_no("javascript:fView('14893')") == "14893"
@@ -311,3 +358,41 @@ class TestForestSocialEconomyDomain:
         ]
         for text, expected in cases:
             assert dc.classify_text(text)[0] == expected
+
+
+class TestCycle11PolicyWhitelist:
+    """11차 허용목록 (b) KOFPI 제목 마감 · (c) 입법예고 의견제출 기간."""
+
+    def test_kofpi_makes_no_period_at_all(self):
+        """(b 폐기) 제목 괄호 표기는 더 이상 마감이 아니다."""
+        config = make_config("kofpi", "https://www.kofpi.or.kr")
+        with patch("alert.crawlers.base.get_config", return_value=config):
+            crawler = KofpiCrawler()
+
+        items = crawler.parse_list(
+            load_fixture("kofpi_notice.html"), "/notice/notice_01view.do", "공지"
+        )
+        built = [
+            crawler._to_announcement(i, "https://www.kofpi.or.kr") for i in items
+        ]
+        assert built and all(a is not None for a in built)
+        assert not any(a.period_start or a.period_end for a in built)
+        assert json.loads(built[0].raw_data)["posted"] == "2026-09-07"
+
+    def test_lawmaking_period_comes_from_the_gate(self):
+        """(c) 의견제출 기간 셀은 **관문에서** 시작·종료가 된다."""
+        config = make_config("lawmaking", "https://opinion.lawmaking.go.kr")
+        with patch("alert.crawlers.base.get_config", return_value=config):
+            crawler = LawmakingCrawler()
+
+        from alert.main import _finalize_periods
+
+        items = crawler.parse_list(load_fixture("lawmaking_list.html"))
+        ann = crawler._to_announcement(items[0], "https://opinion.lawmaking.go.kr")
+        # 크롤러 단계에서는 비어 있다
+        assert (ann.period_start, ann.period_end) == (None, None)
+
+        gated = _finalize_periods(ann.source, ann)
+        assert (gated.period_start, gated.period_end) == (
+            "2026-09-07", "2026-10-19"
+        )

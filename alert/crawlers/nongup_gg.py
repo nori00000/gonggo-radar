@@ -4,6 +4,12 @@ import json
 import re
 from typing import List, Optional
 from .base import BaseCrawler
+from .date_labels import (
+    posted_date,
+    extract_date_and_label,
+    header_labels,
+    label_for,
+)
 from ..models import RawAnnouncement
 
 try:
@@ -133,6 +139,8 @@ class NongupGgCrawler(BaseCrawler):
         if table is None:
             return []
 
+        headers = header_labels(table)
+
         tbody = table.find("tbody") or table
         rows = tbody.find_all("tr")
 
@@ -140,6 +148,7 @@ class NongupGgCrawler(BaseCrawler):
             cells = row.find_all("td")
             if len(cells) < 2:
                 continue
+            date_label = ""
 
             title_link = None
             title_text = ""
@@ -164,6 +173,7 @@ class NongupGgCrawler(BaseCrawler):
 
                 elif any(kw in css_class for kw in ["date", "period", "term"]):
                     date_str = cell.get_text(strip=True)
+                    date_label = label_for(cell, cells, headers, css_class)
 
             if not title_text:
                 for cell in cells:
@@ -181,6 +191,9 @@ class NongupGgCrawler(BaseCrawler):
                     cell_text = cell.get_text(strip=True)
                     if re.search(r"\d{4}[-./]\d{1,2}[-./]\d{1,2}", cell_text):
                         date_str = cell_text
+                        # 표 헤더에서 컬럼 라벨을 읽는다 - "게시일" 이면
+                        # 기간이 아니다 (6차 게이트 #1)
+                        date_label = label_for(cell, cells, headers, "")
                         break
 
             items.append({
@@ -189,6 +202,7 @@ class NongupGgCrawler(BaseCrawler):
                 "author": author,
                 "category": category,
                 "date": date_str,
+                "date_label": date_label,
             })
 
         return items
@@ -237,18 +251,10 @@ class NongupGgCrawler(BaseCrawler):
             if cat_elem:
                 category = cat_elem.get_text(strip=True)
 
-            date_str = ""
-            date_elem = item_elem.find(
-                ["span", "em", "div"],
-                class_=re.compile(r"date|period|term|time", re.I)
-            )
-            if date_elem:
-                date_str = date_elem.get_text(strip=True)
-            else:
-                text = item_elem.get_text()
-                date_match = re.search(r"\d{4}[-./]\d{1,2}[-./]\d{1,2}", text)
-                if date_match:
-                    date_str = date_match.group()
+            # 날짜와 라벨은 **날짜가 든 가장 작은 요소** 안에서만 읽는다.
+            # 항목 전체 텍스트에서 앞말을 자르면 제목이 라벨로 새어 들어와
+            # 게시일이 접수기간이 된다 (7차 게이트 #3).
+            date_str, date_label = extract_date_and_label(item_elem)
 
             items.append({
                 "title": title_text,
@@ -256,6 +262,7 @@ class NongupGgCrawler(BaseCrawler):
                 "author": author,
                 "category": category,
                 "date": date_str,
+                "date_label": date_label,
             })
 
         return items
@@ -385,10 +392,15 @@ class NongupGgCrawler(BaseCrawler):
             author = item.get("author", "").strip()
             category = item.get("category", "").strip()
 
-            date_str = item.get("date", "").strip()
-            period_start, period_end = self._parse_period(date_str)
+            # 13차: 이 소스는 전용 추출기가 없다 = 기간이 없다. 목록
+            # 날짜는 게시일 증거로만 남는다 (관문이 두 필드를 None 으로
+            # 확정한다).
+            posted = posted_date(item.get("date", ""))
 
-            raw_data = json.dumps(item, ensure_ascii=False)
+            payload = dict(item)
+            if posted:
+                payload["posted"] = posted
+            raw_data = json.dumps(payload, ensure_ascii=False)
 
             return RawAnnouncement(
                 source="nongup_gg",
@@ -399,8 +411,8 @@ class NongupGgCrawler(BaseCrawler):
                 author=author or "경기도농업기술원",
                 category=category,
                 target="",
-                period_start=period_start,
-                period_end=period_end,
+                period_start=None,
+                period_end=None,
                 raw_data=raw_data,
             )
 

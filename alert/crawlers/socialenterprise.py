@@ -66,7 +66,7 @@ class SocialenterpriseCrawler(BaseCrawler):
                     announcement = self._to_announcement(item, base_url)
                     if announcement:
                         announcements.append(announcement)
-                return announcements
+                return self.enrich_with_quotes(announcements)
 
         # 전략 2: 폴백 - 게시판 페이지 HTML 파싱
         for board_path in self.BOARD_PATHS:
@@ -86,7 +86,7 @@ class SocialenterpriseCrawler(BaseCrawler):
                         announcements.append(announcement)
                 break
 
-        return announcements
+        return self.enrich_with_quotes(announcements)
 
     def _fetch_ajax_board(
         self, url: str, config: dict, base_url: str
@@ -472,10 +472,24 @@ class SocialenterpriseCrawler(BaseCrawler):
             author = item.get("author", "").strip()
             category = item.get("category", "").strip()
 
+            # 목록의 날짜(WRITE_DATE)는 **게시일**이다. 단일 날짜를 기간으로
+            # 해석하면 period_end 가 게시일이 되어, 판정 4의 "마감 경과 → 제외"
+            # 규칙에 걸려 살아있는 공고가 게시 다음 날부터 조용히 사라진다.
+            # 범위 표기(~)가 있을 때만 접수기간으로 보고, 그 외에는 기간을
+            # 비워 둔 채 상세 페이지 인용(enrich_with_quotes)에 맡긴다.
             date_str = item.get("date", "").strip()
-            period_start, period_end = self._parse_period(date_str)
+            posted: Optional[str] = None
+            period_start: Optional[str] = None
+            period_end: Optional[str] = None
+            if re.search(r"[~\u223c]", date_str):
+                period_start, period_end = self._parse_period(date_str)
+            else:
+                posted = self._normalize_date(date_str)
 
-            raw_data = json.dumps(item, ensure_ascii=False)
+            payload = dict(item)
+            if posted:
+                payload["posted"] = posted
+            raw_data = json.dumps(payload, ensure_ascii=False)
 
             return RawAnnouncement(
                 source="socialenterprise",

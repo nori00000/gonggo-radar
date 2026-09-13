@@ -747,11 +747,6 @@ class TelegramBot:
 
         source_id = hashlib.md5(url.encode()).hexdigest()[:16]
 
-        # Check for duplicates
-        if self.db.is_duplicate("manual", source_id):
-            self._send_message("ℹ️ 이미 등록된 URL입니다.")
-            return
-
         # Create AnalyzedAnnouncement object
         announcement = AnalyzedAnnouncement(
             source="manual",
@@ -763,6 +758,12 @@ class TelegramBot:
             relevance_score=0.5,  # Default medium relevance
             relevance_reason="수동 제보",
         )
+
+        # 중복 판정도 **행 식별자**로 한다 (13차 게이트) - 저장 키와
+        # 판정 키가 다르면 같은 URL 이 두 번 들어간다.
+        if self.db.exists(announcement):
+            self._send_message("ℹ️ 이미 등록된 URL입니다.")
+            return
 
         # Insert into DB
         ann_id = self.db.insert_announcement(announcement)

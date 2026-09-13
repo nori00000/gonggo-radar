@@ -76,7 +76,7 @@ class KofpiCrawler(BaseCrawler):
                 if announcement:
                     announcements.append(announcement)
 
-        return announcements
+        return self.enrich_with_quotes(announcements)
 
     def parse_list(
         self,
@@ -196,52 +196,6 @@ class KofpiCrawler(BaseCrawler):
 
         return None
 
-    def _extract_deadline(self, title: str, posted: Optional[str]) -> Optional[str]:
-        """제목의 "(~9.30)" 형태 마감일을 ISO 날짜로 변환한다.
-
-        연도가 표기되지 않으므로 게시일의 연도를 기준으로 추정하며,
-        마감 월이 게시 월보다 빠르면 다음 해로 넘어간 것으로 본다.
-
-        Args:
-            title: 공고 제목
-            posted: 게시일 (ISO 형식) 또는 None
-
-        Returns:
-            ISO 형식 마감일, 추출 실패 시 None
-        """
-        if not title:
-            return None
-
-        # 연도가 명시된 경우 우선 사용
-        full = re.search(r"~\s*(\d{4})[-./\s]\s*(\d{1,2})[-./\s]\s*(\d{1,2})", title)
-        if full:
-            year, month, day = full.groups()
-            return self._safe_date(int(year), int(month), int(day))
-
-        short = re.search(r"~\s*(\d{1,2})[-./]\s?(\d{1,2})", title)
-        if not short:
-            return None
-
-        month, day = int(short.group(1)), int(short.group(2))
-        if not (1 <= month <= 12 and 1 <= day <= 31):
-            return None
-
-        if posted:
-            posted_year = int(posted[:4])
-            posted_month = int(posted[5:7])
-            year = posted_year + 1 if month < posted_month else posted_year
-        else:
-            return None
-
-        return self._safe_date(year, month, day)
-
-    @staticmethod
-    def _safe_date(year: int, month: int, day: int) -> Optional[str]:
-        """범위를 벗어난 날짜는 버린다."""
-        if not (1 <= month <= 12 and 1 <= day <= 31):
-            return None
-        return f"{year}-{month:02d}-{day:02d}"
-
     def _to_announcement(self, item: dict, base_url: str) -> Optional[RawAnnouncement]:
         """파싱된 공고 데이터를 RawAnnouncement로 변환한다."""
         try:
@@ -254,10 +208,16 @@ class KofpiCrawler(BaseCrawler):
                 title.encode("utf-8")
             ).hexdigest()[:16]
 
+            # 13차: 제목 괄호 ``(~9.30)`` 추출기를 **폐기**했다. 그 패턴은
+            # ``2025년 사업 결과 안내(~9.30)`` 같은 과거 결과 공고와 명시
+            # 과거 연도를 계속 마감으로 만들었다 (9차 게이트 HIGH).
+            # kofpi 는 기간을 만들지 않는다.
             posted = self._normalize_date(item.get("date", ""))
-            deadline = self._extract_deadline(title, posted)
 
-            raw_data = json.dumps(item, ensure_ascii=False)
+            payload = dict(item)
+            if posted:
+                payload["posted"] = posted
+            raw_data = json.dumps(payload, ensure_ascii=False)
 
             return RawAnnouncement(
                 source=self.source_name,
@@ -268,8 +228,8 @@ class KofpiCrawler(BaseCrawler):
                 author="한국임업진흥원",
                 category=item.get("category", "").strip(),
                 target="",
-                period_start=posted,
-                period_end=deadline,
+                period_start=None,
+                period_end=None,
                 raw_data=raw_data,
             )
 
