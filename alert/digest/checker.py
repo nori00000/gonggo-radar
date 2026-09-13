@@ -539,7 +539,8 @@ def glm_warning_summary(markdown_path) -> Dict:
     세 상태를 구분한다(Codex r3 LOW): ①항목 필드가 대체됨 ②출력 전체 폐기
     ③초안만 폐기(항목은 멀쩡). 미리보기가 셋을 같은 문구로 말하면 거짓 안내다.
     """
-    empty = {"count": 0, "discarded": False, "items_replaced": False}
+    empty = {"count": 0, "discarded": False, "items_replaced": False,
+             "partial_batches": []}
     try:
         loaded = json.loads(
             glm_warnings_path(markdown_path).read_text(encoding="utf-8")
@@ -549,10 +550,12 @@ def glm_warning_summary(markdown_path) -> Dict:
     if not isinstance(loaded, dict):
         return empty
     warnings = loaded.get("warnings")
+    partial = loaded.get("partial_batches")
     return {
         "count": len(warnings) if isinstance(warnings, list) else 0,
         "discarded": bool(loaded.get("discarded")),
         "items_replaced": bool(loaded.get("items_replaced")),
+        "partial_batches": partial if isinstance(partial, list) else [],
     }
 
 
@@ -878,6 +881,7 @@ def check_digest(
         "glm_warnings": glm_summary["count"],
         "glm_discarded": glm_summary["discarded"],
         "glm_items_replaced": glm_summary["items_replaced"],
+        "glm_partial_batches": glm_summary["partial_batches"],
         "pass": (
             network_checked
             and alive_count > 0

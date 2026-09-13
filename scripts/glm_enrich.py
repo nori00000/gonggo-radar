@@ -60,7 +60,7 @@ _TAG_RE = re.compile(
     r"^(?:협동조합|사회적기업|산림사업자|마을기업|전체|보류)(?:\([^()]{1,20}\))?$"
 )
 _QUOTE_RE = re.compile(r"«([^»]+)»")
-_MAX_SUMMARY_CHARS = 82  # «» + 구절 최대 80자. 문단급 산출을 걸러낸다
+_MAX_SUMMARY_CHARS = 122  # «» + 문장 최대 120자. 문단급 산출을 걸러낸다
 
 # 상세 텍스트 수집(V3.1 A) — 테스트가 이 이름을 갈아끼운다(실호출 금지).
 fetch_detail_text = http_fetch.fetch_detail_text
@@ -94,35 +94,83 @@ _NUMBER_TOKEN_RE = re.compile(
 # 접속어 화이트리스트를 두었더니 접속어만으로도 주장이 만들어졌다(근거
 # `접수는 9월에만 진행합니다.` → 출력 `상시 접수`), 인용 두 개를 이어 붙여 다른
 # 문장의 술어를 결합할 수 있었고(`«신청» «불가»`), 소수점이 경계로 인정되어
-# `사업비 1.5억원` 에서 `«5억원»` 을 오릴 수 있었다.
+# `사업비 1.5억원` 에서 `«5억원»` 을 오릴 수 있었다. r3b 의 "낱말 경계" 도
+# 뚫렸다 — `사업비 1,500만원 지원` → `«500만원 지원»`(쉼표가 경계),
+# `…신청 가능 여부는 아직 미정입니다` → `«사회적기업 신청 가능»`(부정 앞에서
+# 끊기), 제목+상세를 이어 붙이거나 예산에 맞춰 자르면서 **새 경계**가 생겼고,
+# NFKC 는 `10⁴㎡` 를 `104m2` 로 바꿔 수치의 의미까지 바꿨다.
 #
-# 그래서 문법을 **한 구절**로 줄인다: 값은 `«…»` 하나이거나 정확히 `원문 확인`
-# 이다. 인용 밖 글자는 한 글자도 허용하지 않는다 — 잇는 낱말이 없으면 문장을
-# 조립할 수 없고, 남는 것은 원문에 실제로 있는 한 구절뿐이다.
+# r4 의 결론: 값은 **원문의 완결 문장 하나를 통째로 옮긴 것**이어야 한다.
+# 부분문자열이 아니라 **문장과의 동일성**이다. 문장은 필드별로 쪼개므로 필드를
+# 가로지르거나 절단 지점에서 만들어진 구절은 어떤 문장과도 같을 수 없다.
+# 정규화는 공백 합침뿐이다 — NFKC 는 쓰지 않는다(글자를 바꾸지 않는다).
 _MIN_SPAN_CHARS = 8
-_MAX_SPAN_CHARS = 80
-# 경계로 인정하는 구두점. `.`/`．` 은 여기 없다 — 아래에서 문맥으로 판정한다.
-_BOUNDARY_PUNCT = frozenset(",;:!?()[]{}<>«»\u300c\u300d\u300e\u300f\uff08\uff09\uff3b\uff3d"
-                            "\u00b7\uff0c\uff1b\uff1a\uff01\uff1f\u3001\u2026\u2018\u2019\u201c\u201d'\"/\\|~-")
-_PERIODS = frozenset(".\uff0e")
+_MAX_SENTENCE_CHARS = 120
+# 문장 종결 문자. 뒤가 공백·문서 끝일 때만 종결로 본다.
+_TERMINATORS = frozenset(".!?。．！？")
 
 
 def summary_normalize(text: str) -> str:
-    """`한 줄 의미`와 근거가 **똑같이** 지나는 정규화: NFKC + 공백 합침.
+    """`한 줄 의미`와 근거가 **똑같이** 지나는 정규화 — 공백 합침뿐이다.
 
-    NFKC 를 고른 이유는 전각 소수점이다 — `\uff11\uff0e\uff15\uc5b5\uc6d0` 을 그대로 두면
-    같은 금액이 다른 문자열이 되어 경계 판정이 두 벌 필요해진다. 정규화는
-    출력과 근거 **양쪽에 동일하게** 적용하고, md 에 저장되는 값도 정규화된
-    값이다(저장한 것과 검사한 것이 같아야 한다).
+    NFKC 는 쓰지 않는다: `10⁴㎡` 를 `104m2` 로, `＊…＊` 를 `*…*` 로 바꿔
+    수치의 의미를 바꾸고 형식 게이트를 우회시켰다(Codex r3 실측). 정규화가
+    글자를 바꾸면 "원문 그대로"라는 보장이 깨진다.
     """
-    return " ".join(unicodedata.normalize("NFKC", text or "").split())
+    return " ".join((text or "").split())
+
+
+def _is_sentence_end(line: str, index: int) -> bool:
+    """`line[index]` 의 종결 문자가 문장 끝인가.
+
+    뒤가 공백이거나 줄 끝일 때만 끝으로 본다. 숫자 사이의 마침표는 끝이
+    아니다 — `1.5억원` 은 물론 `2026. 10. 19.` 처럼 **공백을 사이에 둔**
+    숫자 열거도 문장으로 쪼개지 않는다(쪼개면 `…기간: 2026.` 이라는
+    잘린 날짜가 통째 인용 가능한 "문장"이 된다).
+    """
+    following = line[index + 1:]
+    if following and not following[0].isspace():
+        return False
+    previous = line[index - 1] if index > 0 else ""
+    if previous.isdigit():
+        rest = following.lstrip()
+        if rest and rest[0].isdigit():
+            return False
+    return True
+
+
+def split_sentences(text: str) -> List[str]:
+    """원문을 완결 문장 목록으로 쪼갠다 (공백 합침은 **쪼갠 뒤**).
+
+    개행은 종결 문자가 없어도 단단한 경계다 — 목록·표에서 줄이 바뀌면 다른
+    문장이다. 공백을 먼저 합치면 그 경계가 사라지므로 순서가 중요하다.
+    """
+    sentences: List[str] = []
+    for line in (text or "").split("\n"):
+        buffer: List[str] = []
+        for index, char in enumerate(line):
+            buffer.append(char)
+            if char in _TERMINATORS and _is_sentence_end(line, index):
+                sentences.append("".join(buffer))
+                buffer = []
+        if buffer:
+            sentences.append("".join(buffer))
+    return [cleaned for cleaned in (summary_normalize(s) for s in sentences) if cleaned]
+
+
+def sentence_forms(sentence: str) -> Tuple[str, ...]:
+    """문장과 동일하다고 인정하는 표기 (끝 종결 문자는 빼도 된다)."""
+    if sentence and sentence[-1] in _TERMINATORS:
+        return (sentence, sentence[:-1].rstrip())
+    return (sentence,)
 
 
 def format_problem(value: str) -> Optional[str]:
     """평문 형식 위반 사유. 문제가 없으면 None.
 
     검사는 **정규화 전 원본**에 한다 — NBSP·U+2028 은 `str.split()` 이 공백으로
-    삼켜버려서, 정규화 뒤에 보면 이미 사라지고 없다.
+    삼켜버려서, 정규화 뒤에 보면 이미 사라지고 없다. 저장 직전의 **최종
+    문자열**에도 다시 돌린다(`_gate_summary`·`run`).
     """
     for char in value:
         if char in _ALLOWED_CONTROL:
@@ -156,7 +204,7 @@ def quoted_spans(text: str) -> List[str]:
 def unsupported_tokens(text: str, search_text: str) -> List[str]:
     """근거에 없는 숫자 토큰·인용 (인용 필드 `마감`·`자격`·`금액` 전용).
 
-    `한 줄 의미`는 이것만으로 부족해 추출형 문법(`gate_summary_grammar`)으로
+    `한 줄 의미`는 이것만으로 부족해 문장 동일성(`gate_summary_grammar`)으로
     올렸다. 나머지 세 필드는 지금 md 에 실리지 않으므로 이 검사를 유지한다.
     """
     missing: List[str] = []
@@ -169,50 +217,12 @@ def unsupported_tokens(text: str, search_text: str) -> List[str]:
     return missing
 
 
-def _is_boundary(evidence: str, index: int, after: bool) -> bool:
-    """`index` 위치가 인용의 경계인가 (문서 밖이면 경계).
-
-    `.`/`．` 은 **뒤가 공백이거나 끝일 때만** 경계다. 그래서 `1.5억원` 안의
-    소수점은 경계가 아니고(→ `«5억원»` 거절), 문장 끝의 `9.30)` 이나
-    `…입니다.` 는 경계다.
-    """
-    if index < 0 or index >= len(evidence):
-        return True
-    char = evidence[index]
-    if char.isspace() or char in _BOUNDARY_PUNCT:
-        return True
-    if char in _PERIODS:
-        following = index + 1
-        if following >= len(evidence) or evidence[following].isspace():
-            # 숫자 사이의 소수점은(뒤가 공백일 리 없지만) 명시적으로 막는다.
-            return not (
-                index > 0 and evidence[index - 1].isdigit()
-                and following < len(evidence) and evidence[following].isdigit()
-            )
-        return False
-    return False
-
-
-def occurs_at_token_boundary(span: str, evidence: str) -> bool:
-    """`span` 이 근거에 **경계로 둘러싸여** 연속으로 나오는가."""
-    if not span:
-        return False
-    start = 0
-    while True:
-        index = evidence.find(span, start)
-        if index < 0:
-            return False
-        if (_is_boundary(evidence, index - 1, after=False)
-                and _is_boundary(evidence, index + len(span), after=True)):
-            return True
-        start = index + 1
-
-
-def gate_summary_grammar(text: str, evidence: str) -> Optional[str]:
+def gate_summary_grammar(text: str, sentences: Sequence[str]) -> Optional[str]:
     """문법 위반 사유. 통과면 None.
 
-    허용 형태는 둘뿐이다: `«구절»` 하나, 또는 정확히 `원문 확인`.
-    `text`·`evidence` 는 **둘 다 `summary_normalize` 를 지난 뒤** 들어와야 한다.
+    허용 형태는 둘뿐이다: `«문장»` 하나, 또는 정확히 `원문 확인`. 그리고 그
+    문장은 근거의 **완결 문장 하나와 같아야** 한다(부분문자열이 아니다).
+    `text`·`sentences` 는 둘 다 `summary_normalize` 를 지난 뒤 들어온다.
     """
     spans = quoted_spans(text)
     if len(spans) != 1:
@@ -223,14 +233,16 @@ def gate_summary_grammar(text: str, evidence: str) -> Optional[str]:
     span = spans[0]
     if not span:
         return "빈 인용"
-    if not _MIN_SPAN_CHARS <= len(span) <= _MAX_SPAN_CHARS:
-        return (
-            f"인용 {len(span)}자 — {_MIN_SPAN_CHARS}~{_MAX_SPAN_CHARS}자여야 함"
-        )
-    if not occurs_at_token_boundary(span, evidence):
-        return f"근거에 경계로 없는 인용 «{span[:20]}»"
-    return None
-
+    if len(span) < _MIN_SPAN_CHARS:
+        return f"인용 {len(span)}자 — {_MIN_SPAN_CHARS}자 이상이어야 함"
+    if len(span) > _MAX_SENTENCE_CHARS:
+        return f"인용 {len(span)}자 — {_MAX_SENTENCE_CHARS}자 이하여야 함"
+    for sentence in sentences:
+        if not _MIN_SPAN_CHARS <= len(sentence) <= _MAX_SENTENCE_CHARS:
+            continue
+        if span in sentence_forms(sentence):
+            return None
+    return f"근거의 완결 문장과 다른 인용 «{span[:20]}»"
 
 HEADLINE_LINE_RE = re.compile(r"^이번 주 한 줄:.*$")
 GLM_DRAFT_PREFIX = "<!-- GLM 초안: "
@@ -245,10 +257,10 @@ PERSONA_SYSTEM_PROMPT = """너는 산림형사회연대경제협의회의 편집
 1. 아래 필드는 원문(제목·요약·인용 텍스트)에 문자 그대로 있는 내용만 채운다: `마감`, `자격`, `금액`. 원문에 없으면 값 대신 정확히 `원문 확인`이라고 쓴다. 추정·일반 상식·유사 사업의 조건으로 채우지 않는다.
 2. 각 채운 필드 옆에 근거 인용을 `«…»`로 20자 이내 붙인다. 인용을 붙일 수 없으면 그 필드는 `원문 확인`.
 3. `대상 태그`는 {협동조합, 사회적기업, 산림사업자, 마을기업, 전체} 중에서만 고르고 지역 한정이 원문에 있으면 `(도명)`을 붙인다. 판단이 안 서면 `보류`.
-4. `한 줄 의미`는 **원문에서 그대로 옮긴 한 구절(8~80자) 하나**를 `«…»`로만 쓴다. 두 구절 금지, 구절 밖 글자 금지(조사·접속어·설명 한 글자도 붙이지 않는다), 옮길 구절이 없으면 정확히 `원문 확인`.
-   예1: `«2026 산림분야 오픈이노베이션 참여기업 모집»`
-   예2: `«의견 제출 기간: 2026. 10. 19.까지»`
-   구절은 title·detail_text 에 **연속으로** 있어야 하고, 낱말 경계에서 끊어야 한다 — 원문이 `사업비 1.5억원`인데 `«5억원 지원»`으로 오리면 실패다.
+4. `한 줄 의미`는 **원문의 문장 하나를 통째로 그대로** `«…»` 에 넣는다. 문장 일부·두 문장·요약 금지. 8~120자. 옮길 문장이 없으면 정확히 `원문 확인`.
+   예1: `«산림청과 한국임업진흥원은 2026년 산림분야 오픈이노베이션에 참여할 기업을 모집합니다.»`
+   예2: `«의견 제출 기간은 2026. 10. 19.까지입니다.»`
+   문장은 title 또는 detail_text 안에 **한 덩어리로** 있어야 한다. 문장 중간에서 끊거나(`…신청 가능 여부는 미정입니다` → `신청 가능`), 서로 다른 줄·필드의 조각을 이어 붙이거나, 글자를 바꾸면(전각→반각 등) 실패다.
 5. 마감이 오늘 이전이면 `한 줄 의미`에 정확히 `원문 확인`이라고 쓴다.
 6. 출력은 아래 JSON 배열만. 설명·머리말 금지.
 7. 근거는 `title` 과 `detail_text` 뿐이다. 거기에 글자 그대로 없는 숫자·날짜·금액은 쓰지 않는다(추정 금지). 근거가 부족하면 `한 줄 의미`에 정확히 `원문 확인`이라고 쓴다.
@@ -341,6 +353,21 @@ def build_input_items(
     return items
 
 
+def evidence_sentences(item: Dict) -> List[str]:
+    """항목의 **완결 문장 목록** — `한 줄 의미` 가 동일성을 대조할 유일한 대상.
+
+    필드를 **따로** 쪼갠다. 이어 붙이면 제목의 끝과 상세의 앞이 한 문장이 되어
+    `신청 불가 대상: 사회적기업` + `신청 가능 기간은…` 에서 `사회적기업 신청
+    가능` 같은 새 주장이 만들어졌다(Codex r3). 필드별로 쪼개면 어떤 인용도
+    두 필드를 가로지를 수 없다.
+    """
+    sentences: List[str] = []
+    for key in ("title", "summary", "detail_text", "quote_deadline",
+                "quote_eligibility", "quote_amount"):
+        sentences.extend(split_sentences(str(item.get(key) or "")))
+    return sentences
+
+
 def evidence_text(item: Dict) -> str:
     """항목의 **근거 문자열** — 게이트가 대조하는 유일한 대상.
 
@@ -386,38 +413,46 @@ def prompt_bytes(today: str, items: List[Dict]) -> int:
 
 
 def trim_item_to_budget(
-    today: str, item: Dict, budget: int = PROMPT_BYTE_BUDGET
+    today: str, item: Dict, budget: Optional[int] = None
 ) -> Dict:
-    """혼자서도 예산을 넘는 항목의 `detail_text` 를 **뒤에서** 잘라 맞춘다.
+    """예산을 넘는 항목의 `detail_text` 를 **뒤 문장부터 통째로** 버린다.
 
-    항목을 조용히 빼지 않는다 — 빠진 항목은 보강도 경고도 없이 사라져서,
-    사람이 "왜 이 항목만 한 줄이 없지"를 알 길이 없다. 근거를 줄이면 추출형
-    게이트가 알아서 `원문 확인` 쪽으로 기운다(안전한 실패).
+    r4 (Codex HIGH): 글자 수로 자르면 `…신청 가능하지 않습니다` 가
+    `…신청 가능` 에서 끊겨 **없던 주장**이 만들어졌다. 문장 단위로만 버리면
+    남은 텍스트의 모든 문장이 원문의 완결 문장 그대로다.
     """
+    budget = PROMPT_BYTE_BUDGET if budget is None else budget
     trimmed = dict(item)
     if prompt_bytes(today, [trimmed]) <= budget:
         return trimmed
-    detail = trimmed.get("detail_text") or ""
-    low, high = 0, len(detail)
-    while low < high:
-        mid = (low + high + 1) // 2
-        trimmed["detail_text"] = detail[:mid]
+    sentences = split_sentences(str(trimmed.get("detail_text") or ""))
+    while sentences:
+        sentences.pop()
+        trimmed["detail_text"] = " ".join(sentences)
         if prompt_bytes(today, [trimmed]) <= budget:
-            low = mid
-        else:
-            high = mid - 1
-    trimmed["detail_text"] = detail[:low]
+            return trimmed
+    trimmed["detail_text"] = ""
     return trimmed
 
 
 def batch_input_items(
-    today: str, input_items: List[Dict], budget: int = PROMPT_BYTE_BUDGET
-) -> List[List[Dict]]:
-    """항목을 예산 이하의 배치로 탐욕적으로 묶는다 (문서 순서 보존)."""
+    today: str, input_items: List[Dict], budget: Optional[int] = None
+) -> Tuple[List[List[Dict]], List[Dict]]:
+    """(배치 목록, 건너뛴 항목 목록). 배치마다 프롬프트가 budget 이하다.
+
+    `detail_text` 를 전부 버려도 예산을 넘는 항목(제목·인용만으로 초과)은
+    **ds 에 보내지 않는다** — 보내봐야 ds 가 배치를 통째로 거절한다(exit 9).
+    호출자가 항목 경고를 남긴다 (r4, Codex MEDIUM).
+    """
+    budget = PROMPT_BYTE_BUDGET if budget is None else budget
     batches: List[List[Dict]] = []
+    skipped: List[Dict] = []
     current: List[Dict] = []
     for item in input_items:
         candidate = trim_item_to_budget(today, item, budget)
+        if prompt_bytes(today, [candidate]) > budget:
+            skipped.append(candidate)
+            continue
         if current and prompt_bytes(today, current + [candidate]) > budget:
             batches.append(current)
             current = [candidate]
@@ -425,8 +460,7 @@ def batch_input_items(
             current.append(candidate)
     if current:
         batches.append(current)
-    return batches
-
+    return batches, skipped
 
 # ─── ds 호출 ─────────────────────────────────────────────────────────────
 def call_ds_glm(prompt_text: str, timeout: int = DS_SUBPROCESS_TIMEOUT) -> Optional[str]:
@@ -494,7 +528,7 @@ def _gate_quoted_field(value, search_text: str) -> Tuple[str, bool]:
     return text, True
 
 
-def _gate_summary(value, search_text: str) -> Tuple[str, bool, str]:
+def _gate_summary(value, sentences: Sequence[str]) -> Tuple[str, bool, str]:
     """본문에 실리는 유일한 필드 — 형식 + 길이 + **근거 대조**를 모두 통과해야 한다.
 
     Returns:
@@ -512,10 +546,15 @@ def _gate_summary(value, search_text: str) -> Tuple[str, bool, str]:
         return FALLBACK, False, f"{len(text)}자 초과"
     if text == FALLBACK:
         return FALLBACK, True, ""
-    # V3.1 r2: 이 필드는 **추출형**이다 — 근거에서 오려 온 «인용» + 접속어뿐.
-    violation = gate_summary_grammar(text, search_text)
+    # r4: 이 필드는 근거의 **완결 문장 하나**를 통째로 옮긴 것이어야 한다.
+    violation = gate_summary_grammar(text, sentences)
     if violation:
         return FALLBACK, False, violation
+    # 저장 직전 **최종 문자열**에 형식 게이트를 다시 돌린다 — 정규화가 글자를
+    # 바꿔 게이트를 우회하던 경로를 닫는다(Codex r3: `＊…＊` → `*…*`).
+    final_problem = format_problem(text)
+    if final_problem:
+        return FALLBACK, False, f"정규화 후 {final_problem}"
     return text, True, ""
 
 
@@ -586,7 +625,9 @@ def gate_output(
     results: Dict[int, Dict] = {}
     for n in sorted(expected_ns):
         entry = output_by_n[n]
-        search_text = evidence_text(input_by_n[n])
+        item = input_by_n[n]
+        search_text = evidence_text(item)
+        sentences = evidence_sentences(item)
         fields: Dict[str, str] = {}
         tag, tag_ok = _gate_tag(entry.get("대상 태그"))
         fields["대상 태그"] = tag
@@ -598,7 +639,7 @@ def gate_output(
             if not ok:
                 warnings.append(f"n={n} {key} 인용 검증 실패 — 원문 확인으로 대체")
         summary_line, summary_ok, reason = _gate_summary(
-            entry.get("한 줄 의미"), search_text
+            entry.get("한 줄 의미"), sentences
         )
         fields["한 줄 의미"] = summary_line
         if not summary_ok:
@@ -679,6 +720,37 @@ def write_text_atomic(path: Path, text: str) -> None:
     os.replace(temp, path)
 
 
+def commit_markdown_and_manifest(
+    markdown_path: Path, new_text: str, write_manifest
+) -> Optional[str]:
+    """md 와 정본을 **한 트랜잭션처럼** 바꾼다. 실패하면 md 를 되돌린다.
+
+    r4 (Codex MEDIUM): md 교체 직후 정본 쓰기가 실패하면 스크립트는 exit 0
+    인데 checker 는 해시·보강 불일치로 거절했다 — 이 레인의 fail-open 이
+    거짓이 된다. 그래서 md 를 바꾸기 전에 `.bak` 을 남기고, 정본 쓰기가
+    터지면 md 를 되돌린 뒤 경고를 돌려준다.
+
+    Returns:
+        실패 사유(경고 문자열) 또는 None(성공).
+    """
+    backup = markdown_path.with_name(markdown_path.name + ".bak")
+    write_text_atomic(backup, markdown_path.read_text(encoding="utf-8"))
+    write_text_atomic(markdown_path, new_text)
+    try:
+        write_manifest()
+    except Exception:  # noqa: BLE001 — 되돌리고 경고로 남긴다
+        try:
+            os.replace(backup, markdown_path)
+        except OSError:
+            pass
+        return "manifest 쓰기 실패 — md 롤백"
+    try:
+        backup.unlink()
+    except OSError:
+        pass
+    return None
+
+
 def _load_json(path: Path) -> Optional[Dict]:
     try:
         return json.loads(path.read_text(encoding="utf-8"))
@@ -688,7 +760,7 @@ def _load_json(path: Path) -> Optional[Dict]:
 
 def clear_previous_enrichment(
     markdown_path: Path, item_sections: Optional[Sequence[str]] = None
-) -> int:
+) -> Tuple[int, List[str]]:
     """이번 실행의 산출물을 붙이기 **전에** 지난 실행의 보강을 걷어낸다 (V3.1 B4).
 
     이 레인은 fail-open 이라 ds 부재·타임아웃·JSON 불량이면 아무것도 붙이지 않고
@@ -707,7 +779,7 @@ def clear_previous_enrichment(
     정본을 무조건 치유한다.
 
     Returns:
-        지워진 보강 줄 수.
+        (지워진 보강 줄 수, 경고 목록).
     """
     text = markdown_path.read_text(encoding="utf-8")
     present = [
@@ -719,12 +791,21 @@ def clear_previous_enrichment(
         text, {item_id: None for item_id in present}, item_sections
     )
     new_text, draft_removed = strip_headline_drafts(new_text)
-    if changed_ids or draft_removed:
-        write_text_atomic(markdown_path, new_text)
+    warnings: List[str] = []
+    heal = lambda: composer_mod.set_manifest_enrich_lines(  # noqa: E731
+        markdown_path, {}, clear_all=True)
     # md 를 먼저, 정본을 그 다음 — 순서가 거꾸로면 중단 창에서 정본이 md 보다
     # 앞서 나가 "정본에만 있는 보강"이 된다.
-    composer_mod.set_manifest_enrich_lines(markdown_path, {}, clear_all=True)
-    return len(changed_ids)
+    if changed_ids or draft_removed:
+        problem = commit_markdown_and_manifest(markdown_path, new_text, heal)
+        if problem:
+            warnings.append(f"제거 단계 {problem}")
+    else:
+        try:
+            heal()
+        except Exception:  # noqa: BLE001
+            warnings.append("제거 단계 manifest 쓰기 실패")
+    return len(changed_ids), warnings
 
 
 def run(args) -> int:
@@ -757,8 +838,11 @@ def run(args) -> int:
     # 예전에는 DB 조회·8건 HTTP 수집·입력 JSON 저장을 모두 마친 **뒤**에 지웠고,
     # 그 사이에 DB 예외가 나거나 수집 중 잡이 죽으면 지난 보강이 그대로 남았다.
     # `--dry-run` 은 본문을 읽기만 하므로 여기서도 아무것도 지우지 않는다.
+    warnings: List[str] = []
     if not args.dry_run:
-        cleared = clear_previous_enrichment(markdown_path, item_sections)
+        cleared, clear_warnings = clear_previous_enrichment(
+            markdown_path, item_sections)
+        warnings.extend(clear_warnings)
         if cleared:
             _out(f"이전 보강 줄 제거: {cleared}건")
         try:
@@ -770,12 +854,15 @@ def run(args) -> int:
     input_items = build_input_items(manifest_items, args.db)
     # r3: ds 의 프롬프트 상한 때문에 배치가 필요하다. 배치를 **먼저** 잡아야
     # 잘린 detail_text 가 입력 JSON 에도 그대로 남는다(보낸 것과 기록이 같다).
-    batches = batch_input_items(today, input_items)
-    input_items = [item for batch in batches for item in batch]
+    batches, skipped = batch_input_items(today, input_items)
+    input_items = [item for batch in batches for item in batch] + skipped
+    input_items.sort(key=lambda item: item["n"])
     input_payload = {
         "today": today,
         "items": payload_for_glm(input_items),
         "batches": [[item["n"] for item in batch] for batch in batches],
+        # 제목·인용만으로 예산을 넘겨 ds 에 보내지 못한 항목 (r4)
+        "skipped": [item["n"] for item in skipped],
     }
 
     input_json_path = out_dir / f"{args.week}.glm_input.json"
@@ -790,14 +877,21 @@ def run(args) -> int:
         return 0
 
     results: Dict[int, Dict] = {}
-    warnings: List[str] = []
+    failed_batches: List[List[int]] = []
+    field_warnings: List[str] = []
+    for item in skipped:
+        warnings.append(
+            f"n={item['n']} 제목·인용만으로 프롬프트 예산 초과 — ds 호출 생략"
+        )
 
     if args.apply_json:
         # 다른 머신에서 **한 번에** 받은 출력을 적용하는 경로 — 배치 없이
         # 전체 n 집합으로 한 번 검사한다.
         raw_output = Path(args.apply_json).read_text(encoding="utf-8")
         _out(f"GLM 출력(파일): {args.apply_json}")
-        results, warnings = gate_output(raw_output, input_items)
+        results, applied_warnings = gate_output(raw_output, input_items)
+        warnings.extend(applied_warnings)
+        field_warnings.extend(applied_warnings)
     else:
         if not DS_BIN.exists():
             _out(f"⚠️  {DS_BIN} 없음 — GLM 보강 생략")
@@ -811,6 +905,7 @@ def run(args) -> int:
                 {"today": today, "items": payload_for_glm(batch)}
             ))
             if raw_output is None:
+                failed_batches.append(numbers)
                 warnings.append(
                     f"배치 {index} n={numbers} ds 호출 실패/타임아웃 — 이 배치만 미적용"
                 )
@@ -818,25 +913,34 @@ def run(args) -> int:
             # n 집합 정확 일치는 **그 배치의 집합**으로 판정한다.
             batch_results, batch_warnings = gate_output(raw_output, batch)
             warnings.extend(batch_warnings)
+            field_warnings.extend(batch_warnings)
             if not batch_results:
+                failed_batches.append(numbers)
                 warnings.append(
                     f"배치 {index} n={numbers} 출력 폐기 — 이 배치만 미적용"
                 )
                 continue
             results.update(batch_results)
 
-    # 항목 때문에 생긴 경고와 초안 때문에 생긴 경고를 구분해 둔다 — 미리보기
-    # 문구가 "항목 대체"와 "초안만 폐기"를 섞어 말하면 거짓 안내가 된다.
-    item_warnings = len(warnings)
+    # 미리보기 문구를 가르는 세 갈래를 따로 센다 (r4, Codex LOW): 필드가 실제로
+    # 대체된 실행 / 배치 일부가 미적용된 실행 / 초안만 폐기된 실행.
     for warning in warnings:
         _out(f"  ⚠️  {warning}")
 
     id_by_n = {item["n"]: item["id"] for item in input_items}
-    enrich_by_id = {
-        str(id_by_n[n]): blocks_mod.enrich_line_text(fields["한 줄 의미"])
-        for n, fields in results.items()
-        if id_by_n.get(n) is not None
-    }
+    enrich_by_id: Dict[str, str] = {}
+    for n, fields in sorted(results.items()):
+        item_id = id_by_n.get(n)
+        if item_id is None:
+            continue
+        line = blocks_mod.enrich_line_text(fields["한 줄 의미"])
+        # r4: **md 에 써질 줄 그대로**에 형식 게이트를 한 번 더 돌린다.
+        line_problem = format_problem(line)
+        if line_problem:
+            warnings.append(f"n={n} 보강 줄 형식 위반({line_problem}) — 원문 확인으로 대체")
+            field_warnings.append("line")
+            line = blocks_mod.enrich_line_text(FALLBACK)
+        enrich_by_id[str(item_id)] = line
 
     applied = 0
     if enrich_by_id:
@@ -845,12 +949,17 @@ def run(args) -> int:
             markdown_text, enrich_by_id, item_sections
         )
         if changed_ids:
-            write_text_atomic(markdown_path, new_text)
-            composer_mod.set_manifest_enrich_lines(
-                markdown_path,
-                {item_id: enrich_by_id[item_id] for item_id in changed_ids},
+            problem = commit_markdown_and_manifest(
+                markdown_path, new_text,
+                lambda: composer_mod.set_manifest_enrich_lines(
+                    markdown_path,
+                    {item_id: enrich_by_id[item_id] for item_id in changed_ids},
+                ),
             )
-            applied = len(changed_ids)
+            if problem:
+                warnings.append(f"보강 적용 단계 {problem}")
+            else:
+                applied = len(changed_ids)
 
     _out(f"✓ 보강 줄 적용: {applied}건 (게이트 경고 {len(warnings)}건)")
 
@@ -875,9 +984,15 @@ def run(args) -> int:
             text_now = markdown_path.read_text(encoding="utf-8")
             new_text, headline_changed = apply_headline_draft(text_now, draft)
             if headline_changed:
-                write_text_atomic(markdown_path, new_text)
-                composer_mod.set_manifest_enrich_lines(markdown_path, {})
-                _out("✓ 이번 주 한 줄 GLM 초안 갱신")
+                problem = commit_markdown_and_manifest(
+                    markdown_path, new_text,
+                    lambda: composer_mod.set_manifest_enrich_lines(
+                        markdown_path, {}),
+                )
+                if problem:
+                    warnings.append(f"초안 적용 단계 {problem}")
+                else:
+                    _out("✓ 이번 주 한 줄 GLM 초안 갱신")
 
     if warnings:
         # `discarded` = 출력 전체를 버려 **아무것도 적용하지 않은** 실행
@@ -889,7 +1004,9 @@ def run(args) -> int:
                     # 출력 전체를 버려 **아무것도 적용하지 않은** 실행
                     "discarded": not results,
                     # 항목 필드가 실제로 대체된 실행 (초안만 폐기된 경우와 구분)
-                    "items_replaced": item_warnings > 0,
+                    "items_replaced": bool(field_warnings),
+                    # 일부 배치만 미적용된 실행 — 대체도 전체 폐기도 아니다
+                    "partial_batches": failed_batches,
                 },
                 ensure_ascii=False, indent=2,
             ) + "\n",

@@ -22,7 +22,7 @@ import codecs
 import re
 import time
 from collections import deque
-from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeout
+import threading
 from html.parser import HTMLParser
 from typing import Dict, List, Optional
 from urllib.parse import urljoin
@@ -65,7 +65,12 @@ _INVISIBLE_RE = re.compile("[\u200b\u200c\u200d\u2060\ufeff]")
 _META_CHARSET_RE = re.compile(
     rb"""<meta[^>]*charset\s*=\s*["']?\s*([A-Za-z0-9_.:-]+)""", re.IGNORECASE
 )
-_CSS_COMMENT_RE = re.compile(r"/\*.*?\*/", re.DOTALL)
+# 정규식 `/\*.*?\*/` 은 미종결 주석(`"/*x"*8000`)에서 역추적으로 제곱 증가했다
+# (Codex r3 실측 0.9초). find 루프는 선형이다.
+_CSS_COMMENT_OPEN = "/*"
+_CSS_COMMENT_CLOSE = "*/"
+# style 속성은 아무리 길어도 이만큼만 본다 — 숨김 판정에 그 이상은 필요 없다.
+MAX_STYLE_CHARS = 4096
 
 
 # ─── HTML → 보이는 텍스트 (정규식이 아니라 파서) ─────────────────────────
@@ -118,6 +123,10 @@ class _DomBuilder(HTMLParser):
         self._max_nodes = max_nodes
         self._max_depth = max_depth
         self._form_depth = 0
+        # 상한을 넘긴 문서는 **수집 실패**다. 예전에는 한도에서 노드를 스택에
+        # 넣지 않아, 그 아래 `<div hidden>` 의 텍스트가 보이는 부모로 새어
+        # 나갔다(Codex r3: 255단 중첩에서 숨김 문구가 근거가 됐다).
+        self.overflowed = False
 
     def handle_starttag(self, tag, attrs):
         tag = tag.lower()
@@ -132,6 +141,7 @@ class _DomBuilder(HTMLParser):
         if tag == "form" and self._form_depth:
             return
         if self._nodes >= self._max_nodes:
+            self.overflowed = True
             return
         # 열린 <p> 는 블록 요소가 시작되면 암시적으로 닫힌다.
         if tag in _P_CLOSING_TAGS and self._stack[-1].tag == "p":
@@ -139,11 +149,13 @@ class _DomBuilder(HTMLParser):
         node = _Node(tag, {key.lower(): (value or "") for key, value in attrs})
         self._nodes += 1
         self._stack[-1].children.append(node)
-        # 깊이 상한을 넘으면 스택에 쌓지 않는다 — 더 깊은 내용은 형제가 된다.
         if len(self._stack) < self._max_depth:
             self._stack.append(node)
             if tag == "form":
                 self._form_depth += 1
+        else:
+            # 깊이 상한 초과 — 숨김 상속을 보장할 수 없으므로 문서를 버린다.
+            self.overflowed = True
 
     def handle_startendtag(self, tag, attrs):
         if tag.lower() in _BREAK_TAGS:
@@ -171,6 +183,24 @@ class _DomBuilder(HTMLParser):
             self._stack[-1].children.append(data[6:])
 
 
+def strip_css_comments(style: str) -> str:
+    """CSS 주석 제거 — **선형**. 미종결 주석은 그 뒤 전체가 주석이다."""
+    parts: List[str] = []
+    index = 0
+    length = len(style)
+    while index < length:
+        start = style.find(_CSS_COMMENT_OPEN, index)
+        if start < 0:
+            parts.append(style[index:])
+            break
+        parts.append(style[index:start])
+        end = style.find(_CSS_COMMENT_CLOSE, start + 2)
+        if end < 0:
+            break
+        index = end + 2
+    return "".join(parts)
+
+
 def _is_hidden(node: _Node) -> bool:
     attrs = node.attrs
     if "hidden" in attrs:
@@ -178,8 +208,8 @@ def _is_hidden(node: _Node) -> bool:
     if (attrs.get("aria-hidden") or "").strip().lower() == "true":
         return True
     # `display:\nnone` · `display:/**/none` 도 숨김이다 — 주석을 걷고 공백을
-    # 전부 지운 뒤 본다.
-    style = _CSS_COMMENT_RE.sub("", attrs.get("style") or "")
+    # 전부 지운 뒤 본다. 아주 긴 style 은 앞부분만 본다(상한).
+    style = strip_css_comments((attrs.get("style") or "")[:MAX_STYLE_CHARS])
     style = "".join(style.split()).lower()
     return "display:none" in style or "visibility:hidden" in style
 
@@ -337,6 +367,8 @@ def visible_text(
         builder.close()
     except Exception:  # noqa: BLE001 — 깨진 HTML 은 근거 없음으로 본다
         return ""
+    if builder.overflowed:
+        return ""
     if deadline is not None and clock() >= deadline:
         return ""
     return anchored_window(content_text(builder.root), anchor, limit)
@@ -490,7 +522,10 @@ def _fetch(url, anchor, deadline, max_bytes, limit, clock) -> str:
                 _decode(raw, content_type), limit, anchor, deadline, clock
             )
         finally:
-            for closer in ("release_conn", "close"):
+            # **close 가 먼저다**: 미소비 응답에 release_conn 을 먼저 부르면
+            # 연결이 풀로 돌아가고 `_connection=None` 이 되어 뒤따르는 close 가
+            # 그 연결을 닫지 못한다(Codex r3 실측).
+            for closer in ("close", "release_conn"):
                 method = getattr(response, closer, None)
                 if callable(method):
                     try:
@@ -511,10 +546,11 @@ def fetch_detail_text(
 ) -> str:
     """URL 의 본문 중 `anchor`(항목 제목) 기준 한 창. **실패는 빈 문자열**.
 
-    수집 전체를 워커 스레드에 넣고 벽시계로 잘라낸다 — 첫 청크가 오기 전에는
-    어떤 청크 루프도 데드라인을 볼 수 없기 때문이다(9초마다 1바이트를 보내는
-    서버가 read timeout 을 영원히 리셋한다). 시간이 끝나면 스레드는 **버린다**
-    (데몬처럼 남아 연결이 끊길 때까지 돌 수 있다 — 잡은 기다리지 않는다).
+    수집 전체를 **데몬 스레드**에 넣고 벽시계로 잘라낸다 — 첫 청크가 오기
+    전에는 어떤 청크 루프도 데드라인을 볼 수 없기 때문이다(9초마다 1바이트를
+    보내는 서버가 read timeout 을 영원히 리셋한다). 시간이 끝나면 스레드는
+    **버린다**: 데몬이라 인터프리터 종료를 막지 않는다(연결이 끊길 때까지
+    남아 돌 수는 있다).
     """
     if not _is_http_url(url):
         return ""
@@ -523,15 +559,20 @@ def fetch_detail_text(
     deadline = clock() + timeout
     if budget is not None:
         deadline = min(deadline, budget.deadline)
-    executor = ThreadPoolExecutor(max_workers=1)
-    try:
-        future = executor.submit(
-            _fetch, url, anchor, deadline, max_bytes, limit, clock
-        )
-        return future.result(timeout=max(0.0, deadline - clock()))
-    except FutureTimeout:
+    holder: Dict[str, str] = {}
+
+    def worker() -> None:
+        try:
+            holder["text"] = _fetch(url, anchor, deadline, max_bytes, limit, clock)
+        except Exception:  # noqa: BLE001 — 항목 단위 fail-open
+            holder["text"] = ""
+
+    thread = threading.Thread(target=worker, daemon=True)
+    thread.start()
+    thread.join(timeout=max(0.0, deadline - clock()))
+    if thread.is_alive():
+        # 시간이 끝났다. 스레드는 **버린다** — 데몬이므로 인터프리터 종료를
+        # 막지 않는다(ThreadPoolExecutor 는 shutdown(wait=False) 여도 atexit
+        # 에서 join 해 프로세스가 워커를 기다렸다 — Codex r3 실측).
         return ""
-    except Exception:  # noqa: BLE001 — 항목 단위 fail-open
-        return ""
-    finally:
-        executor.shutdown(wait=False)
+    return holder.get("text", "")

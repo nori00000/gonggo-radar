@@ -142,7 +142,7 @@ def _one_input_item(n=1, **overrides):
         "n": n,
         "id": 46,
         "title": "테스트 공고",
-        "summary": "9월 22일까지 접수, 지원금 300만원",
+        "summary": "9월 22일까지 접수합니다. 지원금 300만원.",
         "quote_deadline": "2026-09-22",
         "quote_eligibility": "원문 확인",
         "quote_amount": "원문 확인",
@@ -158,13 +158,13 @@ def test_gate_output_normal_case_applies_all_fields():
         "n": 1, "대상 태그": "사회적기업(경기)",
         "마감": "2026-09-22 «9월 22일까지»",
         "자격": "원문 확인", "금액": "300만원 «지원금 300만원»",
-        "한 줄 의미": "«9월 22일까지 접수»",
+        "한 줄 의미": "«9월 22일까지 접수합니다»",
     }], ensure_ascii=False)
 
     results, warnings = glm_mod.gate_output(raw, items)
 
     assert warnings == []
-    assert results[1]["한 줄 의미"] == "«9월 22일까지 접수»"
+    assert results[1]["한 줄 의미"] == "«9월 22일까지 접수합니다»"
     assert results[1]["마감"] == "2026-09-22 «9월 22일까지»"
     assert results[1]["금액"] == "300만원 «지원금 300만원»"
     assert results[1]["대상 태그"] == "사회적기업(경기)"
@@ -176,7 +176,7 @@ def test_gate_output_quote_not_substring_falls_back_and_warns():
         "n": 1, "대상 태그": "사회적기업",
         "마감": "2026-09-22 «날조된 인용문»",  # 입력 텍스트에 없는 인용
         "자격": "원문 확인", "금액": "원문 확인",
-        "한 줄 의미": "«9월 22일까지 접수»",
+        "한 줄 의미": "«9월 22일까지 접수합니다»",
     }], ensure_ascii=False)
 
     results, warnings = glm_mod.gate_output(raw, items)
@@ -184,7 +184,7 @@ def test_gate_output_quote_not_substring_falls_back_and_warns():
     assert results[1]["마감"] == glm_mod.FALLBACK
     assert any("마감" in w and "인용" in w for w in warnings)
     # 인용 실패가 다른 필드(한 줄 의미)까지 통째로 버리지 않는다
-    assert results[1]["한 줄 의미"] == "«9월 22일까지 접수»"
+    assert results[1]["한 줄 의미"] == "«9월 22일까지 접수합니다»"
 
 
 def test_gate_output_parse_failure_returns_no_results():
@@ -654,7 +654,7 @@ def test_gate_summary_still_replaces_overlong_text_after_normalization():
     raw = json.dumps([{
         "n": 1, "대상 태그": "전체", "마감": "원문 확인",
         "자격": "원문 확인", "금액": "원문 확인",
-        "한 줄 의미": "확인\n" + "가" * 100,
+        "한 줄 의미": "확인\n" + "가" * 130,
     }], ensure_ascii=False)
 
     results, warnings = glm_mod.gate_output(raw, items)
@@ -930,7 +930,7 @@ def test_markdown_kakao_problems_flags_a_dropped_enrich_line(
 
     monkeypatch.setattr(composer_mod, "kakao_blocks_from_markdown", drop_enrich)
     problems = composer_mod.markdown_kakao_problems(text)
-    assert any("보강 줄 누락" in p for p in problems)
+    assert any("보강 줄 불일치" in p for p in problems)
 
 
 # ─── B6. 헤드라인 초안 격리 ────────────────────────────────────────────────
@@ -1138,22 +1138,37 @@ def test_gate_summary_rejects_a_span_cut_from_the_middle_of_a_token():
     results, warnings = glm_mod.gate_output(raw, items)
 
     assert results[1]["한 줄 의미"] == glm_mod.FALLBACK
-    assert any("경계로 없는 인용" in w for w in warnings)
+    assert any("완결 문장과 다른 인용" in w for w in warnings)
 
 
-def test_gate_summary_keeps_a_span_that_crosses_a_newline_in_the_evidence():
-    """근거의 개행을 가로지르는 정상 인용은 오거절되지 않는다 (양쪽 정규화)."""
-    items = [_one_input_item(summary="접수기간\n9월 22일까지\n신청")]
+def test_a_span_crossing_an_evidence_newline_is_rejected_in_r4():
+    """r4: 개행은 **단단한 문장 경계**다 — 줄을 가로지른 인용은 문장이 아니다.
+
+    r3b 에서는 통과시켰다(공백 합침 뒤 부분문자열이었으므로). r4 는 목록·표의
+    줄바꿈이 서로 다른 주장을 가르기 때문에 이 방향을 뒤집었다.
+    """
+    items = [_one_input_item(summary="접수기간\n9월 22일까지 신청하세요")]
     raw = json.dumps([{
         "n": 1, "대상 태그": "전체", "마감": "원문 확인",
         "자격": "원문 확인", "금액": "원문 확인",
-        "한 줄 의미": "«접수기간 9월 22일까지»",
+        "한 줄 의미": "«접수기간 9월 22일까지 신청하세요»",
     }], ensure_ascii=False)
 
     results, warnings = glm_mod.gate_output(raw, items)
 
-    assert results[1]["한 줄 의미"] == "«접수기간 9월 22일까지»"
-    assert warnings == []
+    assert results[1]["한 줄 의미"] == glm_mod.FALLBACK
+    assert any("완결 문장과 다른 인용" in w for w in warnings)
+
+    # 한 줄 안의 완결 문장은 그대로 통과한다
+    ok_items = [_one_input_item(summary="접수기간\n9월 22일까지 신청하세요")]
+    ok_raw = json.dumps([{
+        "n": 1, "대상 태그": "전체", "마감": "원문 확인",
+        "자격": "원문 확인", "금액": "원문 확인",
+        "한 줄 의미": "«9월 22일까지 신청하세요»",
+    }], ensure_ascii=False)
+    ok_results, ok_warnings = glm_mod.gate_output(ok_raw, ok_items)
+    assert ok_results[1]["한 줄 의미"] == "«9월 22일까지 신청하세요»"
+    assert ok_warnings == []
 
 
 def test_gate_summary_rejects_any_character_outside_the_span():
@@ -1162,7 +1177,7 @@ def test_gate_summary_rejects_any_character_outside_the_span():
     raw = json.dumps([{
         "n": 1, "대상 태그": "전체", "마감": "원문 확인",
         "자격": "원문 확인", "금액": "원문 확인",
-        "한 줄 의미": "«9월 22일까지 접수» 무조건 신청",
+        "한 줄 의미": "«9월 22일까지 접수합니다» 무조건 신청",
     }], ensure_ascii=False)
 
     results, warnings = glm_mod.gate_output(raw, items)
@@ -1171,14 +1186,16 @@ def test_gate_summary_rejects_any_character_outside_the_span():
     assert any("인용 밖 글자" in w and "무조건" in w for w in warnings)
 
 
-def test_gate_summary_grammar_requires_exactly_one_span_of_bounded_length():
-    evidence = glm_mod.summary_normalize("가나다라마바사아 " + "바" * 90)
-    two_spans = "«가나다라마바사아» «가나다라마바사아»"
-    assert "인용 2개" in (glm_mod.gate_summary_grammar(two_spans, evidence) or "")
-    assert "인용 0개" in (glm_mod.gate_summary_grammar("상시 접수", evidence) or "")
-    assert "3자" in (glm_mod.gate_summary_grammar("«가나다»", evidence) or "")
-    long_span = "«" + "바" * 90 + "»"
-    assert "90자" in (glm_mod.gate_summary_grammar(long_span, evidence) or "")
+def test_gate_summary_grammar_requires_exactly_one_whole_sentence():
+    sentences = ["가나다라마바사아 문장입니다.", "바" * 130]
+    grammar = glm_mod.gate_summary_grammar
+    assert grammar("«가나다라마바사아 문장입니다»", sentences) is None
+    assert grammar("«가나다라마바사아 문장입니다.»", sentences) is None
+    assert "인용 2개" in (grammar("«가나다» «라마바»", sentences) or "")
+    assert "인용 0개" in (grammar("상시 접수", sentences) or "")
+    assert "8자 이상" in (grammar("«가나다»", sentences) or "")
+    # 120자를 넘는 문장은 애초에 인용 대상이 아니다
+    assert "120자 이하" in (grammar("«" + "바" * 130 + "»", sentences) or "")
 
 
 def test_gate_summary_keeps_the_plain_fallback_string():
@@ -1193,13 +1210,6 @@ def test_gate_summary_keeps_the_plain_fallback_string():
     assert results[1]["한 줄 의미"] == glm_mod.FALLBACK
     assert warnings == []
 
-
-def test_persona_prompt_teaches_the_single_span_grammar():
-    prompt = glm_mod.PERSONA_SYSTEM_PROMPT
-    assert "한 구절(8~80자) 하나" in prompt
-    assert "두 구절 금지" in prompt and "구절 밖 글자 금지" in prompt
-    assert prompt.count("예1:") == 1 and prompt.count("예2:") == 1
-    assert "낱말 경계" in prompt
 
 
 # ─── 2. 형식 게이트 — 맨몸 URL · 양방향 제어문자 ──────────────────────────
@@ -1562,7 +1572,7 @@ def test_markdown_kakao_problems_counts_identical_enrich_lines_per_item(
 
     monkeypatch.setattr(composer_mod, "kakao_blocks_from_markdown", drop_one)
     problems = composer_mod.markdown_kakao_problems(text)
-    assert any("보강 줄 누락(2→1)" in problem for problem in problems)
+    assert any("보강 줄 불일치" in problem for problem in problems)
 
 
 def test_pack_blocks_drops_only_the_enrich_line_when_a_block_overflows():
@@ -1737,8 +1747,9 @@ def test_batch_input_items_keeps_every_prompt_under_the_byte_budget():
     today = "2026-09-13"
     items = [_big_item(n, 2500) for n in range(1, 6)]
 
-    batches = glm_mod.batch_input_items(today, items)
+    batches, skipped = glm_mod.batch_input_items(today, items)
 
+    assert skipped == []
     assert len(batches) > 1
     for batch in batches:
         assert glm_mod.prompt_bytes(today, batch) <= glm_mod.PROMPT_BYTE_BUDGET
@@ -1746,18 +1757,26 @@ def test_batch_input_items_keeps_every_prompt_under_the_byte_budget():
     assert [item["n"] for batch in batches for item in batch] == [1, 2, 3, 4, 5]
 
 
-def test_batch_input_items_trims_a_single_oversized_item_instead_of_dropping_it():
+def test_batch_input_items_trims_whole_sentences_instead_of_dropping_the_item():
+    """r4: 절단은 **문장 단위**다 — 글자 수로 자르면 없던 주장이 만들어진다."""
     today = "2026-09-13"
-    huge = _big_item(1, 20000)
+    huge = _big_item(1, 0)
+    huge["detail_text"] = " ".join(f"{'가' * 100}{n} 문장입니다." for n in range(60))
 
-    batches = glm_mod.batch_input_items(today, [huge])
+    batches, skipped = glm_mod.batch_input_items(today, [huge])
 
+    assert skipped == []
     assert len(batches) == 1 and len(batches[0]) == 1
     trimmed = batches[0][0]
     assert trimmed["n"] == 1                      # 항목이 사라지지 않았다
-    assert 0 < len(trimmed["detail_text"]) < 20000  # 뒤에서 잘렸다
-    assert huge["detail_text"].startswith(trimmed["detail_text"])
+    assert 0 < len(trimmed["detail_text"]) < len(huge["detail_text"])
     assert glm_mod.prompt_bytes(today, [trimmed]) <= glm_mod.PROMPT_BYTE_BUDGET
+    # 남은 텍스트의 모든 문장이 원문의 완결 문장 그대로다
+    original = set(glm_mod.split_sentences(huge["detail_text"]))
+    assert all(
+        sentence in original
+        for sentence in glm_mod.split_sentences(trimmed["detail_text"])
+    )
 
 
 def test_trim_item_to_budget_leaves_a_small_item_untouched():
@@ -1894,8 +1913,8 @@ def test_headline_prompt_stays_under_the_cap(digest_fixture):
 # 1. 한 구절만 허용하는 문법 — Codex 가 뚫은 4행이 전부 막혀야 한다
 # ─────────────────────────────────────────────────────────────────────────
 def _summary_verdict(evidence: str, line: str):
-    """(값, 통과, 사유) — 근거 문자열 하나로 `한 줄 의미`를 직접 판정한다."""
-    return glm_mod._gate_summary(line, glm_mod.summary_normalize(evidence))
+    """(값, 통과, 사유) — 근거 **한 필드**를 문장으로 쪼개 직접 판정한다."""
+    return glm_mod._gate_summary(line, glm_mod.split_sentences(evidence))
 
 
 def test_connectives_alone_cannot_assert_anything():
@@ -1914,55 +1933,94 @@ def test_two_spans_cannot_be_welded_into_a_new_predicate():
     assert "인용 2개" in reason
 
 
-def test_a_decimal_point_is_not_a_token_boundary():
-    """Codex 3행: 근거 `사업비 1.5억원` 에서 `«5억원»` 을 오릴 수 없다."""
-    evidence = "사업비 1.5억원 규모, 접수합니다"
-    # 짧은 형태는 길이 하한(8자)에서 먼저 막힌다
-    short_value, short_ok, short_reason = _summary_verdict(evidence, "«5억원»")
-    assert (short_value, short_ok) == (glm_mod.FALLBACK, False)
-    assert "3자" in short_reason
-    # 길이를 채워도 소수점 뒤에서 오린 구절은 경계 위반이다
-    value, ok, reason = _summary_verdict(evidence, "«5억원 규모, 접수합니다»")
+def test_a_number_cannot_be_cut_out_of_a_sentence():
+    """Codex 3행: 근거 `사업비 1.5억원` 에서 `«5억원 …»` 을 오릴 수 없다."""
+    evidence = "사업비 1.5억원 규모로 접수합니다."
+    value, ok, reason = _summary_verdict(evidence, "«5억원 규모로 접수합니다»")
     assert (value, ok) == (glm_mod.FALLBACK, False)
-    assert "경계로 없는 인용" in reason
-    # 소수점을 포함해 통째로 옮기면 통과한다
-    assert _summary_verdict(evidence, "«사업비 1.5억원 규모»") == (
-        "«사업비 1.5억원 규모»", True, ""
+    assert "완결 문장과 다른 인용" in reason
+    assert _summary_verdict(evidence, "«사업비 1.5억원 규모로 접수합니다»") == (
+        "«사업비 1.5억원 규모로 접수합니다»", True, ""
     )
 
 
-def test_a_full_width_decimal_is_normalized_the_same_way_on_both_sides():
-    """Codex 4행: 전각 소수점도 같은 규칙을 지난다 (NFKC)."""
-    evidence = "사업비 １．５억원 규모, 접수합니다"
-    value, ok, reason = _summary_verdict(evidence, "«５억원 규모, 접수합니다»")
+def test_a_thousands_separator_cannot_become_a_boundary():
+    """Codex r3 1행: `사업비 1,500만원 지원` → `«500만원 지원»` 이 통과했다."""
+    evidence = "사업비 1,500만원 지원합니다."
+    value, ok, reason = _summary_verdict(evidence, "«500만원 지원합니다»")
     assert (value, ok) == (glm_mod.FALLBACK, False)
-    assert "경계로 없는 인용" in reason
-    # 전각으로 옮겨 와도 정규화되어 통과하고, **저장되는 값도 정규화된 값**이다
-    assert _summary_verdict(evidence, "«사업비 １．５억원 규모»") == (
-        "«사업비 1.5억원 규모»", True, ""
+    assert "완결 문장과 다른 인용" in reason
+    # 쉼표가 든 문장을 통째로 옮기면 통과한다
+    assert _summary_verdict(evidence, "«사업비 1,500만원 지원합니다»") == (
+        "«사업비 1,500만원 지원합니다»", True, ""
     )
 
 
-def test_a_period_followed_by_whitespace_still_counts_as_a_boundary():
-    evidence = "접수합니다. 의견 제출 기간: 2026. 10. 19.까지 입니다"
-    assert _summary_verdict(evidence, "«의견 제출 기간: 2026. 10. 19.까지»") == (
-        "«의견 제출 기간: 2026. 10. 19.까지»", True, ""
+def test_a_sentence_cannot_be_cut_before_its_negation():
+    """Codex r3 2행: `…신청 가능 여부는 아직 미정입니다` → `«… 신청 가능»`."""
+    evidence = "사회적기업 신청 가능 여부는 아직 미정입니다."
+    value, ok, reason = _summary_verdict(evidence, "«사회적기업 신청 가능»")
+    assert (value, ok) == (glm_mod.FALLBACK, False)
+    assert "완결 문장과 다른 인용" in reason
+
+
+def test_a_span_cannot_straddle_two_fields():
+    """Codex r3 3행: 제목 끝 + 상세 앞이 한 문장처럼 이어 붙던 경로."""
+    items = [_one_input_item(
+        title="신청 불가 대상: 사회적기업",
+        summary="",
+        detail_text="신청 가능 기간은 9월 22일까지입니다.",
+    )]
+    raw = json.dumps([{
+        "n": 1, "대상 태그": "전체", "마감": "원문 확인",
+        "자격": "원문 확인", "금액": "원문 확인",
+        "한 줄 의미": "«사회적기업 신청 가능 기간은 9월 22일까지입니다»",
+    }], ensure_ascii=False)
+
+    results, warnings = glm_mod.gate_output(raw, items)
+
+    assert results[1]["한 줄 의미"] == glm_mod.FALLBACK
+    assert any("완결 문장과 다른 인용" in w for w in warnings)
+
+
+def test_superscript_and_full_width_glyphs_are_left_alone():
+    """Codex r3 4행: NFKC 가 `10⁴㎡` 를 `104m2` 로 바꿔 수치를 변조했다."""
+    evidence = "지원 면적 10\u2074\u33a1입니다."
+    value, ok, reason = _summary_verdict(evidence, "«지원 면적 104m2입니다»")
+    assert (value, ok) == (glm_mod.FALLBACK, False)
+    assert "완결 문장과 다른 인용" in reason
+    # 원문 글자 그대로면 통과하고, 저장되는 값도 원문 글자 그대로다
+    assert _summary_verdict(evidence, "«지원 면적 10\u2074\u33a1입니다»") == (
+        "«지원 면적 10\u2074\u33a1입니다»", True, ""
     )
 
 
-def test_summary_normalize_is_applied_identically_to_both_sides():
-    assert glm_mod.summary_normalize("１．５억원\n규모") == "1.5억원 규모"
+def test_full_width_asterisks_do_not_slip_past_the_format_gate():
+    """Codex r3 4행 후반: `＊…＊` 가 정규화 뒤 `*…*` 로 저장됐다."""
+    evidence = "\uff0a누구나 가능\uff0a"
+    value, ok, _reason = _summary_verdict(evidence, "«\uff0a누구나 가능\uff0a»")
+    # NFKC 를 쓰지 않으므로 전각 별표는 전각 그대로 남고, 마크다운 문자가
+    # 만들어지지 않는다 — 저장된 값에 ASCII `*` 가 없다.
+    assert "*" not in value
+    if ok:
+        assert value == "«\uff0a누구나 가능\uff0a»"
+
+
+def test_summary_normalize_collapses_whitespace_and_nothing_else():
+    """r4: 정규화는 공백 합침뿐 — 글자를 바꾸지 않는다(NFKC 삭제)."""
     assert glm_mod.summary_normalize("  가   나  ") == "가 나"
+    assert glm_mod.summary_normalize("\uff11\uff0e\uff15억원\n규모") == "\uff11\uff0e\uff15억원 규모"
+    assert glm_mod.summary_normalize("10\u2074\u33a1") == "10\u2074\u33a1"
 
 
 # ─── 2. DOM — 단일 상향 측정 · 노드/깊이/종료태그 상한 ────────────────────
 def test_content_selection_is_linear_on_deeply_nested_containers():
-    """Codex 재현: 20,000단 중첩 `div.view` 가 후보마다 하위를 다시 읽었다."""
+    """20,000단 중첩은 선형으로 처리되고, 깊이 상한을 넘으므로 수집 실패다."""
     html_text = '<div class="view">' * 20000 + "본문" + "</div>" * 20000
     started = time.monotonic()
     text = http_fetch.visible_text(html_text)
     assert time.monotonic() - started < 1.0
-    assert "본문" in text
+    assert text == ""
 
 
 def test_unmatched_end_tags_do_not_scan_the_whole_stack():
@@ -2119,7 +2177,7 @@ def test_kakao_check_catches_a_lost_line_that_is_a_substring_of_another(
 
     monkeypatch.setattr(composer_mod, "kakao_blocks_from_markdown", drop_short)
     problems = composer_mod.markdown_kakao_problems(text)
-    assert any("보강 줄 누락(1→0)" in problem for problem in problems)
+    assert any("보강 줄 불일치" in problem for problem in problems)
 
 
 # ─── 6. 미리보기 — 세 상태 ────────────────────────────────────────────────
@@ -2185,3 +2243,346 @@ def test_preview_says_only_the_headline_draft_was_discarded(
     assert "이번 주 한 줄 초안만 폐기" in preview
     assert "원문 확인'으로 대체" not in preview
     assert "GLM 출력 전체 폐기" not in preview
+
+
+# ══ V3.1 r4 (Codex 최종 라운드 수렴) ══════════════════════════════════════
+# 문장 분해 자체의 계약
+# ─────────────────────────────────────────────────────────────────────────
+def test_split_sentences_treats_newlines_as_hard_boundaries():
+    assert glm_mod.split_sentences("접수기간\n9월 22일까지") == [
+        "접수기간", "9월 22일까지",
+    ]
+
+
+def test_split_sentences_splits_on_terminators_followed_by_space():
+    assert glm_mod.split_sentences("첫 문장입니다. 둘째 문장입니다!") == [
+        "첫 문장입니다.", "둘째 문장입니다!",
+    ]
+
+
+def test_split_sentences_keeps_numeric_runs_together():
+    """`1.5` 도 `2026. 10. 19.` 도 문장으로 쪼개지 않는다."""
+    assert glm_mod.split_sentences("사업비 1.5억원 규모") == ["사업비 1.5억원 규모"]
+    assert glm_mod.split_sentences("의견 제출 2026. 10. 19.까지") == [
+        "의견 제출 2026. 10. 19.까지",
+    ]
+
+
+def test_sentence_forms_allow_dropping_the_trailing_terminator():
+    assert glm_mod.sentence_forms("접수합니다.") == ("접수합니다.", "접수합니다")
+    assert glm_mod.sentence_forms("접수합니다") == ("접수합니다",)
+
+
+def test_evidence_sentences_keeps_the_fields_apart():
+    item = _one_input_item(
+        title="신청 불가 대상: 사회적기업",
+        summary="",
+        detail_text="신청 가능 기간은 9월 22일까지입니다.",
+    )
+    sentences = glm_mod.evidence_sentences(item)
+    assert "신청 불가 대상: 사회적기업" in sentences
+    assert "신청 가능 기간은 9월 22일까지입니다." in sentences
+    assert not any(
+        "사회적기업 신청 가능" in sentence for sentence in sentences
+    )
+
+
+def test_persona_prompt_teaches_the_whole_sentence_rule():
+    prompt = glm_mod.PERSONA_SYSTEM_PROMPT
+    assert "문장 하나를 통째로" in prompt
+    assert "문장 일부" in prompt and "두 문장" in prompt
+    assert "8~120자" in prompt
+    assert prompt.count("예1:") == 1 and prompt.count("예2:") == 1
+
+
+# ─── 3. 절단·건너뛰기 ─────────────────────────────────────────────────────
+def test_an_item_too_big_without_its_detail_text_is_skipped_not_sent():
+    """제목만으로 예산을 넘으면 ds 에 보내지 않는다 (r4, Codex MEDIUM)."""
+    today = "2026-09-13"
+    monster = _big_item(1, 10)
+    monster["title"] = "가" * 5000
+    small = _big_item(2, 10)
+
+    batches, skipped = glm_mod.batch_input_items(today, [monster, small])
+
+    assert [item["n"] for item in skipped] == [1]
+    assert [[item["n"] for item in batch] for batch in batches] == [[2]]
+
+
+def test_run_warns_about_a_skipped_item_and_never_sends_it(
+    digest_fixture, tmp_path, monkeypatch
+):
+    monkeypatch.setattr(
+        glm_mod, "fetch_detail_text", lambda url, **kwargs: "가" * 200
+    )
+    _ds_present(monkeypatch, tmp_path)
+    # 페르소나 지시만으로도 넘는 예산 — 어떤 항목도 보낼 수 없다
+    monkeypatch.setattr(glm_mod, "PROMPT_BYTE_BUDGET", 100)
+    seen = _stub_ds_calls(monkeypatch, lambda prompt, index: "한 줄 문장")
+
+    class Args:
+        week = W13
+        db = digest_fixture["db_path"]
+        out_dir = str(digest_fixture["out_dir"])
+        dry_run = False
+        apply_json = None
+
+    assert glm_mod.run(Args()) == 0
+    payload = json.loads(
+        (digest_fixture["out_dir"] / f"{W13}.glm_input.json").read_text(encoding="utf-8")
+    )
+    assert payload["skipped"] == [1, 2]
+    assert payload["batches"] == []
+    # 요약 프롬프트는 **한 번도** 나가지 않았다 (초안 프롬프트도 예산 초과로 생략)
+    assert seen == []
+    warnings_file = json.loads(
+        (digest_fixture["out_dir"] / f"{W13}.glm_warnings.json").read_text(
+            encoding="utf-8")
+    )
+    assert sum("예산 초과" in w for w in warnings_file["warnings"]) == 2
+
+
+# ─── 6. 타임아웃이 프로세스 종료를 막지 않는다 ────────────────────────────
+def test_fetch_detail_text_returns_on_time_and_leaves_only_a_daemon_thread():
+    """워커는 데몬이다 — 인터프리터 종료가 워커를 기다리지 않는다."""
+    import threading
+
+    release = threading.Event()
+
+    def slow_open(url):
+        release.wait(30)
+        raise AssertionError("도달하면 안 된다")
+
+    original = http_fetch._open
+    http_fetch._open = slow_open
+    try:
+        before = {t.ident for t in threading.enumerate()}
+        started = time.monotonic()
+        assert http_fetch.fetch_detail_text(
+            "https://example.test/a", timeout=0.2
+        ) == ""
+        assert time.monotonic() - started < 3.0
+        leftover = [
+            t for t in threading.enumerate() if t.ident not in before
+        ]
+        # 남은 스레드가 있다면 반드시 데몬이어야 한다 (종료를 막지 않는다)
+        assert all(t.daemon for t in leftover)
+    finally:
+        http_fetch._open = original
+        release.set()
+
+
+# ─── 7. 연결 정리 순서 (close → release_conn) ─────────────────────────────
+class _OrderRecordingResponse(_FakeResponse):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.order = []
+
+    def close(self):
+        self.order.append("close")
+
+    def release_conn(self):
+        self.order.append("release_conn")
+
+
+def test_unconsumed_response_is_closed_before_the_connection_is_released(monkeypatch):
+    """release_conn 을 먼저 부르면 미소비 연결이 풀로 돌아가 close 가 무력해진다."""
+    response = _OrderRecordingResponse(
+        headers={"content-type": "text/html"},
+        chunks=[b"a" * (http_fetch.MAX_DETAIL_BYTES + 10)],
+    )
+    _use_open(monkeypatch, response)
+    http_fetch.fetch_detail_text("https://example.test/a")
+    assert response.order == ["close", "release_conn"]
+
+
+# ─── 8. CSS 주석 제거는 선형 ──────────────────────────────────────────────
+def test_css_comment_stripping_is_linear_on_unterminated_comments():
+    style = "/*x" * 8000
+    started = time.monotonic()
+    http_fetch.strip_css_comments(style)
+    assert time.monotonic() - started < 0.1
+
+
+def test_is_hidden_is_fast_on_a_pathological_style_attribute():
+    html_text = '<body><div style="{}">본문</div></body>'.format("/*x" * 8000)
+    started = time.monotonic()
+    http_fetch.visible_text(html_text)
+    assert time.monotonic() - started < 0.5
+
+
+# ─── 9. 깊이 상한 초과 = 수집 실패 (숨김 누출 금지) ───────────────────────
+def test_exceeding_the_depth_cap_is_a_collection_failure_not_a_leak():
+    """Codex r3: 255단 아래의 `<div hidden>` 문구가 가시 부모로 새어 나왔다."""
+    html_text = (
+        "<div>" * 255
+        + "<div hidden>사회적기업 누구나 신청 가능</div>"
+        + "</div>" * 255
+    )
+    assert http_fetch.visible_text(html_text) == ""
+
+
+def test_exceeding_the_node_cap_is_also_a_collection_failure():
+    builder_html = "<p>x</p>" * 50
+    assert http_fetch.visible_text(builder_html) != ""
+    parser = http_fetch._DomBuilder(max_nodes=5)
+    parser.feed(builder_html)
+    parser.close()
+    assert parser.overflowed is True
+
+
+# ─── 10. md→manifest 두 파일 트랜잭션 ─────────────────────────────────────
+def test_a_failed_manifest_write_rolls_the_markdown_back(
+    digest_fixture, tmp_path, monkeypatch
+):
+    """정본 쓰기가 터지면 md 를 되돌리고 경고만 남긴다 (exit 0 유지)."""
+    markdown_path = digest_fixture["markdown_path"]
+    before = markdown_path.read_bytes()
+
+    class DryArgs:
+        week = W13
+        db = digest_fixture["db_path"]
+        out_dir = str(digest_fixture["out_dir"])
+        dry_run = True
+        apply_json = None
+
+    glm_mod.run(DryArgs())
+    payload = json.loads(
+        (digest_fixture["out_dir"] / f"{W13}.glm_input.json").read_text(encoding="utf-8")
+    )
+    fake = [
+        {
+            "n": entry["n"], "대상 태그": "전체", "마감": "원문 확인",
+            "자격": "원문 확인", "금액": "원문 확인",
+            "한 줄 의미": _label(entry),
+        }
+        for entry in payload["items"]
+    ]
+    output_path = tmp_path / "ok.json"
+    output_path.write_text(json.dumps(fake, ensure_ascii=False), encoding="utf-8")
+
+    real = composer_mod.set_manifest_enrich_lines
+    calls = {"n": 0}
+
+    def flaky(markdown_path_arg, enrich_by_id, clear_all=False):
+        calls["n"] += 1
+        if calls["n"] == 1:          # 제거 단계는 통과시킨다
+            return real(markdown_path_arg, enrich_by_id, clear_all=clear_all)
+        raise RuntimeError("정본 쓰기 실패")
+
+    monkeypatch.setattr(composer_mod, "set_manifest_enrich_lines", flaky)
+
+    class ApplyArgs:
+        week = W13
+        db = digest_fixture["db_path"]
+        out_dir = str(digest_fixture["out_dir"])
+        dry_run = False
+        apply_json = str(output_path)
+
+    assert glm_mod.run(ApplyArgs()) == 0
+    assert markdown_path.read_bytes() == before
+    assert not markdown_path.with_name(markdown_path.name + ".bak").exists()
+    warnings_file = json.loads(
+        (digest_fixture["out_dir"] / f"{W13}.glm_warnings.json").read_text(
+            encoding="utf-8")
+    )
+    assert any("md 롤백" in w for w in warnings_file["warnings"])
+
+    monkeypatch.setattr(composer_mod, "set_manifest_enrich_lines", real)
+    result = check_digest(
+        db_path=digest_fixture["db_path"], markdown_path=markdown_path,
+        output_path=None, skip_network=False,
+    )
+    assert result["pass"], result.get("reason")
+    assert result["manifest_problems"] == []
+
+
+def test_commit_markdown_and_manifest_removes_the_backup_on_success(tmp_path):
+    target = tmp_path / "a.md"
+    target.write_text("원본", encoding="utf-8")
+    assert glm_mod.commit_markdown_and_manifest(
+        target, "새 내용", lambda: None
+    ) is None
+    assert target.read_text(encoding="utf-8") == "새 내용"
+    assert not target.with_name(target.name + ".bak").exists()
+
+
+# ─── 11. 미리보기 부분 배치 상태 · 카톡 항목별 대조 ───────────────────────
+def test_preview_reports_a_partially_applied_run_distinctly(
+    digest_fixture, tmp_path, monkeypatch
+):
+    monkeypatch.setattr(
+        glm_mod, "fetch_detail_text", lambda url, **kwargs: "가" * 3000
+    )
+    _ds_present(monkeypatch, tmp_path)
+
+    def responder(prompt, index):
+        if index == 1:
+            return None                      # 배치 1 ds 실패
+        if index == 2:
+            return _extractive_for(prompt)   # 배치 2 정상
+        return "한 줄 문장"
+
+    _stub_ds_calls(monkeypatch, responder)
+
+    class Args:
+        week = W13
+        db = digest_fixture["db_path"]
+        out_dir = str(digest_fixture["out_dir"])
+        dry_run = False
+        apply_json = None
+
+    assert glm_mod.run(Args()) == 0
+    warnings_file = json.loads(
+        (digest_fixture["out_dir"] / f"{W13}.glm_warnings.json").read_text(
+            encoding="utf-8")
+    )
+    assert warnings_file["partial_batches"] == [[1]]
+    assert warnings_file["items_replaced"] is False
+
+    check = check_digest(
+        db_path=digest_fixture["db_path"],
+        markdown_path=digest_fixture["markdown_path"],
+        output_path=None, skip_network=False,
+    )
+    assert check["glm_partial_batches"] == [[1]]
+    preview = preview_mod.render_preview(
+        W13, digest_fixture["markdown_path"].read_text(encoding="utf-8"), check
+    )
+    assert "일부 배치 미적용 (n=[1])" in preview
+    assert "원문 확인'으로 대체" not in preview
+    assert "GLM 출력 전체 폐기" not in preview
+
+
+def test_kakao_check_catches_two_items_swapping_their_enrich_lines(
+    digest_fixture, monkeypatch
+):
+    """전역 다중집합은 교환을 놓친다 — 항목별 자리 맞춤이라야 잡힌다."""
+    first = "«접수기간 9월 22일까지입니다»"
+    second = "«지원금 300만원을 지급합니다»"
+    text = _set_enrich_lines_directly(
+        digest_fixture["markdown_path"], [first, second]
+    )
+    assert composer_mod.markdown_kakao_problems(text) == []
+
+    original = composer_mod.kakao_blocks_from_markdown
+
+    def swap(markdown_text):
+        blocks = original(markdown_text)
+        enrich_positions = [
+            index for index, block in enumerate(blocks)
+            if len(block.split("\n")) == 3
+            and block.split("\n")[2].strip().startswith("→")
+        ]
+        assert len(enrich_positions) == 2
+        left, right = enrich_positions
+        left_lines = blocks[left].split("\n")
+        right_lines = blocks[right].split("\n")
+        left_lines[2], right_lines[2] = right_lines[2], left_lines[2]
+        blocks[left] = "\n".join(left_lines)
+        blocks[right] = "\n".join(right_lines)
+        return blocks
+
+    monkeypatch.setattr(composer_mod, "kakao_blocks_from_markdown", swap)
+    problems = composer_mod.markdown_kakao_problems(text)
+    assert any("보강 줄 불일치" in problem for problem in problems)

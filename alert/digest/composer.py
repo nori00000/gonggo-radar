@@ -2116,28 +2116,53 @@ def markdown_kakao_problems(markdown_text: str) -> List[str]:
     # 갈라진다. 사람이 md 에서 읽은 문장이 카톡에서 조용히 사라지는 쪽이,
     # 발송을 멈추는 쪽보다 나쁘다.
     #
-    # r3b (Codex MEDIUM): 판정은 **결과물의 보강 줄을 실제로 파싱한 다중집합**
-    # 이다. 부분문자열·출현 수 세기는 `→ «신청»` 과 `→ «신청» «불가»` 처럼 한
-    # 줄이 다른 줄의 부분문자열일 때 유실을 놓쳤다 — 짧은 줄이 사라져도 긴 줄
-    # 안에서 세어졌다. 줄 단위 정확 일치로 바꾼다.
-    expected_enrich = Counter(
+    # r4 (Codex LOW): 판정은 **항목별 자리 맞춤**이다. 전역 다중집합은 부족분만
+    # 보므로 두 항목의 보강 줄이 서로 **바뀌어도** 통과했다. 결과물에서 항목
+    # 자리(제목 줄 + URL 줄)를 찾아 그 뒤의 `→` 줄을 md 의 항목 순서와 1:1로
+    # 맞춘다.
+    expected_enrich = [
         (block.get("enrich_line") or "").strip()
         for block in blocks_mod.item_blocks(markdown_text)
-        if (block.get("enrich_line") or "").strip()
-    )
-    rendered_enrich = Counter(
-        line.strip()
-        for chunk in chunks
-        for line in chunk.split("\n")
-        if line.strip().startswith(blocks_mod.ENRICH_LINE_PREFIX.strip())
-    )
-    for enrich, expected in sorted(expected_enrich.items()):
-        rendered = rendered_enrich.get(enrich, 0)
-        if rendered < expected:
+    ]
+    rendered_enrich = _rendered_item_enrichments(chunks)
+    if len(rendered_enrich) != len(expected_enrich):
+        problems.append(
+            f"카톡 항목 수 불일치: 본문 {len(expected_enrich)}건 "
+            f"≠ 렌더 {len(rendered_enrich)}건"
+        )
+    else:
+        for index, (expected, rendered) in enumerate(
+                zip(expected_enrich, rendered_enrich), start=1):
+            if expected == rendered:
+                continue
             problems.append(
-                f"보강 줄 누락({expected}→{rendered}): {enrich[:40]}…"
+                f"{index}번 보강 줄 불일치: 본문 {expected[:30]!r} "
+                f"≠ 렌더 {rendered[:30]!r}"
             )
     return problems
+
+
+def _rendered_item_enrichments(chunks: Sequence[str]) -> List[str]:
+    """렌더된 조각에서 **항목 자리마다** 보강 줄을 뽑는다 (없으면 빈 문자열).
+
+    항목 자리는 `  <URL>` 줄(또는 URL 대체 표기 줄)이고, 그 바로 다음 줄이
+    `→` 로 시작하면 그 항목의 보강 줄이다.
+    """
+    from alert.digest import blocks as blocks_mod
+
+    marker = blocks_mod.ENRICH_LINE_PREFIX.strip()
+    found: List[str] = []
+    for chunk in chunks:
+        lines = chunk.split("\n")
+        for index, line in enumerate(lines):
+            if index == 0 or not line.startswith("  "):
+                continue
+            stripped = line.strip()
+            if not (_is_url_line(stripped) or stripped == URL_TOO_LONG_NOTICE):
+                continue
+            following = lines[index + 1].strip() if index + 1 < len(lines) else ""
+            found.append(following if following.startswith(marker) else "")
+    return found
 
 
 def _is_item_block(block: str) -> bool:

@@ -217,8 +217,14 @@ def render_preview(
     if glm_warnings:
         # r2: 폐기와 대체를 구분한다 — n 집합 위반·파싱 실패는 **아무것도 적용하지
         # 않은** 실행이고, 그때 "원문 확인으로 대체"라고 쓰면 거짓 안내가 된다.
+        partial = check.get("glm_partial_batches") or []
         if check.get("glm_discarded"):
             detail = "GLM 출력 전체 폐기"
+        elif partial:
+            # r4: 배치 일부가 미적용인 것은 "대체"도 "전체 폐기"도 아니다 —
+            # 그 항목들은 보강 줄 자체가 없다.
+            numbers = sorted({n for batch in partial for n in batch})
+            detail = f"일부 배치 미적용 (n={numbers})"
         elif check.get("glm_items_replaced"):
             detail = "해당 항목은 '원문 확인'으로 대체"
         else:
