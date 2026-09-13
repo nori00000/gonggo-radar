@@ -972,6 +972,7 @@ def test_deadline_cue_detects_extraction_miss(tmp_path):
     "2026.09.16. 개정",
     "설명회 (9.10.(목) 13시)",
     "9월 16일 개최",
+    "교육 안내(9/16(수), 9/17(목))",
     "신청서 제출 9월 16일까지",
     "마감 임박",
     "접수기간 안내",
@@ -987,6 +988,7 @@ def test_deadline_cue_patterns(text):
     "산림 사회적기업 성장 정책 방향 발표",
     "임업 통계 기본계획 발표",
     "2026년 하반기 제도 개선",
+    "예산 1/2 수준으로 조정",        # 빗금은 요일이 따라올 때만 날짜다
 ])
 def test_deadline_cue_is_silent_without_a_date(text):
     """§3: 마감 표기가 없으면 단서도 없다 — 진짜 마감 없음은 그대로 실린다."""
