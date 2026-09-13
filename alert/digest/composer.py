@@ -214,7 +214,12 @@ B2B_SIGNAL_KEYWORDS = (
     "등록",
 )
 
-# 신청 섹션의 소스 다양성 상한 (개정 v2.2 F2). 초과분은 보류로 내려간다.
+# 항목 섹션(신청하세요·알아두세요)의 소스 다양성 상한 (개정 v2.2 F2).
+# 초과분은 보류로 내려간다.
+#
+# P0-B (2026-09-13): 알아두세요에도 같은 상한을 적용한다. 종전에는 신청하세요에만
+# 걸려 있어, 입법예고·고시가 많은 한 부처 소스가 알아두세요 3칸을 독식할 수 있었다
+# (레인 A 실측 `results/A-inventory.md` §5-5 단서 3). 부처 소스를 늘리기 전에 닫는다.
 SOURCE_DIVERSITY_LIMIT = 2
 
 # 보류 사유 (개정 v2.3 G2: 다양성 때문에 밀린 것과 상한 때문에 밀린 것을 구분한다)
@@ -1615,9 +1620,12 @@ def compose_digest_data(
     sections[VERDICT_APPLY] = apply_selected
 
     # 개정 v2.5 (#4): 알아두세요 상한 초과분도 무기록 삭제하지 않는다.
+    # P0-B: 알아두세요도 신청하세요와 같은 다양성 상한을 탄다 — 같은 소스 최대
+    # `SOURCE_DIVERSITY_LIMIT` 건, 초과분의 보류 사유는 `HOLD_REASON_DIVERSITY`.
     (notice_selected, notice_diversity, notice_cap, notice_pin_cap,
      _notice_pinned_taken) = _select_with_pins(
         notice_candidates, SECTION_LIMITS[VERDICT_NOTICE], _sort_notice,
+        SOURCE_DIVERSITY_LIMIT,
     )
     sections[VERDICT_NOTICE] = notice_selected
 
@@ -1630,7 +1638,7 @@ def compose_digest_data(
             (apply_candidates, SECTION_LIMITS[VERDICT_APPLY], _sort_apply,
              SOURCE_DIVERSITY_LIMIT, apply_selected),
             (notice_candidates, SECTION_LIMITS[VERDICT_NOTICE], _sort_notice,
-             None, notice_selected),
+             SOURCE_DIVERSITY_LIMIT, notice_selected),
         ):
             baseline = _select_with_pins(
                 candidates_, limit_, sorter_, diversity_, honor_pins=False)[0]

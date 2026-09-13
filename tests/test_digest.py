@@ -444,20 +444,26 @@ class TestComposer:
         )
 
     def test_compose_digest_notice_cap_is_three(self, tmp_path):
-        """알아두세요 상한 3 (판정 ⑩)."""
+        """알아두세요 상한 3 (판정 ⑩).
+
+        P0-B 갱신: 알아두세요도 소스 다양성 상한(같은 소스 2건)을 타므로,
+        **섹션 상한**만 검증하려면 후보를 서로 다른 소스로 펼쳐야 한다.
+        한 소스로 4건을 넣으면 다양성 상한이 먼저 걸려 2건에서 멈춘다
+        (그 동작은 TestNoticeSourceDiversity 가 따로 증명한다).
+        """
         db_path = tmp_path / "notice.db"
         _create_announcements_table(db_path)
 
-        titles = [
-            "산림재난방지법 시행령 일부개정령안 입법예고",
-            "산지관리법 시행령 일부개정령안 행정예고",
-            "임업·산림 공익직접지불제도 고시 개정",
-            "산림복지 진흥에 관한 법률 시행규칙 개정 예고",
+        rows = [
+            ("lawmaking", "산림재난방지법 시행령 일부개정령안 입법예고"),
+            ("forest_service", "산지관리법 시행령 일부개정령안 행정예고"),
+            ("kofpi", "임업·산림 공익직접지불제도 고시 개정"),
+            ("coop", "산림복지 진흥에 관한 법률 시행규칙 개정 예고"),
         ]
-        for index, title in enumerate(titles):
+        for index, (source, title) in enumerate(rows):
             _insert_one(
                 db_path,
-                source="lawmaking",
+                source=source,
                 source_id=f"law_{index}",
                 title=title,
                 url=f"https://example.com/law-{index}",
@@ -1642,17 +1648,19 @@ class TestComposeExcludeUrls:
         """제외 후에도 섹션 상한을 넘지 않는다."""
         db_path = tmp_path / "limit.db"
         _create_announcements_table(db_path)
-        notice_titles = (
-            "산림재난방지법 시행령 일부개정령안 입법예고",
-            "산지관리법 시행령 일부개정령안 행정예고",
-            "임업·산림 공익직접지불제도 고시 개정",
-            "산림복지 진흥에 관한 법률 시행규칙 개정 예고",
+        # P0-B 갱신: 알아두세요도 다양성 상한(같은 소스 2건)을 타므로, 제외 후에도
+        # **섹션 상한 3**이 지켜지는지를 보려면 후보 소스를 펼쳐야 한다.
+        notice_rows = (
+            ("lawmaking", "산림재난방지법 시행령 일부개정령안 입법예고"),
+            ("forest_service", "산지관리법 시행령 일부개정령안 행정예고"),
+            ("kofpi", "임업·산림 공익직접지불제도 고시 개정"),
+            ("coop", "산림복지 진흥에 관한 법률 시행규칙 개정 예고"),
         )
-        for i, title in enumerate(notice_titles):
+        for i, (source, title) in enumerate(notice_rows):
             _insert_one(
                 db_path,
                 source_id=f"forest_{i:03d}",
-                source="lawmaking",
+                source=source,
                 title=title,
                 url=f"https://example.com/f-{i}",
                 period_end=None,
@@ -1668,6 +1676,68 @@ class TestComposeExcludeUrls:
         # 알아두세요 상한 3, 후보 4건 중 1건 제외 → 상한대로 3건
         assert _count_items(_section_body(markdown, NOTICE_HEADING)) == 3
         assert "https://example.com/f-0" not in markdown
+
+
+class TestNoticeSourceDiversity:
+    """P0-B: 알아두세요도 신청하세요와 같은 소스 다양성 상한을 탄다.
+
+    종전에는 `_select_with_pins` 호출에 diversity 인자를 넘기지 않아 알아두세요
+    3칸을 한 소스가 독식할 수 있었다. 부처 소스를 늘리면 입법예고·고시가 많은
+    한 부처가 섹션을 점령한다(레인 A 실측 `results/A-inventory.md` §5-5 단서 3).
+    """
+
+    # 전부 `입법예고`/`행정예고`/`고시` 라 알아두세요 우선 판정을 받는다.
+    # 알아두세요 정렬은 게시일 내림차순(`_sort_notice`)이므로, 같은 소스 4건을
+    # 상위에 놓고 다른 소스 1건을 맨 뒤에 둔다 — 다양성 상한이 없으면 상위 3건이
+    # 전부 lawmaking 이 되어 섹션을 독식한다.
+    NOTICE_ROWS = (
+        ("lawmaking", "산림재난방지법 시행령 일부개정령안 입법예고", "2026-03-27"),
+        ("lawmaking", "산지관리법 시행령 일부개정령안 행정예고", "2026-03-26"),
+        ("lawmaking", "임업·산림 공익직접지불제도 고시 개정", "2026-03-25"),
+        ("lawmaking", "산림복지 진흥에 관한 법률 시행규칙 개정 예고", "2026-03-24"),
+        ("forest_service", "산림보호법 시행규칙 일부개정령안 입법예고", "2026-03-23"),
+    )
+
+    def _seed(self, db_path):
+        _create_announcements_table(db_path)
+        for index, (source, title, posted) in enumerate(self.NOTICE_ROWS):
+            _insert_one(
+                db_path,
+                source=source,
+                source_id=f"nd_{index}",
+                title=title,
+                url=f"https://example.com/nd-{index}",
+                period_end=None,
+                period_start=posted,
+            )
+
+    def test_same_source_third_notice_is_held_for_diversity(self, tmp_path):
+        db_path = tmp_path / "nd.db"
+        self._seed(db_path)
+
+        data = compose_digest_data(
+            str(db_path), week_str=W13, today=W13_TODAY
+        )
+        sources = [item["source"] for item in data["sections"][VERDICT_NOTICE]]
+        assert sources.count("lawmaking") == SOURCE_DIVERSITY_LIMIT
+
+        reasons = {item["url"]: item["reason"] for item in data["holds"]}
+        # 3번째·4번째 lawmaking 은 다양성 때문에 밀렸다 (상한이 아니라)
+        assert reasons["https://example.com/nd-2"] == HOLD_REASON_DIVERSITY
+        assert reasons["https://example.com/nd-3"] == HOLD_REASON_DIVERSITY
+
+    def test_diversity_lets_a_second_source_into_notice(self, tmp_path):
+        """밀려난 자리는 다른 소스가 채운다 — 상한 3은 그대로 찬다."""
+        db_path = tmp_path / "nd2.db"
+        self._seed(db_path)
+
+        markdown = compose_digest(
+            db_path=str(db_path), week_str=W13, today=W13_TODAY
+        )
+        assert _count_items(_section_body(markdown, NOTICE_HEADING)) == 3
+        # 다양성 상한이 없었다면 자리가 없었을 다른 소스가 실린다
+        assert "https://example.com/nd-4" in markdown
+        assert f"| {HOLD_REASON_DIVERSITY} | id=" in markdown
 
 
 class TestUrlProbe:
