@@ -281,17 +281,23 @@ def apply_council_profile(
         analyze: 회사 키워드 분석 함수 (``KeywordAnalyzer.analyze``).
 
     Returns:
-        ``(협의회 단독 저장 대상, 양쪽 탈락 관찰 레코드)``.
+        ``(협의회 단독 저장 대상, 양쪽 탈락 관찰 레코드, 양쪽 탈락 항목)``.
+
+        셋째 값은 둘째 값과 **같은 항목**을 분석 객체로 담은 것이다. 신규
+        항목에는 쓸 일이 없지만(저장하지 않는다), 재평가 항목에는 쓴다 -
+        이미 저장된 행의 측정값을 새 판정으로 갱신해야 하기 때문이다
+        (Codex 게이트 4R MEDIUM).
     """
     if not profile or not getattr(profile, "sources", None):
-        return [], []
+        return [], [], []
     if source not in profile.sources:
         # 협의회 소스가 아니면 측정도 탈락 기록도 하지 않는다.
-        return [], []
+        return [], [], []
 
     selected_by_id = {ann.source_id: ann for ann in selected}
     extras: List[AnalyzedAnnouncement] = []
     drops: List[CouncilDrop] = []
+    unmatched: List[AnalyzedAnnouncement] = []
 
     for raw in raw_items:
         verdict = score_item(
@@ -306,6 +312,11 @@ def apply_council_profile(
             continue
 
         analyzed = analyze(raw)
+        analyzed.council_score = verdict.score
+        analyzed.council_tags = verdict.tags_json()
+        analyzed.council_match = verdict.match
+        analyzed.council_only = 1
+
         if not verdict.match:
             drops.append(CouncilDrop(
                 source=raw.source,
@@ -317,15 +328,12 @@ def apply_council_profile(
                 council_score=verdict.score,
                 reason=verdict.reason,
             ))
+            unmatched.append(analyzed)
             continue
 
-        analyzed.council_score = verdict.score
-        analyzed.council_tags = verdict.tags_json()
-        analyzed.council_match = verdict.match
-        analyzed.council_only = 1
         extras.append(analyzed)
 
-    return extras, drops
+    return extras, drops, unmatched
 
 
 def run_pipeline(test_mode: bool = False) -> None:
@@ -516,7 +524,7 @@ def run_pipeline(test_mode: bool = False) -> None:
                     # 영원히 없다. 재평가 목록으로 넘겨 회사 분석을 다시
                     # 지나게 한다.
                     try:
-                        if db.is_council_only(raw_ann):
+                        if db.needs_council_recheck(raw_ann):
                             recheck_raw.append(raw_ann)
                     except Exception as e:
                         logger.debug(
@@ -549,22 +557,25 @@ def run_pipeline(test_mode: bool = False) -> None:
             logger.info(f"{crawler_name}: Running keyword analysis on {new_count} announcements")
 
             source_cfg = config.crawler.sources.get(crawler_name)
-            analyzed, bypassed = select_for_storage(
-                keyword_analyzer, new_raw, source_cfg
-            )
-            relevant_count = len(analyzed)
 
-            # 협의회 단독 행 재평가 - **회사 통계와 섞지 않는다**.
-            # 이 항목들은 신규가 아니므로 new_count·relevant_count·
-            # all_new_announcements(지식 레이어) 어디에도 들어가지 않는다.
-            recheck_selected: List[AnalyzedAnnouncement] = []
+            # 신규와 재평가를 **한 목록으로** 고른다 (Codex 게이트 4R HIGH).
+            # 선택 경로가 둘이면 한쪽만 LLM 관문을 지나는 일이 생긴다 - 실제로
+            # 라운드 3 의 재평가분은 키워드 임계만 넘고 Stage 3 를 건너뛰었다.
+            # 통계에서만 뒤에서 갈라낸다.
+            recheck_keys = {(r.source, r.source_id) for r in recheck_raw}
+            selected_all, bypassed = select_for_storage(
+                keyword_analyzer, new_raw + recheck_raw, source_cfg
+            )
+
+            def _is_recheck(ann: AnalyzedAnnouncement) -> bool:
+                return (ann.source, ann.source_id) in recheck_keys
+
+            analyzed = [ann for ann in selected_all if not _is_recheck(ann)]
+            relevant_count = len(analyzed)
             if recheck_raw:
-                recheck_selected, _ = select_for_storage(
-                    keyword_analyzer, recheck_raw, source_cfg
-                )
                 logger.info(
-                    f"{crawler_name}: 협의회 단독 {len(recheck_raw)}건 재평가 "
-                    f"-> 회사 통과 {len(recheck_selected)}건"
+                    f"{crawler_name}: 협의회 단독 {len(recheck_raw)}건을 "
+                    f"신규 {new_count}건과 같은 선택 경로로 보낸다"
                 )
 
             if bypassed:
@@ -583,21 +594,33 @@ def run_pipeline(test_mode: bool = False) -> None:
             # ---------------------------------------------------------------------------
 
             llm_available = claude_analyzer.client or claude_analyzer.backend == "ollama"
-            if relevant_count > 0 and llm_available:
-                logger.info(f"{crawler_name}: Running Claude analysis on {relevant_count} announcements")
-                analyzed = claude_analyzer.analyze_batch(analyzed)
+            if selected_all and llm_available:
+                logger.info(
+                    f"{crawler_name}: Running Claude analysis on "
+                    f"{len(selected_all)} announcements"
+                )
+                selected_all = claude_analyzer.analyze_batch(selected_all)
 
-                # Re-filter by Claude threshold
+                # Re-filter by Claude threshold - 재평가분도 **같은 관문**을 탄다.
                 claude_relevant = [
-                    ann for ann in analyzed
+                    ann for ann in selected_all
                     if ann.relevance_score >= config.analyzer.claude_threshold
                 ]
                 logger.info(
-                    f"{crawler_name}: {len(claude_relevant)}/{relevant_count} passed Claude threshold "
-                    f"(>= {config.analyzer.claude_threshold})"
+                    f"{crawler_name}: {len(claude_relevant)}/{len(selected_all)} "
+                    f"passed Claude threshold (>= {config.analyzer.claude_threshold})"
                 )
-                analyzed = claude_relevant
+                selected_all = claude_relevant
+                analyzed = [ann for ann in selected_all if not _is_recheck(ann)]
                 relevant_count = len(analyzed)
+
+            # 관문을 다 지난 뒤에야 재평가분을 갈라낸다.
+            recheck_selected = [ann for ann in selected_all if _is_recheck(ann)]
+            if recheck_raw:
+                logger.info(
+                    f"{crawler_name}: 재평가 {len(recheck_raw)}건 중 "
+                    f"회사 통과 {len(recheck_selected)}건"
+                )
 
             # ---------------------------------------------------------------------------
             # Stage 4: Save to database
@@ -606,16 +629,17 @@ def run_pipeline(test_mode: bool = False) -> None:
             # ── 협의회 적재 프로파일 (관찰 모드, 계약 §A) ────────────
             # 회사 선택 결과에는 측정값만 붙고, 회사가 버린 협의회 매치만
             # 따로 저장된다. 지식 레이어·알림에는 넘기지 않는다.
-            council_extra, council_drops = apply_council_profile(
+            council_extra, council_drops, _new_unmatched = apply_council_profile(
                 config.council_profile,
                 crawler_name,
                 new_raw,
                 analyzed,
                 keyword_analyzer.analyze,
             )
-            # 재평가분의 탈락 레코드는 **버린다**: 원장의 뜻은 "저장되지 않은
-            # 항목" 이고, 이 항목들은 이미 announcements 에 있다.
-            recheck_extra, _recheck_drops = apply_council_profile(
+            # 재평가분의 탈락 **레코드**는 버린다: 원장의 뜻은 "저장되지 않은
+            # 항목" 이고, 이 항목들은 이미 announcements 에 있다. 대신 탈락
+            # **항목**은 받아서 측정값을 새 판정으로 갱신한다 (게이트 4R).
+            recheck_extra, _recheck_drops, recheck_unmatched = apply_council_profile(
                 config.council_profile,
                 crawler_name,
                 recheck_raw,
@@ -649,14 +673,24 @@ def run_pipeline(test_mode: bool = False) -> None:
                 )
 
             # 재평가분은 전부 UPDATE 경로로 간다 (이미 저장된 행이다).
-            # council_only=0 이면 승격, 1이면 측정값만 새로 고친다.
+            #   recheck_selected  회사 통과 -> council_only=0 으로 **승격**
+            #   recheck_extra     협의회만 매치 -> 플래그 유지, 측정 갱신
+            #   recheck_unmatched 양쪽 탈락 -> 플래그 유지, 측정을 **0 으로** 갱신
+            # 셋 다 council_only 는 UPDATE 의 CASE 가 지킨다(강등 없음).
             promoted = sum(1 for ann in recheck_selected if ann.council_only == 0)
-            for ann in recheck_selected + recheck_extra:
+            for ann in recheck_selected + recheck_extra + recheck_unmatched:
                 db.insert_announcement(ann)
+            for raw_ann in recheck_raw:
+                try:
+                    db.mark_council_rechecked(raw_ann)
+                except Exception as e:
+                    logger.debug(
+                        f"recheck bookkeeping failed for {raw_ann.source_id}: {e}"
+                    )
             if recheck_raw:
                 logger.info(
                     f"{crawler_name}: 재평가 결과 승격 {promoted}건, "
-                    f"측정 갱신 {len(recheck_extra)}건"
+                    f"측정 갱신 {len(recheck_extra) + len(recheck_unmatched)}건"
                 )
 
             # Record run statistics
@@ -744,7 +778,7 @@ def run_pipeline(test_mode: bool = False) -> None:
         if not test_mode:
             if telegram_ok and email_ok:
                 for ann in unnotified:
-                    db.mark_notified(ann.source_id)
+                    db.mark_notified(ann)
                 notified_count = len(unnotified)
                 logger.info(f"Marked {notified_count} announcements as notified")
             else:

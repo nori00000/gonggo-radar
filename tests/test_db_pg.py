@@ -130,7 +130,7 @@ class TestPostgreSQLCRUD:
     def test_mark_notified(self, pg_db, pg_sample_announcement):
         """Mark notified should update is_notified flag."""
         pg_db.insert_announcement(pg_sample_announcement)
-        pg_db.mark_notified("pg-001")
+        pg_db.mark_notified(pg_sample_announcement)
         unnotified = pg_db.get_unnotified()
         assert len(unnotified) == 0
 

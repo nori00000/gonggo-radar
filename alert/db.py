@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
@@ -179,6 +180,26 @@ PHONE_MASK = "[전화]"
 _EMAIL_RE = re.compile(r"[\w.+-]+@[\w-]+(?:\.[\w-]+)+")
 # 0 으로 시작하는 국내 번호꼴만 본다 - `2026-09-13` 같은 날짜를 먹지 않는다.
 _PHONE_RE = re.compile(r"0\d{1,2}[-.\s]?\d{3,4}[-.\s]?\d{4}")
+
+
+# 협의회 단독 행을 다시 채점하기까지의 최소 간격 (계약 §A 라운드 4).
+# 본문이 바뀌면 이 간격과 무관하게 즉시 다시 본다.
+COUNCIL_RECHECK_MIN_HOURS = 24
+
+
+def announcement_content_hash(announcement: RawAnnouncement) -> str:
+    """채점에 쓰이는 네 필드의 해시 — 본문이 바뀌었는지 판정하는 값.
+
+    ``score_item`` 이 보는 필드와 **같은 네 개**를 쓴다. 여기서 빠진 필드가
+    생기면 본문이 바뀌었는데도 재평가를 건너뛴다.
+    """
+    payload = "\u0000".join([
+        announcement.title or "",
+        announcement.summary or "",
+        announcement.target or "",
+        announcement.category or "",
+    ])
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
 def mask_contacts(text: Optional[str], phones: bool = True) -> str:
@@ -412,11 +433,33 @@ class Database:
         ).fetchall()
         return [self._row_to_announcement(r) for r in rows]
 
-    def mark_notified(self, source_id: str) -> None:
-        """Mark an announcement as notified by its *source_id*."""
+    def mark_notified(self, announcement: AnalyzedAnnouncement) -> None:
+        """보낸 **그 행만** 알림 완료로 표시한다.
+
+        예전 구현은 ``WHERE source_id = ?`` 하나로 지웠다. ``source_id`` 는
+        소스 안에서만 유일하므로(저장 키는 ``(source, source_id)``), 다른
+        소스의 같은 식별자를 가진 행까지 함께 알림 완료가 됐다 - 그 행은
+        보내지지 않았는데 영원히 알림 후보에서 사라진다. 협의회 단독 행이
+        생기면서 이 오래된 버그가 실제로 물린다 (Codex 게이트 4R MEDIUM).
+
+        행 id 로 지운다. id 가 없으면 ``_find_row`` 로 한 행을 찾아서 그
+        id 를 쓴다 - 식별은 계속 한 자리에서만 일어난다 (16차 게이트).
+
+        Args:
+            announcement: 실제로 발송한 공고 (``get_unnotified`` 가 준 객체).
+        """
+        row_id = getattr(announcement, "id", None)
+        if row_id is None:
+            row = self._find_row("id", announcement)
+            if row is None:
+                return
+            row_id = row["id"]
         self._conn.execute(
-            _sql("UPDATE announcements SET is_notified = 1, updated_at = ? WHERE source_id = ?"),
-            (datetime.now().isoformat(), source_id),
+            _sql(
+                "UPDATE announcements SET is_notified = 1, updated_at = ?"
+                " WHERE id = ?"
+            ),
+            (datetime.now().isoformat(), row_id),
         )
         if self._backend == "sqlite":
             self._conn.commit()
@@ -637,6 +680,59 @@ class Database:
         """
         row = self._find_row("council_only", announcement)
         return bool(row is not None and row["council_only"])
+
+    def needs_council_recheck(self, announcement: RawAnnouncement) -> bool:
+        """이 협의회 단독 행을 **이번 실행에서** 다시 채점해야 하는가.
+
+        매 실행 전량을 다시 채점하면 목록이 그대로여도 비용이 선형으로 는다.
+        그래서 두 조건 중 하나일 때만 본다 (계약 §A 라운드 4):
+
+        1. 본문(제목·요약·대상·분류) 해시가 지난번과 다르다 - 즉시 재평가.
+        2. 마지막 재평가로부터 ``COUNCIL_RECHECK_MIN_HOURS`` 가 지났다.
+
+        절약 장부가 비어 있으면(``NULL``) 반드시 재평가한다 - 모르는 것은
+        건너뛰지 않는다.
+
+        Returns:
+            협의회 단독 행이면서 위 조건에 해당하면 True.
+        """
+        row = self._find_row(
+            "council_only, council_rechecked_at, council_content_hash", announcement
+        )
+        if row is None or not row["council_only"]:
+            return False
+
+        if row["council_content_hash"] != announcement_content_hash(announcement):
+            return True                      # 본문이 바뀌었다
+
+        last = row["council_rechecked_at"]
+        if not last:
+            return True                      # 재평가한 적 없다
+        try:
+            seen = datetime.fromisoformat(str(last))
+        except ValueError:
+            return True                      # 못 읽는 값은 모르는 값이다
+        return (datetime.now() - seen) >= timedelta(hours=COUNCIL_RECHECK_MIN_HOURS)
+
+    def mark_council_rechecked(self, announcement: RawAnnouncement) -> None:
+        """재평가 장부를 갱신한다 - 행은 ``_find_row`` 로만 찾는다."""
+        row = self._find_row("id", announcement)
+        if row is None:
+            return
+        self._conn.execute(
+            _sql(
+                "UPDATE announcements"
+                "   SET council_rechecked_at = ?, council_content_hash = ?"
+                " WHERE id = ?"
+            ),
+            (
+                datetime.now().isoformat(),
+                announcement_content_hash(announcement),
+                row["id"],
+            ),
+        )
+        if self._backend == "sqlite":
+            self._conn.commit()
 
     def mark_legacy_rows(
         self, evidence_keys: Optional[Dict[str, Sequence[str]]] = None

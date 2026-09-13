@@ -19,7 +19,12 @@ from alert import council
 from alert.config import CouncilProfileConfig, get_config
 from alert.analyzer import KeywordAnalyzer
 from alert import main as main_mod
-from alert.db import COUNCIL_DROP_RETENTION_DAYS, Database
+from alert.db import (
+    COUNCIL_DROP_RETENTION_DAYS,
+    COUNCIL_RECHECK_MIN_HOURS,
+    Database,
+    announcement_content_hash,
+)
 from alert.migrations import MIGRATIONS
 from alert.digest.composer import compose_digest_data
 from alert.main import apply_council_profile, select_for_storage
@@ -233,9 +238,10 @@ class TestStorageRule:
         selected, _ = select_for_storage(company_analyzer, items, None)
         assert selected == []
 
-        extras, drops = apply_council_profile(
+        extras, drops, unmatched = apply_council_profile(
             profile, "kofpi", items, selected, company_analyzer.analyze
         )
+        assert unmatched == []
         assert len(extras) == 1
         assert extras[0].council_match == 1
         assert extras[0].council_only == 1
@@ -247,7 +253,7 @@ class TestStorageRule:
     ):
         """협의회 단독 행의 회사 점수는 **계산값 그대로** (임계 미달)."""
         items = [FIXTURE_ITEMS[2]]
-        extras, _ = apply_council_profile(
+        extras, _drops, _unmatched = apply_council_profile(
             profile, "kofpi", items, [], company_analyzer.analyze
         )
         threshold = get_config().analyzer.keyword_threshold
@@ -256,30 +262,32 @@ class TestStorageRule:
     def test_excluded_item_is_dropped_not_stored(self, profile, company_analyzer):
         """제외어 항목은 저장되지 않고 **탈락 원장 레코드**로 온다."""
         items = [FIXTURE_ITEMS[5]]        # forest_press 호우 보도
-        extras, drops = apply_council_profile(
+        extras, drops, unmatched = apply_council_profile(
             profile, "forest_press", items, [], company_analyzer.analyze
         )
         assert extras == []
         assert len(drops) == 1
         assert drops[0].source_id == "p1"
         assert drops[0].reason.startswith("제외 키워드")
+        # 같은 항목이 분석 객체로도 온다 - 재평가분의 측정 갱신에 쓰인다.
+        assert [a.source_id for a in unmatched] == ["p1"]
+        assert unmatched[0].council_match == 0
 
     def test_drop_records_posted_at_from_raw_data(self, profile, company_analyzer):
         """탈락 레코드의 posted_at 은 raw_data 의 ``posted`` 에서 온다."""
         item = raw("kofpi", "d1", "추석 명절 선물 안내")
         item.raw_data = json.dumps({"posted": "2026-09-10"}, ensure_ascii=False)
-        _, drops = apply_council_profile(
+        _extras, drops, _unmatched = apply_council_profile(
             profile, "kofpi", [item], [], company_analyzer.analyze
         )
         assert drops[0].posted_at == "2026-09-10"
 
     def test_no_drops_for_non_council_sources(self, profile, company_analyzer):
         """협의회 소스가 아니면 측정도 탈락 기록도 하지 않는다."""
-        extras, drops = apply_council_profile(
+        assert apply_council_profile(
             profile, "smartfarm", [raw("smartfarm", "x1", "무관한 공고")],
             [], company_analyzer.analyze
-        )
-        assert (extras, drops) == ([], [])
+        ) == ([], [], [])
 
     def test_bypass_source_leaves_no_extras(self, profile, company_analyzer):
         """bypass 소스는 전량이 이미 선택되므로 단독 적재분이 없다.
@@ -294,17 +302,17 @@ class TestStorageRule:
         )
         assert bypassed and len(selected) == len(items)
 
-        extras, drops = apply_council_profile(
+        extras, drops, unmatched = apply_council_profile(
             profile, "kofpi", items, selected, company_analyzer.analyze
         )
-        assert extras == [] and drops == []
+        assert (extras, drops, unmatched) == ([], [], [])
         assert any(a.council_match == 1 for a in selected)
 
     def test_empty_profile_stores_nothing_extra(self, company_analyzer):
         """프로파일이 비면 배선 전체가 무동작이다."""
         assert apply_council_profile(
             CouncilProfileConfig(), "kofpi", FIXTURE_ITEMS, [], company_analyzer.analyze
-        ) == ([], [])
+        ) == ([], [], [])
 
 
 class TestDropLedger:
@@ -385,7 +393,7 @@ class TestInvariantCompanyAlertPath:
         before = snapshot(before_sel)
 
         after_sel, _ = select_for_storage(company_analyzer, FIXTURE_ITEMS, None)
-        extras, _drops = apply_council_profile(
+        extras, _drops, _unmatched = apply_council_profile(
             profile, "seis", FIXTURE_ITEMS, after_sel, company_analyzer.analyze
         )
 
@@ -1391,10 +1399,392 @@ class TestMigrationSevenDefaults:
     def test_guard_column_keeps_zero_default(self):
         assert "ADD COLUMN council_only INTEGER DEFAULT 0" in self.migration_sql(7)
 
-    def test_no_upgrade_migration_is_declared(self):
-        """마이그레이션 9 는 없다 - 7 을 적용한 DB 가 존재한 적이 없다.
+    def test_no_backfill_migration_rewrites_measurements(self):
+        """측정값을 **소급해 고치는** 마이그레이션은 없다 (보고서 §R3-5).
 
-        보고서 §R3-5 의 근거: 운영 DB 는 schema_version 최대 6, council_* 컬럼
-        0개. 되돌릴 대상이 없으므로 승급 마이그레이션을 만들지 않는다.
+        7 을 적용한 DB 가 존재한 적이 없어 되돌릴 대상이 없고, 구 기본값
+        DB 에서는 미측정과 측정된 미매치를 SQL 로 구분할 수 없다. 그래서
+        어떤 마이그레이션도 council_* 값을 UPDATE 하지 않는다 - 라운드 4 의
+        마이그레이션 9 도 컬럼만 더할 뿐이다.
         """
-        assert max(version for version, _d, _s in MIGRATIONS) == 8
+        for version, _desc, statements in MIGRATIONS:
+            for sql in statements:
+                flat = " ".join(sql.split()).upper()
+                if "UPDATE ANNOUNCEMENTS" in flat and "COUNCIL_" in flat:
+                    raise AssertionError(f"migration {version} 이 측정값을 고친다: {sql}")
+
+    def test_recheck_bookkeeping_columns_are_nullable(self):
+        sql = self.migration_sql(9)
+        assert "ADD COLUMN council_rechecked_at TEXT DEFAULT NULL" in sql
+        assert "ADD COLUMN council_content_hash TEXT DEFAULT NULL" in sql
+
+
+# ---------------------------------------------------------------------------
+# 6. 라운드 4 — Codex 재재검토
+# ---------------------------------------------------------------------------
+
+class _StubLLM:
+    """LLM 백엔드 스텁 — 주어진 점수로 전량을 다시 매긴다."""
+
+    def __init__(self, score):
+        self.score = score
+        self.client = object()          # llm_available 을 True 로
+        self.backend = "claude"
+        self.seen = []
+
+    def analyze_batch(self, announcements):
+        self.seen.append([a.source_id for a in announcements])
+        for ann in announcements:
+            ann.relevance_score = self.score
+        return list(announcements)
+
+
+class TestRecheckGoesThroughTheSameGates(TestPipelinePromotion):
+    """HIGH: 재평가분도 신규와 **같은** 선택 경로(키워드 + LLM)를 지난다."""
+
+    def run_with_llm(self, monkeypatch, db_path, title, captured, llm):
+        titles = [title]
+        monkeypatch.setattr(main_mod, "Database", lambda *a, **k: Database(db_path))
+        monkeypatch.setattr(
+            main_mod, "setup_logger",
+            lambda *a, **k: logging.getLogger("test-pipeline"),
+        )
+        monkeypatch.setattr(
+            main_mod, "_import_crawlers",
+            lambda: {self.SOURCE: self.make_crawler(titles)},
+        )
+        if llm is not None:
+            monkeypatch.setattr(main_mod, "ClaudeAnalyzer", lambda: llm)
+        original = Database.get_unnotified
+
+        def spy(db_self):
+            rows = original(db_self)
+            captured.append([a.source_id for a in rows])
+            return rows
+
+        monkeypatch.setattr(Database, "get_unnotified", spy)
+        main_mod.run_pipeline()
+
+    def seed_council_only(self, monkeypatch, db_path, captured):
+        with monkeypatch.context() as m:
+            self.run_once(m, db_path, self.COUNCIL_ONLY_TITLE, captured)
+        assert self.row(db_path)["council_only"] == 1
+
+    def test_llm_rejection_blocks_promotion(self, tmp_path, monkeypatch):
+        """키워드는 통과해도 LLM 이 거절하면 승격되지 않는다."""
+        db_path = tmp_path / "llm.db"
+        captured = []
+        self.seed_council_only(monkeypatch, db_path, captured)
+
+        llm = _StubLLM(0.0)          # claude_threshold(0.3) 미만 -> 전량 탈락
+        with monkeypatch.context() as m:
+            self.run_with_llm(m, db_path, self.COMPANY_TITLE, captured, llm)
+
+        row = self.row(db_path)
+        assert row["council_only"] == 1, "LLM 관문을 건너뛰고 승격됐다"
+        assert captured[1] == []
+        # 재평가 항목이 실제로 LLM 배치에 들어갔다는 증거
+        assert llm.seen and self.SOURCE_ID in llm.seen[0]
+
+    def test_llm_acceptance_promotes(self, tmp_path, monkeypatch):
+        db_path = tmp_path / "llm.db"
+        captured = []
+        self.seed_council_only(monkeypatch, db_path, captured)
+
+        llm = _StubLLM(0.9)
+        with monkeypatch.context() as m:
+            self.run_with_llm(m, db_path, self.COMPANY_TITLE, captured, llm)
+
+        row = self.row(db_path)
+        assert row["council_only"] == 0
+        assert row["relevance_score"] == pytest.approx(0.9)
+        assert captured[1] == [self.SOURCE_ID]
+
+    def test_single_selection_path_in_source(self):
+        """소스에 선택 함수 호출이 하나뿐인지 — 두 번째 경로가 다시 생기면 실패."""
+        source = (REPO_ROOT / "alert" / "main.py").read_text(encoding="utf-8")
+        tree = ast.parse(source)
+        calls = [
+            node for node in ast.walk(tree)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "select_for_storage"
+        ]
+        assert len(calls) == 1, "select_for_storage 호출이 하나여야 한다"
+
+
+class TestRecheckMeasurementRefresh:
+    """MEDIUM: 양쪽 탈락한 재평가 행도 측정값이 새 판정으로 갱신된다."""
+
+    SOURCE = "mois_sse"
+    SOURCE_ID = "refresh-1"
+
+    def test_unmatched_recheck_refreshes_measurement(self, tmp_path, monkeypatch):
+        db_path = tmp_path / "refresh.db"
+        captured = []
+        promo = TestPipelinePromotion()
+        promo.SOURCE, promo.SOURCE_ID = self.SOURCE, self.SOURCE_ID
+        promo.URL = f"https://example.com/{self.SOURCE}/{self.SOURCE_ID}"
+
+        # 1회차: 협의회 매치 -> council_only=1, council_match=1
+        with monkeypatch.context() as m:
+            promo.run_once(m, db_path, "산림 목재 이용 안내", captured)
+        first = promo.row(db_path)
+        assert (first["council_only"], first["council_match"]) == (1, 1)
+
+        # 2회차: 같은 행, 어느 프로파일에도 걸리지 않는 제목
+        with monkeypatch.context() as m:
+            promo.run_once(m, db_path, "추석 명절 청탁금지법 선물 바로알기", captured)
+
+        second = promo.row(db_path)
+        assert second["council_match"] == 0, "측정값이 갱신되지 않았다"
+        assert second["council_only"] == 1, "회사에 고른 적이 없으므로 플래그는 그대로"
+
+        conn = sqlite3.connect(db_path)
+        try:
+            assert conn.execute(
+                "SELECT COUNT(*) FROM announcements"
+            ).fetchone()[0] == 1, "행이 사라지거나 늘었다"
+            assert conn.execute(
+                "SELECT COUNT(*) FROM council_dropped"
+            ).fetchone()[0] == 0, "이미 저장된 행이 탈락 원장에 들어갔다"
+        finally:
+            conn.close()
+
+
+class TestMarkNotifiedScope:
+    """MEDIUM: 보낸 행만 알림 완료로 표시한다."""
+
+    def rows(self, db):
+        return {
+            (r["source"], r["source_id"]): r["is_notified"]
+            for r in db.conn.execute(
+                "SELECT source, source_id, is_notified FROM announcements"
+            ).fetchall()
+        }
+
+    def test_same_source_id_in_another_source_is_untouched(self, tmp_path):
+        """(A,x) 발송이 (B,x) 를 건드리지 않는다."""
+        db = Database(tmp_path / "notify.db")
+        try:
+            company = AnalyzedAnnouncement(
+                source="seis", source_id="x", title="사회적기업 지원사업 공고",
+                url="https://example.com/a/x", relevance_score=0.5,
+                council_match=1, council_only=0,
+            )
+            council_only = AnalyzedAnnouncement(
+                source="kofpi", source_id="x", title="산림 목재 이용 공고",
+                url="https://example.com/b/x", relevance_score=0.05,
+                council_score=0.5, council_tags="{}", council_match=1, council_only=1,
+            )
+            db.insert_announcement(company)
+            db.insert_announcement(council_only)
+
+            sent = db.get_unnotified()
+            assert [a.source for a in sent] == ["seis"]
+            for ann in sent:
+                db.mark_notified(ann)
+
+            marks = self.rows(db)
+            assert marks[("seis", "x")] == 1
+            assert marks[("kofpi", "x")] == 0, "보내지 않은 행이 알림 완료가 됐다"
+        finally:
+            db.close()
+
+    def test_falls_back_to_storage_key_without_row_id(self, tmp_path):
+        db = Database(tmp_path / "notify.db")
+        try:
+            db.insert_announcement(AnalyzedAnnouncement(
+                source="seis", source_id="x", title="사회적기업 공고",
+                url="https://example.com/a/x", relevance_score=0.5,
+            ))
+            db.insert_announcement(AnalyzedAnnouncement(
+                source="kofpi", source_id="x", title="산림 공고",
+                url="https://example.com/b/x", relevance_score=0.5,
+            ))
+            db.mark_notified(AnalyzedAnnouncement(
+                source="seis", source_id="x", title="", url="",
+            ))
+            marks = self.rows(db)
+            assert marks[("seis", "x")] == 1
+            assert marks[("kofpi", "x")] == 0
+        finally:
+            db.close()
+
+    def test_only_one_production_caller(self):
+        """호출자 감사 — 파이프라인 한 곳만 부른다."""
+        hits = []
+        for rel in ("alert/main.py", "alert/db.py",
+                    "alert/notifiers/telegram_bot.py", "alert/knowledge.py"):
+            for num, line in enumerate(
+                (REPO_ROOT / rel).read_text(encoding="utf-8").splitlines(), 1
+            ):
+                if "mark_notified(" in line and "def mark_notified" not in line:
+                    hits.append((rel, num, line.strip()))
+        # 줄 번호는 고정하지 않는다 - 호출 **수와 자리**만 고정한다.
+        assert len(hits) == 1, hits
+        rel, _num, text = hits[0]
+        assert rel == "alert/main.py"
+        assert text == "db.mark_notified(ann)", text
+
+
+class TestRecheckThrottle:
+    """LOW: 같은 행을 24시간 안에 두 번 채점하지 않는다 (본문이 그대로면)."""
+
+    def stored(self, tmp_path, title="산림 목재 이용 공고"):
+        db = Database(tmp_path / "throttle.db")
+        db.insert_announcement(AnalyzedAnnouncement(
+            source="mois_sse", source_id="t1", title=title,
+            url="https://example.com/t1", relevance_score=0.05,
+            council_score=0.5, council_tags="{}", council_match=1, council_only=1,
+        ))
+        return db
+
+    def fresh(self, title="산림 목재 이용 공고"):
+        return RawAnnouncement(
+            source="mois_sse", source_id="t1", title=title,
+            url="https://example.com/t1",
+        )
+
+    def test_first_sighting_is_always_rechecked(self, tmp_path):
+        db = self.stored(tmp_path)
+        try:
+            assert db.needs_council_recheck(self.fresh()) is True
+        finally:
+            db.close()
+
+    def test_recent_recheck_with_same_content_is_skipped(self, tmp_path):
+        db = self.stored(tmp_path)
+        try:
+            db.mark_council_rechecked(self.fresh())
+            assert db.needs_council_recheck(self.fresh()) is False
+        finally:
+            db.close()
+
+    def test_changed_content_forces_a_recheck(self, tmp_path):
+        db = self.stored(tmp_path)
+        try:
+            db.mark_council_rechecked(self.fresh())
+            assert db.needs_council_recheck(
+                self.fresh("사회적기업 지원사업 공고")
+            ) is True
+        finally:
+            db.close()
+
+    def test_stale_bookkeeping_forces_a_recheck(self, tmp_path):
+        db = self.stored(tmp_path)
+        try:
+            db.mark_council_rechecked(self.fresh())
+            stale = datetime.now() - timedelta(
+                hours=COUNCIL_RECHECK_MIN_HOURS + 1
+            )
+            db.conn.execute(
+                "UPDATE announcements SET council_rechecked_at = ?"
+                " WHERE source_id = 't1'",
+                (stale.isoformat(),),
+            )
+            db.conn.commit()
+            assert db.needs_council_recheck(self.fresh()) is True
+        finally:
+            db.close()
+
+    def test_company_rows_are_never_rechecked(self, tmp_path):
+        db = Database(tmp_path / "throttle.db")
+        try:
+            db.insert_announcement(AnalyzedAnnouncement(
+                source="mois_sse", source_id="c1", title="사회적기업 공고",
+                url="https://example.com/c1", relevance_score=0.5, council_only=0,
+            ))
+            assert db.needs_council_recheck(RawAnnouncement(
+                source="mois_sse", source_id="c1", title="사회적기업 공고",
+                url="https://example.com/c1",
+            )) is False
+        finally:
+            db.close()
+
+    def test_unreadable_timestamp_is_treated_as_unknown(self, tmp_path):
+        db = self.stored(tmp_path)
+        try:
+            db.mark_council_rechecked(self.fresh())
+            db.conn.execute(
+                "UPDATE announcements SET council_rechecked_at = 'not-a-date'"
+                " WHERE source_id = 't1'"
+            )
+            db.conn.commit()
+            assert db.needs_council_recheck(self.fresh()) is True
+        finally:
+            db.close()
+
+    def test_hash_covers_every_scored_field(self):
+        """해시가 score_item 이 보는 네 필드를 전부 덮는가."""
+        base = RawAnnouncement(source="s", source_id="i", title="t", url="u")
+        baseline = announcement_content_hash(base)
+        for field_name in ("title", "summary", "target", "category"):
+            other = RawAnnouncement(source="s", source_id="i", title="t", url="u")
+            setattr(other, field_name, "바뀐값")
+            assert announcement_content_hash(other) != baseline, field_name
+
+    def _run_counting_selections(self, monkeypatch, promo, db_path, title, sizes):
+        """파이프라인 1회 실행 + 선택 함수에 들어간 항목 수 기록."""
+        original = main_mod.select_for_storage
+
+        def spy(analyzer, raw_items, source_cfg):
+            sizes.append(len(raw_items))
+            return original(analyzer, raw_items, source_cfg)
+
+        with monkeypatch.context() as m:
+            m.setattr(main_mod, "select_for_storage", spy)
+            promo.run_once(m, db_path, title, [])
+
+    def test_pipeline_skips_a_fresh_recheck(self, tmp_path, monkeypatch):
+        """3회차는 **선택 함수를 아예 부르지 않는다** - 절약이 실제로 걸렸다.
+
+        절약 장부를 무시하면(중복 필터가 council_only 만 보면) 3회차에도
+        재평가 1건이 선택 함수로 들어가므로 이 단언이 깨진다.
+        """
+        db_path = tmp_path / "throttle-pipeline.db"
+        promo = TestPipelinePromotion()
+        title = promo.COUNCIL_ONLY_TITLE
+        sizes = []
+
+        # 1회차: 신규 1건
+        self._run_counting_selections(monkeypatch, promo, db_path, title, sizes)
+        assert sizes == [1]
+        assert self.bookkeeping(db_path)["council_rechecked_at"] is None
+
+        # 2회차: 장부가 비어 있으므로 재평가 1건
+        self._run_counting_selections(monkeypatch, promo, db_path, title, sizes)
+        assert sizes == [1, 1]
+        book = self.bookkeeping(db_path)
+        assert book["council_rechecked_at"] is not None
+        assert book["council_content_hash"]
+
+        # 3회차: 24시간 안 + 본문 동일 -> 호출 없음
+        self._run_counting_selections(monkeypatch, promo, db_path, title, sizes)
+        assert sizes == [1, 1], "절약 장부가 걸리지 않았다"
+
+    def test_pipeline_rechecks_when_content_changes(self, tmp_path, monkeypatch):
+        db_path = tmp_path / "throttle-pipeline.db"
+        promo = TestPipelinePromotion()
+        sizes = []
+        self._run_counting_selections(
+            monkeypatch, promo, db_path, promo.COUNCIL_ONLY_TITLE, sizes)
+        self._run_counting_selections(
+            monkeypatch, promo, db_path, promo.COUNCIL_ONLY_TITLE, sizes)
+        assert sizes == [1, 1]
+
+        # 본문이 바뀌면 24시간 안이어도 다시 본다
+        self._run_counting_selections(
+            monkeypatch, promo, db_path, "임업 산촌자원 개발 안내", sizes)
+        assert sizes == [1, 1, 1]
+
+    @staticmethod
+    def bookkeeping(db_path):
+        conn = sqlite3.connect(db_path)
+        conn.row_factory = sqlite3.Row
+        try:
+            return dict(conn.execute(
+                "SELECT council_rechecked_at, council_content_hash FROM announcements"
+            ).fetchone())
+        finally:
+            conn.close()

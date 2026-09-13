@@ -171,6 +171,21 @@ MIGRATIONS: List[Tuple[int, str, List[str]]] = [
             " ON council_dropped(seen_at);",
         ]
     ),
+    # 협의회 단독 행 재평가의 **절약 장부** (계약 §A 라운드 4 / Codex LOW).
+    # 같은 행을 매 실행 다시 채점하면 목록이 그대로여도 비용이 선형으로 는다.
+    # 마지막 재평가 시각과 그때의 본문 해시를 남겨, 24시간 안이고 본문이
+    # 그대로면 건너뛴다. 둘 다 NULL = "재평가한 적 없음" = 반드시 본다.
+    #
+    # 이것은 **측정값이 아니라 절약 장부**다. 알림·브리핑 가드(council_only)와
+    # 무관하고, 값이 없다고 해서 결과가 달라지지 않는다(한 번 더 볼 뿐).
+    (
+        9,
+        "Add council recheck bookkeeping columns to announcements",
+        [
+            "ALTER TABLE announcements ADD COLUMN council_rechecked_at TEXT DEFAULT NULL;",
+            "ALTER TABLE announcements ADD COLUMN council_content_hash TEXT DEFAULT NULL;",
+        ]
+    ),
 ]
 
 
