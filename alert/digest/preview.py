@@ -21,12 +21,19 @@ from alert.digest import blocks as blocks_mod
 from alert.digest import sections as sections_mod
 from alert.digest.composer import (
     HEADING_TO_SECTION,
+    HEADLINE_LINE_RE,
     ITEM_SECTIONS,
     KAKAO_CHUNK_LIMIT,
+    KIND_MONTHLY,
     MARKER,
     URL_TOO_LONG_NOTICE,
     chunk_plaintext,
     fit_prose_urls,
+    format_month_day,
+    get_issue_date_range,
+    headline_label,
+    issue_kind,
+    parse_deadline,
 )
 
 __all__ = [
@@ -43,7 +50,8 @@ __all__ = [
 TELEGRAM_LIMIT = KAKAO_CHUNK_LIMIT
 
 _TITLE_RE = re.compile(r"^#\s+(.+)$")
-_HEADLINE_RE = re.compile(r"^이번 주 한 줄:\s*(.*)$")
+# 한 줄 자리 정본은 composer 다 — 주간호 `이번 주 한 줄:` · 월간호 `이번 달 한 줄:`
+_HEADLINE_RE = HEADLINE_LINE_RE
 _PERIOD_IN_TITLE_RE = re.compile(r"\(([^()]*~[^()]*)\)\s*$")
 _HOLD_RE = re.compile(
     r"^<!--\s*보류:\s*(\d+)\.\s*(.*?)\s*\|\s*(.*?)\s*"
@@ -161,10 +169,11 @@ def parse_digest(markdown_text: str, item_sections=None) -> Dict:
     }
 
 
-def status_line(parsed: Dict, check_pass: bool) -> str:
+def status_line(parsed: Dict, check_pass: bool, kind: str = "") -> str:
     """상태줄 — 한 줄이 아직 없으면 "해설 대기", 있고 검증 통과면 "발송 가능"."""
     if parsed.get("has_marker"):
-        return "상태: 해설 대기 (이번 주 한 줄 미확정)"
+        return "상태: 해설 대기 ({} 미확정)".format(
+            headline_label(kind or "weekly"))
     if not check_pass:
         return "상태: 발송 불가 (팩트 게이트 실패)"
     return "상태: 발송 가능"
@@ -179,6 +188,26 @@ USAGE_LINES = (
     "  해설: <본문> — 협의회 의견을 채우고 다시 검증",
     "  /digest 상태 — 현재 상태 · /digest 재검토 — 파일 수정 후 재검증",
 )
+
+# 월간호 미리보기의 머리글·사용법 (P1' 계약 §3: 두 호가 같은 토픽에 공존한다 —
+# 어느 호의 미리보기인지 한 줄로 구분되어야 `제외 n` 을 엉뚱한 호에 쓰지 않는다).
+MONTHLY_USAGE_LINES = tuple(
+    "  상단: <한 줄> — 이번 달 한 줄 확정" if line.startswith("  상단:") else line
+    for line in USAGE_LINES
+)
+
+
+def _period_label(issue: str) -> str:
+    """호 키에서 기간 라벨 (`9/1~9/30`). 못 만들면 빈 문자열."""
+    try:
+        start_text, end_text = get_issue_date_range(issue)
+    except (ValueError, IndexError):
+        return ""
+    start = parse_deadline(start_text)
+    end = parse_deadline(end_text)
+    if not (start and end):
+        return ""
+    return f"{format_month_day(start)}~{format_month_day(end)}"
 
 
 def render_preview(
@@ -199,10 +228,12 @@ def render_preview(
     check_pass = bool(check.get("pass"))
     dropped = check.get("dropped") or []
 
+    kind = issue_kind(week)
     lines = [
-        f"🏛 협의회 주간 정책브리핑 {week}",
+        "🏛 협의회 {} {}".format(
+            "월간 종합" if kind == KIND_MONTHLY else "주간 정책브리핑", week),
         "기간 {} · 검증 {} · 항목 {}건{}".format(
-            parsed["period"] or "미상",
+            parsed["period"] or _period_label(week) or "미상",
             "pass" if check_pass else "fail",
             len(parsed["items"]),
             f" · 죽은 URL 제외 {len(dropped)}건" if dropped else "",
@@ -292,9 +323,10 @@ def render_preview(
         lines.append(f"보류 {len(parsed['holds'])}건 (핀 n으로 승격)")
         lines.append("")
 
-    lines.append(status_line(parsed, check_pass))
+    lines.append(status_line(parsed, check_pass, kind))
     lines.append("")
-    lines.extend(USAGE_LINES)
+    lines.extend(
+        MONTHLY_USAGE_LINES if kind == KIND_MONTHLY else USAGE_LINES)
     return "\n".join(lines)
 
 

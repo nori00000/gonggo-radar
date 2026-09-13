@@ -85,6 +85,13 @@ APPROVAL_ID_LEN = 12
 
 # 주차 형식 (사이클6 #9). ISO 주는 01~53 이다 — W00·W99 나 끝 개행을 받지 않는다.
 WEEK_RE = re.compile(r"\A\d{4}-W(0[1-9]|[1-4]\d|5[0-3])\Z")
+# 월간호 형식 (P1' 계약 §1). 달은 01~12 다 — M00·M13 을 받지 않는다.
+MONTH_RE = re.compile(r"\A\d{4}-M(0[1-9]|1[0-2])\Z")
+
+# 호(issue) 종류. 파일명·lock·state·items.json·check.json·kakao.txt 는 전부
+# **이 키를 그대로** 쓴다 — 주간호와 월간호의 좌표가 섞이지 않는 유일한 근거다.
+KIND_WEEKLY = "weekly"
+KIND_MONTHLY = "monthly"
 
 
 # 발송기 외의 작성자가 잠금을 기다리는 한도 (사이클7 #1)
@@ -105,18 +112,40 @@ def lock_timeout() -> float:
     return LOCK_TIMEOUT_SECONDS
 
 
+def issue_kind(issue) -> Optional[str]:
+    """호 키의 종류 (`2026-W40` → weekly, `2026-M10` → monthly). 아니면 None."""
+    if not isinstance(issue, str):
+        return None
+    if WEEK_RE.match(issue):
+        return KIND_WEEKLY
+    if MONTH_RE.match(issue):
+        return KIND_MONTHLY
+    return None
+
+
+def valid_issue(issue) -> bool:
+    """엄격한 호 키 형식 검사 (주간호 `YYYY-Www` 또는 월간호 `YYYY-Mmm`)."""
+    return issue_kind(issue) is not None
+
+
 def valid_week(week) -> bool:
-    """엄격한 주차 형식 검사."""
-    return bool(isinstance(week, str) and WEEK_RE.match(week))
+    """호 키 형식 검사 (P1' 계약 §1 이후 월간호 키도 받는다).
+
+    이름은 주간호 시절 그대로 두었다 — 호출부(weekly·recheck·notify·send·
+    apply_commentary)가 전부 "이 키로 digests/ 경로를 조립해도 되는가" 를 묻는
+    자리이고, 그 판정은 호 종류와 무관하게 같기 때문이다. 종류가 필요하면
+    :func:`issue_kind` 를 쓴다.
+    """
+    return valid_issue(week)
 
 
 def require_week(week) -> str:
-    """주차 형식이 아니면 ValueError — 경로 조립에 쓰기 전 관문.
+    """호 키 형식이 아니면 ValueError — 경로 조립에 쓰기 전 관문.
 
     `state_path("../x")` 같은 직접 호출이 digests/ 밖을 가리키던 경로를 막는다.
     """
     if not valid_week(week):
-        raise ValueError(f"주차 형식이 아닙니다: {week!r}")
+        raise ValueError(f"호 키 형식이 아닙니다: {week!r}")
     return week
 
 

@@ -1457,6 +1457,10 @@ def test_declared_sections_match_composed_digest(tmp_path):
     composer 에 SECTION_HEADINGS·ITEM_SECTIONS 상수가 있으므로 정본은 계약 v2
     헤딩이다 (sections.from_composer). 빈 DB 에서는 항목 섹션 둘만 실린다 —
     협의회에서·회원사 소식은 내용이 없으면 섹션 자체를 생략한다(개정 v2.4 (c)).
+
+    P1' 계약 §1 이후 선언 목록은 **주간호 + 월간호** 항목 헤딩의 합집합이다 —
+    판정이 언제나 "본문에 실제로 등장한 헤딩" 과의 정확 일치이므로, 주간호 본문의
+    항목 섹션 목록은 아래 둘째 단언처럼 바뀌지 않는다.
     """
     from alert.digest.composer import compose_digest
     from tests.test_digest import _create_announcements_table
@@ -1466,7 +1470,9 @@ def test_declared_sections_match_composed_digest(tmp_path):
     markdown = compose_digest(db_path=str(db), week_str="2026-W37")
     present = sections_mod.headings(markdown)
     item_sections, commentary_sections = sections_mod.declared()
-    assert item_sections == sections_mod.V2_ITEM_SECTIONS
+    assert item_sections == (
+        sections_mod.V2_ITEM_SECTIONS + sections_mod.MONTHLY_ITEM_SECTIONS
+    )
     assert [name for name in present if name in item_sections] == list(
         sections_mod.V2_ITEM_SECTIONS
     )

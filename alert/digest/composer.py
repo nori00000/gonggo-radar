@@ -35,6 +35,9 @@ VERDICT_NOTICE = "알아두세요"
 VERDICT_HOLD = "보류"
 VERDICT_EXCLUDE = "배제"
 
+# P1' 계약 §2: 월간 종합호의 유일한 항목 섹션.
+VERDICT_MONTHLY = "월간 종합"
+
 SECTION_COUNCIL = "협의회에서"
 SECTION_MEMBER = "회원사 소식"
 
@@ -44,12 +47,46 @@ SECTION_HEADINGS = {
     VERDICT_NOTICE: "👀 알아두세요",
     SECTION_COUNCIL: "🤝 협의회에서",
     SECTION_MEMBER: "🏢 회원사 소식",
+    VERDICT_MONTHLY: "📚 월간 종합",
 }
 HEADING_TO_SECTION = {heading: name for name, heading in SECTION_HEADINGS.items()}
 
 # 항목이 실리는 섹션과 그 상한 (판정 ⑩)
 ITEM_SECTIONS = (VERDICT_APPLY, VERDICT_NOTICE)
-SECTION_LIMITS = {VERDICT_APPLY: 5, VERDICT_NOTICE: 3}
+# P1' 계약 §2: 월간호는 항목 섹션이 하나뿐이고 상한은 5건이다.
+MONTHLY_ITEM_SECTIONS = (VERDICT_MONTHLY,)
+SECTION_LIMITS = {VERDICT_APPLY: 5, VERDICT_NOTICE: 3, VERDICT_MONTHLY: 5}
+
+# ─── 호(issue) 종류 ──────────────────────────────────────────────────────
+# 키 형식·판정은 alert.digest.state 가 정본이다 (import 순환을 피하려고 지연 로드).
+KIND_WEEKLY = "weekly"
+KIND_MONTHLY = "monthly"
+
+
+def issue_kind(issue: Optional[str]) -> str:
+    """호 키 → 종류. 월간호 키가 아니면 주간호로 본다 (기존 경로 무변경).
+
+    weekly 경로는 예전처럼 `2026-W37` 만 다루고, compose 호출자가 키를 주지
+    않으면(기본값 = 현재 주) 언제나 weekly 다.
+    """
+    from alert.digest import state as state_mod
+
+    return (state_mod.KIND_MONTHLY
+            if state_mod.issue_kind(issue) == state_mod.KIND_MONTHLY
+            else KIND_WEEKLY)
+
+
+def item_sections_for(kind: str) -> Tuple[str, ...]:
+    """그 종류의 호가 렌더하는 항목 섹션 (순서 = 본문 순서)."""
+    return (MONTHLY_ITEM_SECTIONS if kind == KIND_MONTHLY else ITEM_SECTIONS)
+
+
+def data_kind(data: Dict) -> str:
+    """구조 데이터의 호 종류. `kind` 가 없는 옛/손수 만든 데이터는 키에서 유도한다."""
+    recorded = (data or {}).get("kind")
+    if recorded in (KIND_WEEKLY, KIND_MONTHLY):
+        return recorded
+    return issue_kind((data or {}).get("week"))
 
 # ─── 협의회 소스 풀 (판정 ②) ─────────────────────────────────────────────
 # 회사용 소스(smartfarm·ipet·nongup_gg·rda·goyang·mafra 등 농업·지자체 계열)는
@@ -354,7 +391,24 @@ RENEWAL_KEYWORDS = ("연장", "재공고", "추가모집", "재모집", "2차")
 KAKAO_CHUNK_LIMIT = 4096
 KAKAO_CHUNK_SEPARATOR = "---8<---"
 KAKAO_HEADLINE_PREFIX = "이번 주 한 줄: "
+# P1' 계약 §2: 월간호의 같은 자리 ("이번 달 한 줄"). 마커는 주간과 **동일**하다.
+KAKAO_MONTHLY_HEADLINE_PREFIX = "이번 달 한 줄: "
 KAKAO_HEADLINE_PLACEHOLDER = "(확정 필요)"
+
+# 두 호가 쓰는 한 줄 자리의 이름 (apply_commentary·glm_enrich·preview 가 공유).
+HEADLINE_LABELS = {KIND_WEEKLY: "이번 주 한 줄", KIND_MONTHLY: "이번 달 한 줄"}
+# 본문에서 한 줄 자리를 알아보는 정본 정규식 — 두 표기를 모두 받는다.
+HEADLINE_LINE_RE = re.compile(r"^이번 (?:주|달) 한 줄:\s*(.*)$")
+
+
+def headline_label(kind: str) -> str:
+    """그 종류의 호가 본문에 쓰는 한 줄 자리 이름."""
+    return HEADLINE_LABELS.get(kind, HEADLINE_LABELS[KIND_WEEKLY])
+
+
+def kakao_headline_prefix(kind: str) -> str:
+    return (KAKAO_MONTHLY_HEADLINE_PREFIX if kind == KIND_MONTHLY
+            else KAKAO_HEADLINE_PREFIX)
 
 # 인용 span을 찾을 수 없는 raw_data 키 (링크는 사람이 읽는 문구가 아니다)
 _RAW_SKIP_KEYS = ("link", "url", "href")
@@ -457,6 +511,27 @@ def get_week_date_range(week_str: str) -> Tuple[str, str]:
     week_end = week_start + timedelta(days=6)
 
     return week_start.strftime("%Y-%m-%d"), week_end.strftime("%Y-%m-%d")
+
+
+def get_month_date_range(month_str: str) -> Tuple[str, str]:
+    """월간호 키(`YYYY-Mmm`)에서 그 달의 1일과 말일 (P1' 계약 §2).
+
+    `2026-M09` → ("2026-09-01", "2026-09-30"). 대상은 **그 달에 posted 된 것**이며,
+    창 판정 규칙은 주간호와 같다(compose 가 같은 코드로 자른다).
+    """
+    year_text, _, month_text = month_str.partition("-M")
+    year = int(year_text)
+    month = int(month_text)
+    first = date(year, month, 1)
+    last = (date(year + (month == 12), (month % 12) + 1, 1) - timedelta(days=1))
+    return first.strftime("%Y-%m-%d"), last.strftime("%Y-%m-%d")
+
+
+def get_issue_date_range(issue_str: str) -> Tuple[str, str]:
+    """호 키 → (창 시작, 창 끝) 날짜 문자열. 종류에 따라 주/달을 자른다."""
+    if issue_kind(issue_str) == KIND_MONTHLY:
+        return get_month_date_range(issue_str)
+    return get_week_date_range(issue_str)
 
 
 def strip_controls(text: str) -> str:
@@ -928,6 +1003,30 @@ def classify_item(title: str, summary: str, source: str) -> Classification:
     )
 
 
+# ─── 월간 종합호 선별 (P1' 계약 §2) ──────────────────────────────────────
+# 월간호가 싣는 것은 **행동 대상이 아닌 것**이다: 정책 방향·계획·통계·보도자료·
+# (마감 없는) 행사·2차 미디어 기사. 판정은 새 분류기를 만들지 않고 **주간호 판정의
+# 부정**으로 한다 — 두 호가 같은 근거를 쓰지 않으면 같은 공고가 양쪽에 실린다.
+#   · 주간호 섹션 판정이 `신청하세요` 인 항목 → 주간호 몫
+#   · 마감이 있는 항목(알아두세요의 의견 마감·마감 있는 행사 포함) → 주간호 몫
+MONTHLY_HOLD_ACTIONABLE = "행동 대상 — 주간호 몫"
+MONTHLY_HOLD_DEADLINE = "마감 있음 — 주간호 몫"
+
+
+def monthly_hold_reason(item: Dict) -> Optional[str]:
+    """월간호에 싣지 않을 이유 (결정론). 실을 수 있으면 None.
+
+    `item` 은 `_build_item` 이 만든 딕셔너리이며, 마감은 중복 병합 뒤의
+    **유효 마감**(`item["deadline"]`)을 본다 — 병합 전 값으로 판정하면 복제본이
+    마감 없는 항목처럼 보여 월간호로 새어 들어온다.
+    """
+    if item["verdict"] == VERDICT_APPLY:
+        return MONTHLY_HOLD_ACTIONABLE
+    if item.get("deadline"):
+        return MONTHLY_HOLD_DEADLINE
+    return None
+
+
 # ─── 마감 처리 (판정 ④) ──────────────────────────────────────────────────
 # 개정 v2.5 (#8): `2026. 9. 12.`, `2026-9-12 18:00`, `2026년 9월 7일`, `26.09.30.(수)`,
 # `2026/09/30` 를 모두 받는다. 고정폭 슬라이싱(text[:10])이 이들을 조용히 None으로
@@ -1385,7 +1484,7 @@ def week_bounds(week_str: str) -> Tuple[str, str]:
     Returns:
         (창 시작 문자열, 창 끝 배타 문자열) — `created_at >= a AND created_at < b`
     """
-    week_start, week_end = get_week_date_range(week_str)
+    week_start, week_end = get_issue_date_range(week_str)
     end_exclusive = (
         datetime.strptime(week_end, "%Y-%m-%d") + timedelta(days=1)
     ).strftime("%Y-%m-%d")
@@ -1477,9 +1576,12 @@ def compose_digest_data(
         못한다** — 죽은 정보를 보내지 않는 규율이 편집자 선택보다 위다.
 
     Returns:
-        {"week", "week_start", "week_end", "period_label", "sections",
+        {"week", "kind", "week_start", "week_end", "period_label", "sections",
          "council_notes", "member_news", "holds", "excluded", "opinions",
          "merged_ids", "date_parse_failures", "candidate_ids"}
+
+        `week` 는 호 키다 — 주간호 `YYYY-Www`, 월간호 `YYYY-Mmm` (P1' 계약 §1).
+        `kind` 는 그 키에서 나온 종류이며 렌더·정본이 섹션 목록을 고르는 근거다.
     """
     if week_str is None:
         iso = datetime.now().isocalendar()
@@ -1487,7 +1589,8 @@ def compose_digest_data(
     if today is None:
         today = date.today()
 
-    week_start, week_end = get_week_date_range(week_str)
+    kind = issue_kind(week_str)
+    week_start, week_end = get_issue_date_range(week_str)
     range_start, range_end = window_prefilter_bounds(week_str)
     window_first = parse_deadline(week_start)
     window_last = parse_deadline(week_end)
@@ -1503,8 +1606,13 @@ def compose_digest_data(
     # 관찰 모드 가드 (P0 계약 §A 불변 조건 2): 협의회 프로파일 **단독**으로
     # 적재된 행은 후보에 넣지 않는다 - P0 에서 브리핑 동작은 바뀌지 않는다.
     # 컬럼이 없는 DB(마이그레이션 전·테스트 픽스처)는 거를 것이 없다.
+    #
+    # P1' 계약 §2: **월간호는 이 가드의 예외**다 — 월간호는 아직 발송 전이고
+    # 사람이 텔레그램 미리보기 게이트로 한 번 더 보므로, council_only 행을
+    # 후보에 넣어도 주간 발송 경로의 동작은 바뀌지 않는다.
     council_sql = ""
-    if _has_column(cursor, "announcements", "council_only"):
+    if kind != KIND_MONTHLY and _has_column(
+            cursor, "announcements", "council_only"):
         council_sql = " AND COALESCE(council_only, 0) = 0"
 
     # 판정 ④의 정렬 정본. 빈 문자열도 "마감 없음"으로 취급하려고 NULLIF를 쓴다.
@@ -1559,7 +1667,11 @@ def compose_digest_data(
         #   · 섹션 후보 → 상한·다양성 때문에 뒤에서 보류로 내려갈 항목이다.
         #     pinned 표시만 해 두면 선정 단계가 자리를 먼저 준다.
         if pin_ids and item["id"] in pin_ids:
-            if item["verdict"] == VERDICT_HOLD and item.get("pin_section"):
+            if kind == KIND_MONTHLY:
+                # 월간호의 섹션은 하나뿐이다 — 승격은 "월간호 선별에서 빠질
+                # 항목을 편집자가 되살린다" 는 뜻이고, 목적지는 언제나 월간 종합이다.
+                item["pinned"] = True
+            elif item["verdict"] == VERDICT_HOLD and item.get("pin_section"):
                 item["verdict"] = item["pin_section"]
                 item["pinned"] = True
             elif item["verdict"] in ITEM_SECTIONS:
@@ -1592,12 +1704,61 @@ def compose_digest_data(
         (fitting if kakao_item_fits(item) else url_too_long).append(item)
     kept = fitting
 
-    sections: Dict[str, List[Dict]] = {VERDICT_APPLY: [], VERDICT_NOTICE: []}
+    sections: Dict[str, List[Dict]] = {
+        name: [] for name in item_sections_for(kind)
+    }
     holds: List[Dict] = []
     for item in url_too_long:
         item["verdict"] = VERDICT_HOLD
         item["reason"] = HOLD_REASON_URL_TOO_LONG
         holds.append(item)
+
+    if kind == KIND_MONTHLY:
+        # P1' 계약 §2: 섹션 하나·상한 5·같은 소스 최대 2건. 선별에서 빠진 것은
+        # 버리지 않고 보류 주석으로 남긴다(주간호와 같은 정본 구조 — `핀 n` 복구).
+        monthly_candidates: List[Dict] = []
+        for item in kept:
+            reason = monthly_hold_reason(item)
+            if reason and not item.get("pinned"):
+                item["verdict"] = VERDICT_HOLD
+                item["reason"] = reason
+                holds.append(item)
+                continue
+            item["verdict"] = VERDICT_MONTHLY
+            monthly_candidates.append(item)
+        (monthly_selected, monthly_diversity, monthly_cap, monthly_pin_cap,
+         _monthly_pinned_taken) = _select_with_pins(
+            monthly_candidates, SECTION_LIMITS[VERDICT_MONTHLY], _sort_notice,
+            SOURCE_DIVERSITY_LIMIT,
+        )
+        sections[VERDICT_MONTHLY] = monthly_selected
+        demoted_ids: Set = set()
+        if pin_ids:
+            baseline = _select_with_pins(
+                monthly_candidates, SECTION_LIMITS[VERDICT_MONTHLY],
+                _sort_notice, SOURCE_DIVERSITY_LIMIT, honor_pins=False)[0]
+            demoted_ids = (
+                {item["id"] for item in baseline}
+                - {item["id"] for item in monthly_selected}
+            )
+        for item, reason in (
+            [(item, HOLD_REASON_DIVERSITY) for item in monthly_diversity]
+            + [(item, HOLD_REASON_SECTION_CAP) for item in monthly_cap]
+            + [(item, HOLD_REASON_PIN_CAP) for item in monthly_pin_cap]
+        ):
+            item["verdict"] = VERDICT_HOLD
+            item["reason"] = (
+                HOLD_REASON_PIN_BUMPED
+                if not item.get("pinned") and item["id"] in demoted_ids
+                else reason
+            )
+            holds.append(item)
+        return _finish_digest_data(
+            week_str, kind, week_start, week_end, sections, holds, excluded,
+            survivors, candidate_ids, date_parse_failures, forms_csv_path,
+            warnings_out, stats_out,
+        )
+
     apply_candidates: List[Dict] = []
     notice_candidates: List[Dict] = []
     for item in kept:
@@ -1664,7 +1825,38 @@ def compose_digest_data(
         )
         holds.append(item)
 
-    published = sections[VERDICT_APPLY] + sections[VERDICT_NOTICE]
+    return _finish_digest_data(
+        week_str, kind, week_start, week_end, sections, holds, excluded,
+        survivors, candidate_ids, date_parse_failures, forms_csv_path,
+        warnings_out, stats_out,
+    )
+
+
+def _finish_digest_data(
+    week_str: str,
+    kind: str,
+    week_start: str,
+    week_end: str,
+    sections: Dict[str, List[Dict]],
+    holds: List[Dict],
+    excluded: List[Dict],
+    survivors: List[Dict],
+    candidate_ids: List[int],
+    date_parse_failures: int,
+    forms_csv_path,
+    warnings_out,
+    stats_out,
+) -> Dict:
+    """선정이 끝난 뒤의 공통 마무리 (유사 표기·보류 번호·기간 라벨·폼).
+
+    주간호와 월간호가 **같은 정본 구조**를 갖는 이유가 여기 있다 — 보류 번호
+    (`핀 n` 좌표)·유사 항목 표기·폼 수집을 한 곳에서만 만든다.
+    """
+    published = [
+        item
+        for name in item_sections_for(kind)
+        for item in (sections.get(name) or [])
+    ]
     _mark_similar(published)
 
     for number, item in enumerate(holds, start=1):
@@ -1694,6 +1886,7 @@ def compose_digest_data(
 
     return {
         "week": week_str,
+        "kind": kind,
         "week_start": week_start,
         "week_end": week_end,
         "period_label": period_label,
@@ -1715,7 +1908,11 @@ def item_line(item: Dict) -> str:
     if item["target"]:
         parts.append(f"대상: {item['target']}")
 
-    if item["verdict"] == VERDICT_NOTICE:
+    if item["verdict"] == VERDICT_MONTHLY:
+        # P1' 계약 §2: 월간호는 마감 없는 소식만 싣는다 — "마감 미정" 을 쓰면
+        # 없는 마감을 있는 것처럼 읽히게 한다(항목은 제목 줄 + 보강 줄 + 링크).
+        pass
+    elif item["verdict"] == VERDICT_NOTICE:
         if item["deadline_short"]:
             parts.append(f"의견 {item['deadline_short']}까지")
     else:
@@ -1800,7 +1997,7 @@ def items_manifest(data: Dict, markdown_bytes: bytes = b"") -> Dict:
                 # 올리지 않는다(옛 정본도 여전히 유효 — checker._schema_problems).
                 "enrich_line": item.get("enrich_line") or "",
             }
-            for section in ITEM_SECTIONS
+            for section in item_sections_for(data_kind(data))
             for item in (data["sections"].get(section) or [])
         ],
     }
@@ -1885,6 +2082,20 @@ def set_manifest_enrich_lines(
     return manifest
 
 
+def monthly_title(issue: str) -> str:
+    """월간호 헤더 (P1' 계약 §2) — `📚 협의회 월간 종합 2026년 9월`."""
+    year_text, _, month_text = issue.partition("-M")
+    return f"📚 협의회 월간 종합 {int(year_text)}년 {int(month_text)}월"
+
+
+def document_title(data: Dict) -> str:
+    """본문 `# ` 제목 (카톡 머리글과 **같은 문자열**)."""
+    if data_kind(data) == KIND_MONTHLY:
+        return monthly_title(data["week"])
+    return "📋 협의회 주간 정책브리핑 {} ({})".format(
+        data["week"], data["period_label"])
+
+
 def item_marker(item: Dict) -> str:
     """항목 블록의 구조 마커 (`<!-- item id=123 -->`)."""
     return ITEM_MARKER_TEMPLATE.format(item["id"])
@@ -1922,16 +2133,17 @@ def render_markdown(data: Dict) -> str:
     보류 목록은 맨 아래 HTML 주석으로만 남는다 — send_digest의 마크다운→HTML
     변환이 `<!--` 로 시작하는 줄을 건너뛰므로 발송 HTML에는 실리지 않는다.
     """
+    kind = data_kind(data)
     lines = [
         f"<!-- lane: {LANE} -->",
         "",
-        f"# 📋 협의회 주간 정책브리핑 {data['week']} ({data['period_label']})",
+        f"# {document_title(data)}",
         "",
-        f"이번 주 한 줄: {MARKER}",
+        f"{headline_label(kind)}: {MARKER}",
         "",
     ]
 
-    for section in ITEM_SECTIONS:
+    for section in item_sections_for(kind):
         lines.append(f"## {SECTION_HEADINGS[section]}")
         lines.append("")
         items = data["sections"].get(section) or []
@@ -2277,17 +2489,17 @@ def _pack_blocks(blocks: Sequence[str], limit: int) -> List[str]:
 
 def kakao_blocks(data: Dict, headline: Optional[str] = None) -> List[str]:
     """카톡 평문을 블록 단위로 (항목은 `제목 줄 + URL 줄` 한 덩어리)."""
+    kind = data_kind(data)
     blocks: List[str] = [
-        "{} ({})\n{}{}".format(
-            f"📋 협의회 주간 정책브리핑 {data['week']}",
-            data["period_label"],
-            KAKAO_HEADLINE_PREFIX,
+        "{}\n{}{}".format(
+            document_title(data),
+            kakao_headline_prefix(kind),
             headline.strip() if headline else KAKAO_HEADLINE_PLACEHOLDER,
         ),
         "",
     ]
 
-    for section in ITEM_SECTIONS:
+    for section in item_sections_for(kind):
         blocks.append(SECTION_HEADINGS[section])
         items = data["sections"].get(section) or []
         if not items:

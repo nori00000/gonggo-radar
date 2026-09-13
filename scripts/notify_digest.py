@@ -364,9 +364,14 @@ def main():
                                    snapshot)
         if blocked:
             body = (
-                "🏛 협의회 주간 정책브리핑 {}\n\n⚠️ {}\n\n"
+                "🏛 협의회 {} {}\n\n⚠️ {}\n\n"
                 "`/digest 재검토` 로 다시 검증하세요."
-            ).format(week, blocked)
+            ).format(
+                "월간 종합" if state_mod.issue_kind(week) == state_mod.KIND_MONTHLY
+                else "주간 정책브리핑",
+                week,
+                blocked,
+            )
             chunks = [body]
             item_urls = []
             hold_ids = None

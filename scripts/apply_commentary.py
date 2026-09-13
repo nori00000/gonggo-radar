@@ -42,6 +42,9 @@ from alert.utils.safe_argparse import (
 COUNCIL_HEADING = f"## {SECTION_HEADINGS[SECTION_COUNCIL]}"
 MEMBER_HEADING = f"## {SECTION_HEADINGS[SECTION_MEMBER]}"
 HEADLINE_PREFIX = "이번 주 한 줄:"
+# P1' 계약 §1: 월간호는 같은 자리를 "이번 달 한 줄:" 로 쓴다. 어느 쪽이든
+# **본문에 실제로 있는 줄**을 찾아 바꾼다 — 호 종류를 따로 넘겨받지 않는다.
+HEADLINE_PREFIXES = (HEADLINE_PREFIX, "이번 달 한 줄:")
 
 # 본문을 써도 되는 상태 (사이클3 #6). sending·sent 는 파일을 건드리지 않는다.
 WRITABLE_STATUSES = ("draft", "annotated", "held")
@@ -99,9 +102,13 @@ def apply_headline(markdown_text: str, headline: str):
     text = " ".join((headline or "").split())
     lines = markdown_text.split("\n")
     for index, line in enumerate(lines):
-        if not line.startswith(HEADLINE_PREFIX):
+        prefix = next(
+            (value for value in HEADLINE_PREFIXES if line.startswith(value)),
+            None,
+        )
+        if prefix is None:
             continue
-        replacement = f"{HEADLINE_PREFIX} {text}"
+        replacement = f"{prefix} {text}"
         if line == replacement:
             return markdown_text, False
         lines[index] = replacement

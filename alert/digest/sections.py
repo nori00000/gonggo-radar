@@ -27,6 +27,9 @@ V1_COMMENTARY_SECTIONS = ("회원사 동정", "협의회 의견")
 V2_ITEM_SECTIONS = ("✅ 신청하세요 (마감순)", "👀 알아두세요")
 V2_COMMENTARY_SECTIONS = ("🤝 협의회에서", "🏢 회원사 소식")
 
+# P1' 월간 종합호 (composer.MONTHLY_ITEM_SECTIONS 의 헤딩)
+MONTHLY_ITEM_SECTIONS = ("📚 월간 종합",)
+
 # 미리보기가 본문으로 실어야 하는 "협의회 의견" 섹션 (정확 일치)
 OPINION_SECTIONS = ("협의회 의견", "🤝 협의회에서", "협의회에서")
 
@@ -51,14 +54,25 @@ def from_composer() -> Optional[Tuple[Tuple[str, ...], Tuple[str, ...]]]:
         return None
     if not isinstance(item_names, (list, tuple)) or not item_names:
         return None
+    # P1' 계약 §1: 월간호의 항목 섹션도 **항목**이다. 합집합으로 두는 것이
+    # 안전한 이유는 판정이 언제나 "본문에 실제로 등장한 헤딩" 과의 정확 일치이기
+    # 때문이다(classify/resolve) — 주간호 본문에는 월간 헤딩이 없으므로 주간호의
+    # item_sections 기록은 바뀌지 않는다.
+    monthly_names = getattr(composer, "MONTHLY_ITEM_SECTIONS", None) or ()
+    if not isinstance(monthly_names, (list, tuple)):
+        monthly_names = ()
+    all_item_names = tuple(item_names) + tuple(
+        name for name in monthly_names if name not in item_names
+    )
     items = tuple(
-        str(headings_map[name]) for name in item_names if name in headings_map
+        str(headings_map[name]) for name in all_item_names
+        if name in headings_map
     )
     if not items:
         return None
     commentary = tuple(
         str(value) for key, value in headings_map.items()
-        if key not in item_names
+        if key not in all_item_names
     )
     return items, commentary
 
@@ -79,7 +93,7 @@ def declared() -> Tuple[Tuple[str, ...], Tuple[str, ...]]:
     if from_mod is not None:
         return from_mod
     return (
-        V1_ITEM_SECTIONS + V2_ITEM_SECTIONS,
+        V1_ITEM_SECTIONS + V2_ITEM_SECTIONS + MONTHLY_ITEM_SECTIONS,
         V1_COMMENTARY_SECTIONS + V2_COMMENTARY_SECTIONS,
     )
 

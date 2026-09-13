@@ -82,6 +82,16 @@ def main():
         _err(f"✗ 주차 형식이 아닙니다: {week!r}")
         return 2
 
+    return compose_issue(args, week)
+
+
+def compose_issue(args, week):
+    """호 하나를 조립·검증한다 (잠금 → 승인 폐기 → 생성 → 검증).
+
+    P1' 계약 §1: 주간호·월간호가 **같은 코드**를 탄다 — 잠금·승인 세대 폐기·재조립
+    규율이 호 종류에 따라 갈라지면 한쪽만 고쳐지는 길이 생긴다. 호를 가르는 것은
+    키 형식 하나이며, 그 키가 digests/ 의 모든 파일 이름이다.
+    """
     out_dir = Path(args.out_dir)
     state_path = state_mod.state_path(week, out_dir)
     lock_path = state_mod.lock_path(week, out_dir)

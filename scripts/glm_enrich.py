@@ -317,7 +317,8 @@ def unsupported_tokens(text: str, search_text: str) -> List[str]:
             missing.append(f"«{quote}»")
     return missing
 
-HEADLINE_LINE_RE = re.compile(r"^이번 주 한 줄:.*$")
+# P1' 계약 §1: 월간호는 같은 자리를 "이번 달 한 줄:" 로 쓴다 (판정 정본은 composer).
+HEADLINE_LINE_RE = re.compile(r"^이번 (?:주|달) 한 줄:.*$")
 GLM_DRAFT_PREFIX = "<!-- GLM 초안: "
 GLM_DRAFT_SUFFIX = " -->"
 _MAX_HEADLINE_CHARS = 80
