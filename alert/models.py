@@ -32,6 +32,11 @@ class AnalyzedAnnouncement(RawAnnouncement):
     matched_keywords: list = field(default_factory=list)
     id: Optional[int] = None
 
+    # LLM 2차 분석이 **이 항목을 실제로 봤는가** (실행 중 상태, DB 컬럼 아님).
+    # `max_claude_calls_per_run` 상한을 넘겼거나 백엔드가 실패하면 키워드 점수가
+    # 그대로 남는데, 그 점수는 LLM 관문을 통과한 근거가 아니다 (계약 §A 라운드 5).
+    llm_evaluated: bool = False
+
     # 협의회 적재 프로파일 측정값 (P0 계약 §A). 회사 점수와 독립이다.
     # 기본값 None = **미측정** (프로파일이 이 항목을 채점한 적이 없음).
     # council_only 만 가드라서 기본값이 0 이다 - 자세한 이유는 migration 7 주석.

@@ -594,7 +594,9 @@ def run_pipeline(test_mode: bool = False) -> None:
             # ---------------------------------------------------------------------------
 
             llm_available = claude_analyzer.client or claude_analyzer.backend == "ollama"
+            llm_ran = False
             if selected_all and llm_available:
+                llm_ran = True
                 logger.info(
                     f"{crawler_name}: Running Claude analysis on "
                     f"{len(selected_all)} announcements"
@@ -616,6 +618,24 @@ def run_pipeline(test_mode: bool = False) -> None:
 
             # 관문을 다 지난 뒤에야 재평가분을 갈라낸다.
             recheck_selected = [ann for ann in selected_all if _is_recheck(ann)]
+
+            # LLM 관문이 켜져 있는데 **이 항목을 보지 못했다면**(호출 상한 초과·
+            # 백엔드 오류·타임아웃) 승격시키지 않는다. 남아 있는 점수는 키워드
+            # 점수일 뿐 LLM 관문을 통과한 근거가 아니다 (계약 §A 라운드 5).
+            # 신규 항목은 종전 동작 그대로 둔다 - 회사 경로는 바뀌지 않는다.
+            recheck_deferred: List[AnalyzedAnnouncement] = []
+            if llm_ran:
+                recheck_deferred = [
+                    ann for ann in recheck_selected if not ann.llm_evaluated
+                ]
+                recheck_selected = [
+                    ann for ann in recheck_selected if ann.llm_evaluated
+                ]
+            if recheck_deferred:
+                logger.info(
+                    f"{crawler_name}: 재평가 {len(recheck_deferred)}건은 LLM 이 "
+                    f"보지 못해 승격을 미룬다 (다음 실행에서 다시 본다)"
+                )
             if recheck_raw:
                 logger.info(
                     f"{crawler_name}: 재평가 {len(recheck_raw)}건 중 "
@@ -680,7 +700,14 @@ def run_pipeline(test_mode: bool = False) -> None:
             promoted = sum(1 for ann in recheck_selected if ann.council_only == 0)
             for ann in recheck_selected + recheck_extra + recheck_unmatched:
                 db.insert_announcement(ann)
+            # 보지 못한 항목은 장부를 **건드리지 않는다** - 절약 장부가 서면
+            # 24시간 동안 다시 보지 않게 되어, 미룬 승격이 미뤄진 채 굳는다.
+            deferred_keys = {
+                (ann.source, ann.source_id) for ann in recheck_deferred
+            }
             for raw_ann in recheck_raw:
+                if (raw_ann.source, raw_ann.source_id) in deferred_keys:
+                    continue
                 try:
                     db.mark_council_rechecked(raw_ann)
                 except Exception as e:

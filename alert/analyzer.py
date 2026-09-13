@@ -381,6 +381,11 @@ matched_aspects 필드에는 매칭된 비즈니스 도메인을 포함하세요
             if matched_aspects:
                 announcement.relevance_reason += f" (매칭: {', '.join(matched_aspects)})"
 
+            # 여기까지 온 항목만 LLM 이 실제로 본 것이다. 아래 except 로
+            # 빠지면(파싱 실패·연결 오류·타임아웃) 표시하지 않는다 - 그때
+            # 남는 점수는 키워드 점수이지 LLM 판정이 아니다.
+            announcement.llm_evaluated = True
+
             logger.debug(
                 f"{self.backend} analysis complete: {announcement.title} -> "
                 f"score={announcement.relevance_score:.2f}"
@@ -404,6 +409,10 @@ matched_aspects 필드에는 매칭된 비즈니스 도메인을 포함하세요
 
         Only processes announcements with keyword score >= claude_threshold.
         Respects max_claude_calls_per_run limit.
+
+        상한을 넘긴 항목은 **키워드 점수 그대로** 돌려준다 (기존 동작). 그
+        항목에는 ``llm_evaluated`` 가 서지 않으므로, 호출자는 "LLM 이 본 점수"
+        와 "아직 못 본 점수"를 구분할 수 있다 (계약 §A 라운드 5).
 
         Args:
             announcements: List of keyword-analyzed announcements.

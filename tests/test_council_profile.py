@@ -17,7 +17,7 @@ import pytest
 
 from alert import council
 from alert.config import CouncilProfileConfig, get_config
-from alert.analyzer import KeywordAnalyzer
+from alert.analyzer import ClaudeAnalyzer, KeywordAnalyzer
 from alert import main as main_mod
 from alert.db import (
     COUNCIL_DROP_RETENTION_DAYS,
@@ -1433,9 +1433,11 @@ class _StubLLM:
         self.seen = []
 
     def analyze_batch(self, announcements):
+        """상한이 없는 백엔드 — 받은 항목을 전부 본다."""
         self.seen.append([a.source_id for a in announcements])
         for ann in announcements:
             ann.relevance_score = self.score
+            ann.llm_evaluated = True
         return list(announcements)
 
 
@@ -1788,3 +1790,269 @@ class TestRecheckThrottle:
             ).fetchone())
         finally:
             conn.close()
+
+
+# ---------------------------------------------------------------------------
+# 7. 라운드 5 — LLM 호출 상한을 넘긴 재평가분
+# ---------------------------------------------------------------------------
+
+class _CapConfig:
+    """`ClaudeAnalyzer.analyze_batch` 가 읽는 최소 설정."""
+
+    def __init__(self, max_calls, threshold=0.3):
+        self.analyzer = type(
+            "_A", (), {
+                "claude_threshold": threshold,
+                "max_claude_calls_per_run": max_calls,
+            },
+        )()
+
+
+def make_capped_llm(max_calls, verdict_score):
+    """**진짜** `analyze_batch`(상한 로직 포함) + 스텁 `analyze`.
+
+    네트워크는 타지 않는다. 상한 안에 든 항목만 ``llm_evaluated`` 가 선다 —
+    상한 밖 항목을 키워드 점수 그대로 돌려주는 것은 기존 동작이다.
+    """
+    llm = ClaudeAnalyzer.__new__(ClaudeAnalyzer)
+    llm.config = _CapConfig(max_calls)
+    llm.backend = "claude"
+    llm.client = object()
+    llm.model = "stub"
+    llm.evaluated = []
+
+    def fake_analyze(announcement, user_context=None):
+        llm.evaluated.append(announcement.source_id)
+        announcement.relevance_score = verdict_score
+        announcement.relevance_reason = "스텁 판정"
+        announcement.llm_evaluated = True
+        return announcement
+
+    llm.analyze = fake_analyze
+    return llm
+
+
+class TestLlmCapDoesNotPromoteUnseenRechecks:
+    """HIGH: 상한을 넘겨 LLM 이 못 본 재평가분은 이번 실행에 승격되지 않는다."""
+
+    SOURCE = "mois_sse"
+    RECHECK_ID = "cap-recheck"
+    NEW_ID = "cap-new"
+
+    # 키워드 점수를 갈라 놓는다: 신규 0.8 > 재평가 0.55.
+    # 상한 1건은 정렬 상위(신규)가 가져가고 재평가는 상한 밖으로 밀린다.
+    NEW_TITLE = "사회적기업 농업 경기도 고양시 지원사업 공모 보조금 안내"
+    RECHECK_COUNCIL_TITLE = "산림 목재 이용 안내"          # 협의회만 매치
+    RECHECK_COMPANY_TITLE = "사회적기업 지원사업 공고"       # 회사 must_match 매치
+
+    def items(self, specs):
+        return [
+            RawAnnouncement(
+                source=self.SOURCE, source_id=sid, title=title,
+                url=f"https://example.com/{self.SOURCE}/{sid}", summary="",
+            )
+            for sid, title in specs
+        ]
+
+    def crawler_for(self, specs):
+        payload = self.items(specs)
+
+        class FakeCrawler:
+            def is_enabled(self):
+                return True
+
+            def set_quoted_source_ids(self, ids):
+                return None
+
+            def safe_fetch(self):
+                return list(payload)
+
+        return FakeCrawler
+
+    def run(self, monkeypatch, db_path, specs, llm=None):
+        monkeypatch.setattr(main_mod, "Database", lambda *a, **k: Database(db_path))
+        monkeypatch.setattr(
+            main_mod, "setup_logger",
+            lambda *a, **k: logging.getLogger("test-cap"),
+        )
+        monkeypatch.setattr(
+            main_mod, "_import_crawlers",
+            lambda: {self.SOURCE: self.crawler_for(specs)},
+        )
+        if llm is not None:
+            monkeypatch.setattr(main_mod, "ClaudeAnalyzer", lambda: llm)
+        main_mod.run_pipeline()
+
+    def row(self, db_path, source_id):
+        conn = sqlite3.connect(db_path)
+        conn.row_factory = sqlite3.Row
+        try:
+            found = conn.execute(
+                "SELECT relevance_score, council_match, council_only,"
+                "       council_rechecked_at, is_notified"
+                "  FROM announcements WHERE source_id = ?",
+                (source_id,),
+            ).fetchone()
+            return dict(found) if found else None
+        finally:
+            conn.close()
+
+    def seed(self, monkeypatch, db_path):
+        """1회차: LLM 없이 협의회 단독 행을 만든다."""
+        with monkeypatch.context() as m:
+            self.run(m, db_path, [(self.RECHECK_ID, self.RECHECK_COUNCIL_TITLE)])
+        assert self.row(db_path, self.RECHECK_ID)["council_only"] == 1
+
+    def test_keyword_scores_are_ordered_as_the_test_assumes(self, company_analyzer):
+        """전제 고정: 신규가 재평가보다 점수가 높아야 상한 밖으로 밀린다."""
+        new_score = company_analyzer.analyze(
+            self.items([(self.NEW_ID, self.NEW_TITLE)])[0]
+        ).relevance_score
+        recheck_score = company_analyzer.analyze(
+            self.items([(self.RECHECK_ID, self.RECHECK_COMPANY_TITLE)])[0]
+        ).relevance_score
+        threshold = get_config().analyzer.keyword_threshold
+        assert new_score > recheck_score >= threshold
+
+    def test_over_cap_recheck_is_not_promoted(self, tmp_path, monkeypatch):
+        """max_calls=1, LLM 거절 → 상한 밖 재평가분은 council_only=1 로 남는다."""
+        db_path = tmp_path / "cap.db"
+        self.seed(monkeypatch, db_path)
+
+        llm = make_capped_llm(max_calls=1, verdict_score=0.0)
+        with monkeypatch.context() as m:
+            self.run(m, db_path, [
+                (self.NEW_ID, self.NEW_TITLE),
+                (self.RECHECK_ID, self.RECHECK_COMPANY_TITLE),
+            ], llm)
+
+        # 상한 1건은 신규가 가져갔다
+        assert llm.evaluated == [self.NEW_ID]
+
+        recheck = self.row(db_path, self.RECHECK_ID)
+        assert recheck["council_only"] == 1, "LLM 이 못 본 항목이 승격됐다"
+        assert recheck["is_notified"] == 0
+        # 장부를 건드리지 않아 다음 실행에서 다시 본다
+        assert recheck["council_rechecked_at"] is None
+        # 측정값은 새 판정으로 갱신됐다 (회사 제목이라 협의회 어휘도 맞는다)
+        assert recheck["council_match"] == 1
+
+    def test_next_run_within_the_cap_promotes(self, tmp_path, monkeypatch):
+        """상한이 허락하는 다음 실행에서는 평가되고 승격된다."""
+        db_path = tmp_path / "cap.db"
+        self.seed(monkeypatch, db_path)
+
+        with monkeypatch.context() as m:
+            self.run(m, db_path, [
+                (self.NEW_ID, self.NEW_TITLE),
+                (self.RECHECK_ID, self.RECHECK_COMPANY_TITLE),
+            ], make_capped_llm(max_calls=1, verdict_score=0.0))
+        assert self.row(db_path, self.RECHECK_ID)["council_only"] == 1
+
+        accepting = make_capped_llm(max_calls=5, verdict_score=0.9)
+        with monkeypatch.context() as m:
+            self.run(m, db_path, [
+                (self.RECHECK_ID, self.RECHECK_COMPANY_TITLE),
+            ], accepting)
+
+        assert self.RECHECK_ID in accepting.evaluated
+        promoted = self.row(db_path, self.RECHECK_ID)
+        assert promoted["council_only"] == 0
+        assert promoted["relevance_score"] == pytest.approx(0.9)
+        assert promoted["council_rechecked_at"] is not None
+
+    def test_next_run_within_the_cap_can_also_reject(self, tmp_path, monkeypatch):
+        """평가된 결과가 거절이면 승격되지 않는다 (상한과 무관)."""
+        db_path = tmp_path / "cap.db"
+        self.seed(monkeypatch, db_path)
+
+        rejecting = make_capped_llm(max_calls=5, verdict_score=0.0)
+        with monkeypatch.context() as m:
+            self.run(m, db_path, [
+                (self.RECHECK_ID, self.RECHECK_COMPANY_TITLE),
+            ], rejecting)
+
+        assert self.RECHECK_ID in rejecting.evaluated
+        row = self.row(db_path, self.RECHECK_ID)
+        assert row["council_only"] == 1
+        # 평가는 받았으므로 장부는 선다 - 24시간 동안 다시 보지 않는다
+        assert row["council_rechecked_at"] is not None
+
+    def test_new_items_keep_their_over_cap_behaviour(self, tmp_path, monkeypatch):
+        """회사 경로 불변: 상한 밖 **신규** 항목은 종전처럼 키워드 점수로 저장된다."""
+        db_path = tmp_path / "cap-new.db"
+        llm = make_capped_llm(max_calls=1, verdict_score=0.9)
+        with monkeypatch.context() as m:
+            self.run(m, db_path, [
+                (self.NEW_ID, self.NEW_TITLE),
+                ("cap-new-2", self.RECHECK_COMPANY_TITLE),
+            ], llm)
+
+        assert llm.evaluated == [self.NEW_ID]
+        second = self.row(db_path, "cap-new-2")
+        assert second is not None, "상한 밖 신규 항목이 저장되지 않았다"
+        assert second["council_only"] == 0
+        # LLM 이 못 봤으므로 키워드 점수 그대로 (0.9 가 아니다)
+        assert second["relevance_score"] < 0.9
+
+
+class TestLlmEvaluatedFlag:
+    """플래그가 **성공한 호출에만** 선다."""
+
+    def announcement(self):
+        return AnalyzedAnnouncement(
+            source="mois_sse", source_id="f1", title="사회적기업 공고",
+            url="https://example.com/f1", relevance_score=0.5,
+        )
+
+    def analyzer(self, monkeypatch, raises=None, payload=None):
+        llm = ClaudeAnalyzer.__new__(ClaudeAnalyzer)
+        llm.config = _CapConfig(5)
+        llm.backend = "claude"
+        llm.client = object()
+        llm.model = "stub"
+
+        def call(system_prompt, user_prompt):
+            if raises is not None:
+                raise raises
+            return payload
+
+        monkeypatch.setattr(llm, "_call_claude", call, raising=False)
+        monkeypatch.setattr(
+            llm, "_build_prompts", lambda ann, ctx: ("s", "u"), raising=False
+        )
+        return llm
+
+    def test_default_is_false(self):
+        assert self.announcement().llm_evaluated is False
+
+    def test_successful_call_sets_the_flag(self, monkeypatch):
+        llm = self.analyzer(monkeypatch, payload=json.dumps(
+            {"score": 0.9, "reason": "맞다"}, ensure_ascii=False
+        ))
+        result = llm.analyze(self.announcement())
+        assert result.llm_evaluated is True
+        assert result.relevance_score == pytest.approx(0.9)
+
+    def test_backend_error_leaves_the_flag_down(self, monkeypatch):
+        llm = self.analyzer(monkeypatch, raises=RuntimeError("timeout"))
+        result = llm.analyze(self.announcement())
+        assert result.llm_evaluated is False
+        assert result.relevance_score == pytest.approx(0.5)   # 키워드 점수 그대로
+
+    def test_unparseable_response_leaves_the_flag_down(self, monkeypatch):
+        llm = self.analyzer(monkeypatch, payload="not json")
+        assert llm.analyze(self.announcement()).llm_evaluated is False
+
+    def test_over_cap_items_are_unflagged(self, monkeypatch):
+        """`analyze_batch` 의 상한 밖 항목에는 플래그가 서지 않는다."""
+        llm = make_capped_llm(max_calls=1, verdict_score=0.9)
+        first = self.announcement()
+        second = self.announcement()
+        second.source_id = "f2"
+        second.relevance_score = 0.4          # 임계 위, 정렬 아래
+
+        results = {a.source_id: a for a in llm.analyze_batch([first, second])}
+        assert results["f1"].llm_evaluated is True
+        assert results["f2"].llm_evaluated is False
+        assert results["f2"].relevance_score == pytest.approx(0.4)
