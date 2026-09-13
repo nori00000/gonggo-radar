@@ -7,24 +7,27 @@ HEAD 를 지원하지 않으므로, 둘이 갈라지면 "게이트는 살아 있
 
 여기서 가져오는 본문은 **외부 입력**이다 — 상세 텍스트는 그 자체로 발송본에
 들어가지 않는다. GLM 이 그것을 읽고 낸 문장은 glm_enrich 의 결정론 게이트
-(추출형 문법·근거 토큰 경계 대조·n 집합)와 사람의 미리보기 승인을 지난 뒤에만
-md 로 들어간다 (alert/digest/checker.py 의 THREAT_MODEL 참고).
+(구절 하나를 그대로 옮긴 «인용» + 경계 대조)와 사람의 미리보기 승인을 지난
+뒤에만 md 로 들어간다 (alert/digest/checker.py 의 THREAT_MODEL 참고).
 
-시간·크기 규율 (Codex v3.1 MEDIUM): 항목 하나는 **벽시계 기준** DETAIL_TIMEOUT
-안에 끝나야 하고(느리게 찔끔찔끔 보내는 서버가 read timeout 을 영원히 리셋하는
-경로를 막는다), 잡 전체는 FetchBudget 을 넘기지 못한다. 리다이렉트는 직접
-따라간다 — requests 의 자동 추적은 중간 응답 본문을 전부 소비해 크기 상한 밖이다.
+**requests 를 쓰지 않는 이유** (Codex r3 실측): `allow_redirects=False,
+stream=True` 여도 requests 는 `Response.next` 를 준비하며 3xx 의 본문을 **get 이
+반환하기 전에 전부 읽는다**(1MiB 리다이렉트 본문이 크기 상한 밖에서 소비됐다).
+그래서 urllib3 을 직접 쓰고 리다이렉트도 직접 따라간다. 또 첫 청크가 오기
+전에는 어떤 청크 루프도 데드라인을 검사할 수 없으므로, 항목 수집 전체를
+워커 스레드에 넣고 **벽시계로 잘라낸다**.
 """
 
 import codecs
 import re
 import time
 from collections import deque
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeout
 from html.parser import HTMLParser
 from typing import Dict, List, Optional
 from urllib.parse import urljoin
 
-import requests
+import urllib3
 
 # 공공기관 사이트 다수가 기본 python-requests UA를 차단하거나 HEAD를 지원하지 않는다.
 BROWSER_USER_AGENT = (
@@ -41,27 +44,31 @@ PROBE_HEADERS = {
 # 멈추지 않는다(항목 단위 fail-open).
 DETAIL_TIMEOUT = 10          # 항목 하나의 **벽시계** 상한(초)
 JOB_BUDGET_SECONDS = 120     # 잡 전체의 수집 예산(초). 소진 뒤 항목은 빈 문자열
+CONNECT_TIMEOUT = 5
+READ_TIMEOUT = 5
 MAX_DETAIL_BYTES = 512 * 1024
 MAX_REDIRECTS = 3
 DETAIL_TEXT_CHARS = 2000
-# 앵커(제목)를 통째로 못 찾을 때 다시 시도하는 앞부분 길이. 목록 페이지의 제목이
-# 말줄임(`…`)·괄호 정리로 정본 제목과 달라지는 경우가 흔하다.
+# 앵커(제목)를 통째로 못 찾을 때 다시 시도하는 앞부분 길이.
 ANCHOR_PARTIAL_CHARS = 20
+
+# DOM 상한 (Codex r3 MEDIUM: 512KB 입력 제한은 DOM 메모리 제한이 아니다).
+MAX_DOM_NODES = 100_000
+MAX_DOM_DEPTH = 256
+_END_TAG_SEARCH_FRAMES = 32
+_FEED_CHUNK = 65536
 
 _REDIRECT_STATUS = frozenset({301, 302, 303, 307, 308})
 _READ_CHUNK = 16384
 
-# 제로폭·BOM 은 공백 정규화로 사라지지 않는다 — 여기서 지운다.
 _INVISIBLE_RE = re.compile("[\u200b\u200c\u200d\u2060\ufeff]")
 _META_CHARSET_RE = re.compile(
     rb"""<meta[^>]*charset\s*=\s*["']?\s*([A-Za-z0-9_.:-]+)""", re.IGNORECASE
 )
+_CSS_COMMENT_RE = re.compile(r"/\*.*?\*/", re.DOTALL)
 
 
 # ─── HTML → 보이는 텍스트 (정규식이 아니라 파서) ─────────────────────────
-# 정규식 해체는 `"<" * 32000` 에서 약 0.94초로 제곱 증가했고(Codex 실측), 닫히지
-# 않은 <script> 내용과 <div hidden> 을 근거로 남겼다. 파서는 선형이고, 숨김·메뉴
-# 판정을 요소 단위로 할 수 있다.
 _VOID_TAGS = frozenset({
     "area", "base", "basefont", "br", "col", "embed", "hr", "img", "input",
     "link", "meta", "param", "source", "track", "wbr",
@@ -72,15 +79,20 @@ _DROP_TAGS = frozenset({
     "aside", "svg", "iframe", "select", "option", "button",
 })
 # 이 요소는 앞뒤에 공백을 넣지 않는다 — `9월 <b>22</b>일` 이 `9월 22 일` 로
-# 쪼개지면 근거 토큰 대조가 깨진다.
+# 쪼개지면 근거 경계 대조가 깨진다.
 _INLINE_TAGS = frozenset({
     "a", "abbr", "b", "bdi", "bdo", "cite", "code", "data", "dfn", "em", "font",
     "i", "kbd", "label", "mark", "q", "s", "samp", "small", "span", "strike",
     "strong", "sub", "sup", "time", "u", "var",
 })
-# 줄바꿈 구실을 하는 빈 요소 — 공백 하나로 남긴다.
 _BREAK_TAGS = frozenset({"br", "hr"})
-# 사이트별 본문 컨테이너 힌트 (id/class).
+# 열린 `<p>` 를 암시적으로 닫는 블록 요소들 (HTML 파싱 규칙 "in body").
+_P_CLOSING_TAGS = frozenset({
+    "address", "article", "aside", "blockquote", "details", "div", "dl",
+    "fieldset", "figcaption", "figure", "footer", "form", "h1", "h2", "h3",
+    "h4", "h5", "h6", "header", "hgroup", "hr", "main", "menu", "nav", "ol",
+    "p", "pre", "section", "table", "ul",
+})
 _CONTENT_HINT_RE = re.compile(r"content|board|view|article|bbs|detail", re.IGNORECASE)
 
 _DOCUMENT_TAG = "[document]"
@@ -96,12 +108,16 @@ class _Node:
 
 
 class _DomBuilder(HTMLParser):
-    """관대한 트리 빌더. 닫히지 않은 태그·짝 없는 종료 태그를 그냥 흘려보낸다."""
+    """관대한 트리 빌더 — 노드 수·깊이·종료 태그 탐색을 전부 상한으로 묶는다."""
 
-    def __init__(self):
+    def __init__(self, max_nodes: int = MAX_DOM_NODES, max_depth: int = MAX_DOM_DEPTH):
         super().__init__(convert_charrefs=True)
         self.root = _Node(_DOCUMENT_TAG)
         self._stack = [self.root]
+        self._nodes = 0
+        self._max_nodes = max_nodes
+        self._max_depth = max_depth
+        self._form_depth = 0
 
     def handle_starttag(self, tag, attrs):
         tag = tag.lower()
@@ -110,9 +126,24 @@ class _DomBuilder(HTMLParser):
             return
         if tag in _VOID_TAGS:
             return
+        # 중첩 <form> 시작 태그는 무시한다 (브라우저와 같게) — 무시하지 않으면
+        # `<form hidden><form></form>본문` 에서 </form> 이 안쪽만 닫아
+        # 공개 본문이 숨김 폼 안에 남는다.
+        if tag == "form" and self._form_depth:
+            return
+        if self._nodes >= self._max_nodes:
+            return
+        # 열린 <p> 는 블록 요소가 시작되면 암시적으로 닫힌다.
+        if tag in _P_CLOSING_TAGS and self._stack[-1].tag == "p":
+            self._stack.pop()
         node = _Node(tag, {key.lower(): (value or "") for key, value in attrs})
+        self._nodes += 1
         self._stack[-1].children.append(node)
-        self._stack.append(node)
+        # 깊이 상한을 넘으면 스택에 쌓지 않는다 — 더 깊은 내용은 형제가 된다.
+        if len(self._stack) < self._max_depth:
+            self._stack.append(node)
+            if tag == "form":
+                self._form_depth += 1
 
     def handle_startendtag(self, tag, attrs):
         if tag.lower() in _BREAK_TAGS:
@@ -120,14 +151,24 @@ class _DomBuilder(HTMLParser):
 
     def handle_endtag(self, tag):
         tag = tag.lower()
-        for index in range(len(self._stack) - 1, 0, -1):
+        # 스택 전체를 뒤지면 종료 태그마다 O(depth) 다 — 위쪽 몇 프레임만 본다.
+        lowest = max(1, len(self._stack) - _END_TAG_SEARCH_FRAMES)
+        for index in range(len(self._stack) - 1, lowest - 1, -1):
             if self._stack[index].tag == tag:
+                for node in self._stack[index:]:
+                    if node.tag == "form" and self._form_depth:
+                        self._form_depth -= 1
                 del self._stack[index:]
                 return
         # 짝 없는 종료 태그는 무시한다 (fail-open 파싱)
 
     def handle_data(self, data):
         self._stack[-1].children.append(data)
+
+    def unknown_decl(self, data):
+        # XHTML 의 `<![CDATA[…]]>` 본문은 텍스트다 — 버리면 근거가 사라진다.
+        if data.startswith("CDATA["):
+            self._stack[-1].children.append(data[6:])
 
 
 def _is_hidden(node: _Node) -> bool:
@@ -136,12 +177,15 @@ def _is_hidden(node: _Node) -> bool:
         return True
     if (attrs.get("aria-hidden") or "").strip().lower() == "true":
         return True
-    style = (attrs.get("style") or "").replace(" ", "").lower()
+    # `display:\nnone` · `display:/**/none` 도 숨김이다 — 주석을 걷고 공백을
+    # 전부 지운 뒤 본다.
+    style = _CSS_COMMENT_RE.sub("", attrs.get("style") or "")
+    style = "".join(style.split()).lower()
     return "display:none" in style or "visibility:hidden" in style
 
 
 def _text_of(node: _Node) -> str:
-    """요소의 보이는 텍스트 (숨김·드롭 요소는 하위까지 통째로 제외). 선형 시간."""
+    """요소의 보이는 텍스트 (숨김·드롭 요소는 하위까지 제외). 선형 시간."""
     parts: List[str] = []
     stack: List = [node]
     while stack:
@@ -157,6 +201,38 @@ def _text_of(node: _Node) -> str:
         for child in reversed(items):
             stack.append(child)
     return "".join(parts)
+
+
+def _measure(root: _Node) -> Dict[int, int]:
+    """노드별 보이는 글자 수를 **한 번의 상향 순회**로 센다 (id(node) → 길이).
+
+    예전에는 후보마다 하위 트리 텍스트를 다시 만들어 이어 붙였다 — 20,000단
+    중첩에서 O(N²)였다(Codex r3 실측). 순위 판정에는 길이만 있으면 되고,
+    텍스트는 **고른 노드 하나**에 대해서만 만든다.
+    """
+    lengths: Dict[int, int] = {}
+    stack: List = [(root, False)]
+    while stack:
+        node, done = stack.pop()
+        if isinstance(node, str):
+            continue
+        if node.tag in _DROP_TAGS or _is_hidden(node):
+            lengths[id(node)] = 0
+            continue
+        if done:
+            total = 0
+            for child in node.children:
+                if isinstance(child, str):
+                    total += sum(1 for char in child if not char.isspace())
+                else:
+                    total += lengths.get(id(child), 0)
+            lengths[id(node)] = total
+            continue
+        stack.append((node, True))
+        for child in node.children:
+            if not isinstance(child, str):
+                stack.append((child, False))
+    return lengths
 
 
 def _clean(text: str) -> str:
@@ -180,11 +256,10 @@ def _walk(root: _Node):
 def content_text(root: _Node) -> str:
     """본문 컨테이너를 골라 그 텍스트만 돌려준다 (없으면 body 전체).
 
-    메뉴가 2,000자를 넘기는 사이트에서는 문서 앞에서부터 자른 창이 기사에
-    닿지 못한다 — 그래서 자르기 **전에** 본문을 고른다.
     우선순위: `<article>` → `<main>`/`role=main` → id·class 가 본문 힌트에
-    걸리는 컨테이너 중 **텍스트가 가장 긴 것** → body 전체.
+    걸리는 컨테이너 중 **글자 수가 가장 많은 것** → body 전체.
     """
+    lengths = _measure(root)
     articles: List[_Node] = []
     mains: List[_Node] = []
     containers: List[_Node] = []
@@ -202,17 +277,17 @@ def content_text(root: _Node) -> str:
             body = node
 
     for node in articles + mains:
-        text = _clean(_text_of(node))
-        if text:
-            return text
+        if lengths.get(id(node), 0) > 0:
+            return _clean(_text_of(node))
 
-    best = ""
+    best = None
+    best_length = 0
     for node in containers:
-        text = _clean(_text_of(node))
-        if len(text) > len(best):
-            best = text
-    if best:
-        return best
+        length = lengths.get(id(node), 0)
+        if length > best_length:
+            best, best_length = node, length
+    if best is not None:
+        return _clean(_text_of(best))
 
     return _clean(_text_of(body if body is not None else root))
 
@@ -225,12 +300,7 @@ def normalize_space(text: str) -> str:
 def anchored_window(
     text: str, anchor: str = "", limit: int = DETAIL_TEXT_CHARS
 ) -> str:
-    """본문에서 `anchor`(제목)가 **마지막으로** 나오는 자리부터 limit 자.
-
-    목록·빵부스러기·`<title>` 에도 제목이 박혀 있으므로 **마지막** 출현을
-    고른다 — 본문 제목이 대개 그 뒤에 본문을 달고 온다. 제목 전체를 못 찾으면
-    앞 `ANCHOR_PARTIAL_CHARS` 자로 한 번 더 찾고, 그래도 없으면 앞에서부터 자른다.
-    """
+    """본문에서 `anchor`(제목)가 **마지막으로** 나오는 자리부터 limit 자."""
     if not text:
         return ""
     needle = normalize_space(anchor)
@@ -245,16 +315,29 @@ def anchored_window(
 
 
 def visible_text(
-    html_text: str, limit: int = DETAIL_TEXT_CHARS, anchor: str = ""
+    html_text: str,
+    limit: int = DETAIL_TEXT_CHARS,
+    anchor: str = "",
+    deadline: Optional[float] = None,
+    clock=time.monotonic,
 ) -> str:
-    """HTML → 본문 컨테이너의 보이는 텍스트 중 앵커 기준 limit 자."""
+    """HTML → 본문 컨테이너의 보이는 텍스트 중 앵커 기준 limit 자.
+
+    `deadline` 이 주어지면 **파싱 도중에도** 벽시계를 본다 — 거대한 입력이
+    파서 안에서 시간을 다 쓰는 경로를 막는다(넘기면 빈 문자열).
+    """
     if not html_text:
         return ""
     builder = _DomBuilder()
     try:
-        builder.feed(html_text)
+        for start in range(0, len(html_text), _FEED_CHUNK):
+            if deadline is not None and clock() >= deadline:
+                return ""
+            builder.feed(html_text[start:start + _FEED_CHUNK])
         builder.close()
     except Exception:  # noqa: BLE001 — 깨진 HTML 은 근거 없음으로 본다
+        return ""
+    if deadline is not None and clock() >= deadline:
         return ""
     return anchored_window(content_text(builder.root), anchor, limit)
 
@@ -277,11 +360,7 @@ def _meta_charset(raw: bytes) -> Optional[str]:
 
 
 def _decode(raw: bytes, content_type: str) -> str:
-    """BOM → meta charset → 헤더 charset → utf-8 순. 마지막은 errors=replace.
-
-    헤더가 `iso-8859-1` 이라고 우겨도 문서가 meta 로 utf-8 을 선언하면 meta 가
-    이긴다 — 헤더만 믿어 깨진 텍스트를 근거로 쓰던 분기다(Codex LOW).
-    """
+    """BOM → meta charset → 헤더 charset → utf-8 순. 마지막은 errors=replace."""
     for bom, encoding in (
         (codecs.BOM_UTF8, "utf-8-sig"),
         (codecs.BOM_UTF16_LE, "utf-16"),
@@ -310,11 +389,7 @@ def _decode(raw: bytes, content_type: str) -> str:
 
 # ─── 수집 예산 ───────────────────────────────────────────────────────────
 class FetchBudget:
-    """잡 전체의 수집 시간 예산. 소진 뒤의 항목은 `detail_text` 를 받지 못한다.
-
-    순차 8–50건이면 항목 타임아웃만으로 80–500초가 나온다(Codex 실측) — nightly
-    잡 하나가 그만큼 물고 있으면 안 된다. 소진은 실패가 아니라 **빈 근거**다.
-    """
+    """잡 전체의 수집 시간 예산. 소진 뒤의 항목은 `detail_text` 를 받지 못한다."""
 
     def __init__(self, seconds: float = JOB_BUDGET_SECONDS, clock=time.monotonic):
         self._clock = clock
@@ -332,11 +407,47 @@ def _is_http_url(url) -> bool:
     return bool(url) and str(url).lower().startswith(("http://", "https://"))
 
 
+_POOL: Optional[urllib3.PoolManager] = None
+
+
+def _pool() -> urllib3.PoolManager:
+    global _POOL
+    if _POOL is None:
+        _POOL = urllib3.PoolManager(retries=False)
+    return _POOL
+
+
+def _open(url: str):
+    """GET 한 번 — 리다이렉트를 따라가지 않고 본문을 미리 읽지 않는다.
+
+    테스트는 이 이름을 갈아끼운다(실호출 금지).
+    """
+    return _pool().request(
+        "GET",
+        url,
+        headers=PROBE_HEADERS,
+        redirect=False,
+        preload_content=False,
+        timeout=urllib3.Timeout(connect=CONNECT_TIMEOUT, read=READ_TIMEOUT),
+    )
+
+
+def _header(response, name: str) -> str:
+    headers = getattr(response, "headers", None) or {}
+    try:
+        value = headers.get(name)
+        if value is None:
+            value = headers.get(name.title())
+    except AttributeError:
+        value = None
+    return value or ""
+
+
 def _read_capped(response, max_bytes: int, deadline: float, clock) -> Optional[bytes]:
     """본문을 max_bytes 까지, deadline 까지만 읽는다. 시간 초과면 None."""
     chunks: List[bytes] = []
     size = 0
-    for chunk in response.iter_content(chunk_size=_READ_CHUNK):
+    for chunk in response.stream(_READ_CHUNK, decode_content=True):
         if clock() >= deadline:
             return None
         if not chunk:
@@ -344,46 +455,48 @@ def _read_capped(response, max_bytes: int, deadline: float, clock) -> Optional[b
         chunks.append(chunk)
         size += len(chunk)
         if size >= max_bytes:
-            break
+            break  # 상한에서 멈춘다 — 남은 본문을 drain 하지 않는다
     return b"".join(chunks)[:max_bytes]
 
 
-def _fetch(session, url, anchor, deadline, max_bytes, limit, clock) -> str:
+def _fetch(url, anchor, deadline, max_bytes, limit, clock) -> str:
     current = str(url)
     for _hop in range(MAX_REDIRECTS + 1):
-        remaining = deadline - clock()
-        if remaining <= 0:
+        if clock() >= deadline:
             return ""
-        response = session.get(
-            current,
-            timeout=remaining,
-            allow_redirects=False,
-            headers=PROBE_HEADERS,
-            stream=True,
-        )
+        response = _open(current)
         try:
-            status = response.status_code
+            status = getattr(response, "status", 0)
             if status in _REDIRECT_STATUS:
-                # 중간 응답 본문은 **읽지 않고** 닫는다(0바이트 — 크기 상한 안).
-                target = urljoin(
-                    current, (response.headers.get("Location") or "").strip()
-                )
+                location = _header(response, "location").strip()
+                # Location 없는 3xx 는 실패다 — 같은 URL 을 다시 부르면 홉을
+                # 낭비하며 같은 응답을 반복한다(Codex r3).
+                if not location:
+                    return ""
+                target = urljoin(current, location)
                 if not _is_http_url(target):
                     return ""
                 current = target
                 continue
-            if status >= 400:
+            if not 200 <= status < 300:
                 return ""
-            content_type = (response.headers.get("Content-Type") or "").lower()
-            # Content-Type 누락·text/plain 은 거절한다 — "비 HTML 거절"과 말을 맞춘다.
+            content_type = _header(response, "content-type").lower()
             if "html" not in content_type:
                 return ""
             raw = _read_capped(response, max_bytes, deadline, clock)
             if not raw:
                 return ""
-            return visible_text(_decode(raw, content_type), limit, anchor)
+            return visible_text(
+                _decode(raw, content_type), limit, anchor, deadline, clock
+            )
         finally:
-            response.close()
+            for closer in ("release_conn", "close"):
+                method = getattr(response, closer, None)
+                if callable(method):
+                    try:
+                        method()
+                    except Exception:  # noqa: BLE001
+                        pass
     return ""
 
 
@@ -398,8 +511,10 @@ def fetch_detail_text(
 ) -> str:
     """URL 의 본문 중 `anchor`(항목 제목) 기준 한 창. **실패는 빈 문자열**.
 
-    실패로 보는 것: URL 아님·요청 예외·4xx/5xx·비 HTML(Content-Type 누락 포함)·
-    빈 본문·항목 벽시계 초과·리다이렉트 4홉 초과·잡 예산 소진.
+    수집 전체를 워커 스레드에 넣고 벽시계로 잘라낸다 — 첫 청크가 오기 전에는
+    어떤 청크 루프도 데드라인을 볼 수 없기 때문이다(9초마다 1바이트를 보내는
+    서버가 read timeout 을 영원히 리셋한다). 시간이 끝나면 스레드는 **버린다**
+    (데몬처럼 남아 연결이 끊길 때까지 돌 수 있다 — 잡은 기다리지 않는다).
     """
     if not _is_http_url(url):
         return ""
@@ -408,13 +523,15 @@ def fetch_detail_text(
     deadline = clock() + timeout
     if budget is not None:
         deadline = min(deadline, budget.deadline)
-    session = requests.Session()
+    executor = ThreadPoolExecutor(max_workers=1)
     try:
-        return _fetch(session, url, anchor, deadline, max_bytes, limit, clock)
+        future = executor.submit(
+            _fetch, url, anchor, deadline, max_bytes, limit, clock
+        )
+        return future.result(timeout=max(0.0, deadline - clock()))
+    except FutureTimeout:
+        return ""
     except Exception:  # noqa: BLE001 — 항목 단위 fail-open
         return ""
     finally:
-        try:
-            session.close()
-        except Exception:  # noqa: BLE001
-            pass
+        executor.shutdown(wait=False)

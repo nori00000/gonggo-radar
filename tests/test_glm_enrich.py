@@ -2,7 +2,9 @@
 
 import codecs
 import json
+import os
 import sqlite3
+import time
 
 import pytest
 
@@ -28,12 +30,12 @@ def stub_detail_fetch(monkeypatch):
 
 
 def _label(entry) -> str:
-    """항목 제목의 첫 낱말을 오려 온 **추출형** 한 줄 의미 (r2 문법 통과).
+    """항목 제목을 그대로 옮긴 **추출형** 한 줄 의미 (r3b 문법 통과).
 
-    r2 부터 `한 줄 의미`는 근거에서 오려 온 «인용» + 접속어 화이트리스트로만
-    이루어져야 한다 — 자유 문장은 어떤 것도 통과하지 못한다.
+    r3b 부터 `한 줄 의미`는 «구절» **하나**이거나 정확히 `원문 확인` 이다 —
+    인용 밖에는 한 글자도 올 수 없다.
     """
-    return "«{}» 신청".format(entry["title"].split()[0])
+    return "«{}»".format(entry["title"])
 
 
 def _create_table(db_path) -> None:
@@ -156,13 +158,13 @@ def test_gate_output_normal_case_applies_all_fields():
         "n": 1, "대상 태그": "사회적기업(경기)",
         "마감": "2026-09-22 «9월 22일까지»",
         "자격": "원문 확인", "금액": "300만원 «지원금 300만원»",
-        "한 줄 의미": "«9월 22일까지» 접수",
+        "한 줄 의미": "«9월 22일까지 접수»",
     }], ensure_ascii=False)
 
     results, warnings = glm_mod.gate_output(raw, items)
 
     assert warnings == []
-    assert results[1]["한 줄 의미"] == "«9월 22일까지» 접수"
+    assert results[1]["한 줄 의미"] == "«9월 22일까지 접수»"
     assert results[1]["마감"] == "2026-09-22 «9월 22일까지»"
     assert results[1]["금액"] == "300만원 «지원금 300만원»"
     assert results[1]["대상 태그"] == "사회적기업(경기)"
@@ -174,7 +176,7 @@ def test_gate_output_quote_not_substring_falls_back_and_warns():
         "n": 1, "대상 태그": "사회적기업",
         "마감": "2026-09-22 «날조된 인용문»",  # 입력 텍스트에 없는 인용
         "자격": "원문 확인", "금액": "원문 확인",
-        "한 줄 의미": "«9월 22일까지» 접수",
+        "한 줄 의미": "«9월 22일까지 접수»",
     }], ensure_ascii=False)
 
     results, warnings = glm_mod.gate_output(raw, items)
@@ -182,7 +184,7 @@ def test_gate_output_quote_not_substring_falls_back_and_warns():
     assert results[1]["마감"] == glm_mod.FALLBACK
     assert any("마감" in w and "인용" in w for w in warnings)
     # 인용 실패가 다른 필드(한 줄 의미)까지 통째로 버리지 않는다
-    assert results[1]["한 줄 의미"] == "«9월 22일까지» 접수"
+    assert results[1]["한 줄 의미"] == "«9월 22일까지 접수»"
 
 
 def test_gate_output_parse_failure_returns_no_results():
@@ -419,39 +421,49 @@ def test_apply_headline_draft_replaces_existing_draft_idempotently():
 # A. 근거 공급 — 상세 텍스트 수집 (공용 헬퍼 alert/utils/http_fetch)
 # ─────────────────────────────────────────────────────────────────────────
 class _FakeResponse:
-    def __init__(self, status_code=200, headers=None, chunks=()):
-        self.status_code = status_code
+    """urllib3 HTTPResponse 흉내 — `_open` 이 돌려주는 것."""
+
+    def __init__(self, status=200, headers=None, chunks=()):
+        self.status = status
         self.headers = headers or {}
         self._chunks = list(chunks)
-        self.closed = False
+        self.released = False
 
-    def iter_content(self, chunk_size=1):
+    def stream(self, amt=None, decode_content=True):
         return iter(self._chunks)
 
-    def close(self):
-        self.closed = True
-
-
-class _FakeSession:
-    def __init__(self, response=None, exc=None):
-        self.response = response
-        self.exc = exc
-        self.max_redirects = None
-        self.calls = []
-
-    def get(self, url, **kwargs):
-        self.calls.append((url, kwargs))
-        if self.exc is not None:
-            raise self.exc
-        return self.response
+    def release_conn(self):
+        self.released = True
 
     def close(self):
         pass
 
 
-def _use_session(monkeypatch, session):
-    monkeypatch.setattr(http_fetch.requests, "Session", lambda: session)
-    return session
+def _use_open(monkeypatch, *responses):
+    """`http_fetch._open` 을 갈아끼우고 요청 URL 을 기록한다 (실호출 금지)."""
+    queue = list(responses)
+    calls = []
+
+    def fake_open(url):
+        calls.append(url)
+        if not queue:
+            raise AssertionError("예상보다 많은 요청")
+        return queue.pop(0) if len(queue) > 1 else queue[0]
+
+    monkeypatch.setattr(http_fetch, "_open", fake_open)
+    return calls
+
+
+def _html_response(body: str):
+    return _FakeResponse(
+        headers={"content-type": "text/html; charset=utf-8"},
+        chunks=[body.encode("utf-8")],
+    )
+
+
+def _redirect_response(location, status=302):
+    headers = {"location": location} if location is not None else {}
+    return _FakeResponse(status=status, headers=headers)
 
 
 def test_visible_text_drops_script_style_nav_and_normalizes_whitespace():
@@ -475,29 +487,25 @@ def test_visible_text_truncates_to_limit():
     )
 
 
-def test_fetch_detail_text_reads_html_with_shared_browser_headers(monkeypatch):
-    body = "<html><body><p>공고 본문</p></body></html>".encode("utf-8")
-    session = _use_session(monkeypatch, _FakeSession(_FakeResponse(
-        headers={"Content-Type": "text/html; charset=utf-8"}, chunks=[body],
-    )))
-    text = http_fetch.fetch_detail_text("https://example.test/a")
-    assert text == "공고 본문"
-    assert session.calls[0][1]["headers"] is http_fetch.PROBE_HEADERS
-    # 리다이렉트는 직접 따라간다 — requests 자동 추적은 중간 본문을 다 읽는다
-    assert session.calls[0][1]["allow_redirects"] is False
-    assert 0 < session.calls[0][1]["timeout"] <= http_fetch.DETAIL_TIMEOUT
+def test_fetch_detail_text_reads_html_through_the_shared_open_helper(monkeypatch):
+    calls = _use_open(monkeypatch, _html_response("<html><body><p>공고 본문</p></body></html>"))
+    assert http_fetch.fetch_detail_text("https://example.test/a") == "공고 본문"
+    assert calls == ["https://example.test/a"]
 
 
 def test_fetch_detail_text_is_fail_open_on_error_status_non_html_and_exception(monkeypatch):
-    _use_session(monkeypatch, _FakeSession(_FakeResponse(status_code=404)))
+    _use_open(monkeypatch, _FakeResponse(status=404))
     assert http_fetch.fetch_detail_text("https://example.test/a") == ""
 
-    _use_session(monkeypatch, _FakeSession(_FakeResponse(
-        headers={"Content-Type": "application/pdf"}, chunks=[b"%PDF-1.4"],
-    )))
+    _use_open(monkeypatch, _FakeResponse(
+        headers={"content-type": "application/pdf"}, chunks=[b"%PDF-1.4"],
+    ))
     assert http_fetch.fetch_detail_text("https://example.test/a") == ""
 
-    _use_session(monkeypatch, _FakeSession(exc=RuntimeError("boom")))
+    def boom(url):
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(http_fetch, "_open", boom)
     assert http_fetch.fetch_detail_text("https://example.test/a") == ""
 
     assert http_fetch.fetch_detail_text("ftp://example.test/a") == ""
@@ -505,10 +513,10 @@ def test_fetch_detail_text_is_fail_open_on_error_status_non_html_and_exception(m
 
 
 def test_fetch_detail_text_stops_at_max_bytes(monkeypatch):
-    _use_session(monkeypatch, _FakeSession(_FakeResponse(
-        headers={"Content-Type": "text/html"},
+    _use_open(monkeypatch, _FakeResponse(
+        headers={"content-type": "text/html"},
         chunks=[b"a" * 400000, b"b" * 400000, b"c" * 400000],
-    )))
+    ))
     text = http_fetch.fetch_detail_text(
         "https://example.test/a", limit=http_fetch.MAX_DETAIL_BYTES
     )
@@ -566,20 +574,20 @@ def test_gate_summary_replaces_a_fabricated_claim_with_no_quoted_span():
     results, warnings = glm_mod.gate_output(raw, items)
 
     assert results[1]["한 줄 의미"] == glm_mod.FALLBACK
-    assert any("허용 밖 낱말" in w for w in warnings)
+    assert any("인용 0개" in w for w in warnings)
 
 
 def test_gate_summary_keeps_a_valid_extractive_line_from_detail_text():
-    items = [_one_input_item(detail_text="사업비 1억원, 9.30 까지 접수")]
+    items = [_one_input_item(detail_text="사업비 1억원, 9.30 까지 접수합니다")]
     raw = json.dumps([{
         "n": 1, "대상 태그": "전체", "마감": "원문 확인",
         "자격": "원문 확인", "금액": "원문 확인",
-        "한 줄 의미": "«사업비 1억원» 신청 «9.30» 까지",
+        "한 줄 의미": "«사업비 1억원, 9.30 까지 접수합니다»",
     }], ensure_ascii=False)
 
     results, warnings = glm_mod.gate_output(raw, items)
 
-    assert results[1]["한 줄 의미"] == "«사업비 1억원» 신청 «9.30» 까지"
+    assert results[1]["한 줄 의미"] == "«사업비 1억원, 9.30 까지 접수합니다»"
     assert warnings == []
 
 
@@ -594,7 +602,7 @@ def test_gate_summary_checks_every_quote_not_only_the_first():
     results, warnings = glm_mod.gate_output(raw, items)
 
     assert results[1]["한 줄 의미"] == glm_mod.FALLBACK
-    assert any("날조" in w for w in warnings)
+    assert any("인용 2개" in w for w in warnings)
 
 
 def test_gate_quoted_field_checks_every_quote_not_only_the_first():
@@ -646,7 +654,7 @@ def test_gate_summary_still_replaces_overlong_text_after_normalization():
     raw = json.dumps([{
         "n": 1, "대상 태그": "전체", "마감": "원문 확인",
         "자격": "원문 확인", "금액": "원문 확인",
-        "한 줄 의미": "확인\n" + "가" * 60,
+        "한 줄 의미": "확인\n" + "가" * 100,
     }], ensure_ascii=False)
 
     results, warnings = glm_mod.gate_output(raw, items)
@@ -1080,10 +1088,7 @@ def test_fetch_detail_text_anchors_the_window_at_the_article_title(monkeypatch):
         "<div class='view'><h2>" + _TITLE + "</h2><p>" + _BODY + "</p></div>"
         "</body></html>"
     )
-    _use_session(monkeypatch, _FakeSession(_FakeResponse(
-        headers={"Content-Type": "text/html; charset=utf-8"},
-        chunks=[html_body.encode("utf-8")],
-    )))
+    _use_open(monkeypatch, _html_response(html_body))
     text = http_fetch.fetch_detail_text("https://example.test/a", anchor=_TITLE)
     assert text.startswith(_TITLE)
     assert text.count(_TITLE) == 1
@@ -1123,17 +1128,17 @@ def test_build_input_items_passes_the_item_title_as_the_anchor(
 # ─────────────────────────────────────────────────────────────────────────
 def test_gate_summary_rejects_a_span_cut_from_the_middle_of_a_token():
     """근거 `사업비 11억원` 에서 `1억원` 을 오려 새 금액을 만들 수 없다."""
-    items = [_one_input_item(summary="사업비 11억원 규모")]
+    items = [_one_input_item(summary="사업비 11억원 규모입니다")]
     raw = json.dumps([{
         "n": 1, "대상 태그": "전체", "마감": "원문 확인",
         "자격": "원문 확인", "금액": "원문 확인",
-        "한 줄 의미": "«1억원» 신청",
+        "한 줄 의미": "«1억원 규모입니다»",
     }], ensure_ascii=False)
 
     results, warnings = glm_mod.gate_output(raw, items)
 
     assert results[1]["한 줄 의미"] == glm_mod.FALLBACK
-    assert any("토큰 경계" in w for w in warnings)
+    assert any("경계로 없는 인용" in w for w in warnings)
 
 
 def test_gate_summary_keeps_a_span_that_crosses_a_newline_in_the_evidence():
@@ -1142,35 +1147,38 @@ def test_gate_summary_keeps_a_span_that_crosses_a_newline_in_the_evidence():
     raw = json.dumps([{
         "n": 1, "대상 태그": "전체", "마감": "원문 확인",
         "자격": "원문 확인", "금액": "원문 확인",
-        "한 줄 의미": "«접수기간 9월 22일까지» 신청",
+        "한 줄 의미": "«접수기간 9월 22일까지»",
     }], ensure_ascii=False)
 
     results, warnings = glm_mod.gate_output(raw, items)
 
-    assert results[1]["한 줄 의미"] == "«접수기간 9월 22일까지» 신청"
+    assert results[1]["한 줄 의미"] == "«접수기간 9월 22일까지»"
     assert warnings == []
 
 
-def test_gate_summary_rejects_a_connective_outside_the_whitelist():
+def test_gate_summary_rejects_any_character_outside_the_span():
+    """r3b: 구절 밖에는 조사 한 글자도 올 수 없다."""
     items = [_one_input_item()]
     raw = json.dumps([{
         "n": 1, "대상 태그": "전체", "마감": "원문 확인",
         "자격": "원문 확인", "금액": "원문 확인",
-        "한 줄 의미": "«9월 22일까지» 무조건 신청",
+        "한 줄 의미": "«9월 22일까지 접수» 무조건 신청",
     }], ensure_ascii=False)
 
     results, warnings = glm_mod.gate_output(raw, items)
 
     assert results[1]["한 줄 의미"] == glm_mod.FALLBACK
-    assert any("허용 밖 낱말" in w and "무조건" in w for w in warnings)
+    assert any("인용 밖 글자" in w and "무조건" in w for w in warnings)
 
 
-def test_gate_summary_grammar_limits_span_count_and_length():
-    evidence = glm_mod.http_fetch.normalize_space("가 나 다 라 마 " + "바" * 70)
-    five_spans = " ".join(f"«{token}»" for token in "가나다라마")
-    assert "인용" in (glm_mod.gate_summary_grammar(five_spans, evidence) or "")
-    long_span = "«" + "바" * 70 + "»"
-    assert "자 초과" in (glm_mod.gate_summary_grammar(long_span, evidence) or "")
+def test_gate_summary_grammar_requires_exactly_one_span_of_bounded_length():
+    evidence = glm_mod.summary_normalize("가나다라마바사아 " + "바" * 90)
+    two_spans = "«가나다라마바사아» «가나다라마바사아»"
+    assert "인용 2개" in (glm_mod.gate_summary_grammar(two_spans, evidence) or "")
+    assert "인용 0개" in (glm_mod.gate_summary_grammar("상시 접수", evidence) or "")
+    assert "3자" in (glm_mod.gate_summary_grammar("«가나다»", evidence) or "")
+    long_span = "«" + "바" * 90 + "»"
+    assert "90자" in (glm_mod.gate_summary_grammar(long_span, evidence) or "")
 
 
 def test_gate_summary_keeps_the_plain_fallback_string():
@@ -1186,9 +1194,10 @@ def test_gate_summary_keeps_the_plain_fallback_string():
     assert warnings == []
 
 
-def test_persona_prompt_teaches_the_extractive_grammar():
+def test_persona_prompt_teaches_the_single_span_grammar():
     prompt = glm_mod.PERSONA_SYSTEM_PROMPT
-    assert "오려 붙인다" in prompt
+    assert "한 구절(8~80자) 하나" in prompt
+    assert "두 구절 금지" in prompt and "구절 밖 글자 금지" in prompt
     assert prompt.count("예1:") == 1 and prompt.count("예2:") == 1
     assert "낱말 경계" in prompt
 
@@ -1317,59 +1326,46 @@ class _Clock:
         return self.now
 
 
-class _SeqSession:
-    """응답을 순서대로 돌려주는 세션 — 리다이렉트 홉 검증용."""
-
-    def __init__(self, responses):
-        self._responses = list(responses)
-        self.urls = []
-        self.max_redirects = None
-
-    def get(self, url, **kwargs):
-        self.urls.append(url)
-        if not self._responses:
-            raise AssertionError("예상보다 많은 요청")
-        return self._responses.pop(0)
-
-    def close(self):
-        pass
-
-
-def _redirect(location, status=302):
-    return _FakeResponse(status_code=status, headers={"Location": location})
-
-
-def _html(body: str):
-    return _FakeResponse(
-        headers={"Content-Type": "text/html; charset=utf-8"},
-        chunks=[body.encode("utf-8")],
-    )
-
-
 def test_fetch_detail_text_aborts_on_the_item_wall_clock_deadline(monkeypatch):
     """9초마다 조금씩 보내는 서버가 read timeout 을 영원히 리셋하지 못한다."""
     clock = _Clock()
 
     class _Slow(_FakeResponse):
-        def iter_content(self, chunk_size=1):
+        def stream(self, amt=None, decode_content=True):
             def generate():
                 while True:
                     clock.now += 4.0
                     yield b"<p>a</p>"
             return generate()
 
-    _use_session(monkeypatch, _FakeSession(
-        _Slow(headers={"Content-Type": "text/html"})
-    ))
+    _use_open(monkeypatch, _Slow(headers={"content-type": "text/html"}))
     assert http_fetch.fetch_detail_text(
         "https://example.test/a", clock=clock
     ) == ""
     assert clock.now - 1000.0 <= http_fetch.DETAIL_TIMEOUT + 4.0
 
 
+def test_fetch_detail_text_cuts_a_server_that_never_sends_a_first_chunk(monkeypatch):
+    """첫 청크 전에는 청크 루프가 돌지 않는다 — 워커 스레드를 벽시계로 자른다."""
+    import threading
+
+    blocked = threading.Event()
+
+    def never_returns(url):
+        blocked.wait(30)
+        raise AssertionError("도달하면 안 된다")
+
+    monkeypatch.setattr(http_fetch, "_open", never_returns)
+    started = time.monotonic()
+    assert http_fetch.fetch_detail_text("https://example.test/a", timeout=0.2) == ""
+    elapsed = time.monotonic() - started
+    blocked.set()
+    assert elapsed < 3.0
+
+
 def test_fetch_detail_text_skips_items_once_the_job_budget_is_spent(monkeypatch):
     clock = _Clock()
-    session = _use_session(monkeypatch, _FakeSession(_html("<p>본문</p>")))
+    calls = _use_open(monkeypatch, _html_response("<p>본문</p>"))
     budget = http_fetch.FetchBudget(seconds=5, clock=clock)
 
     assert http_fetch.fetch_detail_text(
@@ -1378,46 +1374,60 @@ def test_fetch_detail_text_skips_items_once_the_job_budget_is_spent(monkeypatch)
 
     clock.now += 10  # 예산 소진
     assert budget.exhausted()
-    before = len(session.calls)
+    before = len(calls)
     assert http_fetch.fetch_detail_text(
         "https://example.test/b", budget=budget, clock=clock
     ) == ""
-    assert len(session.calls) == before  # 요청조차 하지 않는다
+    assert len(calls) == before  # 요청조차 하지 않는다
 
 
 def test_fetch_detail_text_follows_redirects_manually_up_to_the_limit(monkeypatch):
-    session = _SeqSession([
-        _redirect("/b"), _redirect("/c"), _html("<p>도착</p>"),
-    ])
-    monkeypatch.setattr(http_fetch.requests, "Session", lambda: session)
+    calls = _use_open(
+        monkeypatch,
+        _redirect_response("/b"), _redirect_response("/c"),
+        _html_response("<p>도착</p>"),
+    )
     assert http_fetch.fetch_detail_text("https://example.test/a") == "도착"
-    assert session.urls == [
+    assert calls == [
         "https://example.test/a", "https://example.test/b", "https://example.test/c",
     ]
 
 
 def test_fetch_detail_text_gives_up_after_too_many_redirects(monkeypatch):
-    session = _SeqSession([_redirect(f"/{n}") for n in range(6)])
-    monkeypatch.setattr(http_fetch.requests, "Session", lambda: session)
+    calls = _use_open(
+        monkeypatch, *[_redirect_response(f"/{n}") for n in range(6)]
+    )
     assert http_fetch.fetch_detail_text("https://example.test/a") == ""
-    assert len(session.urls) == http_fetch.MAX_REDIRECTS + 1
+    assert len(calls) == http_fetch.MAX_REDIRECTS + 1
 
 
 def test_fetch_detail_text_refuses_a_non_http_redirect_target(monkeypatch):
-    session = _SeqSession([_redirect("ftp://example.test/a")])
-    monkeypatch.setattr(http_fetch.requests, "Session", lambda: session)
+    _use_open(monkeypatch, _redirect_response("ftp://example.test/a"))
+    assert http_fetch.fetch_detail_text("https://example.test/a") == ""
+
+
+def test_a_redirect_without_location_is_a_failure_not_a_retry(monkeypatch):
+    """Location 없는 3xx 로 같은 URL 을 다시 부르지 않는다 (Codex r3)."""
+    calls = _use_open(monkeypatch, _redirect_response(None))
+    assert http_fetch.fetch_detail_text("https://example.test/a") == ""
+    assert calls == ["https://example.test/a"]
+
+
+def test_a_multiple_choices_response_is_not_accepted_as_evidence(monkeypatch):
+    _use_open(monkeypatch, _FakeResponse(
+        status=300, headers={"content-type": "text/html"},
+        chunks=[b"<p>\xea\xb3\xa8\xeb\x9d\xbc</p>"],
+    ))
     assert http_fetch.fetch_detail_text("https://example.test/a") == ""
 
 
 @pytest.mark.parametrize("headers", [
     {},                                    # Content-Type 누락
-    {"Content-Type": "text/plain"},        # 평문
-    {"Content-Type": "application/json"},
+    {"content-type": "text/plain"},        # 평문
+    {"content-type": "application/json"},
 ])
 def test_fetch_detail_text_requires_an_html_content_type(monkeypatch, headers):
-    _use_session(monkeypatch, _FakeSession(
-        _FakeResponse(headers=headers, chunks=[b"<p>x</p>"])
-    ))
+    _use_open(monkeypatch, _FakeResponse(headers=headers, chunks=[b"<p>x</p>"]))
     assert http_fetch.fetch_detail_text("https://example.test/a") == ""
 
 
@@ -1716,7 +1726,7 @@ def test_a_rejected_headline_draft_is_recorded_in_the_warnings_file(
 def _big_item(n, chars, id_=None):
     return {
         "n": n, "id": id_ if id_ is not None else 40 + n,
-        "title": f"공고 {n}", "source_name": "기관",
+        "title": f"산림 지원사업 참여기업 모집 공고 {n}", "source_name": "기관",
         "summary": "", "detail_text": "가" * chars,
         "quote_deadline": "", "quote_eligibility": "원문 확인",
         "quote_amount": "원문 확인", "url": f"https://example.com/{n}",
@@ -1785,7 +1795,7 @@ def _extractive_for(prompt):
         {
             "n": item["n"], "대상 태그": "전체", "마감": "원문 확인",
             "자격": "원문 확인", "금액": "원문 확인",
-            "한 줄 의미": "«{}» 신청".format(item["title"].split()[0]),
+            "한 줄 의미": "«{}»".format(item["title"]),
         }
         for item in payload["items"]
     ], ensure_ascii=False)
@@ -1878,3 +1888,300 @@ def test_headline_prompt_stays_under_the_cap(digest_fixture):
     manifest_items = _manifest_items(digest_fixture["markdown_path"])
     prompt = glm_mod.build_headline_prompt(manifest_items)
     assert len(prompt.encode("utf-8")) <= glm_mod.PROMPT_BYTE_BUDGET
+
+
+# ══ V3.1 r3b (Codex 실검토 3회차 수렴) ════════════════════════════════════
+# 1. 한 구절만 허용하는 문법 — Codex 가 뚫은 4행이 전부 막혀야 한다
+# ─────────────────────────────────────────────────────────────────────────
+def _summary_verdict(evidence: str, line: str):
+    """(값, 통과, 사유) — 근거 문자열 하나로 `한 줄 의미`를 직접 판정한다."""
+    return glm_mod._gate_summary(line, glm_mod.summary_normalize(evidence))
+
+
+def test_connectives_alone_cannot_assert_anything():
+    """Codex 1행: 근거 `접수는 9월에만` 인데 출력 `상시 접수` 가 통과했다."""
+    value, ok, reason = _summary_verdict("접수는 9월에만 진행합니다.", "상시 접수")
+    assert (value, ok) == (glm_mod.FALLBACK, False)
+    assert "인용 0개" in reason
+
+
+def test_two_spans_cannot_be_welded_into_a_new_predicate():
+    """Codex 2행: `«신청» «불가»` — 다른 문장의 술어를 결합했다."""
+    value, ok, reason = _summary_verdict(
+        "신청 가능. 환불 불가.", "«신청 가능합니다» «환불 불가합니다»"
+    )
+    assert (value, ok) == (glm_mod.FALLBACK, False)
+    assert "인용 2개" in reason
+
+
+def test_a_decimal_point_is_not_a_token_boundary():
+    """Codex 3행: 근거 `사업비 1.5억원` 에서 `«5억원»` 을 오릴 수 없다."""
+    evidence = "사업비 1.5억원 규모, 접수합니다"
+    # 짧은 형태는 길이 하한(8자)에서 먼저 막힌다
+    short_value, short_ok, short_reason = _summary_verdict(evidence, "«5억원»")
+    assert (short_value, short_ok) == (glm_mod.FALLBACK, False)
+    assert "3자" in short_reason
+    # 길이를 채워도 소수점 뒤에서 오린 구절은 경계 위반이다
+    value, ok, reason = _summary_verdict(evidence, "«5억원 규모, 접수합니다»")
+    assert (value, ok) == (glm_mod.FALLBACK, False)
+    assert "경계로 없는 인용" in reason
+    # 소수점을 포함해 통째로 옮기면 통과한다
+    assert _summary_verdict(evidence, "«사업비 1.5억원 규모»") == (
+        "«사업비 1.5억원 규모»", True, ""
+    )
+
+
+def test_a_full_width_decimal_is_normalized_the_same_way_on_both_sides():
+    """Codex 4행: 전각 소수점도 같은 규칙을 지난다 (NFKC)."""
+    evidence = "사업비 １．５억원 규모, 접수합니다"
+    value, ok, reason = _summary_verdict(evidence, "«５억원 규모, 접수합니다»")
+    assert (value, ok) == (glm_mod.FALLBACK, False)
+    assert "경계로 없는 인용" in reason
+    # 전각으로 옮겨 와도 정규화되어 통과하고, **저장되는 값도 정규화된 값**이다
+    assert _summary_verdict(evidence, "«사업비 １．５억원 규모»") == (
+        "«사업비 1.5억원 규모»", True, ""
+    )
+
+
+def test_a_period_followed_by_whitespace_still_counts_as_a_boundary():
+    evidence = "접수합니다. 의견 제출 기간: 2026. 10. 19.까지 입니다"
+    assert _summary_verdict(evidence, "«의견 제출 기간: 2026. 10. 19.까지»") == (
+        "«의견 제출 기간: 2026. 10. 19.까지»", True, ""
+    )
+
+
+def test_summary_normalize_is_applied_identically_to_both_sides():
+    assert glm_mod.summary_normalize("１．５억원\n규모") == "1.5억원 규모"
+    assert glm_mod.summary_normalize("  가   나  ") == "가 나"
+
+
+# ─── 2. DOM — 단일 상향 측정 · 노드/깊이/종료태그 상한 ────────────────────
+def test_content_selection_is_linear_on_deeply_nested_containers():
+    """Codex 재현: 20,000단 중첩 `div.view` 가 후보마다 하위를 다시 읽었다."""
+    html_text = '<div class="view">' * 20000 + "본문" + "</div>" * 20000
+    started = time.monotonic()
+    text = http_fetch.visible_text(html_text)
+    assert time.monotonic() - started < 1.0
+    assert "본문" in text
+
+
+def test_unmatched_end_tags_do_not_scan_the_whole_stack():
+    html_text = "<div>" * 50000 + "</x>" * 50000 + "<p>본문</p>"
+    started = time.monotonic()
+    http_fetch.visible_text(html_text)
+    assert time.monotonic() - started < 1.0
+
+
+def test_dom_depth_and_node_caps_are_enforced():
+    builder = http_fetch._DomBuilder(max_nodes=10, max_depth=4)
+    builder.feed("<div>" * 20 + "본문" + "</div>" * 20)
+    builder.close()
+    depth = 0
+    node = builder.root
+    while True:
+        children = [c for c in node.children if not isinstance(c, str)]
+        if not children:
+            break
+        node = children[0]
+        depth += 1
+    assert depth <= 4
+    assert builder._nodes <= 10
+
+
+def test_parsing_aborts_when_the_item_deadline_passes():
+    clock = _Clock()
+
+    def ticking():
+        clock.now += 100.0
+        return clock.now
+
+    assert http_fetch.visible_text(
+        "<p>본문</p>" * 20000, deadline=clock.now + 1, clock=ticking
+    ) == ""
+
+
+# ─── 3. 숨김·깨진 HTML ────────────────────────────────────────────────────
+@pytest.mark.parametrize("style", [
+    "display:\nnone",
+    "display:/**/none",
+    "  VISIBILITY :  HIDDEN  ",
+])
+def test_hidden_styles_are_normalized_before_matching(style):
+    html_text = f"<body><div style=\"{style}\">숨김</div><p>본문</p></body>"
+    text = http_fetch.visible_text(html_text)
+    assert "숨김" not in text
+    assert "본문" in text
+
+
+def test_an_implicitly_closed_p_does_not_swallow_the_visible_body():
+    """`<p hidden>숨김<p>본문` — 둘째 `<p>` 가 첫째를 닫는다."""
+    text = http_fetch.visible_text("<body><p hidden>숨김<p>본문</body>")
+    assert "숨김" not in text
+    assert "본문" in text
+
+
+def test_a_nested_form_start_tag_is_ignored_like_a_browser():
+    """`<form hidden><form></form>본문` — `</form>` 이 바깥 폼을 닫는다."""
+    text = http_fetch.visible_text(
+        "<body><form hidden><form></form>본문</body>"
+    )
+    assert "본문" in text
+
+
+def test_cdata_content_becomes_text():
+    text = http_fetch.visible_text(
+        "<body><p><![CDATA[접수기간 9월 22일까지]]></p></body>"
+    )
+    assert "접수기간 9월 22일까지" in text
+
+
+# ─── 4. md 쓰기도 원자적 ──────────────────────────────────────────────────
+def test_a_crash_during_the_md_write_leaves_the_original_intact(
+    digest_fixture, tmp_path, monkeypatch
+):
+    """`write_text` 는 먼저 truncate 한다 — 그 창에서 죽으면 복구가 안 됐다."""
+    markdown_path = digest_fixture["markdown_path"]
+    _apply_fake_enrichment(digest_fixture, tmp_path)
+    before = markdown_path.read_bytes()
+    assert b"  \xe2\x86\x92 " in before
+
+    def exploding(src, dst):
+        raise RuntimeError("쓰기 도중 중단")
+
+    monkeypatch.setattr(glm_mod.os, "replace", exploding)
+
+    broken = tmp_path / "any.json"
+    broken.write_text("[]", encoding="utf-8")
+
+    class Args:
+        week = W13
+        db = digest_fixture["db_path"]
+        out_dir = str(digest_fixture["out_dir"])
+        dry_run = False
+        apply_json = str(broken)
+
+    with pytest.raises(RuntimeError):
+        glm_mod.run(Args())
+
+    assert markdown_path.read_bytes() == before
+
+
+def test_write_text_atomic_replaces_through_a_temp_file(tmp_path):
+    target = tmp_path / "a.md"
+    target.write_text("원본", encoding="utf-8")
+    glm_mod.write_text_atomic(target, "새 내용")
+    assert target.read_text(encoding="utf-8") == "새 내용"
+    assert not target.with_name(target.name + ".tmp").exists()
+
+
+# ─── 5. 카톡 — 줄 단위 정확 대조 (부분문자열 아님) ────────────────────────
+def _set_enrich_lines_directly(markdown_path, texts):
+    """md 의 항목 블록에 보강 줄을 직접 박는다 (게이트를 거치지 않는 픽스처)."""
+    text = markdown_path.read_text(encoding="utf-8")
+    ids = [
+        str(block["item_id"]) for block in blocks_mod.item_blocks(text)
+    ]
+    assert len(ids) == len(texts)
+    new_text, changed = blocks_mod.set_enrich_lines(
+        text,
+        {
+            item_id: blocks_mod.enrich_line_text(value)
+            for item_id, value in zip(ids, texts)
+        },
+    )
+    assert len(changed) == len(texts)
+    markdown_path.write_text(new_text, encoding="utf-8")
+    return new_text
+
+
+def test_kakao_check_catches_a_lost_line_that_is_a_substring_of_another(
+    digest_fixture, monkeypatch
+):
+    """Codex r3: `→ «신청»` 이 `→ «신청» «불가»` 안에서 세어져 유실을 놓쳤다."""
+    short = "«접수기간 9월 22일까지»"
+    long = "«접수기간 9월 22일까지 신청 가능»"
+    text = _set_enrich_lines_directly(
+        digest_fixture["markdown_path"], [short, long]
+    )
+    assert composer_mod.markdown_kakao_problems(text) == []
+
+    original = composer_mod.kakao_blocks_from_markdown
+
+    def drop_short(markdown_text):
+        out = []
+        for block in original(markdown_text):
+            lines = block.split("\n")
+            if len(lines) == 3 and lines[2].strip() == f"→ {short}":
+                out.append("\n".join(lines[:2]))
+                continue
+            out.append(block)
+        return out
+
+    monkeypatch.setattr(composer_mod, "kakao_blocks_from_markdown", drop_short)
+    problems = composer_mod.markdown_kakao_problems(text)
+    assert any("보강 줄 누락(1→0)" in problem for problem in problems)
+
+
+# ─── 6. 미리보기 — 세 상태 ────────────────────────────────────────────────
+def test_preview_says_only_the_headline_draft_was_discarded(
+    digest_fixture, tmp_path, monkeypatch
+):
+    """항목은 전부 통과하고 초안만 거절된 실행을 '항목 대체'라고 쓰지 않는다."""
+    fake_ds = tmp_path / "ds"
+    fake_ds.write_text("#!/bin/sh\n", encoding="utf-8")
+    monkeypatch.setattr(glm_mod, "DS_BIN", fake_ds)
+
+    class DryArgs:
+        week = W13
+        db = digest_fixture["db_path"]
+        out_dir = str(digest_fixture["out_dir"])
+        dry_run = True
+        apply_json = None
+
+    glm_mod.run(DryArgs())
+    payload = json.loads(
+        (digest_fixture["out_dir"] / f"{W13}.glm_input.json").read_text(encoding="utf-8")
+    )
+    summary_output = json.dumps([
+        {
+            "n": entry["n"], "대상 태그": "전체", "마감": "원문 확인",
+            "자격": "원문 확인", "금액": "원문 확인",
+            "한 줄 의미": _label(entry),
+        }
+        for entry in payload["items"]
+    ], ensure_ascii=False)
+    calls = {"n": 0}
+
+    def fake_ds_call(prompt, timeout=None):
+        calls["n"] += 1
+        return summary_output if calls["n"] == 1 else "-->허위 문장<!--"
+
+    monkeypatch.setattr(glm_mod, "call_ds_glm", fake_ds_call)
+
+    class Args:
+        week = W13
+        db = digest_fixture["db_path"]
+        out_dir = str(digest_fixture["out_dir"])
+        dry_run = False
+        apply_json = None
+
+    assert glm_mod.run(Args()) == 0
+    warnings_file = json.loads(
+        (digest_fixture["out_dir"] / f"{W13}.glm_warnings.json").read_text(
+            encoding="utf-8")
+    )
+    assert warnings_file["items_replaced"] is False
+    assert warnings_file["discarded"] is False
+
+    check = check_digest(
+        db_path=digest_fixture["db_path"],
+        markdown_path=digest_fixture["markdown_path"],
+        output_path=None, skip_network=False,
+    )
+    assert check["glm_items_replaced"] is False
+    preview = preview_mod.render_preview(
+        W13, digest_fixture["markdown_path"].read_text(encoding="utf-8"), check
+    )
+    assert "이번 주 한 줄 초안만 폐기" in preview
+    assert "원문 확인'으로 대체" not in preview
+    assert "GLM 출력 전체 폐기" not in preview

@@ -216,10 +216,12 @@ def render_preview(
     if glm_warnings:
         # r2: 폐기와 대체를 구분한다 — n 집합 위반·파싱 실패는 **아무것도 적용하지
         # 않은** 실행이고, 그때 "원문 확인으로 대체"라고 쓰면 거짓 안내가 된다.
-        detail = (
-            "GLM 출력 전체 폐기" if check.get("glm_discarded")
-            else "해당 항목은 '원문 확인'으로 대체"
-        )
+        if check.get("glm_discarded"):
+            detail = "GLM 출력 전체 폐기"
+        elif check.get("glm_items_replaced"):
+            detail = "해당 항목은 '원문 확인'으로 대체"
+        else:
+            detail = "이번 주 한 줄 초안만 폐기 (항목은 그대로)"
         lines.append(f"GLM 보강 경고 {glm_warnings}건 ({detail})")
     lines.append("")
 

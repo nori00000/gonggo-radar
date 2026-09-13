@@ -1994,15 +1994,23 @@ def markdown_kakao_problems(markdown_text: str) -> List[str]:
     # 갈라진다. 사람이 md 에서 읽은 문장이 카톡에서 조용히 사라지는 쪽이,
     # 발송을 멈추는 쪽보다 나쁘다.
     #
-    # r2 (Codex MEDIUM): 판정은 **출현 수**다. 두 항목이 모두 `→ 원문 확인` 일
-    # 때 `enrich in joined` 는 하나만 살아남아도 참이라 유실을 놓쳤다.
-    enrich_counts = Counter(
+    # r3b (Codex MEDIUM): 판정은 **결과물의 보강 줄을 실제로 파싱한 다중집합**
+    # 이다. 부분문자열·출현 수 세기는 `→ «신청»` 과 `→ «신청» «불가»` 처럼 한
+    # 줄이 다른 줄의 부분문자열일 때 유실을 놓쳤다 — 짧은 줄이 사라져도 긴 줄
+    # 안에서 세어졌다. 줄 단위 정확 일치로 바꾼다.
+    expected_enrich = Counter(
         (block.get("enrich_line") or "").strip()
         for block in blocks_mod.item_blocks(markdown_text)
         if (block.get("enrich_line") or "").strip()
     )
-    for enrich, expected in sorted(enrich_counts.items()):
-        rendered = joined.count(enrich)
+    rendered_enrich = Counter(
+        line.strip()
+        for chunk in chunks
+        for line in chunk.split("\n")
+        if line.strip().startswith(blocks_mod.ENRICH_LINE_PREFIX.strip())
+    )
+    for enrich, expected in sorted(expected_enrich.items()):
+        rendered = rendered_enrich.get(enrich, 0)
         if rendered < expected:
             problems.append(
                 f"보강 줄 누락({expected}→{rendered}): {enrich[:40]}…"

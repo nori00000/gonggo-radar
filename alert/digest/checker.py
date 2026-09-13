@@ -533,29 +533,32 @@ def glm_warnings_path(markdown_path) -> Path:
     return markdown_path.with_name(stem + GLM_WARNINGS_SUFFIX)
 
 
-def glm_warning_summary(markdown_path) -> Tuple[int, bool]:
-    """(경고 건수, 출력 전체 폐기 여부). 파일이 없거나 깨졌으면 (0, False).
+def glm_warning_summary(markdown_path) -> Dict:
+    """GLM 보강 경고 요약 — `{count, discarded, items_replaced}`.
 
-    `discarded` 는 n 집합 위반·파싱 실패로 **아무것도 적용하지 않은** 실행이다 —
-    미리보기 문구가 "원문 확인으로 대체"와 "출력 전체 폐기"를 구분해야 한다
-    (Codex v3.1 LOW: 폐기인데 대체라고 표시했다).
+    세 상태를 구분한다(Codex r3 LOW): ①항목 필드가 대체됨 ②출력 전체 폐기
+    ③초안만 폐기(항목은 멀쩡). 미리보기가 셋을 같은 문구로 말하면 거짓 안내다.
     """
+    empty = {"count": 0, "discarded": False, "items_replaced": False}
     try:
         loaded = json.loads(
             glm_warnings_path(markdown_path).read_text(encoding="utf-8")
         )
     except (OSError, json.JSONDecodeError):
-        return 0, False
+        return empty
     if not isinstance(loaded, dict):
-        return 0, False
+        return empty
     warnings = loaded.get("warnings")
-    count = len(warnings) if isinstance(warnings, list) else 0
-    return count, bool(loaded.get("discarded"))
+    return {
+        "count": len(warnings) if isinstance(warnings, list) else 0,
+        "discarded": bool(loaded.get("discarded")),
+        "items_replaced": bool(loaded.get("items_replaced")),
+    }
 
 
 def glm_warning_count(markdown_path) -> int:
     """GLM 보강 게이트 경고 건수 (표시용, 게이트 아님)."""
-    return glm_warning_summary(markdown_path)[0]
+    return glm_warning_summary(markdown_path)["count"]
 
 def extract_item_urls(markdown_text: str, item_sections=None) -> List[str]:
     """항목 블록의 원문 URL을 문서 순서대로, 중복 없이 뽑는다.
@@ -828,7 +831,7 @@ def check_digest(
     # 사이클 9 #5: 치환 규칙이 완전한지 **생성 후** 확인한다 — 한도를 넘긴 조각과
     # 분절·유실된 URL 을 둘 다 본다(조각 길이만 보면 "URL 을 잘라 맞춘" 출력이 통과).
     kakao_problems = markdown_kakao_problems(markdown_text)
-    glm_warnings_count, glm_discarded = glm_warning_summary(markdown_path)
+    glm_summary = glm_warning_summary(markdown_path)
 
     if not network_checked:
         reason = "네트워크 미검사"
@@ -872,8 +875,9 @@ def check_digest(
         # V3.1: GLM 보강 게이트가 남긴 경고 건수 — 미리보기 상단에 표시만 한다
         # (발송 차단 아님. 경고 = "GLM 이 낸 문장을 게이트가 버렸다" 이므로 본문은
         # 이미 안전한 쪽으로 대체돼 있다. 사람은 그 사실을 알고 승인해야 한다).
-        "glm_warnings": glm_warnings_count,
-        "glm_discarded": glm_discarded,
+        "glm_warnings": glm_summary["count"],
+        "glm_discarded": glm_summary["discarded"],
+        "glm_items_replaced": glm_summary["items_replaced"],
         "pass": (
             network_checked
             and alive_count > 0

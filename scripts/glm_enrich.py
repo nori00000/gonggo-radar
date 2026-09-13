@@ -60,7 +60,7 @@ _TAG_RE = re.compile(
     r"^(?:협동조합|사회적기업|산림사업자|마을기업|전체|보류)(?:\([^()]{1,20}\))?$"
 )
 _QUOTE_RE = re.compile(r"«([^»]+)»")
-_MAX_SUMMARY_CHARS = 40  # "15자 내외" 규칙에 여유를 둔 상한 — 문단급 산출만 걸러낸다
+_MAX_SUMMARY_CHARS = 82  # «» + 구절 최대 80자. 문단급 산출을 걸러낸다
 
 # 상세 텍스트 수집(V3.1 A) — 테스트가 이 이름을 갈아끼운다(실호출 금지).
 fetch_detail_text = http_fetch.fetch_detail_text
@@ -90,19 +90,32 @@ _NUMBER_TOKEN_RE = re.compile(
     r"\d(?:[\d.,\-/:]*\d)?" + _NUMBER_UNIT + r"?"
 )
 
-# ─── 추출형 `한 줄 의미` 문법 (V3.1 r2 — Codex HIGH) ─────────────────────
-# 부분문자열 대조만으로는 의미를 검증하지 못했다: 근거가 `모집 공고` 뿐이어도
-# `전 기업 일억원 지급 확정` 이 통과했고, 근거 `사업비 11억원` 에서 `1억원` 을
-# 오려 `1억원 지급 확정` 을 만들 수도 있었다. 그래서 이 필드를 **생성**이 아니라
-# **추출**로 좁힌다: 값은 근거에서 그대로 오려 온 «인용» 들과 아래 접속어
-# 화이트리스트만으로 이루어져야 한다. 화이트리스트 밖 낱말이 하나라도 있으면
-# 그 필드는 `원문 확인` 이다 — 새 주장을 쓸 자리가 문법적으로 없다.
-_SUMMARY_CONNECTIVES = frozenset({
-    "대상", "마감", "까지", "신청", "접수", "의견", "제출", "설명회", "상시",
-    "원문", "확인", "·", ",", "/",
-})
-_MAX_SUMMARY_SPANS = 4
-_MAX_SPAN_CHARS = 60
+# ─── 추출형 `한 줄 의미` 문법 (r3b — Codex HIGH 2회차) ────────────────────
+# 접속어 화이트리스트를 두었더니 접속어만으로도 주장이 만들어졌다(근거
+# `접수는 9월에만 진행합니다.` → 출력 `상시 접수`), 인용 두 개를 이어 붙여 다른
+# 문장의 술어를 결합할 수 있었고(`«신청» «불가»`), 소수점이 경계로 인정되어
+# `사업비 1.5억원` 에서 `«5억원»` 을 오릴 수 있었다.
+#
+# 그래서 문법을 **한 구절**로 줄인다: 값은 `«…»` 하나이거나 정확히 `원문 확인`
+# 이다. 인용 밖 글자는 한 글자도 허용하지 않는다 — 잇는 낱말이 없으면 문장을
+# 조립할 수 없고, 남는 것은 원문에 실제로 있는 한 구절뿐이다.
+_MIN_SPAN_CHARS = 8
+_MAX_SPAN_CHARS = 80
+# 경계로 인정하는 구두점. `.`/`．` 은 여기 없다 — 아래에서 문맥으로 판정한다.
+_BOUNDARY_PUNCT = frozenset(",;:!?()[]{}<>«»\u300c\u300d\u300e\u300f\uff08\uff09\uff3b\uff3d"
+                            "\u00b7\uff0c\uff1b\uff1a\uff01\uff1f\u3001\u2026\u2018\u2019\u201c\u201d'\"/\\|~-")
+_PERIODS = frozenset(".\uff0e")
+
+
+def summary_normalize(text: str) -> str:
+    """`한 줄 의미`와 근거가 **똑같이** 지나는 정규화: NFKC + 공백 합침.
+
+    NFKC 를 고른 이유는 전각 소수점이다 — `\uff11\uff0e\uff15\uc5b5\uc6d0` 을 그대로 두면
+    같은 금액이 다른 문자열이 되어 경계 판정이 두 벌 필요해진다. 정규화는
+    출력과 근거 **양쪽에 동일하게** 적용하고, md 에 저장되는 값도 정규화된
+    값이다(저장한 것과 검사한 것이 같아야 한다).
+    """
+    return " ".join(unicodedata.normalize("NFKC", text or "").split())
 
 
 def format_problem(value: str) -> Optional[str]:
@@ -156,18 +169,32 @@ def unsupported_tokens(text: str, search_text: str) -> List[str]:
     return missing
 
 
-def _is_boundary(char: str) -> bool:
-    """토큰 경계인가 — 문서 끝이거나 글자·숫자가 아닌 문자."""
-    return char == "" or not char.isalnum()
+def _is_boundary(evidence: str, index: int, after: bool) -> bool:
+    """`index` 위치가 인용의 경계인가 (문서 밖이면 경계).
+
+    `.`/`．` 은 **뒤가 공백이거나 끝일 때만** 경계다. 그래서 `1.5억원` 안의
+    소수점은 경계가 아니고(→ `«5억원»` 거절), 문장 끝의 `9.30)` 이나
+    `…입니다.` 는 경계다.
+    """
+    if index < 0 or index >= len(evidence):
+        return True
+    char = evidence[index]
+    if char.isspace() or char in _BOUNDARY_PUNCT:
+        return True
+    if char in _PERIODS:
+        following = index + 1
+        if following >= len(evidence) or evidence[following].isspace():
+            # 숫자 사이의 소수점은(뒤가 공백일 리 없지만) 명시적으로 막는다.
+            return not (
+                index > 0 and evidence[index - 1].isdigit()
+                and following < len(evidence) and evidence[following].isdigit()
+            )
+        return False
+    return False
 
 
 def occurs_at_token_boundary(span: str, evidence: str) -> bool:
-    """`span` 이 근거에 **토큰 경계로** 나오는가.
-
-    부분문자열만 보면 근거 `사업비 11억원` 에서 `1억원` 이 통과한다 — 숫자의
-    한가운데를 오려 새 금액을 만드는 길이다. 앞뒤가 공백·구두점·문서 끝일 때만
-    인정한다.
-    """
+    """`span` 이 근거에 **경계로 둘러싸여** 연속으로 나오는가."""
     if not span:
         return False
     start = 0
@@ -175,36 +202,35 @@ def occurs_at_token_boundary(span: str, evidence: str) -> bool:
         index = evidence.find(span, start)
         if index < 0:
             return False
-        before = evidence[index - 1] if index > 0 else ""
-        after_index = index + len(span)
-        after = evidence[after_index] if after_index < len(evidence) else ""
-        if _is_boundary(before) and _is_boundary(after):
+        if (_is_boundary(evidence, index - 1, after=False)
+                and _is_boundary(evidence, index + len(span), after=True)):
             return True
         start = index + 1
 
 
 def gate_summary_grammar(text: str, evidence: str) -> Optional[str]:
-    """추출형 문법 위반 사유. 통과면 None.
+    """문법 위반 사유. 통과면 None.
 
-    `text`·`evidence` 는 **둘 다 공백 정규화된 뒤** 들어와야 한다 — 근거의
-    개행을 가로지르는 정상 인용이 오거절되던 분기다(Codex v3.1).
+    허용 형태는 둘뿐이다: `«구절»` 하나, 또는 정확히 `원문 확인`.
+    `text`·`evidence` 는 **둘 다 `summary_normalize` 를 지난 뒤** 들어와야 한다.
     """
     spans = quoted_spans(text)
-    if len(spans) > _MAX_SUMMARY_SPANS:
-        return f"인용 {len(spans)}개 초과"
-    for span in spans:
-        if len(span) > _MAX_SPAN_CHARS:
-            return f"인용 {len(span)}자 초과"
-        if not occurs_at_token_boundary(span, evidence):
-            return f"근거에 토큰 경계로 없는 인용 «{span[:20]}»"
-    leftover = _QUOTE_RE.sub(" ", text)
-    stray = [
-        token for token in leftover.split()
-        if token not in _SUMMARY_CONNECTIVES
-    ]
-    if stray:
-        return "허용 밖 낱말 " + ", ".join(sorted(set(stray))[:3])
+    if len(spans) != 1:
+        return f"인용 {len(spans)}개 — 정확히 1개여야 함"
+    outside = _QUOTE_RE.sub("", text).strip()
+    if outside:
+        return "인용 밖 글자: " + outside[:12]
+    span = spans[0]
+    if not span:
+        return "빈 인용"
+    if not _MIN_SPAN_CHARS <= len(span) <= _MAX_SPAN_CHARS:
+        return (
+            f"인용 {len(span)}자 — {_MIN_SPAN_CHARS}~{_MAX_SPAN_CHARS}자여야 함"
+        )
+    if not occurs_at_token_boundary(span, evidence):
+        return f"근거에 경계로 없는 인용 «{span[:20]}»"
     return None
+
 
 HEADLINE_LINE_RE = re.compile(r"^이번 주 한 줄:.*$")
 GLM_DRAFT_PREFIX = "<!-- GLM 초안: "
@@ -219,10 +245,10 @@ PERSONA_SYSTEM_PROMPT = """너는 산림형사회연대경제협의회의 편집
 1. 아래 필드는 원문(제목·요약·인용 텍스트)에 문자 그대로 있는 내용만 채운다: `마감`, `자격`, `금액`. 원문에 없으면 값 대신 정확히 `원문 확인`이라고 쓴다. 추정·일반 상식·유사 사업의 조건으로 채우지 않는다.
 2. 각 채운 필드 옆에 근거 인용을 `«…»`로 20자 이내 붙인다. 인용을 붙일 수 없으면 그 필드는 `원문 확인`.
 3. `대상 태그`는 {협동조합, 사회적기업, 산림사업자, 마을기업, 전체} 중에서만 고르고 지역 한정이 원문에 있으면 `(도명)`을 붙인다. 판단이 안 서면 `보류`.
-4. `한 줄 의미`는 **새로 쓰지 않는다 — 오려 붙인다.** 문법은 딱 하나다: 원문(title·detail_text)에서 **글자 그대로** 오려 온 조각을 `«…»`로 감싸고(최대 4개, 각 60자 이내), 그 사이는 아래 낱말로만 잇는다: `대상` `마감` `까지` `신청` `접수` `의견` `제출` `설명회` `상시` `·` `,` `/`. 이 목록 밖의 낱말을 하나라도 쓰면 실패다(전체가 `원문 확인`으로 대체된다). 오릴 조각이 없으면 정확히 `원문 확인`이라고 쓴다.
-   예1: `«산림분야 오픈이노베이션» 신청 «~9.30» 까지`
-   예2: `«입법예고» 의견 제출 «2026-10-19» 까지`
-   오려 온 조각은 원문에서 **낱말 경계**로 끊어야 한다 — 원문이 `사업비 11억원`인데 `«1억원»`으로 오리면 실패다.
+4. `한 줄 의미`는 **원문에서 그대로 옮긴 한 구절(8~80자) 하나**를 `«…»`로만 쓴다. 두 구절 금지, 구절 밖 글자 금지(조사·접속어·설명 한 글자도 붙이지 않는다), 옮길 구절이 없으면 정확히 `원문 확인`.
+   예1: `«2026 산림분야 오픈이노베이션 참여기업 모집»`
+   예2: `«의견 제출 기간: 2026. 10. 19.까지»`
+   구절은 title·detail_text 에 **연속으로** 있어야 하고, 낱말 경계에서 끊어야 한다 — 원문이 `사업비 1.5억원`인데 `«5억원 지원»`으로 오리면 실패다.
 5. 마감이 오늘 이전이면 `한 줄 의미`에 정확히 `원문 확인`이라고 쓴다.
 6. 출력은 아래 JSON 배열만. 설명·머리말 금지.
 7. 근거는 `title` 과 `detail_text` 뿐이다. 거기에 글자 그대로 없는 숫자·날짜·금액은 쓰지 않는다(추정 금지). 근거가 부족하면 `한 줄 의미`에 정확히 `원문 확인`이라고 쓴다.
@@ -232,7 +258,7 @@ PERSONA_SYSTEM_PROMPT = """너는 산림형사회연대경제협의회의 편집
 {"today":"YYYY-MM-DD","items":[{"n":1,"title":"…","source_name":"…","summary":"…","detail_text":"…","quote_deadline":"…","quote_eligibility":"…","quote_amount":"…","url":"…"}]}
 
 출력 형식
-[{"n":1,"대상 태그":"사회적기업(경기)","마감":"2026-09-22 «~9.22까지»","자격":"원문 확인","금액":"원문 확인","한 줄 의미":"«조달 컨설팅» 신청 «~9.22까지»"}]"""
+[{"n":1,"대상 태그":"사회적기업(경기)","마감":"2026-09-22 «~9.22까지»","자격":"원문 확인","금액":"원문 확인","한 줄 의미":"«조달 컨설팅 지원사업 참여기업 모집»"}]"""
 
 HEADLINE_SYSTEM_PROMPT = """너는 산림형사회연대경제협의회의 편집 보조다. 입력은 이번 주 다이제스트에 확정된 항목 목록(JSON 배열, 각 {"title":..., "deadline_label":..., "period_end":...})이다.
 출력: 독자에게 이번 주 브리핑을 한 문장(40자 내외)으로. 사실만, 항목 수와 가장 임박한 마감을 포함한다. 과장·권유 금지. 출력은 문장 하나뿐 — 따옴표·설명·머리말 금지.
@@ -322,7 +348,7 @@ def evidence_text(item: Dict) -> str:
     정규화해서, 근거의 개행을 가로지르는 정상 인용(`접수기간\\n9월 22일까지`)이
     오거절됐다 (Codex v3.1).
     """
-    return http_fetch.normalize_space(" ".join(
+    return summary_normalize(" ".join(
         str(item.get(key) or "")
         for key in ("title", "summary", "detail_text", "quote_deadline",
                     "quote_eligibility", "quote_amount")
@@ -479,7 +505,7 @@ def _gate_summary(value, search_text: str) -> Tuple[str, bool, str]:
     problem = format_problem(value)
     if problem:
         return FALLBACK, False, problem
-    text = " ".join(value.strip().split())
+    text = summary_normalize(value)
     if not text:
         return FALLBACK, False, "빈 값"
     if len(text) > _MAX_SUMMARY_CHARS:
@@ -641,6 +667,18 @@ def strip_headline_drafts(markdown_text: str) -> Tuple[str, bool]:
 
 
 # ─── 메인 ────────────────────────────────────────────────────────────────
+def write_text_atomic(path: Path, text: str) -> None:
+    """임시 파일 → `os.replace`. 쓰는 도중 죽어도 원본이 남는다 (r3b).
+
+    `write_text` 는 파일을 먼저 truncate 한다 — 그 직후 죽으면 md 가 빈 파일이
+    되고, 정본은 멀쩡한 구본이라 재실행으로도 항목을 복원하지 못한다
+    (checker 가 계속 막고 재조립이 필요해진다 — Codex r3 MEDIUM).
+    """
+    temp = path.with_name(path.name + ".tmp")
+    temp.write_text(text, encoding="utf-8")
+    os.replace(temp, path)
+
+
 def _load_json(path: Path) -> Optional[Dict]:
     try:
         return json.loads(path.read_text(encoding="utf-8"))
@@ -682,7 +720,7 @@ def clear_previous_enrichment(
     )
     new_text, draft_removed = strip_headline_drafts(new_text)
     if changed_ids or draft_removed:
-        markdown_path.write_text(new_text, encoding="utf-8")
+        write_text_atomic(markdown_path, new_text)
     # md 를 먼저, 정본을 그 다음 — 순서가 거꾸로면 중단 창에서 정본이 md 보다
     # 앞서 나가 "정본에만 있는 보강"이 된다.
     composer_mod.set_manifest_enrich_lines(markdown_path, {}, clear_all=True)
@@ -787,6 +825,9 @@ def run(args) -> int:
                 continue
             results.update(batch_results)
 
+    # 항목 때문에 생긴 경고와 초안 때문에 생긴 경고를 구분해 둔다 — 미리보기
+    # 문구가 "항목 대체"와 "초안만 폐기"를 섞어 말하면 거짓 안내가 된다.
+    item_warnings = len(warnings)
     for warning in warnings:
         _out(f"  ⚠️  {warning}")
 
@@ -804,7 +845,7 @@ def run(args) -> int:
             markdown_text, enrich_by_id, item_sections
         )
         if changed_ids:
-            markdown_path.write_text(new_text, encoding="utf-8")
+            write_text_atomic(markdown_path, new_text)
             composer_mod.set_manifest_enrich_lines(
                 markdown_path,
                 {item_id: enrich_by_id[item_id] for item_id in changed_ids},
@@ -834,7 +875,7 @@ def run(args) -> int:
             text_now = markdown_path.read_text(encoding="utf-8")
             new_text, headline_changed = apply_headline_draft(text_now, draft)
             if headline_changed:
-                markdown_path.write_text(new_text, encoding="utf-8")
+                write_text_atomic(markdown_path, new_text)
                 composer_mod.set_manifest_enrich_lines(markdown_path, {})
                 _out("✓ 이번 주 한 줄 GLM 초안 갱신")
 
@@ -843,7 +884,13 @@ def run(args) -> int:
         # (n 집합 위반·파싱 실패). 미리보기 문구가 대체와 폐기를 구분한다.
         warn_path.write_text(
             json.dumps(
-                {"warnings": warnings, "discarded": not results},
+                {
+                    "warnings": warnings,
+                    # 출력 전체를 버려 **아무것도 적용하지 않은** 실행
+                    "discarded": not results,
+                    # 항목 필드가 실제로 대체된 실행 (초안만 폐기된 경우와 구분)
+                    "items_replaced": item_warnings > 0,
+                },
                 ensure_ascii=False, indent=2,
             ) + "\n",
             encoding="utf-8",
