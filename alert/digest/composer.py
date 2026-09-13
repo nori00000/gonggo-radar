@@ -1391,6 +1391,7 @@ def _select_with_pins(
     limit: int,
     sorter,
     diversity_limit: Optional[int] = None,
+    honor_pins: bool = True,
 ) -> Tuple[List[Dict], List[Dict], List[Dict], List[Dict], int]:
     """섹션 선정 (V4 판정 ③).
 
@@ -1400,12 +1401,18 @@ def _select_with_pins(
 
     Returns:
         (선정, 다양성 밀림, 상한 초과, 핀 상한 초과, 핀이 먹은 자리 수)
-        상한 초과 목록의 **앞에서부터 "핀이 먹은 자리 수" 만큼**이 핀 때문에 밀린
-        항목이다(그만큼 정확히 자리가 줄었다).
+        "핀이 먹은 자리 수" 는 진단용이다 — **밀린 항목의 판정에는 쓰지 않는다.**
+        핀이 원래부터 선정권에 있던 항목이면 자리를 줄이지 않으므로, 그 수로
+        상한 초과 목록을 잘라 사유를 붙이면 원래부터 보류였던 항목에 `핀 승격으로
+        밀림` 이 붙는다(Codex 재현). 실제 밀림은 기준선과의 **집합 차이**다.
     """
     ordered = sorter(candidates)
-    pinned = [item for item in ordered if item.get("pinned")]
-    regular = [item for item in ordered if not item.get("pinned")]
+    # honor_pins=False 는 **기준선**(핀이 없었다면 무엇이 실렸을까)을 구하는 호출이다.
+    # 밀림 사유는 그 기준선과의 차이로만 붙는다 (라운드 2, Codex MEDIUM).
+    pinned = [item for item in ordered
+              if honor_pins and item.get("pinned")]
+    regular = [item for item in ordered
+               if not (honor_pins and item.get("pinned"))]
 
     selected: List[Dict] = []
     pin_overflow: List[Dict] = []
@@ -1582,33 +1589,52 @@ def compose_digest_data(
     # 항목은 `상한 초과`로만 기록한다(편집자에게 사유가 과장돼 보이지 않게).
     # V4 판정 ③: 핀은 자리를 **먼저** 가져가고, 그만큼 뒤가 밀린다.
     (apply_selected, apply_diversity, apply_cap, apply_pin_cap,
-     apply_pinned_taken) = _select_with_pins(
+     _apply_pinned_taken) = _select_with_pins(
         apply_candidates, SECTION_LIMITS[VERDICT_APPLY], _sort_apply,
         SOURCE_DIVERSITY_LIMIT,
     )
     sections[VERDICT_APPLY] = apply_selected
 
     # 개정 v2.5 (#4): 알아두세요 상한 초과분도 무기록 삭제하지 않는다.
-    (notice_selected, _notice_diversity, notice_cap, notice_pin_cap,
-     notice_pinned_taken) = _select_with_pins(
+    (notice_selected, notice_diversity, notice_cap, notice_pin_cap,
+     _notice_pinned_taken) = _select_with_pins(
         notice_candidates, SECTION_LIMITS[VERDICT_NOTICE], _sort_notice,
     )
     sections[VERDICT_NOTICE] = notice_selected
 
-    # 상한 초과 목록의 앞쪽 `pinned_taken` 건이 **핀 때문에** 밀린 항목이다.
-    bumped = (apply_cap[:apply_pinned_taken] + notice_cap[:notice_pinned_taken])
-    cap_overflow = (apply_cap[apply_pinned_taken:]
-                    + notice_cap[notice_pinned_taken:])
+    # 라운드 2 (Codex MEDIUM): **핀이 없었다면 실렸을 집합**을 따로 구해, 거기서
+    # 사라진 항목만 `핀 승격으로 밀림` 이다. 핀이 원래부터 선정권에 있었다면
+    # 차이가 없으므로 아무에게도 이 사유가 붙지 않는다.
+    demoted_ids: Set = set()
+    if pin_ids:
+        for candidates_, limit_, sorter_, diversity_, selected_ in (
+            (apply_candidates, SECTION_LIMITS[VERDICT_APPLY], _sort_apply,
+             SOURCE_DIVERSITY_LIMIT, apply_selected),
+            (notice_candidates, SECTION_LIMITS[VERDICT_NOTICE], _sort_notice,
+             None, notice_selected),
+        ):
+            baseline = _select_with_pins(
+                candidates_, limit_, sorter_, diversity_, honor_pins=False)[0]
+            demoted_ids |= (
+                {item["id"] for item in baseline}
+                - {item["id"] for item in selected_}
+            )
 
     for item, reason in (
-        [(item, HOLD_REASON_DIVERSITY) for item in apply_diversity]
-        + [(item, HOLD_REASON_PIN_BUMPED) for item in bumped]
-        + [(item, HOLD_REASON_SECTION_CAP) for item in cap_overflow]
+        [(item, HOLD_REASON_DIVERSITY)
+         for item in apply_diversity + notice_diversity]
+        + [(item, HOLD_REASON_SECTION_CAP)
+           for item in apply_cap + notice_cap]
         + [(item, HOLD_REASON_PIN_CAP)
            for item in apply_pin_cap + notice_pin_cap]
     ):
         item["verdict"] = VERDICT_HOLD
-        item["reason"] = reason
+        # 승격된 항목 자신은 `상한 초과(핀)` 를 유지한다 — 그쪽이 더 정확하다.
+        item["reason"] = (
+            HOLD_REASON_PIN_BUMPED
+            if not item.get("pinned") and item["id"] in demoted_ids
+            else reason
+        )
         holds.append(item)
 
     published = sections[VERDICT_APPLY] + sections[VERDICT_NOTICE]

@@ -112,9 +112,11 @@ class TestPinPromotion:
                                     today=W13_TODAY, pin_ids={pushed["id"]})
         assert pushed["id"] in _ids(after["sections"][VERDICT_APPLY])
         assert len(after["sections"][VERDICT_APPLY]) == SOURCE_DIVERSITY_LIMIT
-        # 자리를 내준 쪽은 사유와 함께 보류로 남는다 (무기록 삭제 없음)
+        # 자리를 내준 쪽은 사유와 함께 보류로 남는다 (무기록 삭제 없음).
+        # 라운드 2: 사유는 `다양성 상한` 이 아니라 `핀 승격으로 밀림` 이다 —
+        # 핀이 없었다면 실렸을 항목이고, 실제로 핀이 그 자리를 가져갔다.
         assert [item["reason"] for item in after["holds"]] == [
-            HOLD_REASON_DIVERSITY
+            HOLD_REASON_PIN_BUMPED
         ]
 
     def test_pin_bumps_last_item_when_section_is_full(self, tmp_path):
@@ -321,3 +323,112 @@ class TestWeeklyDigestPinsFlag:
     def test_without_flag_pins_are_ignored(self, tmp_path, monkeypatch):
         seen = self._run(tmp_path, monkeypatch, [], [11, 12])
         assert seen["pin_ids"] is None
+
+
+class TestPinBumpReasonIsSetDifference:
+    """`핀 승격으로 밀림` 은 **실제로 밀린 항목에만** 붙는다 (라운드 2, Codex MEDIUM).
+
+    라운드 1 은 "핀이 먹은 자리 수" 만큼 상한 초과 목록의 앞을 잘라 사유를 붙였다.
+    핀이 원래부터 선정권에 있었다면 자리는 줄지 않는데도 뒤의 항목이 밀렸다고
+    표시됐다 — 편집자에게 "내가 민 항목" 을 거짓으로 알린다.
+    """
+
+    def _seed_seven(self, db_path):
+        """정렬순 1~7, 소스가 모두 달라 다양성 상한에 걸리지 않는다."""
+        pool = ("kofpi", "forest_service", "forest_press", "fowi", "lawmaking",
+                "coop", "socialenterprise")
+        for index, source in enumerate(pool):
+            _insert_one(
+                db_path, source=source, source_id=f"seq_{index}",
+                title=f"산림 사회적기업 지원사업 참여기업 모집 {index}",
+                url=f"https://example.com/seq-{index}",
+                # 마감 오름차순 = 정렬 순서 (D-day 순)
+                period_end=f"2026-12-0{index + 1}",
+            )
+
+    def test_pin_of_already_selected_item_bumps_nobody(self, tmp_path):
+        """Codex 재현: 1 제외 뒤 6을 핀으로 유지해도 7에 밀림 사유가 붙지 않는다."""
+        db_path = tmp_path / "codex.db"
+        _create_announcements_table(db_path)
+        self._seed_seven(db_path)
+
+        ordered = compose_digest_data(str(db_path), week_str=W13,
+                                      today=W13_TODAY)
+        first = ordered["sections"][VERDICT_APPLY][0]
+        sixth = ordered["holds"][0]          # 상한 5 밖 첫 항목
+        assert sixth["reason"] == HOLD_REASON_SECTION_CAP
+
+        # ① 6을 핀 → 5가 밀린다 (기준선에 있던 항목이 사라졌으므로)
+        pinned = compose_digest_data(str(db_path), week_str=W13,
+                                     today=W13_TODAY, pin_ids={sixth["id"]})
+        assert sixth["id"] in _ids(pinned["sections"][VERDICT_APPLY])
+        bumped = [item for item in pinned["holds"]
+                  if item["reason"] == HOLD_REASON_PIN_BUMPED]
+        assert len(bumped) == 1
+
+        # ② 1을 제외하고 핀은 유지 → 6이 상한 안으로 들어오므로 **아무도 밀리지
+        #    않는다**. 원래부터 보류였던 7에 밀림 사유가 붙으면 안 된다.
+        after = compose_digest_data(
+            str(db_path), week_str=W13, today=W13_TODAY,
+            pin_ids={sixth["id"]}, exclude_urls={first["url"]},
+        )
+        assert sixth["id"] in _ids(after["sections"][VERDICT_APPLY])
+        assert len(after["sections"][VERDICT_APPLY]) == \
+            SECTION_LIMITS[VERDICT_APPLY]
+        assert [item["reason"] for item in after["holds"]] == [
+            HOLD_REASON_SECTION_CAP
+        ]
+        assert not any(item["reason"] == HOLD_REASON_PIN_BUMPED
+                       for item in after["holds"])
+
+    def test_pinned_overflow_keeps_its_own_reason(self, tmp_path):
+        """넘친 핀 자신은 `상한 초과(핀)` 를 유지한다 (밀림 사유로 덮지 않는다)."""
+        db_path = tmp_path / "pincap.db"
+        _create_announcements_table(db_path)
+        self._seed_seven(db_path)
+
+        every = compose_digest_data(str(db_path), week_str=W13,
+                                    today=W13_TODAY)
+        ids = (_ids(every["sections"][VERDICT_APPLY])
+               + [item["id"] for item in every["holds"]])
+        after = compose_digest_data(str(db_path), week_str=W13,
+                                    today=W13_TODAY, pin_ids=set(ids))
+        assert [item["reason"] for item in after["holds"]] == [
+            HOLD_REASON_PIN_CAP, HOLD_REASON_PIN_CAP
+        ]
+
+
+class TestPinClearsApproval:
+    """승격은 곧 본문이 바뀐다 — 그 자리에서 승인을 폐기한다 (라운드 2)."""
+
+    def test_add_pinned_ids_drops_approval(self):
+        state = state_mod.record_preview(
+            state_mod.default_state(W13), [2014], ["u"], "a" * 64, "c" * 64)
+        assert state_mod.approval_of(state)["id"]
+        pinned = state_mod.add_pinned_ids(state, [11])
+        assert pinned["approval"] is None
+        assert state_mod.pinned_ids(pinned) == [11]
+
+
+class TestHoldCoordinateUnknownIsPreserved:
+    """좌표 미확인(None)을 빈 목록으로 바꾸지 않는다 (라운드 2, Codex LOW)."""
+
+    def test_none_hold_ids_stay_none(self):
+        state = state_mod.record_preview_messages(
+            state_mod.default_state(W13), [2014], ["u"], None)
+        assert state["preview_holds"]["2014"] is None
+        assert state_mod.preview_hold_ids(state) is None
+
+    def test_empty_hold_ids_are_a_fact(self):
+        """빈 목록은 '보류 0건' 이라는 사실 주장이므로 그대로 보존된다."""
+        state = state_mod.record_preview_messages(
+            state_mod.default_state(W13), [2014], ["u"], [])
+        assert state["preview_holds"]["2014"] == []
+        assert state_mod.preview_hold_ids(state) == []
+
+    def test_none_survives_save_and_load(self, tmp_path):
+        path = tmp_path / f"{W13}.state.json"
+        state_mod.save_state(path, state_mod.record_preview_messages(
+            state_mod.default_state(W13), [2014], ["u"], None))
+        loaded = state_mod.load_state(path, W13)
+        assert state_mod.preview_hold_ids(loaded) is None

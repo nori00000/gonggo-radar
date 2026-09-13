@@ -5708,3 +5708,78 @@ def test_superseded_history_is_bounded():
         state, range(state_mod.SUPERSEDED_MAX + 10))
     assert len(state["superseded_message_ids"]) == state_mod.SUPERSEDED_MAX
     assert state["superseded_message_ids"][-1] == state_mod.SUPERSEDED_MAX + 9
+
+
+# ══ V4 라운드 2 (Codex MEDIUM): 부분 전송에서는 옛 미리보기를 지우지 않는다 ══
+def _two_chunk_preview(monkeypatch):
+    """미리보기를 2조각으로 강제한다 (부분 전송을 만들 유일한 손잡이)."""
+    monkeypatch.setattr(preview_mod, "chunk_text",
+                        lambda text, limit=None: ["조각 1", "조각 2"])
+
+
+def test_notify_keeps_old_preview_on_partial_send(tmp_path, monkeypatch):
+    """2조각 중 1조각만 도착하면 아무것도 지우지 않는다.
+
+    라운드 1 의 조건은 `if message_ids:` 였다 — 반쪽 미리보기만 남기고 온전한 옛
+    미리보기를 지워, 편집자에게 완전한 미리보기가 하나도 없는 상태를 만들었다.
+    """
+    from scripts import notify_digest
+
+    annotated, _ = apply_headline(SAMPLE_MD, "확정 의견")
+    md = _write_digest(tmp_path, annotated)
+    state_path = state_mod.state_path_for_markdown(md)
+    state_mod.save_state(state_path, dict(
+        state_mod.default_state("2026-W37"),
+        preview_message_ids=[1000],
+        preview_items={"1000": ["https://example.com/a"]},
+        notice_message_ids=[1001]))
+
+    deleted = []
+    _delete_stub(monkeypatch, notify_digest, deleted)
+    _two_chunk_preview(monkeypatch)
+    calls = []
+
+    def send_chunk(token, chat, thread, text):
+        calls.append(text)
+        if len(calls) == 1:
+            return True, 3000, ""
+        return False, None, "API 실패: too many requests"
+
+    _notify_stubs(monkeypatch, notify_digest, send_chunk)
+    monkeypatch.setattr(
+        "sys.argv", ["notify_digest.py", str(md), "--db", _db_for(md)])
+    assert notify_digest.main() == 2
+
+    assert len(calls) == 2                 # 두 번째에서 깨졌다
+    assert deleted == []                   # 옛 미리보기·안내 모두 살아 있다
+    state = state_mod.load_state(state_path, "2026-W37")
+    # 도착해 버린 새 조각은 superseded 후보로만 적는다 (지우지는 않는다)
+    assert state["superseded_message_ids"] == [3000]
+    assert state["approval"] is None       # 반쪽 미리보기는 승인 대상이 아니다
+
+
+def test_notify_deletes_only_after_every_chunk_arrives(tmp_path, monkeypatch):
+    """2조각이 **전부** 도착하면 그때 지운다 (부분 전송 가드의 반대 분기)."""
+    from scripts import notify_digest
+
+    annotated, _ = apply_headline(SAMPLE_MD, "확정 의견")
+    md = _write_digest(tmp_path, annotated)
+    state_path = state_mod.state_path_for_markdown(md)
+    state_mod.save_state(state_path, dict(
+        state_mod.default_state("2026-W37"),
+        preview_message_ids=[1000], notice_message_ids=[1001]))
+
+    deleted = []
+    _delete_stub(monkeypatch, notify_digest, deleted)
+    _two_chunk_preview(monkeypatch)
+    ids = iter([3000, 3001])
+    _notify_stubs(monkeypatch, notify_digest,
+                  lambda token, chat, thread, text: (True, next(ids), ""))
+    monkeypatch.setattr(
+        "sys.argv", ["notify_digest.py", str(md), "--db", _db_for(md)])
+    assert notify_digest.main() == 0
+
+    assert deleted == [1000, 1001]
+    state = state_mod.load_state(state_path, "2026-W37")
+    assert state["preview_message_ids"] == [3000, 3001]
+    assert state["superseded_message_ids"] == [1000, 1001]

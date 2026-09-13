@@ -504,8 +504,12 @@ def record_preview_messages(state: Dict, message_ids, item_urls=None,
     items = dict(updated.get("preview_items") or {})
     urls = list(item_urls or [])
     # V4 계약 ①: 보류 번호도 같은 미리보기에 묶는다 (`핀 n` 의 좌표).
+    # 라운드 2 (Codex LOW): None(= 좌표를 알 수 없음)을 []로 바꾸지 않는다.
+    # []는 "보류가 0건이었다" 는 **사실 주장**이고, None 은 "이 미리보기의 좌표를
+    # 만들지 못했다" 는 미확인이다. 둘을 섞으면 봇이 좌표 부재를 알아채지 못한다.
     holds = dict(updated.get("preview_holds") or {})
-    hold_list = [int(value) for value in (hold_ids or [])]
+    hold_list = (None if hold_ids is None
+                 else [int(value) for value in hold_ids])
     for mid in ids:
         items.pop(str(mid), None)     # 재기록 시 순서를 최신으로
         items[str(mid)] = urls
@@ -681,6 +685,10 @@ def add_pinned_ids(state: Dict, ids) -> Dict:
         if value not in existing:
             existing.append(value)
     updated["pinned_ids"] = existing
+    # 라운드 2 (Codex 승인 경합 미검증): 승격은 곧 본문이 바뀐다는 뜻이다.
+    # mark_rebuild_failed 와 같은 규율으로 **그 자리에서** 승인을 폐기한다 —
+    # 재조립·재검증까지의 창에서 옛 카드가 살아 있지 않게(구조로 닫는다).
+    updated["approval"] = None
     return updated
 
 

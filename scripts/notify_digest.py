@@ -451,17 +451,29 @@ def main():
         message_ids.append(message_id)
         _out(f"✓ 전송 {index}/{len(chunks)} message_id={message_id}")
 
-    # V4 계약 ②: 새 메시지가 실제로 도착한 뒤에만 옛 것을 지운다.
-    # 차단 안내는 **안내만** 밀어낸다 — 미리보기를 지우면 `제외 n`·`핀 n` 의 번호
-    # 좌표가 편집자 화면에서 사라진다(승인이 폐기돼도 좌표는 남아 있어야 한다).
+    # V4 계약 ② (라운드 2, Codex MEDIUM): 새 미리보기가 **전부** 도착한 뒤에만
+    # 옛 것을 지운다.
+    #
+    # 라운드 1 의 조건은 `if message_ids:` 였다 — 2조각 중 1조각만 성공한 부분 전송
+    # 에서도 참이 되어, 반쪽 미리보기만 남기고 온전한 옛 미리보기를 지웠다.
+    # 편집자에게 완전한 미리보기가 하나도 없는 상태가 만들어진다.
+    #
+    # 부분 실패에서는 아무것도 지우지 않고, 도착해 버린 **새 조각들**을
+    # superseded 후보로만 적는다(승인은 어차피 폐기되므로 그 조각들은 승인 대상이
+    # 아니다). 지우지 않는 이유는 실패의 증거를 편집자 화면에서 없애지 않기 위해서다.
+    delivered_all = send_error is None and len(message_ids) == len(chunks)
     superseded = []
-    if message_ids:
+    if delivered_all and message_ids:
         superseded = (stale_previews + stale_notices) if prepared is not None \
             else list(stale_notices)
         for stale in superseded:
             ok, error = delete_message(token, chat_id, stale)
             if not ok:
                 _err(f"⚠️  옛 메시지 삭제 실패(진행함) message_id={stale}: {error}")
+    elif message_ids:
+        superseded = list(message_ids)
+        _err("⚠️  부분 전송({}/{}) — 옛 미리보기를 지우지 않았습니다".format(
+            len(message_ids), len(chunks)))
 
     # ── 잠금 ②: 준비 시점의 세대가 그대로일 때만 message_id 를 기록한다 ──
     try:
@@ -540,8 +552,12 @@ def _finish_locked(state_path, week, prepared, message_ids, item_urls,
     if send_error or not same_generation:
         drop_card = live.get("card_message_id")
         try:
+            # 라운드 2: 부분 전송으로 도착해 버린 새 조각도 superseded 후보로
+            # 남긴다 — 승인은 폐기되지만 그 조각들이 존재했다는 사실은 남아야 한다.
             state_mod.update_state_locked(
-                state_path, week, state_mod.clear_approval)
+                state_path, week,
+                lambda cur: state_mod.record_superseded(
+                    state_mod.clear_approval(cur), superseded))
         except (state_mod.StateError, state_mod.TransitionError,
                 OSError) as exc:
             return (2 if send_error else 1), drop_card, \
