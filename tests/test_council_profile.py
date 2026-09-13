@@ -4,9 +4,11 @@
 임시 파일이다.
 """
 
+import ast
 import json
 import sqlite3
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
+from pathlib import Path
 from unittest.mock import MagicMock
 
 import pytest
@@ -14,13 +16,15 @@ import pytest
 from alert import council
 from alert.config import CouncilProfileConfig, get_config
 from alert.analyzer import KeywordAnalyzer
-from alert.db import Database
+from alert.db import COUNCIL_DROP_RETENTION_DAYS, Database
 from alert.digest.composer import compose_digest_data
 from alert.main import apply_council_profile, select_for_storage
 from alert.migrations import run_migrations
 from alert.models import AnalyzedAnnouncement, Keyword, RawAnnouncement
 
 import scripts.council_observe as observe
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
 
 # 다이제스트 테스트가 쓰는 고정 주차 (test_digest.py 와 같은 값)
 W13 = "2026-W13"
@@ -225,32 +229,53 @@ class TestStorageRule:
         selected, _ = select_for_storage(company_analyzer, items, None)
         assert selected == []
 
-        extras = apply_council_profile(
+        extras, drops = apply_council_profile(
             profile, "kofpi", items, selected, company_analyzer.analyze
         )
         assert len(extras) == 1
         assert extras[0].council_match == 1
         assert extras[0].council_only == 1
         assert extras[0].source_id == "k1"
+        assert drops == []
 
     def test_council_only_keeps_sub_threshold_company_score(
         self, profile, company_analyzer
     ):
         """협의회 단독 행의 회사 점수는 **계산값 그대로** (임계 미달)."""
         items = [FIXTURE_ITEMS[2]]
-        extras = apply_council_profile(
+        extras, _ = apply_council_profile(
             profile, "kofpi", items, [], company_analyzer.analyze
         )
         threshold = get_config().analyzer.keyword_threshold
         assert extras[0].relevance_score < threshold
 
-    def test_excluded_item_is_not_stored(self, profile, company_analyzer):
-        """제외어에 걸린 항목은 협의회 경로로도 저장되지 않는다."""
+    def test_excluded_item_is_dropped_not_stored(self, profile, company_analyzer):
+        """제외어 항목은 저장되지 않고 **탈락 원장 레코드**로 온다."""
         items = [FIXTURE_ITEMS[5]]        # forest_press 호우 보도
-        extras = apply_council_profile(
+        extras, drops = apply_council_profile(
             profile, "forest_press", items, [], company_analyzer.analyze
         )
         assert extras == []
+        assert len(drops) == 1
+        assert drops[0].source_id == "p1"
+        assert drops[0].reason.startswith("제외 키워드")
+
+    def test_drop_records_posted_at_from_raw_data(self, profile, company_analyzer):
+        """탈락 레코드의 posted_at 은 raw_data 의 ``posted`` 에서 온다."""
+        item = raw("kofpi", "d1", "추석 명절 선물 안내")
+        item.raw_data = json.dumps({"posted": "2026-09-10"}, ensure_ascii=False)
+        _, drops = apply_council_profile(
+            profile, "kofpi", [item], [], company_analyzer.analyze
+        )
+        assert drops[0].posted_at == "2026-09-10"
+
+    def test_no_drops_for_non_council_sources(self, profile, company_analyzer):
+        """협의회 소스가 아니면 측정도 탈락 기록도 하지 않는다."""
+        extras, drops = apply_council_profile(
+            profile, "smartfarm", [raw("smartfarm", "x1", "무관한 공고")],
+            [], company_analyzer.analyze
+        )
+        assert (extras, drops) == ([], [])
 
     def test_bypass_source_leaves_no_extras(self, profile, company_analyzer):
         """bypass 소스는 전량이 이미 선택되므로 단독 적재분이 없다.
@@ -265,18 +290,76 @@ class TestStorageRule:
         )
         assert bypassed and len(selected) == len(items)
 
-        extras = apply_council_profile(
+        extras, drops = apply_council_profile(
             profile, "kofpi", items, selected, company_analyzer.analyze
         )
-        assert extras == []
+        assert extras == [] and drops == []
         assert any(a.council_match == 1 for a in selected)
 
     def test_empty_profile_stores_nothing_extra(self, company_analyzer):
         """프로파일이 비면 배선 전체가 무동작이다."""
-        extras = apply_council_profile(
+        assert apply_council_profile(
             CouncilProfileConfig(), "kofpi", FIXTURE_ITEMS, [], company_analyzer.analyze
+        ) == ([], [])
+
+
+class TestDropLedger:
+    """``council_dropped`` — 저장되지 않은 항목의 관찰 원장 (Codex 게이트 2R)."""
+
+    def drop(self, source_id="d1", title="추석 명절 선물 안내"):
+        return council.CouncilDrop(
+            source="kofpi", source_id=source_id, title=title,
+            url=f"https://example.com/{source_id}", posted_at="2026-09-10",
+            company_score=0.05, council_score=0.0, reason="협의회 어휘 없음",
         )
-        assert extras == []
+
+    def test_records_and_is_idempotent(self, tmp_path):
+        db = Database(tmp_path / "drops.db")
+        try:
+            db.record_council_drops([self.drop()])
+            db.record_council_drops([self.drop(title="제목이 바뀐 같은 공고")])
+            rows = db.conn.execute(
+                "SELECT source, source_id, title, posted_at, reason"
+                "  FROM council_dropped"
+            ).fetchall()
+            assert len(rows) == 1
+            assert rows[0]["title"] == "제목이 바뀐 같은 공고"
+            assert rows[0]["posted_at"] == "2026-09-10"
+        finally:
+            db.close()
+
+    def test_prunes_beyond_retention(self, tmp_path):
+        db = Database(tmp_path / "drops.db")
+        try:
+            db.record_council_drops([self.drop("old"), self.drop("new")])
+            stale = (datetime.now() - timedelta(days=COUNCIL_DROP_RETENTION_DAYS + 1))
+            db.conn.execute(
+                "UPDATE council_dropped SET seen_at = ? WHERE source_id = 'old'",
+                (stale.isoformat(),),
+            )
+            db.conn.commit()
+
+            assert db.prune_council_drops() == 1
+            remaining = [r["source_id"] for r in db.conn.execute(
+                "SELECT source_id FROM council_dropped"
+            ).fetchall()]
+            assert remaining == ["new"]
+        finally:
+            db.close()
+
+    def test_retention_is_30_days(self):
+        assert COUNCIL_DROP_RETENTION_DAYS == 30
+
+    def test_ledger_never_reaches_notification_or_briefing(self):
+        """알림·브리핑 코드는 council_dropped 를 읽지 않는다."""
+        for rel in ("alert/db.py", "alert/digest/composer.py",
+                    "alert/notifiers/telegram_bot.py"):
+            source = (REPO_ROOT / rel).read_text(encoding="utf-8")
+            reads = [
+                line for line in source.splitlines()
+                if "council_dropped" in line and "SELECT" in line.upper()
+            ]
+            assert reads == [], f"{rel} 가 탈락 원장을 읽는다: {reads}"
 
 
 # ---------------------------------------------------------------------------
@@ -298,7 +381,7 @@ class TestInvariantCompanyAlertPath:
         before = snapshot(before_sel)
 
         after_sel, _ = select_for_storage(company_analyzer, FIXTURE_ITEMS, None)
-        extras = apply_council_profile(
+        extras, _drops = apply_council_profile(
             profile, "seis", FIXTURE_ITEMS, after_sel, company_analyzer.analyze
         )
 
@@ -400,8 +483,8 @@ class TestMigration:
     def test_idempotent(self, in_memory_conn):
         assert run_migrations(in_memory_conn, vec_available=False) == 0
 
-    def test_existing_rows_default_to_zero(self, in_memory_conn):
-        """마이그레이션 전에 있던 행은 전부 0 — 전후 동작이 같다."""
+    def test_measurement_columns_default_to_null(self, in_memory_conn):
+        """측정 3열은 NULL(=미측정), 가드 1열만 0 — 둘은 다른 것이다."""
         now = datetime.now().isoformat()
         in_memory_conn.execute(
             "INSERT INTO announcements"
@@ -410,10 +493,18 @@ class TestMigration:
             (now, now),
         )
         row = in_memory_conn.execute(
-            "SELECT council_score, council_match, council_only FROM announcements"
-            " WHERE source_id = 'old-1'"
+            "SELECT council_score, council_tags, council_match, council_only"
+            "  FROM announcements WHERE source_id = 'old-1'"
         ).fetchone()
-        assert (row[0], row[1], row[2]) == (0.0, 0, 0)
+        assert (row[0], row[1], row[2]) == (None, None, None)
+        # 가드가 NULL 이면 `council_only = 0` 이 옛 행을 통째로 떨군다.
+        assert row[3] == 0
+
+    def test_creates_drop_ledger(self, in_memory_conn):
+        tables = {r[0] for r in in_memory_conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'"
+        ).fetchall()}
+        assert "council_dropped" in tables
 
 
 # ---------------------------------------------------------------------------
@@ -487,9 +578,10 @@ class TestObserveReport:
         table = observe.render_table(counts, {"kofpi", "seis"})
         lines = table.splitlines()
         assert lines[0] == (
-            "| source | 협의회풀 | fetched | 저장 | council_match | 회사통과 | 둘다 |"
+            "| source | 협의회풀 | fetched | 저장 | council_match | 미측정 "
+            "| 회사통과 | 둘다 |"
         )
-        assert lines[1] == "|---|---|---|---|---|---|---|"
+        assert lines[1] == "|---|---|---|---|---|---|---|---|"
         assert lines[-1].startswith("| **합계** |")
         assert len(lines) == 2 + len(counts) + 1
 
@@ -581,7 +673,8 @@ class TestObserveOnUnmigratedDb:
         finally:
             conn.close()
         assert counts["kofpi"] == {
-            "fetched": 20, "stored": 1, "council": 0, "company": 1, "both": 0
+            "fetched": 20, "stored": 1, "council": 0, "unmeasured": 1,
+            "company": 1, "both": 0,
         }
 
     def test_report_states_migration_is_pending(self, legacy_db, tmp_path):
@@ -601,4 +694,368 @@ class TestObserveOnUnmigratedDb:
         finally:
             conn.close()
         assert [s["표본군"] for s in samples] == [observe.SAMPLE_SOURCE_ONLY]
-        assert samples[0]["council_match"] == 0
+        # 컬럼이 없는 DB 의 행은 **미측정**이지 미매치가 아니다.
+        assert samples[0]["council_match"] is None
+
+
+# ---------------------------------------------------------------------------
+# 5. 라운드 2 — Codex 게이트
+# ---------------------------------------------------------------------------
+
+class TestPromotionToCompanyPath:
+    """HIGH: 협의회 단독 행이 나중에 회사 임계를 통과하면 **승격**한다."""
+
+    def council_row(self):
+        return AnalyzedAnnouncement(
+            source="kofpi", source_id="promo-1", title="산림 목재 이용 공고",
+            url="https://example.com/promo-1", relevance_score=0.05,
+            relevance_reason="추가 키워드 1개", matched_keywords=["산림"],
+            council_score=0.5, council_tags='{}', council_match=1, council_only=1,
+        )
+
+    def company_row(self, url="https://example.com/promo-1"):
+        return AnalyzedAnnouncement(
+            source="kofpi", source_id="promo-1", title="산림 사회적기업 지원사업 공고",
+            url=url, relevance_score=0.8,
+            relevance_reason="필수 키워드 매칭", matched_keywords=["사회적기업"],
+            council_score=0.55, council_tags='{}', council_match=1, council_only=0,
+        )
+
+    def test_two_runs_promote_to_notification_candidate(self, tmp_path):
+        """1회차 협의회 단독 → 2회차 회사 통과 → 알림 후보 1건(0.8)."""
+        db = Database(tmp_path / "promo.db")
+        try:
+            db.insert_announcement(self.council_row())
+            assert db.get_unnotified() == []          # 1회차: 알림 후보 아님
+
+            # 2회차: 같은 (source, source_id) 로 회사 점수 재삽입 (URL 변경분 포함)
+            db.insert_announcement(self.company_row("https://example.com/promo-1?v=2"))
+
+            candidates = db.get_unnotified()
+            assert len(candidates) == 1
+            assert candidates[0].relevance_score == pytest.approx(0.8)
+
+            row = db.conn.execute(
+                "SELECT council_only, is_notified, relevance_reason"
+                "  FROM announcements WHERE source_id = 'promo-1'"
+            ).fetchone()
+            assert row["council_only"] == 0
+            assert row["is_notified"] == 0
+            assert row["relevance_reason"] == "필수 키워드 매칭"
+        finally:
+            db.close()
+
+    def test_company_row_is_never_downgraded(self, tmp_path):
+        """회사 행이 협의회 단독으로 강등되면 조용히 알림에서 사라진다 — 금지."""
+        db = Database(tmp_path / "promo.db")
+        try:
+            db.insert_announcement(self.company_row())
+            db.insert_announcement(self.council_row())
+
+            row = db.conn.execute(
+                "SELECT council_only FROM announcements WHERE source_id = 'promo-1'"
+            ).fetchone()
+            assert row["council_only"] == 0
+            assert len(db.get_unnotified()) == 1
+        finally:
+            db.close()
+
+    def test_update_keeps_prior_measurement_when_profile_is_off(self, tmp_path):
+        """프로파일이 꺼진 실행(측정값 None)이 먼저 잰 측정을 지우지 않는다."""
+        db = Database(tmp_path / "promo.db")
+        try:
+            db.insert_announcement(self.council_row())
+            db.insert_announcement(AnalyzedAnnouncement(
+                source="kofpi", source_id="promo-1", title="산림 목재 이용 공고",
+                url="https://example.com/promo-1", relevance_score=0.8,
+            ))
+            row = db.conn.execute(
+                "SELECT council_score, council_match FROM announcements"
+                "  WHERE source_id = 'promo-1'"
+            ).fetchone()
+            assert row["council_score"] == pytest.approx(0.5)
+            assert row["council_match"] == 1
+        finally:
+            db.close()
+
+
+class TestExcludeTokenBoundary:
+    """MEDIUM (a): 제외어는 토큰 경계로만 맞는다 — Codex 재현 문자열."""
+
+    @pytest.fixture
+    def inSA(self):
+        return CouncilProfileConfig(
+            sources=["kofpi"], must_match=["산림", "지원사업"], exclude=["인사"]
+        )
+
+    def test_insight_is_not_excluded(self, inSA):
+        v = council.score_item(inSA, "kofpi", "산림 인사이트 지원사업")
+        assert v.match == 1, v.reason
+
+    def test_spaced_words_do_not_form_the_term(self, inSA):
+        v = council.score_item(
+            inSA, "kofpi", "산림 지원사업", summary="법인 사업자 대상 확인 사항"
+        )
+        assert v.match == 1, v.reason
+
+    def test_standalone_token_is_excluded(self, inSA):
+        v = council.score_item(inSA, "kofpi", "산림청 인사 발령 알림 지원사업")
+        assert v.match == 0
+        assert v.reason == "제외 키워드: 인사"
+
+    def test_multi_token_phrase_matches_in_order(self):
+        profile = CouncilProfileConfig(
+            sources=["kofpi"], must_match=["공모전"], exclude=["수상작 발표"]
+        )
+        hit = council.score_item(profile, "kofpi", "「K-포레스트」 공모전 수상작 발표")
+        assert hit.reason == "제외 키워드: 수상작 발표"
+
+        miss = council.score_item(profile, "kofpi", "공모전 발표 수상작 안내")
+        assert miss.match == 1, miss.reason
+
+    def test_production_exclude_terms_are_token_matched(self, profile):
+        """운영 사전으로도 같다: 괄호에 싸인 제외어는 잡고, 접사는 안 잡는다."""
+        boxed = council.score_item(
+            profile, "kofpi", "[공모결과] 2026년 임산물 가공유통 선정 결과"
+        )
+        assert boxed.reason == "제외 키워드: 공모결과"
+
+
+class TestPerFieldEvaluation:
+    """MEDIUM (b): 필드를 이어 붙이지 않는다."""
+
+    @pytest.fixture
+    def coop_profile(self):
+        return CouncilProfileConfig(sources=["coop"], must_match=["협동조합"])
+
+    def test_split_across_title_and_summary_does_not_match(self, coop_profile):
+        v = council.score_item(
+            coop_profile, "coop", title="지역 협동", summary="조합 지원사업 안내"
+        )
+        assert v.match == 0, v.reason
+
+    def test_within_one_field_whitespace_is_still_absorbed(self, coop_profile):
+        v = council.score_item(coop_profile, "coop", title="지역 협동 조합 안내")
+        assert v.match == 1
+
+    def test_summary_alone_can_match(self, coop_profile):
+        v = council.score_item(
+            coop_profile, "coop", title="안내문", summary="협동조합 설립 상담"
+        )
+        assert v.match == 1
+
+    def test_tags_are_also_per_field(self):
+        profile = CouncilProfileConfig(
+            sources=["coop"], must_match=["안내"],
+            region={"경기": ["경기도"]},
+        )
+        split = council.score_item(
+            profile, "coop", title="상담 안내 경기", summary="도 지원사업"
+        )
+        assert "region" not in split.tags
+
+
+class TestObserveOutputSafety:
+    """MEDIUM: 출력이 입력 DB 를 덮어쓰지 못한다."""
+
+    def test_refuses_when_output_resolves_to_input_db(self, tmp_path, observe_db):
+        collision = tmp_path / f"{date.today().isoformat()}.md"
+        observe_db.rename(collision)
+        assert observe.main([
+            "2", "--db", str(collision), "--out-dir", str(tmp_path)
+        ]) == 2
+        # DB 가 살아 있다 — 덮어쓰지 않았다.
+        conn = sqlite3.connect(collision)
+        try:
+            assert conn.execute("SELECT COUNT(*) FROM announcements").fetchone()[0] == 3
+        finally:
+            conn.close()
+
+    def test_refuses_existing_non_report_file(self, tmp_path, observe_db):
+        out_dir = tmp_path / "out"
+        out_dir.mkdir()
+        assert observe.unsafe_output(observe_db, (observe_db,)).startswith("✗")
+        assert observe.unsafe_output(observe_db, (out_dir / "x.md",)) == ""
+
+    def test_unsafe_output_flags_foreign_extension(self, tmp_path, observe_db):
+        stray = tmp_path / "report.sqlite"
+        stray.write_text("not a report", encoding="utf-8")
+        assert "md/.csv" in observe.unsafe_output(observe_db, (stray,))
+
+
+class TestObserveUnmeasuredVsUnmatched:
+    """LOW: 미측정(NULL)과 미매치(0)를 따로 센다."""
+
+    @pytest.fixture
+    def mixed_db(self, tmp_path):
+        db_path = tmp_path / "mixed.db"
+        Database(db_path).close()
+        now = datetime.now().isoformat()
+        conn = sqlite3.connect(db_path)
+        rows = [("m1", 1), ("m0", 0), ("mnull", None)]
+        for sid, match in rows:
+            conn.execute(
+                "INSERT INTO announcements"
+                " (source, source_id, title, summary, url, created_at, updated_at,"
+                "  council_match, council_only)"
+                " VALUES ('kofpi', ?, '산림 공고', '', ?, ?, ?, ?, 0)",
+                (sid, f"https://example.com/{sid}", now, now, match),
+            )
+        conn.commit()
+        conn.close()
+        return db_path
+
+    def test_counts_are_separate(self, mixed_db):
+        conn = observe.open_readonly(mixed_db)
+        try:
+            counts = observe.collect_counts(conn, observe.window_start(2))
+        finally:
+            conn.close()
+        assert counts["kofpi"]["stored"] == 3
+        assert counts["kofpi"]["council"] == 1
+        assert counts["kofpi"]["unmeasured"] == 1
+
+    def test_unmeasured_row_is_not_reported_as_unmatched_only(self, mixed_db):
+        conn = observe.open_readonly(mixed_db)
+        try:
+            counts = observe.collect_counts(conn, observe.window_start(2))
+        finally:
+            conn.close()
+        c = counts["kofpi"]
+        unmatched_only = c["stored"] - c["council"] - c["unmeasured"]
+        assert unmatched_only == 1
+
+
+class TestObserveDropSection:
+    """탈락 표본 — 저장되지 않은 항목을 원장에서 읽어 보여 준다."""
+
+    @pytest.fixture
+    def dropped_db(self, tmp_path):
+        db_path = tmp_path / "dropped.db"
+        db = Database(db_path)
+        db.record_council_drops([council.CouncilDrop(
+            source="kofpi", source_id="d1", title="추석 명절 선물 안내",
+            url="https://example.com/d1", posted_at="2026-09-10",
+            company_score=0.05, council_score=0.0, reason="협의회 어휘 없음",
+        )])
+        db.close()
+        return db_path
+
+    def test_collect_drops_reads_ledger(self, dropped_db):
+        conn = observe.open_readonly(dropped_db)
+        try:
+            drops = observe.collect_drops(conn, observe.window_start(2), 25, 0)
+        finally:
+            conn.close()
+        assert len(drops) == 1
+        assert drops[0]["reason"] == "협의회 어휘 없음"
+
+    def test_report_has_drop_section(self, dropped_db, tmp_path):
+        out_dir = tmp_path / "observe"
+        assert observe.main([
+            "2", "--sample", "5", "--db", str(dropped_db), "--out-dir", str(out_dir)
+        ]) == 0
+        body = (out_dir / f"{date.today().isoformat()}.md").read_text(encoding="utf-8")
+        assert "## 탈락 표본 (저장되지 않은 항목)" in body
+        assert "추석 명절 선물 안내" in body
+
+    def test_missing_ledger_is_announced(self, tmp_path):
+        db_path = tmp_path / "noledger.db"
+        now = datetime.now().isoformat()
+        conn = sqlite3.connect(db_path)
+        conn.execute(
+            "CREATE TABLE announcements ("
+            " id INTEGER PRIMARY KEY AUTOINCREMENT, source TEXT NOT NULL,"
+            " source_id TEXT NOT NULL, title TEXT NOT NULL, summary TEXT DEFAULT '',"
+            " url TEXT NOT NULL, relevance_score REAL DEFAULT 0.0,"
+            " created_at TEXT NOT NULL, updated_at TEXT NOT NULL)"
+        )
+        conn.execute(
+            "CREATE TABLE run_history (id INTEGER PRIMARY KEY AUTOINCREMENT,"
+            " started_at TEXT NOT NULL, source TEXT NOT NULL,"
+            " total_fetched INTEGER DEFAULT 0)"
+        )
+        conn.execute(
+            "INSERT INTO announcements"
+            " (source, source_id, title, url, created_at, updated_at)"
+            " VALUES ('kofpi', 'x', '산림 공고', 'https://example.com/x', ?, ?)",
+            (now, now),
+        )
+        conn.commit()
+        conn.close()
+
+        out_dir = tmp_path / "observe"
+        assert observe.main(["2", "--db", str(db_path), "--out-dir", str(out_dir)]) == 0
+        body = (out_dir / f"{date.today().isoformat()}.md").read_text(encoding="utf-8")
+        assert observe.DROP_LEDGER_MISSING_NOTE in body
+
+
+# db.py 의 announcements SELECT 중 council_only 가드가 **없어도 되는** 자리.
+# 새 SELECT 를 추가하면 이 목록에 올리거나 가드를 달아야 테스트가 통과한다.
+GUARD_EXEMPT_DB_FUNCTIONS = {
+    # 식별·중복 제거·기간 관문 — 모든 행을 봐야 한다. 가드를 달면 협의회 단독
+    # 행이 "없는 행" 이 되어 매 실행 중복 저장된다.
+    "is_duplicate",
+    "get_quoted_source_ids",
+    "_find_row",
+    "mark_legacy_rows",
+    "revalidate_periods",
+    "clear_periods_except",
+    "overwrite_periods",
+    "get_quote_attempts",
+    # id 를 가진 쪽이 이미 대상을 골랐다 - 가드를 달면 존재하는 id 가 조용히
+    # None 이 된다 (텔레그램 /app, 지식 레이어).
+    "get_announcement_by_id",
+    "get_announcement_domain",
+}
+
+
+class TestCompanyFacingQueryGuard:
+    """sweep: db.py 의 회사향 SELECT 는 전부 council_only 가드를 갖는다."""
+
+    def db_functions_with_announcement_selects(self):
+        tree = ast.parse((REPO_ROOT / "alert" / "db.py").read_text(encoding="utf-8"))
+        found = {}
+        for node in ast.walk(tree):
+            if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            literals = [
+                sub.value for sub in ast.walk(node)
+                if isinstance(sub, ast.Constant) and isinstance(sub.value, str)
+            ]
+            blob = "\n".join(literals)
+            if "FROM announcements" in blob:
+                found[node.name] = blob
+        return found
+
+    def test_every_select_is_guarded_or_exempt(self):
+        offenders = [
+            name for name, blob in self.db_functions_with_announcement_selects().items()
+            if "council_only = 0" not in blob and name not in GUARD_EXEMPT_DB_FUNCTIONS
+        ]
+        assert offenders == [], f"council_only 가드 없는 회사향 쿼리: {offenders}"
+
+    def test_guarded_functions_are_the_expected_ones(self):
+        guarded = {
+            name for name, blob in self.db_functions_with_announcement_selects().items()
+            if "council_only = 0" in blob
+        }
+        assert guarded == {
+            "get_unnotified", "search_announcements", "get_stats",
+            "get_announcements_by_period", "get_domain_stats",
+        }
+
+    def test_telegram_recent_is_guarded(self):
+        source = (REPO_ROOT / "alert" / "notifiers" / "telegram_bot.py").read_text(
+            encoding="utf-8"
+        )
+        tree = ast.parse(source)
+        for node in ast.walk(tree):
+            if isinstance(node, ast.FunctionDef) and node.name == "cmd_recent":
+                blob = "\n".join(
+                    sub.value for sub in ast.walk(node)
+                    if isinstance(sub, ast.Constant) and isinstance(sub.value, str)
+                )
+                assert "council_only = 0" in blob
+                return
+        pytest.fail("cmd_recent 을 찾지 못했다")

@@ -121,23 +121,54 @@ MIGRATIONS: List[Tuple[int, str, List[str]]] = [
         ]
     ),
     # P0 계약 §A - 협의회 적재 프로파일의 측정 컬럼.
-    # ``council_only`` 는 3개 측정 컬럼과 성격이 다르다: **회사 경로가 고르지
-    # 않았는데 협의회 매치라서 저장된 행**을 표시한다. 회사 알림 쿼리
-    # (``Database.get_unnotified``)와 브리핑 후보 쿼리가 이 플래그 하나로
-    # 그 행들을 건너뛴다 - 불변 조건 1·2를 지키는 유일한 관문이다.
-    # 기존 행은 전부 기본값 0 이므로 전후 동작이 같다.
+    #
+    # 측정 3열(score/tags/match)의 기본값은 **NULL = 미측정**이다. 0 으로 두면
+    # 마이그레이션만 적용된 옛 행("아직 채점한 적 없음")과 채점 결과 0("협의회
+    # 어휘 없음")이 같은 값이 되어, 관찰 표가 미측정을 미매치로 보고한다
+    # (Codex 게이트 2R LOW).
+    #
+    # ``council_only`` 만 성격이 다르다: 측정값이 아니라 **회사 경로가 고르지
+    # 않았는데 협의회 매치라서 저장된 행**을 가리키는 가드다. 회사 알림 쿼리와
+    # 브리핑 후보 쿼리가 이 플래그 하나로 그 행들을 건너뛰므로 기본값은 반드시
+    # 0 이어야 한다 - NULL 이면 ``council_only = 0`` 이 옛 행을 통째로 떨군다.
     (
         7,
         "Add council profile observation columns to announcements",
         [
-            "ALTER TABLE announcements ADD COLUMN council_score REAL DEFAULT 0.0;",
-            "ALTER TABLE announcements ADD COLUMN council_tags TEXT DEFAULT '{}';",
-            "ALTER TABLE announcements ADD COLUMN council_match INTEGER DEFAULT 0;",
+            "ALTER TABLE announcements ADD COLUMN council_score REAL DEFAULT NULL;",
+            "ALTER TABLE announcements ADD COLUMN council_tags TEXT DEFAULT NULL;",
+            "ALTER TABLE announcements ADD COLUMN council_match INTEGER DEFAULT NULL;",
             "ALTER TABLE announcements ADD COLUMN council_only INTEGER DEFAULT 0;",
             "CREATE INDEX IF NOT EXISTS idx_ann_council_match"
             " ON announcements(council_match);",
             "CREATE INDEX IF NOT EXISTS idx_ann_council_only"
             " ON announcements(council_only);",
+        ]
+    ),
+    # 두 프로파일 **모두** 탈락한 협의회 소스 항목의 관찰 원장.
+    # 저장되지 않는 항목은 표본에 나타날 수 없어 오탈락이 영원히 조용하다
+    # (Codex 게이트 2R MEDIUM). 이 테이블은 알림·브리핑 어느 쪽도 읽지 않는다.
+    (
+        8,
+        "Create council_dropped observation ledger",
+        [
+            """
+            CREATE TABLE IF NOT EXISTS council_dropped (
+                id            INTEGER PRIMARY KEY AUTOINCREMENT,
+                source        TEXT    NOT NULL,
+                source_id     TEXT    NOT NULL,
+                title         TEXT    NOT NULL,
+                url           TEXT    DEFAULT '',
+                posted_at     TEXT    DEFAULT '',
+                company_score REAL    DEFAULT 0.0,
+                council_score REAL    DEFAULT 0.0,
+                reason        TEXT    DEFAULT '',
+                seen_at       TEXT    NOT NULL,
+                UNIQUE(source, source_id)
+            );
+            """,
+            "CREATE INDEX IF NOT EXISTS idx_council_dropped_seen"
+            " ON council_dropped(seen_at);",
         ]
     ),
 ]

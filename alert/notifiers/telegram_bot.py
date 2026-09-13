@@ -561,9 +561,12 @@ class TelegramBot:
         """Show 5 most recent announcements."""
         # Get recent announcements by searching with empty query
         # and sorting by created_at
+        # 회사 사용자에게 그대로 보이는 목록이라 협의회 단독 행은 뺀다
+        # (P0 계약 불변 조건 1).
         query_result = self.db._conn.execute(
             """
             SELECT * FROM announcements
+            WHERE council_only = 0
             ORDER BY created_at DESC
             LIMIT 5
             """

@@ -13,7 +13,7 @@ from datetime import datetime
 from typing import List, Dict, Any, Optional, Tuple
 
 from .config import get_config
-from .council import score_item
+from .council import CouncilDrop, score_item
 from .db import Database
 from .analyzer import KeywordAnalyzer, ClaudeAnalyzer
 from .models import RawAnnouncement, AnalyzedAnnouncement
@@ -234,16 +234,31 @@ def select_for_storage(
     return keyword_analyzer.analyze_batch(raw_announcements), False
 
 
+def _posted_from_raw(raw_data: Optional[str]) -> str:
+    """``raw_data`` 의 ``posted`` (게시일)를 꺼낸다. 없으면 빈 문자열.
+
+    9개 크롤러가 이 키를 남긴다 (``grep -l '"posted"' alert/crawlers/*.py``).
+    관찰 원장의 표시용일 뿐 기간 관문(``_finalize_periods``)과 무관하다.
+    """
+    try:
+        raw = json.loads(raw_data or "{}")
+    except (ValueError, TypeError):
+        return ""
+    if not isinstance(raw, dict):
+        return ""
+    return str(raw.get("posted") or "")
+
+
 def apply_council_profile(
     profile: Any,
     source: str,
     raw_items: List[RawAnnouncement],
     selected: List[AnalyzedAnnouncement],
     analyze: Any,
-) -> List[AnalyzedAnnouncement]:
+) -> Tuple[List[AnalyzedAnnouncement], List[CouncilDrop]]:
     """협의회 프로파일을 적용한다 - **회사 선택 결과는 건드리지 않는다**.
 
-    두 가지 일만 한다:
+    세 가지 일만 한다:
 
     1. 회사 경로가 이미 고른 항목(``selected``)에는 측정값(council_score·
        council_tags·council_match)만 붙인다. ``relevance_score``·
@@ -251,6 +266,9 @@ def apply_council_profile(
     2. 회사 경로가 버렸지만 ``council_match=1`` 인 항목은 **별도 목록**으로
        돌려준다. 이 항목의 회사 점수는 계산값(임계 미달) 그대로 두고
        ``council_only=1`` 을 세워 알림·브리핑 쿼리가 집지 않게 한다.
+    3. 회사·협의회 **둘 다** 탈락한 협의회 소스 항목은 관찰 원장 레코드
+       (:class:`alert.council.CouncilDrop`)로 돌려준다. 저장되지 않는 항목은
+       표본에 나타날 수 없어 오탈락이 조용해지기 때문이다 (Codex 게이트 2R).
 
     계약 §A 불변 조건 1이 여기서 갈린다: 이 함수는 ``selected`` 의 원소를
     **더하거나 빼지 않는다**.
@@ -263,13 +281,17 @@ def apply_council_profile(
         analyze: 회사 키워드 분석 함수 (``KeywordAnalyzer.analyze``).
 
     Returns:
-        협의회 프로파일 **단독**으로 저장할 항목 목록 (``council_only=1``).
+        ``(협의회 단독 저장 대상, 양쪽 탈락 관찰 레코드)``.
     """
     if not profile or not getattr(profile, "sources", None):
-        return []
+        return [], []
+    if source not in profile.sources:
+        # 협의회 소스가 아니면 측정도 탈락 기록도 하지 않는다.
+        return [], []
 
     selected_by_id = {ann.source_id: ann for ann in selected}
     extras: List[AnalyzedAnnouncement] = []
+    drops: List[CouncilDrop] = []
 
     for raw in raw_items:
         verdict = score_item(
@@ -282,16 +304,28 @@ def apply_council_profile(
             chosen.council_match = verdict.match
             chosen.council_only = 0
             continue
-        if not verdict.match:
-            continue
-        extra = analyze(raw)
-        extra.council_score = verdict.score
-        extra.council_tags = verdict.tags_json()
-        extra.council_match = verdict.match
-        extra.council_only = 1
-        extras.append(extra)
 
-    return extras
+        analyzed = analyze(raw)
+        if not verdict.match:
+            drops.append(CouncilDrop(
+                source=raw.source,
+                source_id=raw.source_id,
+                title=raw.title,
+                url=raw.url,
+                posted_at=_posted_from_raw(raw.raw_data),
+                company_score=analyzed.relevance_score,
+                council_score=verdict.score,
+                reason=verdict.reason,
+            ))
+            continue
+
+        analyzed.council_score = verdict.score
+        analyzed.council_tags = verdict.tags_json()
+        analyzed.council_match = verdict.match
+        analyzed.council_only = 1
+        extras.append(analyzed)
+
+    return extras, drops
 
 
 def run_pipeline(test_mode: bool = False) -> None:
@@ -319,6 +353,13 @@ def run_pipeline(test_mode: bool = False) -> None:
         logger.info(f"레거시 식별자 행: {marked} 건 표시 (기간·알림 제외)")
     except Exception as e:
         logger.error(f"레거시 표시 실패: {e}")
+
+    # 협의회 탈락 관찰 원장 보관 기간 적용 (멱등, 실행당 1회)
+    try:
+        pruned = db.prune_council_drops()
+        logger.info(f"협의회 탈락 원장: {pruned} 행 정리 (보관 기간 경과)")
+    except Exception as e:
+        logger.error(f"탈락 원장 정리 실패 (비치명): {e}")
 
     # 기존 오염 정규화 (멱등) - 허용목록 **여집합 전체**의 기간을 지운다.
     # 12차 게이트: 대상을 몇 개 소스로 좁혔더니 bizinfo 같은 소스의 오염이
@@ -536,13 +577,21 @@ def run_pipeline(test_mode: bool = False) -> None:
             # ── 협의회 적재 프로파일 (관찰 모드, 계약 §A) ────────────
             # 회사 선택 결과에는 측정값만 붙고, 회사가 버린 협의회 매치만
             # 따로 저장된다. 지식 레이어·알림에는 넘기지 않는다.
-            council_extra = apply_council_profile(
+            council_extra, council_drops = apply_council_profile(
                 config.council_profile,
                 crawler_name,
                 new_raw,
                 analyzed,
                 keyword_analyzer.analyze,
             )
+            if council_drops:
+                try:
+                    db.record_council_drops(council_drops)
+                    logger.info(
+                        f"{crawler_name}: 양쪽 탈락 {len(council_drops)}건 관찰 원장 기록"
+                    )
+                except Exception as e:
+                    logger.error(f"{crawler_name}: 탈락 원장 기록 실패 (비치명): {e}")
 
             for ann in analyzed:
                 row_id = db.insert_announcement(ann)

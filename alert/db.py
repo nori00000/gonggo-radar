@@ -6,7 +6,7 @@ import json
 import logging
 import os
 import sqlite3
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence
 
@@ -165,6 +165,10 @@ _PG_CREATE_INDEXES = [
 ]
 
 
+# 협의회 탈락 관찰 원장의 보관 기간 (P0 계약 §A 라운드 2)
+COUNCIL_DROP_RETENTION_DAYS = 30
+
+
 class Database:
     """Persistence layer for the alert bot (SQLite / PostgreSQL)."""
 
@@ -301,10 +305,10 @@ class Database:
                 ann.period_end, ann.relevance_score, ann.relevance_reason,
                 json.dumps(ann.matched_keywords, ensure_ascii=False),
                 ann.raw_data, now, now,
-                getattr(ann, "council_score", 0.0),
-                getattr(ann, "council_tags", "{}"),
-                getattr(ann, "council_match", 0),
-                getattr(ann, "council_only", 0),
+                getattr(ann, "council_score", None),
+                getattr(ann, "council_tags", None),
+                getattr(ann, "council_match", None),
+                getattr(ann, "council_only", 0) or 0,
             )
             if self._backend == "postgresql":
                 cur = self._conn.cursor()
@@ -319,6 +323,16 @@ class Database:
             # 같은 **행 식별자**가 이미 있다 = 같은 공고다. 점수·사유만
             # 갱신한다. 행은 ``_find_row`` 로만 찾는다 - 저장 경로에도
             # 식별 우회가 없어야 한다 (13차 게이트).
+            #
+            # ``council_only`` 는 **한 방향으로만** 움직인다 (Codex 게이트 2R HIGH):
+            #   1 -> 0  협의회 단독으로 먼저 저장된 행이 나중에 회사 임계를
+            #           통과하면 **승격**한다. 새 회사 점수가 그대로 기록되고
+            #           is_notified 는 건드리지 않으므로(협의회 단독 행은 알림된
+            #           적이 없어 0) 바로 회사 알림 후보가 된다.
+            #   0 -> 1  절대 없다. 회사 행이 협의회 단독으로 **강등**되면 이미
+            #           보낸 경로에서 조용히 사라진다.
+            # 측정 3열은 COALESCE 로 덮는다 - 프로파일이 꺼진 실행(값 None)이
+            # 먼저 잰 측정을 지우지 않게.
             row = self._find_row("id", ann)
             if row is None:
                 return None
@@ -328,9 +342,11 @@ class Database:
                    SET relevance_score  = ?,
                        relevance_reason = ?,
                        matched_keywords = ?,
-                       council_score    = ?,
-                       council_tags     = ?,
-                       council_match    = ?,
+                       council_score    = COALESCE(?, council_score),
+                       council_tags     = COALESCE(?, council_tags),
+                       council_match    = COALESCE(?, council_match),
+                       council_only     = CASE WHEN ? = 0 THEN 0
+                                               ELSE COALESCE(council_only, 0) END,
                        updated_at       = ?
                  WHERE id = ?
                 """),
@@ -338,9 +354,10 @@ class Database:
                     ann.relevance_score,
                     ann.relevance_reason,
                     json.dumps(ann.matched_keywords, ensure_ascii=False),
-                    getattr(ann, "council_score", 0.0),
-                    getattr(ann, "council_tags", "{}"),
-                    getattr(ann, "council_match", 0),
+                    getattr(ann, "council_score", None),
+                    getattr(ann, "council_tags", None),
+                    getattr(ann, "council_match", None),
+                    getattr(ann, "council_only", 0) or 0,
                     now,
                     row["id"],
                 ),
@@ -389,6 +406,54 @@ class Database:
             (source, source_id),
         ).fetchone()
         return row is not None
+
+    def record_council_drops(self, drops: Sequence[Any]) -> int:
+        """협의회 소스에서 **두 프로파일 모두** 탈락한 항목을 관찰 원장에 남긴다.
+
+        ``(source, source_id)`` 당 한 행이고 재실행하면 덮어쓴다(멱등). 알림·
+        브리핑 어느 쪽도 이 테이블을 읽지 않는다 - 순수 관찰용이다.
+
+        Args:
+            drops: :class:`alert.council.CouncilDrop` 목록.
+
+        Returns:
+            기록한 행 수.
+        """
+        if not drops:
+            return 0
+        now = datetime.now().isoformat()
+        sql = _sql("""
+            INSERT INTO council_dropped
+                (source, source_id, title, url, posted_at,
+                 company_score, council_score, reason, seen_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(source, source_id) DO UPDATE SET
+                title         = excluded.title,
+                url           = excluded.url,
+                posted_at     = excluded.posted_at,
+                company_score = excluded.company_score,
+                council_score = excluded.council_score,
+                reason        = excluded.reason,
+                seen_at       = excluded.seen_at
+            """)
+        for drop in drops:
+            self._conn.execute(sql, (
+                drop.source, drop.source_id, drop.title, drop.url, drop.posted_at,
+                drop.company_score, drop.council_score, drop.reason, now,
+            ))
+        if self._backend == "sqlite":
+            self._conn.commit()
+        return len(drops)
+
+    def prune_council_drops(self, days: int = COUNCIL_DROP_RETENTION_DAYS) -> int:
+        """관찰 원장에서 ``days`` 일보다 오래된 행을 지운다."""
+        cutoff = (datetime.now() - timedelta(days=days)).isoformat()
+        cur = self._conn.execute(
+            _sql("DELETE FROM council_dropped WHERE seen_at < ?"), (cutoff,)
+        )
+        if self._backend == "sqlite":
+            self._conn.commit()
+        return cur.rowcount if cur.rowcount and cur.rowcount > 0 else 0
 
     def get_quoted_source_ids(self, source: str) -> set:
         """이미 상세 인용을 받은 공고의 source_id 집합.
@@ -777,12 +842,16 @@ class Database:
         """Full-text search across title and summary.
 
         Uses ``LIKE`` for simplicity; upgrade to FTS5 / tsvector if needed.
+
+        텔레그램 ``/search`` 가 회사 사용자에게 그대로 보여 주는 결과다 -
+        협의회 단독 행은 제외한다 (P0 계약 불변 조건 1).
         """
         pattern = f"%{query}%"
         rows = self._conn.execute(
             _sql("""
             SELECT * FROM announcements
-             WHERE title LIKE ? OR summary LIKE ?
+             WHERE (title LIKE ? OR summary LIKE ?)
+               AND council_only = 0
              ORDER BY relevance_score DESC, created_at DESC
              LIMIT ?
             """),
@@ -936,13 +1005,19 @@ class Database:
             Dict with keys ``total``, ``by_source``, ``by_month``,
             ``notified``, ``unnotified``.
         """
-        total = self._conn.execute("SELECT COUNT(*) AS cnt FROM announcements").fetchone()["cnt"]
+        # 회사 사용자가 텔레그램에서 보는 수치다 - 협의회 단독 행은 세지 않는다
+        # (P0 계약 불변 조건 1). 협의회 쪽 수치는 scripts/council_observe.py 몫.
+        total = self._conn.execute(
+            "SELECT COUNT(*) AS cnt FROM announcements WHERE council_only = 0"
+        ).fetchone()["cnt"]
         notified = self._conn.execute(
-            "SELECT COUNT(*) AS cnt FROM announcements WHERE is_notified = 1"
+            "SELECT COUNT(*) AS cnt FROM announcements"
+            " WHERE is_notified = 1 AND council_only = 0"
         ).fetchone()["cnt"]
 
         by_source_rows = self._conn.execute(
-            "SELECT source, COUNT(*) AS cnt FROM announcements GROUP BY source ORDER BY cnt DESC"
+            "SELECT source, COUNT(*) AS cnt FROM announcements"
+            " WHERE council_only = 0 GROUP BY source ORDER BY cnt DESC"
         ).fetchall()
         by_source = {r["source"]: r["cnt"] for r in by_source_rows}
 
@@ -951,6 +1026,7 @@ class Database:
                 """
                 SELECT TO_CHAR(created_at::timestamp, 'YYYY-MM') AS month, COUNT(*) AS cnt
                   FROM announcements
+                 WHERE council_only = 0
                  GROUP BY month
                  ORDER BY month DESC
                  LIMIT 12
@@ -961,6 +1037,7 @@ class Database:
                 """
                 SELECT strftime('%Y-%m', created_at) AS month, COUNT(*) AS cnt
                   FROM announcements
+                 WHERE council_only = 0
                  GROUP BY month
                  ORDER BY month DESC
                  LIMIT 12
@@ -1185,12 +1262,15 @@ class Database:
         """Get announcements created within a date range.
 
         다이제스트 후보에서도 레거시 행은 뺀다 (15차 게이트).
+        협의회 단독 행도 뺀다 - 이 함수는 회사용 리서치 문서의 입력이다
+        (``alert/research_generator.py``).
         """
         rows = self._conn.execute(
             _sql("""
             SELECT * FROM announcements
              WHERE created_at >= ? AND created_at <= ?
                AND legacy = 0
+               AND council_only = 0
              ORDER BY relevance_score DESC, created_at DESC
             """),
             (start, end),
@@ -1205,6 +1285,7 @@ class Database:
               FROM announcements
              WHERE created_at >= ? AND created_at <= ?
                AND business_domain != ''
+               AND council_only = 0
              GROUP BY business_domain
              ORDER BY cnt DESC
             """),
