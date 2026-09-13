@@ -12,11 +12,11 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from typing import List, Dict, Any, Optional, Tuple
 
-from .config import get_config
+from .config import get_config, is_media_source
 from .council import CouncilDrop, score_item
 from .db import Database
 from .analyzer import KeywordAnalyzer, ClaudeAnalyzer
-from .models import RawAnnouncement, AnalyzedAnnouncement
+from .models import SOURCE_KIND_DEFAULT, RawAnnouncement, AnalyzedAnnouncement
 from .notifiers.telegram_bot import TelegramNotifier
 from .notifiers.email_sender import EmailNotifier
 from .utils.logger import setup_logger
@@ -80,6 +80,11 @@ def _import_crawlers() -> Dict[str, Any]:
         ("forest_press", "alert.crawlers.forest_press", "ForestPressCrawler"),
         ("lawmaking", "alert.crawlers.lawmaking", "LawmakingCrawler"),
         ("coop", "alert.crawlers.coop", "CoopCrawler"),
+        # 2차 미디어 RSS (P1-R 계약, kind: media - 월간호 전용)
+        ("lifein", "alert.crawlers.media_rss", "LifeinCrawler"),
+        ("eroun", "alert.crawlers.media_rss", "ErounCrawler"),
+        ("senews", "alert.crawlers.media_rss", "SenewsCrawler"),
+        ("kfnews", "alert.crawlers.media_rss", "KfnewsCrawler"),
     ]
 
     for name, module_path, class_name in crawler_modules:
@@ -220,9 +225,18 @@ def select_for_storage(
         raw_announcements: 중복 제거를 마친 신규 공고
         source_cfg: 해당 소스의 SourceConfig (없으면 None)
 
+    P1-R 계약: `kind: media` 소스는 **회사 경로에 한 건도 들어가지 않는다**.
+    제목에 회사 must_match 어휘("사회적기업" 등)가 있어도 마찬가지다 - 2차
+    미디어 보도는 회사가 신청할 공고가 아니다. 적재 여부는 협의회 프로파일이
+    단독으로 정한다(매치 -> council_only=1, 미매치 -> 탈락 원장). 회사 알림
+    무영향이 어휘가 아니라 **경로 분리**로 지켜지는 자리다.
+
     Returns:
         (저장 대상 목록, bypass 적용 여부)
     """
+    if is_media_source(source_cfg):
+        return [], False
+
     if source_cfg is not None and getattr(source_cfg, "bypass_threshold", False):
         analyzed = [keyword_analyzer.analyze(raw) for raw in raw_announcements]
         for ann in analyzed:
@@ -674,6 +688,15 @@ def run_pipeline(test_mode: bool = False) -> None:
                     )
                 except Exception as e:
                     logger.error(f"{crawler_name}: 탈락 원장 기록 실패 (비치명): {e}")
+
+            # 저장 직전 소스 종류를 찍는다 - 크롤러가 아니라 설정이 정본이다
+            # (기간 관문과 같은 자리, 같은 이유: 우회 경로를 두지 않는다).
+            source_kind = getattr(source_cfg, "kind", SOURCE_KIND_DEFAULT)
+            for ann in (
+                analyzed + council_extra + recheck_selected
+                + recheck_extra + recheck_unmatched
+            ):
+                ann.kind = source_kind
 
             for ann in analyzed:
                 row_id = db.insert_announcement(ann)

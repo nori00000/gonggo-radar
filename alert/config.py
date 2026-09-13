@@ -10,6 +10,8 @@ from typing import Any, Dict, Optional
 import yaml
 from dotenv import load_dotenv
 
+from .models import SOURCE_KIND_DEFAULT, SOURCE_KIND_MEDIA
+
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
@@ -34,6 +36,18 @@ class SourceConfig:
     bypass_threshold: bool = False
     # 계약 v2.1 V2: True면 상세 페이지에서 마감/자격/금액 인용을 추출한다.
     fetch_detail: bool = False
+    # P1-R 계약: 소스 종류. "gonggo"(기본) | "media"(2차 미디어 RSS).
+    # media 는 회사 선택 경로에 들어가지 않는다 - select_for_storage 참조.
+    kind: str = SOURCE_KIND_DEFAULT
+
+
+def is_media_source(source_cfg: Any) -> bool:
+    """이 소스가 2차 미디어(``kind: media``)인가 — 판정의 단일 구현.
+
+    설정이 없는 소스(``None``)는 공고 소스로 본다. 문자열 비교를 여기 한
+    곳에만 두어 ``"media"`` 오타가 조용히 회사 경로를 열지 않게 한다.
+    """
+    return getattr(source_cfg, "kind", SOURCE_KIND_DEFAULT) == SOURCE_KIND_MEDIA
 
 
 @dataclass

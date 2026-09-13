@@ -186,6 +186,21 @@ MIGRATIONS: List[Tuple[int, str, List[str]]] = [
             "ALTER TABLE announcements ADD COLUMN council_content_hash TEXT DEFAULT NULL;",
         ]
     ),
+    # P1-R 계약 - 소스 종류. 2차 미디어(``media``) 항목을 회사향 조회에서
+    # 빼는 근거가 되는 컬럼이다.
+    #
+    # 기본값은 반드시 ``'gonggo'`` 다. NULL 이면 마이그레이션만 적용된 옛
+    # 행("종류를 적은 적 없음")이 ``kind <> 'media'`` 비교에서 통째로
+    # 떨어진다 - 회사 알림이 조용히 비는 자리다(migration 7 의 council_only
+    # 와 같은 이유). 조회 쪽도 ``COALESCE`` 로 한 번 더 받는다.
+    (
+        10,
+        "Add source kind column to announcements (gonggo | media)",
+        [
+            "ALTER TABLE announcements ADD COLUMN kind TEXT DEFAULT 'gonggo';",
+            "CREATE INDEX IF NOT EXISTS idx_ann_kind ON announcements(kind);",
+        ]
+    ),
 ]
 
 

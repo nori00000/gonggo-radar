@@ -135,6 +135,37 @@ crawler:
       bypass_threshold: true
       fetch_detail: false
 
+    # ── 2차 미디어 RSS (P1-R 계약) ────────────────────────────────────
+    # kind: media = **월간호 전용**. 회사 선택 경로(select_for_storage)에
+    # 들어가지 않으므로 bypass_threshold 는 의미가 없고, 그래서 false 로
+    # 못박아 둔다 - true 로 바뀌어도 회사 알림이 열리지 않지만 읽는 사람이
+    # 헷갈린다. base_url 이 곧 검증된 피드 URL 이다
+    # (results/R-monthly-sources.md §1 의 URL 그대로, 추측 금지).
+    lifein:
+      enabled: true
+      base_url: "https://www.lifein.news/rss/allArticle.xml"
+      kind: "media"
+      bypass_threshold: false
+      fetch_detail: false
+    eroun:
+      enabled: true
+      base_url: "https://www.eroun.net/rss/S1N1.xml"
+      kind: "media"
+      bypass_threshold: false
+      fetch_detail: false
+    senews:
+      enabled: true
+      base_url: "https://www.senews.kr/rss/rss_news.php"
+      kind: "media"
+      bypass_threshold: false
+      fetch_detail: false
+    kfnews:
+      enabled: true
+      base_url: "https://www.kfnews.co.kr/rss/allArticle.xml"
+      kind: "media"
+      bypass_threshold: false
+      fetch_detail: false
+
 analyzer:
   keyword_threshold: 0.3
   claude_threshold: 0.3
@@ -381,6 +412,12 @@ council_profile:
     - "g2b"
     - "kstartup"
     - "subsidy24"
+    # 2차 미디어 (P1-R). 협의회 어휘에 걸리는 기사만 남고 나머지는 탈락
+    # 원장으로 간다 - senews 의 지역행정 기사가 여기서 걸러진다.
+    - "lifein"
+    - "eroun"
+    - "senews"
+    - "kfnews"
 
   # council-vocab.md §1 — 가/나/다/라 4군 전량
   must_match:
