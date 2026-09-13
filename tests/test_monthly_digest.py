@@ -27,22 +27,30 @@ from alert.digest.composer import (
     MONTHLY_FOOTER_LINE,
     MONTHLY_HOLD_ACTIONABLE,
     MONTHLY_HOLD_DEADLINE,
+    MONTHLY_HOLD_DEADLINE_UNKNOWN,
+    MONTHLY_HOLD_NOT_ELIGIBLE,
     MONTHLY_HOLD_NOT_MONTHLY,
     MONTHLY_HOLD_NO_COUNCIL_MATCH,
     MONTHLY_ITEM_SECTIONS,
     MONTHLY_RESCUE_MEDIA_REASON,
     MONTHLY_RESCUE_PRESS_REASON,
+    MONTHLY_RULE_MEDIA,
+    MONTHLY_RULE_NOTICE,
+    MONTHLY_RULE_PRESS,
     SECTION_HEADINGS,
     SECTION_LIMITS,
     SECTION_NOTICE,
     SOURCE_DIVERSITY_LIMIT,
     VERDICT_MONTHLY,
+    VERDICT_NOTICE,
     _sort_monthly,
     compose_digest,
     compose_digest_data,
     get_month_date_range,
+    deadline_cue,
     issue_kind,
     item_line,
+    monthly_rule,
     load_items_manifest,
     source_display_name,
 )
@@ -527,14 +535,15 @@ def test_previous_month_key(today, expected):
     assert monthly_digest.previous_month_key(date(*today)) == expected
 
 
-def test_monthly_job_skips_when_not_first_week(tmp_path):
-    """§2: 매주 목요일에 깨어나되 1~7일이 아니면 exit 0 로 끝난다."""
+def test_monthly_job_script_shape(tmp_path):
+    """§2: 잡의 순서·가드·시간대가 스크립트 안에 있다."""
     import subprocess
     from pathlib import Path
 
     script = Path(__file__).resolve().parent.parent / "scripts" / "monthly_job.sh"
     source = script.read_text(encoding="utf-8")
-    assert 'date "+%d"' in source
+    assert 'export TZ="Asia/Seoul"' in source      # 라운드 3: 시간대 고정
+    assert '"+%u"' in source and '"+%d"' in source  # 요일 AND 일자
     assert "10#" in source          # 08·09 를 8진수로 읽지 않는다
     assert "monthly_digest.py" in source
     assert "glm_enrich.py" in source
@@ -935,3 +944,221 @@ def test_media_selected_on_the_real_migrated_schema(tmp_path):
     # 주간호는 여전히 media 를 보지 않는다
     weekly = compose_digest_data(db_path=str(db), week_str="2026-W37")
     assert url not in json.dumps(weekly, ensure_ascii=False, default=str)
+
+
+# ══ 라운드 3 (Codex 게이트) — 마감 추출 실패 · 허용 목록 ═══════════════════
+def test_deadline_cue_detects_extraction_miss(tmp_path):
+    """Codex MEDIUM 재현: `알아두세요` + 제목 `(~9.16.)` + period_end NULL.
+
+    라운드 2까지는 제외 사유가 None(= 실림)이었다. 추출 실패를 "마감 없음" 으로
+    읽으면 이미 끝난 의견수렴이 월간 종합에 실린다.
+    """
+    db = _round2_db(tmp_path)
+    _insert(db, "lawmaking", "산림 사회적기업 제도 의견수렴 안내 (~9.16.)",
+            source_id="cue", period_end=None, summary="요약")
+    weekly = compose_digest_data(db_path=str(db), week_str="2026-W37")
+    assert weekly["sections"]["알아두세요"], "주간 판정은 알아두세요여야 재현이 된다"
+
+    data = _compose(db)
+    assert data["sections"][VERDICT_MONTHLY] == []
+    assert [hold["reason"] for hold in data["holds"]] == [
+        MONTHLY_HOLD_DEADLINE_UNKNOWN]
+
+
+@pytest.mark.parametrize("text", [
+    "의견수렴 안내 (~9.16.)",
+    "접수 ~ 9. 30. 연장",
+    "2026-09-16 시행 예정",
+    "2026.09.16. 개정",
+    "설명회 (9.10.(목) 13시)",
+    "9월 16일 개최",
+    "신청서 제출 9월 16일까지",
+    "마감 임박",
+    "접수기간 안내",
+    "신청기간 변경",
+    "제출기한 연장",
+])
+def test_deadline_cue_patterns(text):
+    """§3: 사람 눈에 보이는 마감 표기는 전부 단서로 잡는다 (fail-closed)."""
+    assert deadline_cue(text) is not None
+
+
+@pytest.mark.parametrize("text", [
+    "산림 사회적기업 성장 정책 방향 발표",
+    "임업 통계 기본계획 발표",
+    "2026년 하반기 제도 개선",
+])
+def test_deadline_cue_is_silent_without_a_date(text):
+    """§3: 마감 표기가 없으면 단서도 없다 — 진짜 마감 없음은 그대로 실린다."""
+    assert deadline_cue(text) is None
+
+
+def test_deadline_cue_reads_the_summary_too(tmp_path):
+    """§3: 제목이 깨끗해도 요약에 마감이 보이면 `마감 미확인` 이다."""
+    db = _round2_db(tmp_path)
+    _insert(db, "lawmaking", "산림 사회적기업 제도 개선 안내", source_id="cue2",
+            period_end=None, summary="신청서는 9월 16일까지 제출하세요")
+    data = _compose(db)
+    assert data["sections"][VERDICT_MONTHLY] == []
+    assert data["holds"][0]["reason"] == MONTHLY_HOLD_DEADLINE_UNKNOWN
+
+
+def test_deadline_cue_does_not_touch_the_weekly_issue(tmp_path):
+    """§3: 단서 판정은 월간 경로 전용이다 — 주간호는 그대로 싣는다."""
+    db = _round2_db(tmp_path)
+    _insert(db, "lawmaking", "산림 사회적기업 제도 의견수렴 안내 (~9.16.)",
+            source_id="cue3", period_end=None)
+    weekly = compose_digest_data(db_path=str(db), week_str="2026-W37")
+    assert len(weekly["sections"]["알아두세요"]) == 1
+
+
+def test_generic_hold_is_not_eligible(tmp_path):
+    """Codex MEDIUM 재현: 비미디어 `보류/섹션 판정 불명` 행은 월간 대상이 아니다.
+
+    허용 목록은 (a) 알아두세요 · (b) 기관 보도·정책 · (c) 2차 미디어뿐이다.
+    `kofpi` 는 기관 보도 소스 목록에 없으므로 어느 규칙에도 걸리지 않는다.
+    """
+    db = _round2_db(tmp_path)
+    _insert(db, "kofpi", "산림 사회적기업 협력 사례", source_id="generic",
+            period_end=None, summary="요약")
+    weekly = compose_digest_data(db_path=str(db), week_str="2026-W37")
+    assert weekly["holds"][0]["reason"] == "섹션 판정 불명"
+
+    data = _compose(db)
+    assert data["sections"][VERDICT_MONTHLY] == []
+    assert [hold["reason"] for hold in data["holds"]] == [
+        MONTHLY_HOLD_NOT_ELIGIBLE]
+
+
+def test_monthly_rule_allowlist_table():
+    """§4: 어느 규칙으로 들어오는가 — (a)/(b)/(c) 와 '해당 없음'."""
+    from alert.digest.composer import Classification, VERDICT_HOLD
+
+    notice = Classification(VERDICT_NOTICE, "제도: 입법예고", (), ("전체",), None)
+    hold = Classification(VERDICT_HOLD, "섹션 판정 불명", (), (), None)
+    excluded = Classification("배제", "협의회 소스 풀 외", (), (), None)
+
+    assert monthly_rule("lawmaking", notice, {}) == MONTHLY_RULE_NOTICE
+    assert monthly_rule("mafra", excluded, {"council_match": 1}) == \
+        MONTHLY_RULE_PRESS
+    assert monthly_rule("mafra", excluded, {"council_only": 0}) == \
+        MONTHLY_RULE_PRESS
+    assert monthly_rule("mafra", excluded,
+                        {"council_match": 0, "council_only": 1}) is None
+    assert monthly_rule("lifein", excluded,
+                        {"kind": "media", "council_match": 1}) == \
+        MONTHLY_RULE_MEDIA
+    assert monthly_rule("lifein", excluded,
+                        {"kind": "media", "council_match": 0}) is None
+    # 허용 목록 밖: 기관 보도 소스도 아니고 알아두세요도 아니다
+    assert monthly_rule("kofpi", hold, {"council_match": 1}) is None
+
+
+def test_press_rule_admits_without_a_rescue(tmp_path):
+    """§4(b): 기관 보도 소스는 주간 배제가 아니어도 (b)로 들어온다."""
+    db = _round2_db(tmp_path)
+    from alert.digest.composer import classify_item
+
+    url = _insert(db, "coop", "산림 협동조합 협력 사례", source_id="press-hold",
+                  period_end=None, council_match=1, council_only=1)
+    # 주간 분류는 `보류/섹션 판정 불명` 이다 (배제가 아니므로 되살림 경로가 아니다)
+    assert classify_item("산림 협동조합 협력 사례", "요약", "coop").reason == \
+        "섹션 판정 불명"
+    data = _compose(db)
+    assert [item["url"] for item in data["sections"][VERDICT_MONTHLY]] == [url]
+    assert data["sections"][VERDICT_MONTHLY][0]["monthly_rule"] == \
+        MONTHLY_RULE_PRESS
+
+
+def test_deadline_cue_beats_every_admission_rule(tmp_path):
+    """§3+§4: 규칙에 맞아도 마감 단서가 있으면 내려간다 (미디어 포함)."""
+    db = _round2_db(tmp_path)
+    _insert_media(db, "사회적기업 현장 기사 신청기간 안내", source_id="cue-media")
+    _insert(db, "mafra", "농림축산식품 정책 발표 (~9.30.)", source_id="cue-press",
+            period_end=None, council_match=1, council_only=1)
+    data = _compose(db)
+    assert data["sections"][VERDICT_MONTHLY] == []
+    assert {hold["reason"] for hold in data["holds"]} == {
+        MONTHLY_HOLD_DEADLINE_UNKNOWN}
+
+
+# ══ 라운드 3 §5 — 잡의 날짜 가드 (요일 AND 일자, KST) ═════════════════════
+def _run_monthly_job(tmp_path, now, extra_env=None):
+    """`monthly_job.sh` 를 스텁 파이썬으로 돌린다 (네트워크·DB 접근 없음).
+
+    스텁은 받은 argv 를 파일에 적고 0 으로 끝난다 — 가드가 열렸는지, 어떤 호 키로
+    생성기를 불렀는지를 **실행으로** 본다.
+    """
+    import os
+    import subprocess
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parent.parent
+    log = tmp_path / "argv.log"
+    stub = tmp_path / "py"
+    stub.write_text(
+        "#!/bin/sh\nprintf '%s\\n' \"$*\" >> " + f"'{log}'\n" + "exit 0\n",
+        encoding="utf-8",
+    )
+    stub.chmod(0o755)
+    env = dict(os.environ, MONTHLY_JOB_NOW=now, GONGGO_PYTHON=str(stub))
+    env.update(extra_env or {})
+    proc = subprocess.run(
+        ["bash", str(root / "scripts" / "monthly_job.sh")],
+        capture_output=True, text=True, env=env, cwd=str(root),
+    )
+    calls = log.read_text(encoding="utf-8").splitlines() if log.exists() else []
+    return proc, calls
+
+
+@pytest.mark.parametrize("now,why", [
+    ("2026-10-02", "목요일이 아님"),      # Codex 재현: 금요일
+    ("2026-10-08", "첫째 주가 아님"),     # 목요일이지만 일자 8
+    ("2026-10-05", "목요일이 아님"),      # 월요일, 일자 5
+])
+def test_monthly_job_guard_refuses(tmp_path, now, why):
+    """§5: 목요일 **그리고** 일자 ≤ 7 이 아니면 파이프라인을 시작하지 않는다."""
+    proc, calls = _run_monthly_job(tmp_path, now)
+    assert proc.returncode == 0
+    assert "skip" in proc.stdout and why in proc.stdout
+    assert calls == [], "가드가 열리면 안 되는 날에 생성기를 불렀다"
+
+
+def test_monthly_job_runs_on_the_first_thursday(tmp_path):
+    """§5: 2026-10-01(목, 1일)에는 직전 달 키로 생성기를 부른다."""
+    proc, calls = _run_monthly_job(tmp_path, "2026-10-01")
+    assert calls and calls[0].startswith("scripts/monthly_digest.py 2026-M09")
+    # 스텁이 md 를 만들지 않으므로 그 다음 단계로 넘어가지 않는다 (네트워크 없음)
+    assert proc.returncode == 1
+    assert "월간호 파일 없음" in proc.stderr
+    assert len(calls) == 1
+
+
+def test_monthly_job_forces_kst(tmp_path):
+    """§5: 실행 환경 TZ 가 무엇이든 잡은 KST 달력을 본다."""
+    proc, calls = _run_monthly_job(
+        tmp_path, "2026-10-01", extra_env={"TZ": "America/New_York"})
+    assert calls and calls[0].startswith("scripts/monthly_digest.py 2026-M09")
+
+
+def test_monthly_job_explicit_key_skips_the_guard(tmp_path):
+    """§5: 인자로 호 키를 주면(수동 재실행) 날짜 가드를 지나지 않는다."""
+    import os
+    import subprocess
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parent.parent
+    log = tmp_path / "argv.log"
+    stub = tmp_path / "py"
+    stub.write_text(
+        "#!/bin/sh\nprintf '%s\\n' \"$*\" >> " + f"'{log}'\n" + "exit 0\n",
+        encoding="utf-8")
+    stub.chmod(0o755)
+    proc = subprocess.run(
+        ["bash", str(root / "scripts" / "monthly_job.sh"), "2026-M07"],
+        capture_output=True, text=True, cwd=str(root),
+        env=dict(os.environ, GONGGO_PYTHON=str(stub), MONTHLY_JOB_NOW="2026-10-02"),
+    )
+    calls = log.read_text(encoding="utf-8").splitlines()
+    assert calls[0].startswith("scripts/monthly_digest.py 2026-M07")
+    assert proc.returncode == 1     # 스텁이 md 를 만들지 않는다

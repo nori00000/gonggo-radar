@@ -1026,6 +1026,15 @@ def classify_item(title: str, summary: str, source: str) -> Classification:
 #   · 마감이 있는 항목(알아두세요의 의견 마감·마감 있는 행사 포함) → 주간호 몫
 MONTHLY_HOLD_ACTIONABLE = "행동 대상 — 주간호 몫"
 MONTHLY_HOLD_DEADLINE = "마감 있음 — 주간호 몫"
+# 라운드 3 (Codex MEDIUM): **추출 실패**와 **진짜 마감 없음**은 다른 사실이다.
+# DB period_end 가 비어 있는 것은 "마감이 없다" 가 아니라 "우리가 못 읽었다" 일 수
+# 있다 — 소스 32개 중 기간 추출기가 있는 것은 둘뿐이기 때문이다(분석서 §1).
+# 제목·요약에 마감 단서가 보이는데 DB 가 비어 있으면 **모른다** 고 말하고 내린다.
+MONTHLY_HOLD_DEADLINE_UNKNOWN = "마감 미확인"
+# 라운드 3 (Codex MEDIUM): 월간 지면은 **허용 목록**이다. (a)/(b)/(c) 가 아니면
+# 들어오지 않는다 — "배제되지 않은 나머지" 를 싣는 규칙은 `섹션 판정 불명` 을
+# 전부 통과시켰다.
+MONTHLY_HOLD_NOT_ELIGIBLE = "월간 대상 아님"
 # 라운드 2: 주간호가 이미 "회원이 신청할 사업이 아니다" 라고 판정한 부류는 월간호
 # 지면에도 올리지 않는다. 1R 실측에서 월간 후보 24건 중 6건이 이 둘이었다.
 MONTHLY_HOLD_NOT_MONTHLY = "월간호 대상 아님 (노이즈·참가자 모집)"
@@ -1037,6 +1046,10 @@ MONTHLY_HOLD_NO_COUNCIL_MATCH = "협의회 어휘 없음 — 2차 미디어 제�
 # `mafra` 는 `COUNCIL_SOURCES` 밖이라 주간 분류가 "협의회 소스 풀 외"로 배제한다 —
 # 월간호는 그 배제를 뒤집는다(마감 없는 정책·보도자료가 이 레인의 본체이기 때문).
 MONTHLY_PRESS_SOURCES = ("forest_press", "mafra", "socialenterprise", "coop")
+# 허용 목록의 규칙 이름 (라운드 3). 항목에 `monthly_rule` 로 실려 판정 근거가 된다.
+MONTHLY_RULE_NOTICE = "a"       # 주간 판정이 `알아두세요`
+MONTHLY_RULE_PRESS = "b"        # 기관 보도·정책
+MONTHLY_RULE_MEDIA = "c"        # 2차 미디어
 # 되살리지 않는 배제 사유 — 노이즈는 어느 호에서도 노이즈다.
 MONTHLY_RESCUE_BLOCKED_PREFIXES = ("노이즈",)
 MONTHLY_RESCUE_PRESS_REASON = "월간 편입: 기관 보도·정책"
@@ -1052,6 +1065,45 @@ MEDIA_MARKER = "<!-- media -->"
 MONTHLY_FOOTER_LINE = "기사 항목은 제목·링크·원문 1문장만 인용합니다."
 
 
+# 마감 단서 — DB 가 비어 있어도 **사람 눈에는 보이는** 마감 표기 (라운드 3).
+# 목적은 날짜를 얻는 것이 아니라 "모른다" 를 알아내는 것이다. 그래서 값은 쓰지
+# 않고 존재만 본다 — composer 의 철칙(마감 근거는 DB period_end 뿐, 사이클 12 #3)은
+# 그대로다. 여기서 뽑은 날짜는 어디에도 렌더되지 않는다.
+DEADLINE_CUE_WORDS = (
+    "까지",
+    "마감",
+    "접수기간",
+    "접수 기간",
+    "신청기간",
+    "신청 기간",
+    "제출기한",
+    "기한",
+)
+_DEADLINE_CUE_RE = re.compile(
+    r"~\s*\d{1,4}\s*[.\-/]\s*\d{1,2}"                       # ~9.16 · ~ 9. 30.
+    r"|\d{4}\s*[.\-/]\s*\d{1,2}\s*[.\-/]\s*\d{1,2}"         # 2026-09-16
+    r"|\d{1,2}\s*\.\s*\d{1,2}\s*\."                         # 9.10. (연도 생략)
+    r"|\d{1,2}\s*월\s*\d{1,2}\s*일"                          # 9월 16일
+)
+
+
+def deadline_cue(title: str, summary: str = "") -> Optional[str]:
+    """제목·요약에 보이는 마감 단서. 없으면 None (결정론, 값은 쓰지 않는다).
+
+    이 함수는 마감**일**을 만들지 않는다 — 있는지 없는지만 답한다. 마감의 근거는
+    언제나 DB `period_end` 하나이고(사이클 12 #3), 여기서 찾은 문자열은 "DB 가
+    비었지만 원문에는 마감이 있다" 는 **불일치의 증거**로만 쓰인다.
+    """
+    for field in (title or "", summary or ""):
+        matched = _DEADLINE_CUE_RE.search(field)
+        if matched:
+            return matched.group(0).strip()
+        for word in DEADLINE_CUE_WORDS:
+            if word in field:
+                return word
+    return None
+
+
 def monthly_hold_reason(item: Dict) -> Optional[str]:
     """월간호에 싣지 않을 이유 (결정론). 실을 수 있으면 None.
 
@@ -1059,26 +1111,53 @@ def monthly_hold_reason(item: Dict) -> Optional[str]:
     **유효 마감**(`item["deadline"]`)을 본다 — 병합 전 값으로 판정하면 복제본이
     마감 없는 항목처럼 보여 월간호로 새어 들어온다.
 
-    판정 순서 (라운드 2):
-      ① 2차 미디어 — 협의회 어휘가 맞은 것만 (기사에는 마감이 없다)
-      ② 주간 보류 사유가 노이즈 의심·참가자 모집(B2C) → 어느 호에도 싣지 않는다
-      ③ 주간 섹션 판정이 `신청하세요` → 주간호 몫
-      ④ 마감이 있음 → 주간호 몫
+    판정 순서 (라운드 3 — 마지막 줄이 **허용 목록**이라는 것이 요점이다):
+      ① 주간 보류 사유가 노이즈 의심·참가자 모집(B2C) → 어느 호에도 싣지 않는다
+      ② 마감이 있음 → 주간호 몫
+      ③ DB 마감은 비었는데 원문에 마감 단서가 보임 → **마감 미확인** (추출 실패)
+      ④ 2차 미디어 — 협의회 어휘가 맞은 것만
+      ⑤ 주간 섹션 판정이 `신청하세요` → 주간호 몫
+      ⑥ (a)/(b) 규칙에 해당하지 않으면 → **월간 대상 아님**
     """
     # 노이즈·B2C 판정이 **먼저**다 — 미디어라고 이 관문을 건너뛰면
     # `채용`·`참가자 모집` 기사가 월간 지면으로 들어온다.
     if str(item.get("reason") or "").startswith(MONTHLY_EXCLUDED_HOLD_PREFIXES):
         return MONTHLY_HOLD_NOT_MONTHLY
-    if item.get("media"):
-        if not item.get("council_match"):
-            return MONTHLY_HOLD_NO_COUNCIL_MATCH
-        if item.get("deadline"):
-            return MONTHLY_HOLD_DEADLINE
-        return None
-    if item["verdict"] == VERDICT_APPLY:
-        return MONTHLY_HOLD_ACTIONABLE
     if item.get("deadline"):
         return MONTHLY_HOLD_DEADLINE
+    if item.get("deadline_cue"):
+        return MONTHLY_HOLD_DEADLINE_UNKNOWN
+    if item.get("media"):
+        return (None if item.get("council_match")
+                else MONTHLY_HOLD_NO_COUNCIL_MATCH)
+    if item["verdict"] == VERDICT_APPLY:
+        return MONTHLY_HOLD_ACTIONABLE
+    if item.get("monthly_rule") in (MONTHLY_RULE_NOTICE, MONTHLY_RULE_PRESS):
+        return None
+    return MONTHLY_HOLD_NOT_ELIGIBLE
+
+
+def monthly_rule(
+    source: str, classification: "Classification", meta: Dict
+) -> Optional[str]:
+    """이 행이 월간 지면에 들어올 **규칙**. 해당 없으면 None (라운드 3 허용 목록).
+
+      (a) `MONTHLY_RULE_NOTICE` — 주간 섹션 판정이 `알아두세요`
+      (b) `MONTHLY_RULE_PRESS`  — `MONTHLY_PRESS_SOURCES` 의 기관 보도·정책 행으로
+          협의회 어휘가 맞았거나(`council_match=1`) 회사 선택분(`council_only=0`)
+      (c) `MONTHLY_RULE_MEDIA`  — `kind='media'` 이고 협의회 어휘가 맞은 것
+
+    마감·노이즈·B2C 판정은 여기서 하지 않는다(`monthly_hold_reason` 몫) —
+    이 함수는 "어느 규칙으로 들어오는가" 하나만 답한다.
+    """
+    council_match = bool(meta.get("council_match"))
+    if meta.get("kind") == MEDIA_KIND:
+        return MONTHLY_RULE_MEDIA if council_match else None
+    if source in MONTHLY_PRESS_SOURCES and (
+            council_match or not meta.get("council_only")):
+        return MONTHLY_RULE_PRESS
+    if classification.verdict == VERDICT_NOTICE:
+        return MONTHLY_RULE_NOTICE
     return None
 
 
@@ -1087,15 +1166,14 @@ def monthly_rescue_reason(
 ) -> Optional[str]:
     """주간 분류가 **배제**한 행을 월간호 후보로 되살릴 이유. 없으면 None.
 
-    되살림은 두 갈래뿐이고 둘 다 마감이 없을 때만 성립한다:
-      (b) `MONTHLY_PRESS_SOURCES` 의 기관 보도·정책 행으로 협의회 어휘가 맞았거나
-          (`council_match=1`) 회사 선택 경로가 이미 고른 행(`council_only=0`)
-      (c) `kind='media'` 2차 미디어 행으로 협의회 어휘가 맞은 것
+    되살림 자격은 `monthly_rule` 이 정하고(허용 목록), 여기서는 "배제된 행을
+    되살려도 되는가" 만 더 본다:
 
-    노이즈는 되살리지 않는다 — 어느 호에서도 노이즈다. 배제 사유만 보면
-    충분하지 않다: 협의회 소스 풀 밖(`mafra`)은 노이즈 판정에 **닿기 전에**
-    "협의회 소스 풀 외"로 끝나므로(`classify_item` 의 ② 관문), 여기서 노이즈
-    사전을 제목에 한 번 더 적용한다.
+    · 노이즈는 되살리지 않는다 — 어느 호에서도 노이즈다. 배제 사유만 보면
+      충분하지 않다: 협의회 소스 풀 밖(`mafra`)은 노이즈 판정에 **닿기 전에**
+      "협의회 소스 풀 외"로 끝나므로(`classify_item` 의 ② 관문), 여기서 노이즈
+      사전을 제목에 한 번 더 적용한다.
+    · 마감이 있으면 주간호 몫이므로 되살리지 않는다.
     """
     if str(classification.reason or "").startswith(
             MONTHLY_RESCUE_BLOCKED_PREFIXES):
@@ -1104,11 +1182,10 @@ def monthly_rescue_reason(
         return None
     if meta.get("period_end"):
         return None
-    council_match = bool(meta.get("council_match"))
-    if meta.get("kind") == MEDIA_KIND:
-        return MONTHLY_RESCUE_MEDIA_REASON if council_match else None
-    if source in MONTHLY_PRESS_SOURCES and (
-            council_match or not meta.get("council_only")):
+    rule = monthly_rule(source, classification, meta)
+    if rule == MONTHLY_RULE_MEDIA:
+        return MONTHLY_RESCUE_MEDIA_REASON
+    if rule == MONTHLY_RULE_PRESS:
         return MONTHLY_RESCUE_PRESS_REASON
     return None
 
@@ -1799,6 +1876,10 @@ def compose_digest_data(
             item["council_score"] = meta.get("council_score")
             item["council_match"] = bool(meta.get("council_match"))
             item["media"] = meta.get("kind") == MEDIA_KIND
+            # 라운드 3: 허용 목록 규칙과 마감 단서를 여기서 한 번만 계산한다.
+            item["monthly_rule"] = monthly_rule(source, classification, meta)
+            item["deadline_cue"] = (
+                None if row[6] else deadline_cue(title, summary))
             if item["media"]:
                 item.update(media_fields(row[8], item.get("posted") or ""))
 

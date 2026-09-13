@@ -5,32 +5,54 @@
 # 발송은 이 잡이 하지 않는다 — 사람이 텔레그램 [발송] 버튼으로만 한다.
 #
 # 왜 날짜 가드가 스크립트에 있나: launchd 는 "매월 첫째 목요일"을 표현하지 못한다.
-# plist 는 **매주 목요일 23:00** 에 깨우고, 여기서 `date +%d` 가 1~7 일 때만
-# 진행한다(그 주의 목요일이 곧 그 달의 첫째 목요일이다). 나머지 주는 로그 한 줄을
-# 남기고 exit 0 으로 끝낸다 — 실패가 아니라 "이번 주는 차례가 아님"이다.
+# plist 는 **매주 목요일 23:00** 에 깨우고, 여기서 "요일 = 목 **그리고** 일자 ≤ 7"
+# 일 때만 진행한다(그 두 조건을 함께 만족하는 날이 곧 그 달의 첫째 목요일이다).
+#
+# 라운드 3 (Codex MEDIUM): 일자만 보면 **2026-10-02 금요일**에도 진행됐다.
+# launchd 스케줄을 사람이 고치거나 손으로 실행하는 순간 조건이 깨진다 — 잡 자신이
+# 두 조건을 모두 확인한다. 시간대도 실행 환경에 맡기지 않고 KST 로 고정한다:
+# 23:00 잡은 UTC 로 읽으면 **전날**이 되어 요일·일자가 함께 어긋난다.
 set -euo pipefail
+
+# 시간대 고정 — `date` 와 아래 Python 단계가 같은 달력을 본다.
+export TZ="Asia/Seoul"
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "${ROOT}" || exit 1
-PY="${ROOT}/venv/bin/python"
+# 운영 기본값은 워크트리의 venv. 테스트는 이 손잡이로 파이썬 단계를 대체한다.
+PY="${GONGGO_PYTHON:-${ROOT}/venv/bin/python}"
 DB="${GONGGO_DB:-alert/data/announcements.db}"
 
-# 첫째 목요일 판정. 인자로 호 키를 직접 주면(재실행·수동 조립) 가드를 건너뛴다.
+# 인자로 호 키를 직접 주면(재실행·수동 조립) 날짜 가드를 건너뛴다.
 if [ "$#" -eq 0 ]; then
-  DAY_OF_MONTH="$(date "+%d")"
+  # MONTHLY_JOB_NOW 는 **테스트 전용** 손잡이다 (YYYY-MM-DD). 운영에서는 비어 있다.
+  NOW="${MONTHLY_JOB_NOW:-}"
+  if [ -n "${NOW}" ]; then
+    DOW="$(date -j -f "%Y-%m-%d" "${NOW}" "+%u")"
+    DOM="$(date -j -f "%Y-%m-%d" "${NOW}" "+%d")"
+    MONTH="$(date -j -v-1m -f "%Y-%m-%d" "${NOW}" "+%Y-M%m")"
+  else
+    NOW="$(date "+%Y-%m-%d")"
+    DOW="$(date "+%u")"
+    DOM="$(date "+%d")"
+    MONTH="$(date -v-1m "+%Y-M%m")"
+  fi
   # 10진수 강제 (08·09 를 8진수로 읽지 않게)
-  if [ "$((10#${DAY_OF_MONTH}))" -gt 7 ]; then
-    echo "=== monthly_job skip ($(date "+%Y-%m-%d")) — 첫째 목요일이 아님(일자 ${DAY_OF_MONTH}) ==="
+  if [ "$((10#${DOW}))" -ne 4 ]; then
+    echo "=== monthly_job skip (${NOW} KST) — 목요일이 아님(요일 ${DOW}) ==="
     exit 0
   fi
-  MONTH="$("${PY}" -c 'import datetime,sys; t=datetime.date.today(); y,m=(t.year,t.month-1) if t.month>1 else (t.year-1,12); print(f"{y}-M{m:02d}")')"
+  if [ "$((10#${DOM}))" -gt 7 ]; then
+    echo "=== monthly_job skip (${NOW} KST) — 첫째 주가 아님(일자 ${DOM}) ==="
+    exit 0
+  fi
 else
   MONTH="$1"
 fi
 
 MD="digests/${MONTH}.md"
 
-echo "=== monthly_job ${MONTH} ($(date "+%Y-%m-%d %H:%M:%S")) ==="
+echo "=== monthly_job ${MONTH} ($(date "+%Y-%m-%d %H:%M:%S") KST) ==="
 
 GEN_RC=0
 "${PY}" scripts/monthly_digest.py "${MONTH}" --db "${DB}" --exclude-state || GEN_RC=$?
