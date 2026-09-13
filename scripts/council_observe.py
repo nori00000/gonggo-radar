@@ -26,6 +26,7 @@ DB 는 ``mode=ro`` URI 로 연다. 출력 경로가 입력 DB 를 가리키면 �
 """
 
 import csv
+import os
 import random
 import sqlite3
 import sys
@@ -91,19 +92,44 @@ def open_readonly(db_path: Path) -> sqlite3.Connection:
     return conn
 
 
-def unsafe_output(db_path: Path, targets) -> str:
+def _same_file(a: Path, b: Path) -> bool:
+    """같은 파일인가 — 이름이 아니라 **inode** 로 본다.
+
+    ``resolve()`` 비교는 심볼릭 링크만 푼다. 하드 링크는 경로도 다르고
+    resolve 결과도 다르지만 같은 파일이라 그대로 통과한다
+    (Codex 게이트 3R MEDIUM). ``os.path.samefile`` 은 st_dev·st_ino 를 본다.
+    """
+    try:
+        return os.path.samefile(a, b)
+    except OSError:
+        return False
+
+
+def unsafe_output(db_path: Path, targets, out_dir: Path = None) -> str:
     """출력이 입력 DB(또는 남의 파일)를 덮어쓰는가. 안전하면 빈 문자열.
 
     ``mode=ro`` 는 **SQLite 연결**만 막는다. 리포트를 쓰는 것은 평범한
     ``write_text`` 라, DB 파일명이 마침 ``<오늘>.md`` 이면 그대로 덮어쓴다
-    (Codex 게이트 2R MEDIUM). 그래서 경로를 직접 본다.
+    (Codex 게이트 2R MEDIUM). 그래서 쓰기 전에 경로를 직접 본다.
+
+    세 겹이다:
+      ① 경로가 resolve 후 같은가 (심볼릭 링크·상대 경로)
+      ② ``os.path.samefile`` 로 같은 inode 인가 (하드 링크, 게이트 3R)
+      ③ 출력 디렉터리 안의 **기존 파일 전부**가 DB 와 다른 파일인가 —
+         DB 가 출력 디렉터리에 다른 이름으로 놓여 있으면 아예 쓰지 않는다
+      ④ 덮어쓸 기존 파일의 확장자가 .md/.csv 인가
     """
     db_real = db_path.resolve()
     for target in targets:
-        if target.resolve() == db_real:
+        if target.resolve() == db_real or _same_file(target, db_path):
             return f"✗ 출력 경로가 입력 DB 와 같습니다: {target}"
         if target.exists() and target.suffix.lower() not in SAFE_OUTPUT_SUFFIXES:
             return f"✗ 출력 경로에 .md/.csv 가 아닌 파일이 있습니다: {target}"
+
+    if out_dir is not None and out_dir.is_dir():
+        for existing in sorted(out_dir.iterdir()):
+            if existing.is_file() and _same_file(existing, db_path):
+                return (f"✗ 출력 디렉터리에 입력 DB 가 들어 있습니다: {existing}")
     return ""
 
 
@@ -366,7 +392,7 @@ def main(argv=None) -> int:
     csv_path = out_dir / f"{stem}.csv"
 
     # 쓰기 전에 본다 - 쓴 뒤에 알아차리면 이미 DB 가 없다.
-    problem = unsafe_output(db_path, (md_path, csv_path))
+    problem = unsafe_output(db_path, (md_path, csv_path), out_dir)
     if problem:
         _err(problem)
         return 2

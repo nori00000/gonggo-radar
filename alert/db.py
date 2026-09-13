@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import sqlite3
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -165,8 +166,29 @@ _PG_CREATE_INDEXES = [
 ]
 
 
-# 협의회 탈락 관찰 원장의 보관 기간 (P0 계약 §A 라운드 2)
+# 협의회 탈락 관찰 원장의 보관 기간 (P0 계약 §A 라운드 2).
+# 기준은 **마지막으로 본 시각**(``seen_at``)이다 - 같은 항목이 다시 탈락하면
+# upsert 가 ``seen_at`` 을 갱신하므로 목록에 계속 올라 있는 동안에는 지워지지
+# 않고, 목록에서 내려간 뒤 30일이 지나야 정리된다.
 COUNCIL_DROP_RETENTION_DAYS = 30
+
+# 관찰 원장에 남기기 전에 가리는 연락처 (Codex 게이트 3R MEDIUM).
+# 원장은 사람이 열어 보는 표본이라 담당자 메일·전화가 그대로 남으면 안 된다.
+EMAIL_MASK = "[이메일]"
+PHONE_MASK = "[전화]"
+_EMAIL_RE = re.compile(r"[\w.+-]+@[\w-]+(?:\.[\w-]+)+")
+# 0 으로 시작하는 국내 번호꼴만 본다 - `2026-09-13` 같은 날짜를 먹지 않는다.
+_PHONE_RE = re.compile(r"0\d{1,2}[-.\s]?\d{3,4}[-.\s]?\d{4}")
+
+
+def mask_contacts(text: Optional[str], phones: bool = True) -> str:
+    """메일 주소(와 선택적으로 전화번호)를 가린 문자열."""
+    if not text:
+        return ""
+    out = _EMAIL_RE.sub(EMAIL_MASK, str(text))
+    if phones:
+        out = _PHONE_RE.sub(PHONE_MASK, out)
+    return out
 
 
 class Database:
@@ -410,8 +432,13 @@ class Database:
     def record_council_drops(self, drops: Sequence[Any]) -> int:
         """협의회 소스에서 **두 프로파일 모두** 탈락한 항목을 관찰 원장에 남긴다.
 
-        ``(source, source_id)`` 당 한 행이고 재실행하면 덮어쓴다(멱등). 알림·
-        브리핑 어느 쪽도 이 테이블을 읽지 않는다 - 순수 관찰용이다.
+        ``(source, source_id)`` 당 한 행이고 재실행하면 덮어쓴다(멱등).
+        덮어쓸 때 ``seen_at`` 이 갱신되므로 보관 기간
+        ``COUNCIL_DROP_RETENTION_DAYS`` 는 **마지막으로 본 시각 기준**이다.
+        알림·브리핑 어느 쪽도 이 테이블을 읽지 않는다 - 순수 관찰용이다.
+
+        제목·URL 의 메일 주소와 제목의 전화번호는 ``mask_contacts`` 로 가린
+        뒤 저장한다 - 원장은 사람이 열어 보는 표본이다.
 
         Args:
             drops: :class:`alert.council.CouncilDrop` 목록.
@@ -438,7 +465,10 @@ class Database:
             """)
         for drop in drops:
             self._conn.execute(sql, (
-                drop.source, drop.source_id, drop.title, drop.url, drop.posted_at,
+                drop.source, drop.source_id,
+                mask_contacts(drop.title),
+                mask_contacts(drop.url, phones=False),
+                drop.posted_at,
                 drop.company_score, drop.council_score, drop.reason, now,
             ))
         if self._backend == "sqlite":
@@ -592,6 +622,21 @@ class Database:
     def exists(self, announcement: RawAnnouncement) -> bool:
         """이 공고가 이미 저장돼 있는가 (``(source, source_id)`` 기준)."""
         return self._find_row("id", announcement) is not None
+
+    def is_council_only(self, announcement: RawAnnouncement) -> bool:
+        """이 공고가 **협의회 단독**으로 저장돼 있는가.
+
+        중복 필터(``alert.main.run_pipeline``)가 이 행을 건너뛰면 회사 어휘가
+        나중에 맞아도 승격될 기회가 없다 - ``exists`` 와 저장 키가 같은
+        ``(source, source_id)`` 라서 UPDATE 경로에 닿지도 못한다
+        (Codex 게이트 3R HIGH). 행은 ``_find_row`` 로만 찾는다: 식별 우회를
+        만들지 않는다 (13차 게이트).
+
+        Returns:
+            저장돼 있고 ``council_only=1`` 이면 True.
+        """
+        row = self._find_row("council_only", announcement)
+        return bool(row is not None and row["council_only"])
 
     def mark_legacy_rows(
         self, evidence_keys: Optional[Dict[str, Sequence[str]]] = None

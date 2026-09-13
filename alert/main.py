@@ -470,6 +470,8 @@ def run_pipeline(test_mode: bool = False) -> None:
 
             # Filter out duplicates
             new_raw: List[RawAnnouncement] = []
+            # 협의회 단독으로 저장된 행은 중복이어도 다시 본다 (승격 경로).
+            recheck_raw: List[RawAnnouncement] = []
             duplicate_count = 0
             quote_merge_count = 0
             period_reset_count = 0
@@ -506,6 +508,20 @@ def run_pipeline(test_mode: bool = False) -> None:
                             quote_merge_count += 1
                     except Exception as e:
                         logger.debug(f"quote merge failed for {raw_ann.source_id}: {e}")
+
+                    # 협의회 단독 행은 **여기서 끝내지 않는다** (계약 §A
+                    # 라운드 3 / Codex HIGH). ``exists`` 와 저장 키가 같은
+                    # ``(source, source_id)`` 라서, 같은 URL 로 다시 온 항목을
+                    # 여기서 버리면 회사 어휘가 나중에 맞아도 승격될 기회가
+                    # 영원히 없다. 재평가 목록으로 넘겨 회사 분석을 다시
+                    # 지나게 한다.
+                    try:
+                        if db.is_council_only(raw_ann):
+                            recheck_raw.append(raw_ann)
+                    except Exception as e:
+                        logger.debug(
+                            f"council recheck lookup failed for {raw_ann.source_id}: {e}"
+                        )
                     logger.debug(f"Duplicate: {raw_ann.title}")
                 else:
                     new_raw.append(raw_ann)
@@ -517,7 +533,7 @@ def run_pipeline(test_mode: bool = False) -> None:
                 f"{f', {period_reset_count} period resets' if period_reset_count else ''}"
             )
 
-            if new_count == 0:
+            if new_count == 0 and not recheck_raw:
                 run_stats[crawler_name] = {
                     "total_fetched": total_fetched,
                     "new_count": 0,
@@ -537,6 +553,19 @@ def run_pipeline(test_mode: bool = False) -> None:
                 keyword_analyzer, new_raw, source_cfg
             )
             relevant_count = len(analyzed)
+
+            # 협의회 단독 행 재평가 - **회사 통계와 섞지 않는다**.
+            # 이 항목들은 신규가 아니므로 new_count·relevant_count·
+            # all_new_announcements(지식 레이어) 어디에도 들어가지 않는다.
+            recheck_selected: List[AnalyzedAnnouncement] = []
+            if recheck_raw:
+                recheck_selected, _ = select_for_storage(
+                    keyword_analyzer, recheck_raw, source_cfg
+                )
+                logger.info(
+                    f"{crawler_name}: 협의회 단독 {len(recheck_raw)}건 재평가 "
+                    f"-> 회사 통과 {len(recheck_selected)}건"
+                )
 
             if bypassed:
                 logger.info(
@@ -584,6 +613,15 @@ def run_pipeline(test_mode: bool = False) -> None:
                 analyzed,
                 keyword_analyzer.analyze,
             )
+            # 재평가분의 탈락 레코드는 **버린다**: 원장의 뜻은 "저장되지 않은
+            # 항목" 이고, 이 항목들은 이미 announcements 에 있다.
+            recheck_extra, _recheck_drops = apply_council_profile(
+                config.council_profile,
+                crawler_name,
+                recheck_raw,
+                recheck_selected,
+                keyword_analyzer.analyze,
+            )
             if council_drops:
                 try:
                     db.record_council_drops(council_drops)
@@ -608,6 +646,17 @@ def run_pipeline(test_mode: bool = False) -> None:
                 logger.info(
                     f"{crawler_name}: 협의회 단독 적재 {council_saved}/"
                     f"{len(council_extra)}건 (회사 알림·브리핑 경로 제외)"
+                )
+
+            # 재평가분은 전부 UPDATE 경로로 간다 (이미 저장된 행이다).
+            # council_only=0 이면 승격, 1이면 측정값만 새로 고친다.
+            promoted = sum(1 for ann in recheck_selected if ann.council_only == 0)
+            for ann in recheck_selected + recheck_extra:
+                db.insert_announcement(ann)
+            if recheck_raw:
+                logger.info(
+                    f"{crawler_name}: 재평가 결과 승격 {promoted}건, "
+                    f"측정 갱신 {len(recheck_extra)}건"
                 )
 
             # Record run statistics

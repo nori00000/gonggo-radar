@@ -53,6 +53,12 @@ _BRACKET_CHARS = "()[]{}<>（）［］「」『』"
 # 공백까지 지우는 정규화가 추가로 먹는 문자 (어휘 판정 전용)
 _SPACE_CHARS = " \t\r\n"
 
+# 제외어 토큰화에서 **공백과 같이 취급**하는 구두점 (Codex 게이트 3R MEDIUM).
+# 공백만 분리자로 보면 `인사·발령`·`인사, 사회적기업` 의 `인사` 가 토큰이
+# 되지 못해 제외어를 빠져나간다. 이 목록은 ``tokens`` 에만 쓰이고
+# ``normalize`` 에는 쓰지 않는다 — must_match 판정은 건드리지 않는다.
+_PUNCT_CHARS = "·,./:;、。…!?~|\"\'“”‘’"
+
 
 def normalize(text: Any) -> str:
     """어휘 판정용 정규화 — 괄호·공백을 지우고 소문자로 내린다.
@@ -69,11 +75,15 @@ def normalize(text: Any) -> str:
 
 
 def tokens(text: Any) -> List[str]:
-    """제외어 판정용 토큰 — 괄호류는 공백으로 바꾸되 **공백은 남긴다**."""
+    """제외어 판정용 토큰 — 괄호·구두점을 공백으로 바꾸고 공백으로 자른다.
+
+    ``normalize`` 와 달리 **공백을 지우지 않는다**. 제외어는 항목을 통째로
+    버리는 유일한 판정이라 토큰 경계로만 맞아야 한다.
+    """
     if not text:
         return []
     out = str(text)
-    for ch in _BRACKET_CHARS:
+    for ch in _BRACKET_CHARS + _PUNCT_CHARS:
         out = out.replace(ch, " ")
     return [tok for tok in out.lower().split() if tok]
 

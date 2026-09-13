@@ -6,6 +6,8 @@
 
 import ast
 import json
+import logging
+import os
 import sqlite3
 from datetime import date, datetime, timedelta
 from pathlib import Path
@@ -16,7 +18,9 @@ import pytest
 from alert import council
 from alert.config import CouncilProfileConfig, get_config
 from alert.analyzer import KeywordAnalyzer
+from alert import main as main_mod
 from alert.db import COUNCIL_DROP_RETENTION_DAYS, Database
+from alert.migrations import MIGRATIONS
 from alert.digest.composer import compose_digest_data
 from alert.main import apply_council_profile, select_for_storage
 from alert.migrations import run_migrations
@@ -1010,52 +1014,387 @@ GUARD_EXEMPT_DB_FUNCTIONS = {
 }
 
 
-class TestCompanyFacingQueryGuard:
-    """sweep: db.py 의 회사향 SELECT 는 전부 council_only 가드를 갖는다."""
+def _sql_texts(node):
+    """함수 안의 SQL 문자열들. f-string 은 치환부를 ``?`` 로 근사한다."""
+    texts = []
+    for sub in ast.walk(node):
+        if isinstance(sub, ast.Constant) and isinstance(sub.value, str):
+            texts.append(sub.value)
+        elif isinstance(sub, ast.JoinedStr):
+            texts.append("".join(
+                part.value if isinstance(part, ast.Constant)
+                and isinstance(part.value, str) else "?"
+                for part in sub.values
+            ))
+    return texts
 
-    def db_functions_with_announcement_selects(self):
-        tree = ast.parse((REPO_ROOT / "alert" / "db.py").read_text(encoding="utf-8"))
-        found = {}
-        for node in ast.walk(tree):
-            if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+
+def _where_clause(sql):
+    """``FROM announcements`` 를 가진 문장의 WHERE 절. 없으면 빈 문자열."""
+    norm = " ".join(sql.split())
+    upper = norm.upper()
+    idx = upper.find("FROM ANNOUNCEMENTS")
+    if idx < 0:
+        return None
+    where = upper.find("WHERE", idx)
+    if where < 0:
+        return ""
+    end = len(norm)
+    for keyword in ("ORDER BY", "GROUP BY", "LIMIT", "RETURNING"):
+        pos = upper.find(keyword, where)
+        if pos >= 0:
+            end = min(end, pos)
+    return norm[where:end]
+
+
+def _announcement_selects_by_function(rel):
+    """``rel`` 파일의 함수별 ``FROM announcements`` SELECT 문장들."""
+    tree = ast.parse((REPO_ROOT / rel).read_text(encoding="utf-8"))
+    found = {}
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        statements = []
+        for text in _sql_texts(node):
+            flat = " ".join(text.split()).upper()
+            if "FROM ANNOUNCEMENTS" not in flat or "SELECT" not in flat:
                 continue
-            literals = [
-                sub.value for sub in ast.walk(node)
-                if isinstance(sub, ast.Constant) and isinstance(sub.value, str)
-            ]
-            blob = "\n".join(literals)
-            if "FROM announcements" in blob:
-                found[node.name] = blob
-        return found
+            statements.append(text)
+        if statements:
+            found[node.name] = statements
+    return found
 
-    def test_every_select_is_guarded_or_exempt(self):
-        offenders = [
-            name for name, blob in self.db_functions_with_announcement_selects().items()
-            if "council_only = 0" not in blob and name not in GUARD_EXEMPT_DB_FUNCTIONS
-        ]
-        assert offenders == [], f"council_only 가드 없는 회사향 쿼리: {offenders}"
+
+class TestCompanyFacingQueryGuard:
+    """sweep: 회사향 SELECT 는 **그 문장의 WHERE 안에** 가드를 갖는다.
+
+    라운드 2 는 함수 단위로 문자열을 합쳐 봤다 - 한 함수에 가드가 있는 쿼리와
+    없는 쿼리가 섞여 있으면 통과해 버린다. 라운드 3 은 문장별로 WHERE 절을
+    떼어 본다 (Codex 게이트 3R).
+    """
+
+    def test_every_select_is_guarded_in_its_own_where(self):
+        offenders = []
+        for name, statements in _announcement_selects_by_function("alert/db.py").items():
+            if name in GUARD_EXEMPT_DB_FUNCTIONS:
+                continue
+            for sql in statements:
+                where = _where_clause(sql)
+                if not where or "COUNCIL_ONLY = 0" not in where.upper():
+                    offenders.append((name, " ".join(sql.split())[:80]))
+        assert offenders == [], f"WHERE 에 가드가 없는 회사향 쿼리: {offenders}"
 
     def test_guarded_functions_are_the_expected_ones(self):
         guarded = {
-            name for name, blob in self.db_functions_with_announcement_selects().items()
-            if "council_only = 0" in blob
+            name for name, statements
+            in _announcement_selects_by_function("alert/db.py").items()
+            if any("council_only = 0" in sql for sql in statements)
         }
         assert guarded == {
             "get_unnotified", "search_announcements", "get_stats",
             "get_announcements_by_period", "get_domain_stats",
         }
 
+    def test_where_clause_helper_rejects_a_guardless_statement(self):
+        """헬퍼 자체가 무르지 않은지 - 가드 없는 문장은 잡혀야 한다."""
+        assert "COUNCIL_ONLY" not in _where_clause(
+            "SELECT * FROM announcements WHERE is_notified = 0 ORDER BY id"
+        ).upper()
+        assert _where_clause("SELECT * FROM announcements") == ""
+
+    def test_guard_outside_the_where_does_not_count(self):
+        """ORDER BY 뒤에 문자열만 있는 것은 가드가 아니다."""
+        sql = "SELECT * FROM announcements WHERE is_notified = 0 ORDER BY council_only = 0"
+        assert "COUNCIL_ONLY = 0" not in _where_clause(sql).upper()
+
     def test_telegram_recent_is_guarded(self):
-        source = (REPO_ROOT / "alert" / "notifiers" / "telegram_bot.py").read_text(
-            encoding="utf-8"
+        selects = _announcement_selects_by_function(
+            "alert/notifiers/telegram_bot.py"
         )
-        tree = ast.parse(source)
-        for node in ast.walk(tree):
-            if isinstance(node, ast.FunctionDef) and node.name == "cmd_recent":
-                blob = "\n".join(
-                    sub.value for sub in ast.walk(node)
-                    if isinstance(sub, ast.Constant) and isinstance(sub.value, str)
-                )
-                assert "council_only = 0" in blob
-                return
-        pytest.fail("cmd_recent 을 찾지 못했다")
+        assert "cmd_recent" in selects
+        where = _where_clause(selects["cmd_recent"][0])
+        assert "COUNCIL_ONLY = 0" in where.upper()
+
+
+class TestPipelinePromotion:
+    """HIGH (재검토): 같은 URL 로 다시 온 협의회 단독 행이 승격되는가.
+
+    DB 계층이 아니라 **파이프라인 전체**를 돌린다. 네트워크는 타지 않는다 -
+    크롤러는 스텁이고, 알림 두 채널은 config 에서 꺼져 있다.
+    """
+
+    SOURCE = "mois_sse"          # 협의회 소스이면서 bypass_threshold 가 없다
+    SOURCE_ID = "promo-1"
+    URL = "https://example.com/mois_sse/promo-1"
+
+    COUNCIL_ONLY_TITLE = "산림 목재 이용 안내"          # 협의회만 매치
+    COMPANY_TITLE = "사회적기업 지원사업 공고"           # 회사 must_match 매치
+
+    def make_crawler(self, titles):
+        source, source_id, url = self.SOURCE, self.SOURCE_ID, self.URL
+
+        class FakeCrawler:
+            """네트워크를 타지 않는 크롤러 스텁."""
+
+            def is_enabled(self):
+                return True
+
+            def set_quoted_source_ids(self, ids):
+                return None
+
+            def safe_fetch(self):
+                return [RawAnnouncement(
+                    source=source, source_id=source_id,
+                    title=titles[0], url=url, summary="",
+                )]
+
+        return FakeCrawler
+
+    def run_once(self, monkeypatch, db_path, title, captured):
+        titles = [title]
+        monkeypatch.setattr(main_mod, "Database", lambda *a, **k: Database(db_path))
+        monkeypatch.setattr(
+            main_mod, "setup_logger",
+            lambda *a, **k: logging.getLogger("test-pipeline"),
+        )
+        monkeypatch.setattr(
+            main_mod, "_import_crawlers",
+            lambda: {self.SOURCE: self.make_crawler(titles)},
+        )
+        original = Database.get_unnotified
+
+        def spy(db_self):
+            rows = original(db_self)
+            captured.append([(a.source_id, a.relevance_score) for a in rows])
+            return rows
+
+        monkeypatch.setattr(Database, "get_unnotified", spy)
+        main_mod.run_pipeline()
+
+    def row(self, db_path):
+        conn = sqlite3.connect(db_path)
+        conn.row_factory = sqlite3.Row
+        try:
+            return dict(conn.execute(
+                "SELECT relevance_score, council_score, council_match, council_only,"
+                "       is_notified FROM announcements WHERE source_id = ?",
+                (self.SOURCE_ID,),
+            ).fetchone())
+        finally:
+            conn.close()
+
+    def test_same_url_second_run_promotes(self, tmp_path, monkeypatch):
+        db_path = tmp_path / "pipeline.db"
+        captured = []
+
+        # 1회차: 협의회 어휘만 -> 협의회 단독 저장, 알림 후보 0건
+        with monkeypatch.context() as m:
+            self.run_once(m, db_path, self.COUNCIL_ONLY_TITLE, captured)
+        first = self.row(db_path)
+        assert first["council_only"] == 1
+        assert first["council_match"] == 1
+        assert captured[0] == []
+
+        # 2회차: **같은 URL·같은 source_id**, 회사 어휘가 맞는 제목
+        with monkeypatch.context() as m:
+            self.run_once(m, db_path, self.COMPANY_TITLE, captured)
+
+        second = self.row(db_path)
+        assert second["council_only"] == 0, "승격되지 않았다"
+        assert second["relevance_score"] >= get_config().analyzer.keyword_threshold
+        assert captured[1] == [(self.SOURCE_ID, second["relevance_score"])]
+        assert len(captured[1]) == 1
+
+    def test_still_council_only_when_company_keeps_failing(self, tmp_path, monkeypatch):
+        """회사가 계속 탈락하면 플래그는 그대로고 측정만 새로 고쳐진다."""
+        db_path = tmp_path / "pipeline.db"
+        captured = []
+        with monkeypatch.context() as m:
+            self.run_once(m, db_path, self.COUNCIL_ONLY_TITLE, captured)
+        with monkeypatch.context() as m:
+            self.run_once(m, db_path, "임업 산촌자원 개발 안내", captured)
+
+        row = self.row(db_path)
+        assert row["council_only"] == 1
+        assert row["council_match"] == 1
+        assert captured[1] == []
+
+    def test_row_is_not_duplicated_across_runs(self, tmp_path, monkeypatch):
+        db_path = tmp_path / "pipeline.db"
+        captured = []
+        for title in (self.COUNCIL_ONLY_TITLE, self.COMPANY_TITLE):
+            with monkeypatch.context() as m:
+                self.run_once(m, db_path, title, captured)
+        conn = sqlite3.connect(db_path)
+        try:
+            assert conn.execute(
+                "SELECT COUNT(*) FROM announcements"
+            ).fetchone()[0] == 1
+        finally:
+            conn.close()
+
+
+class TestExcludePunctuation:
+    """MEDIUM (재검토): 구두점도 토큰 분리자다."""
+
+    @pytest.fixture
+    def punct_profile(self):
+        return CouncilProfileConfig(
+            sources=["kofpi"], must_match=["사회적기업"], exclude=["인사"]
+        )
+
+    def test_middot_separates(self, punct_profile):
+        v = council.score_item(punct_profile, "kofpi", "인사·발령 사회적기업")
+        assert v.match == 0
+        assert v.reason == "제외 키워드: 인사"
+
+    def test_comma_separates(self, punct_profile):
+        v = council.score_item(punct_profile, "kofpi", "인사, 사회적기업")
+        assert v.match == 0
+        assert v.reason == "제외 키워드: 인사"
+
+    @pytest.mark.parametrize("text", [
+        "인사.사회적기업", "인사/사회적기업", "인사:사회적기업",
+        "[인사] 사회적기업", "(인사) 사회적기업",
+    ])
+    def test_other_separators(self, punct_profile, text):
+        assert council.score_item(punct_profile, "kofpi", text).match == 0
+
+    def test_word_interior_still_survives(self, punct_profile):
+        """구두점이 없으면 여전히 한 토큰이라 제외되지 않는다."""
+        assert council.score_item(
+            punct_profile, "kofpi", "인사이트 사회적기업"
+        ).match == 1
+
+    def test_must_match_is_unaffected_by_punctuation(self):
+        """must_match 는 종전 규칙 그대로 (필드 내 공백 흡수, 구두점 유지)."""
+        profile = CouncilProfileConfig(
+            sources=["coop"], must_match=["협동조합", "사회적기업"]
+        )
+        assert council.score_item(profile, "coop", "협동 조합 안내").match == 1
+        assert council.score_item(profile, "coop", "사회적기업·협동조합").match == 1
+
+    def test_tokens_helper_splits_on_punctuation(self):
+        assert council.tokens("인사·발령, 사회적기업") == [
+            "인사", "발령", "사회적기업"
+        ]
+
+
+class TestObserveHardlinkSafety:
+    """MEDIUM (재검토): 하드 링크로 경로 검사를 우회할 수 없다."""
+
+    def test_hardlinked_target_is_refused(self, tmp_path, observe_db):
+        out_dir = tmp_path / "out"
+        out_dir.mkdir()
+        link = out_dir / f"{date.today().isoformat()}.md"
+        os.link(observe_db, link)              # 하드 링크: resolve() 는 다르다
+        assert link.resolve() != observe_db.resolve()
+
+        assert observe.main([
+            "2", "--db", str(observe_db), "--out-dir", str(out_dir)
+        ]) == 2
+
+        conn = sqlite3.connect(observe_db)
+        try:
+            assert conn.execute(
+                "SELECT COUNT(*) FROM announcements"
+            ).fetchone()[0] == 3
+        finally:
+            conn.close()
+
+    def test_db_hardlinked_under_another_name_in_out_dir(self, tmp_path, observe_db):
+        out_dir = tmp_path / "out"
+        out_dir.mkdir()
+        os.link(observe_db, out_dir / "backup.md")
+        assert observe.main([
+            "2", "--db", str(observe_db), "--out-dir", str(out_dir)
+        ]) == 2
+
+    def test_samefile_catches_hardlink_without_the_dir_scan(self, tmp_path, observe_db):
+        """디렉터리 스캔에 기대지 않고 타깃 자체가 같은 inode 인지 본다.
+
+        하드 링크는 경로도 resolve() 결과도 다르므로 경로 비교만으로는 통과한다.
+        """
+        link = tmp_path / "link.md"
+        os.link(observe_db, link)
+        assert link.resolve() != observe_db.resolve()
+        assert observe.unsafe_output(observe_db, (link,)).startswith("✗")
+
+    def test_unrelated_out_dir_is_fine(self, tmp_path, observe_db):
+        out_dir = tmp_path / "clean"
+        assert observe.unsafe_output(
+            observe_db, (out_dir / "a.md", out_dir / "a.csv"), out_dir
+        ) == ""
+
+
+class TestDropLedgerPrivacy:
+    """MEDIUM (재검토): 원장에 연락처를 남기지 않는다."""
+
+    def test_masks_email_and_phone(self, tmp_path):
+        db = Database(tmp_path / "mask.db")
+        try:
+            db.record_council_drops([council.CouncilDrop(
+                source="kofpi", source_id="m1",
+                title="문의 hong.gil@example.co.kr 또는 010-1234-5678 로 연락",
+                url="https://example.com/apply?email=hong.gil@example.co.kr",
+                posted_at="2026-09-10", company_score=0.0, council_score=0.0,
+                reason="협의회 어휘 없음",
+            )])
+            row = db.conn.execute(
+                "SELECT title, url FROM council_dropped WHERE source_id = 'm1'"
+            ).fetchone()
+        finally:
+            db.close()
+
+        assert "@" not in row["title"] and "@" not in row["url"]
+        assert "010-1234-5678" not in row["title"]
+        assert "[이메일]" in row["title"] and "[이메일]" in row["url"]
+        assert "[전화]" in row["title"]
+
+    def test_dates_are_not_mistaken_for_phone_numbers(self, tmp_path):
+        db = Database(tmp_path / "mask.db")
+        try:
+            db.record_council_drops([council.CouncilDrop(
+                source="kofpi", source_id="m2",
+                title="2026-09-13 접수 마감 (제1차, 2025.10.01 공고)",
+                url="https://example.com/x", reason="협의회 어휘 없음",
+            )])
+            row = db.conn.execute(
+                "SELECT title FROM council_dropped WHERE source_id = 'm2'"
+            ).fetchone()
+        finally:
+            db.close()
+        assert row["title"] == "2026-09-13 접수 마감 (제1차, 2025.10.01 공고)"
+
+    def test_mask_helper_is_pure(self):
+        from alert.db import mask_contacts
+        assert mask_contacts("") == ""
+        assert mask_contacts(None) == ""
+        assert mask_contacts("010-1234-5678", phones=False) == "010-1234-5678"
+
+
+class TestMigrationSevenDefaults:
+    """LOW (재검토): 마이그레이션 7 의 NULL 기본값이 되돌아가지 않게 못을 박는다."""
+
+    def migration_sql(self, version):
+        for ver, _desc, statements in MIGRATIONS:
+            if ver == version:
+                return " ".join(statements)
+        raise AssertionError(f"migration {version} 을 찾지 못했다")
+
+    def test_measurement_columns_declare_null_default(self):
+        sql = self.migration_sql(7)
+        for column in ("council_score REAL", "council_tags TEXT",
+                       "council_match INTEGER"):
+            assert f"ADD COLUMN {column} DEFAULT NULL" in sql
+
+    def test_guard_column_keeps_zero_default(self):
+        assert "ADD COLUMN council_only INTEGER DEFAULT 0" in self.migration_sql(7)
+
+    def test_no_upgrade_migration_is_declared(self):
+        """마이그레이션 9 는 없다 - 7 을 적용한 DB 가 존재한 적이 없다.
+
+        보고서 §R3-5 의 근거: 운영 DB 는 schema_version 최대 6, council_* 컬럼
+        0개. 되돌릴 대상이 없으므로 승급 마이그레이션을 만들지 않는다.
+        """
+        assert max(version for version, _d, _s in MIGRATIONS) == 8
