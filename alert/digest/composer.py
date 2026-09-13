@@ -221,6 +221,12 @@ SOURCE_DIVERSITY_LIMIT = 2
 HOLD_REASON_DIVERSITY = f"소스 다양성 상한(같은 소스 {SOURCE_DIVERSITY_LIMIT}건)"
 HOLD_REASON_SECTION_CAP = "상한 초과"
 HOLD_REASON_URL_TOO_LONG = "URL 길이 초과"
+# V4 판정 ③: `핀 n` 이 자리를 먹어 밀려난 항목과, 핀 자체가 상한을 넘은 경우.
+# 두 사유를 구분해야 편집자가 "내가 민 것" 과 "원래 못 실린 것" 을 구별한다.
+# homelab bin/hq_digest_gate.PIN_BUMPED_REASON 과 **같은 문자열**이어야 한다
+# (봇이 이 사유로 "밀려난 항목" 알림을 만든다).
+HOLD_REASON_PIN_BUMPED = "핀 승격으로 밀림"
+HOLD_REASON_PIN_CAP = "상한 초과(핀)"
 
 # ─── 대상 태그 (판정 ①) ──────────────────────────────────────────────────
 TAG_SOCIAL_COOP = "사협"          # 사회적협동조합
@@ -420,6 +426,10 @@ class Classification(NamedTuple):
     matched: Tuple[str, ...]
     tags: Tuple[str, ...]
     region: Optional[str]
+    # V4 판정 ③: 이 항목을 `핀 n` 으로 승격하면 **어느 섹션**으로 가는가.
+    # 보류 판정에만 채운다 — 편집자가 섹션을 고르지 않아도 되도록 분류가 미리 정한다.
+    # 기본값이 있으므로 기존 위치 인자 생성(테스트 포함)은 그대로 성립한다.
+    pin_section: Optional[str] = None
 
 
 def get_week_date_range(week_str: str) -> Tuple[str, str]:
@@ -832,6 +842,14 @@ def classify_item(title: str, summary: str, source: str) -> Classification:
     opportunity = _hits(title, OPPORTUNITY_KEYWORDS)
     institution = _institution_hits(title, relevance)
 
+    # V4 판정 ③: 보류 항목의 **승격 목적지**. 입법·행정예고·고시가 있으면 제도이고,
+    # 기회 신호가 있으면 신청, 둘 다 없으면(섹션 판정 불명) 중립인 알아두세요다.
+    pin_target = (
+        VERDICT_NOTICE
+        if _hits(title, INSTITUTION_PRIORITY_KEYWORDS)
+        else VERDICT_APPLY if opportunity else VERDICT_NOTICE
+    )
+
     # ③ 노이즈 사전 — 개정 v2.5 (#6): **제목에만** 적용한다. 요약의 "통합정보시스템에서
     # 접수" 같은 접수 안내 상용구로 유효 공고를 영구 배제하던 결함을 막는다.
     # 제목에 기회·제도 신호가 같이 있으면 배제가 아니라 **보류**(편집자 복구 가능).
@@ -844,6 +862,7 @@ def classify_item(title: str, summary: str, source: str) -> Classification:
                 relevance + noise,
                 tags,
                 region,
+                pin_target,
             )
         return Classification(
             VERDICT_EXCLUDE, f"노이즈: {noise[0]}", noise, (), None
@@ -854,7 +873,9 @@ def classify_item(title: str, summary: str, source: str) -> Classification:
 
     # ① 대상 태그를 못 붙이면 발송본에 싣지 않는다
     if not tags:
-        return Classification(VERDICT_HOLD, "대상 태그 없음", relevance, (), None)
+        return Classification(
+            VERDICT_HOLD, "대상 태그 없음", relevance, (), None, pin_target
+        )
 
     # 개정 v2.5 (#10): 입법예고·행정예고·고시는 `공고`보다 우선한다.
     priority = _hits(title, INSTITUTION_PRIORITY_KEYWORDS)
@@ -878,6 +899,7 @@ def classify_item(title: str, summary: str, source: str) -> Classification:
                 relevance + opportunity + b2c,
                 tags,
                 region,
+                VERDICT_APPLY,
             )
         return Classification(
             VERDICT_APPLY,
@@ -896,7 +918,9 @@ def classify_item(title: str, summary: str, source: str) -> Classification:
             region,
         )
 
-    return Classification(VERDICT_HOLD, "섹션 판정 불명", relevance, tags, region)
+    return Classification(
+        VERDICT_HOLD, "섹션 판정 불명", relevance, tags, region, pin_target
+    )
 
 
 # ─── 마감 처리 (판정 ④) ──────────────────────────────────────────────────
@@ -1172,6 +1196,9 @@ def _build_item(row: Sequence, classification: Classification, today: date) -> D
         ),
         "merged_ids": [],
         "similar_count": 0,
+        # V4 판정 ③: 승격 목적지(보류일 때만 채워진다)와 승격 표시.
+        "pin_section": classification.pin_section,
+        "pinned": False,
     }
     item.update(_deadline_fields(deadline, posted_known, today))
     item.update(quotes)
@@ -1360,6 +1387,62 @@ def week_bounds(week_str: str) -> Tuple[str, str]:
     return week_start, end_exclusive
 
 
+def _select_with_pins(
+    candidates: List[Dict],
+    limit: int,
+    sorter,
+    diversity_limit: Optional[int] = None,
+    honor_pins: bool = True,
+) -> Tuple[List[Dict], List[Dict], List[Dict], List[Dict], int]:
+    """섹션 선정 (V4 판정 ③).
+
+    `핀 n` 으로 승격된 항목이 **먼저** 자리를 잡고(소스 다양성 상한을 타지 않는다 —
+    편집자의 명시적 선택이다), 남은 자리를 정렬 상위부터 채운다. 마지막에 다시 정렬해
+    섹션 안의 순서(마감순·게시일순)는 핀 여부와 무관하게 유지된다.
+
+    Returns:
+        (선정, 다양성 밀림, 상한 초과, 핀 상한 초과, 핀이 먹은 자리 수)
+        "핀이 먹은 자리 수" 는 진단용이다 — **밀린 항목의 판정에는 쓰지 않는다.**
+        핀이 원래부터 선정권에 있던 항목이면 자리를 줄이지 않으므로, 그 수로
+        상한 초과 목록을 잘라 사유를 붙이면 원래부터 보류였던 항목에 `핀 승격으로
+        밀림` 이 붙는다(Codex 재현). 실제 밀림은 기준선과의 **집합 차이**다.
+    """
+    ordered = sorter(candidates)
+    # honor_pins=False 는 **기준선**(핀이 없었다면 무엇이 실렸을까)을 구하는 호출이다.
+    # 밀림 사유는 그 기준선과의 차이로만 붙는다 (라운드 2, Codex MEDIUM).
+    pinned = [item for item in ordered
+              if honor_pins and item.get("pinned")]
+    regular = [item for item in ordered
+               if not (honor_pins and item.get("pinned"))]
+
+    selected: List[Dict] = []
+    pin_overflow: List[Dict] = []
+    per_source: Counter = Counter()
+    for item in pinned:
+        if len(selected) >= limit:
+            pin_overflow.append(item)
+            continue
+        per_source[item["source"]] += 1
+        selected.append(item)
+    pinned_taken = len(selected)
+
+    diversity_skipped: List[Dict] = []
+    cap_overflow: List[Dict] = []
+    for item in regular:
+        if len(selected) >= limit:
+            cap_overflow.append(item)
+            continue
+        if (diversity_limit is not None
+                and per_source[item["source"]] >= diversity_limit):
+            diversity_skipped.append(item)
+            continue
+        per_source[item["source"]] += 1
+        selected.append(item)
+
+    return (sorter(selected), diversity_skipped, cap_overflow, pin_overflow,
+            pinned_taken)
+
+
 def compose_digest_data(
     db_path: str,
     week_str: Optional[str] = None,
@@ -1368,8 +1451,14 @@ def compose_digest_data(
     exclude_urls: Optional[Set[str]] = None,
     today: Optional[date] = None,
     stats_out: Optional[Dict] = None,
+    pin_ids: Optional[Set[int]] = None,
 ) -> Dict:
     """다이제스트 구조 데이터 생성 (렌더 전 단계).
+
+    pin_ids: 편집자가 `핀 n` 으로 승격한 공고 id 집합 (상태 파일의 `pinned_ids`).
+        보류 항목은 분류가 정한 목적지(pin_section)로, 상한·다양성 때문에 밀렸던
+        항목은 제 섹션으로 되돌아간다. **마감 경과·URL 길이 초과는 핀이 이기지
+        못한다** — 죽은 정보를 보내지 않는 규율이 편집자 선택보다 위다.
 
     Returns:
         {"week", "week_start", "week_end", "period_label", "sections",
@@ -1441,6 +1530,18 @@ def compose_digest_data(
             excluded.append(item)
             continue
 
+        # V4 판정 ③: 승격은 **보류 목록에 있는 항목만** 대상이다. 배제는 위에서
+        # 이미 걸러졌으므로 여기 남은 것은 보류이거나 섹션 후보다.
+        #   · 보류(분류) → 분류가 정한 목적지(pin_section)로 올린다
+        #   · 섹션 후보 → 상한·다양성 때문에 뒤에서 보류로 내려갈 항목이다.
+        #     pinned 표시만 해 두면 선정 단계가 자리를 먼저 준다.
+        if pin_ids and item["id"] in pin_ids:
+            if item["verdict"] == VERDICT_HOLD and item.get("pin_section"):
+                item["verdict"] = item["pin_section"]
+                item["pinned"] = True
+            elif item["verdict"] in ITEM_SECTIONS:
+                item["pinned"] = True
+
         survivors.append(item)
 
     # 개정 v2.5 (#3): **중복 병합을 먼저** 하고, 병합 그룹의 유효 마감으로 경과를 판정한다.
@@ -1487,33 +1588,54 @@ def compose_digest_data(
     # 개정 v2.2 F2 + v2.3 G2: 정렬 상위부터 상한(5)을 채우며 같은 소스 3번째부터 건너뛴다.
     # 다양성 사유는 **실제로 다양성 때문에 밀린 항목에만** 붙고, 상한이 이미 찬 뒤에 남은
     # 항목은 `상한 초과`로만 기록한다(편집자에게 사유가 과장돼 보이지 않게).
-    selected: List[Dict] = []
-    diversity_skipped: List[Dict] = []
-    cap_overflow: List[Dict] = []
-    per_source: Counter = Counter()
-    for item in _sort_apply(apply_candidates):
-        if len(selected) >= SECTION_LIMITS[VERDICT_APPLY]:
-            cap_overflow.append(item)
-            continue
-        if per_source[item["source"]] >= SOURCE_DIVERSITY_LIMIT:
-            diversity_skipped.append(item)
-            continue
-        per_source[item["source"]] += 1
-        selected.append(item)
-
-    sections[VERDICT_APPLY] = selected
+    # V4 판정 ③: 핀은 자리를 **먼저** 가져가고, 그만큼 뒤가 밀린다.
+    (apply_selected, apply_diversity, apply_cap, apply_pin_cap,
+     _apply_pinned_taken) = _select_with_pins(
+        apply_candidates, SECTION_LIMITS[VERDICT_APPLY], _sort_apply,
+        SOURCE_DIVERSITY_LIMIT,
+    )
+    sections[VERDICT_APPLY] = apply_selected
 
     # 개정 v2.5 (#4): 알아두세요 상한 초과분도 무기록 삭제하지 않는다.
-    sorted_notice = _sort_notice(notice_candidates)
-    sections[VERDICT_NOTICE] = sorted_notice[: SECTION_LIMITS[VERDICT_NOTICE]]
-    cap_overflow.extend(sorted_notice[SECTION_LIMITS[VERDICT_NOTICE]:])
+    (notice_selected, notice_diversity, notice_cap, notice_pin_cap,
+     _notice_pinned_taken) = _select_with_pins(
+        notice_candidates, SECTION_LIMITS[VERDICT_NOTICE], _sort_notice,
+    )
+    sections[VERDICT_NOTICE] = notice_selected
+
+    # 라운드 2 (Codex MEDIUM): **핀이 없었다면 실렸을 집합**을 따로 구해, 거기서
+    # 사라진 항목만 `핀 승격으로 밀림` 이다. 핀이 원래부터 선정권에 있었다면
+    # 차이가 없으므로 아무에게도 이 사유가 붙지 않는다.
+    demoted_ids: Set = set()
+    if pin_ids:
+        for candidates_, limit_, sorter_, diversity_, selected_ in (
+            (apply_candidates, SECTION_LIMITS[VERDICT_APPLY], _sort_apply,
+             SOURCE_DIVERSITY_LIMIT, apply_selected),
+            (notice_candidates, SECTION_LIMITS[VERDICT_NOTICE], _sort_notice,
+             None, notice_selected),
+        ):
+            baseline = _select_with_pins(
+                candidates_, limit_, sorter_, diversity_, honor_pins=False)[0]
+            demoted_ids |= (
+                {item["id"] for item in baseline}
+                - {item["id"] for item in selected_}
+            )
 
     for item, reason in (
-        [(item, HOLD_REASON_DIVERSITY) for item in diversity_skipped]
-        + [(item, HOLD_REASON_SECTION_CAP) for item in cap_overflow]
+        [(item, HOLD_REASON_DIVERSITY)
+         for item in apply_diversity + notice_diversity]
+        + [(item, HOLD_REASON_SECTION_CAP)
+           for item in apply_cap + notice_cap]
+        + [(item, HOLD_REASON_PIN_CAP)
+           for item in apply_pin_cap + notice_pin_cap]
     ):
         item["verdict"] = VERDICT_HOLD
-        item["reason"] = reason
+        # 승격된 항목 자신은 `상한 초과(핀)` 를 유지한다 — 그쪽이 더 정확하다.
+        item["reason"] = (
+            HOLD_REASON_PIN_BUMPED
+            if not item.get("pinned") and item["id"] in demoted_ids
+            else reason
+        )
         holds.append(item)
 
     published = sections[VERDICT_APPLY] + sections[VERDICT_NOTICE]
@@ -2243,6 +2365,7 @@ def compose_digest(
     exclude_urls: Optional[Set[str]] = None,
     today: Optional[date] = None,
     stats_out: Optional[Dict] = None,
+    pin_ids: Optional[Set[int]] = None,
 ) -> str:
     """주간 정책브리핑 다이제스트 마크다운 생성 (계약 v2.1).
 
@@ -2256,6 +2379,7 @@ def compose_digest(
         warnings_out: 경고 수집용 리스트 (폼 로드 실패 등)
         exclude_urls: 제외할 원문 URL 집합 (계약 v1.2: url_alive=false 자동 제외)
         today: 기준 날짜 (기본: 오늘). D-day·새 소식/상시 판정에 쓰인다
+        pin_ids: `핀 n` 으로 승격한 공고 id 집합 (상태 파일의 pinned_ids)
 
     Returns:
         생성된 마크다운 텍스트
@@ -2268,6 +2392,7 @@ def compose_digest(
         exclude_urls=exclude_urls,
         today=today,
         stats_out=stats_out,
+        pin_ids=pin_ids,
     )
 
     markdown = render_markdown(data)

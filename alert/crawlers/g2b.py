@@ -4,6 +4,7 @@ import os
 from datetime import datetime, timedelta
 from typing import List, Optional, Dict, Any
 from .base import BaseCrawler
+from .identity import clean_text
 from ..models import RawAnnouncement
 
 
@@ -259,18 +260,28 @@ class G2bCrawler(BaseCrawler):
         """
         try:
             # Required fields
-            source_id = str(item.get("bidNtceNo", "")).strip()
-            title = str(item.get("bidNtceNm", "")).strip()
+            notice_no = clean_text(item.get("bidNtceNo"))
+            # 차수(``bidNtceOrd``)가 다르면 **마감이 다른 별개 공고**다.
+            # 번호만 쓰면 01차 마감이 00차 제목에 붙는다 (13차 게이트 HIGH).
+            notice_ord = clean_text(item.get("bidNtceOrd"))
+            source_id = f"{notice_no}-{notice_ord}" if notice_ord else notice_no
+            title = clean_text(item.get("bidNtceNm"))
 
-            if not source_id or not title:
+            # 14차 게이트: 공고번호가 없어도 **고유 입찰 URL** 이 있으면
+            # 공고를 버리지 않는다 - 식별은 그 URL 이 맡는다.
+            if not title or not (notice_no or clean_text(item.get("bidNtceUrl"))):
                 self.logger.warning(f"Item missing required fields: {item}")
                 return None
 
-            # URL - use provided URL or construct from notice number
-            url = str(item.get("bidNtceUrl", "")).strip()
-            if not url:
-                # Construct URL if not provided
-                url = f"http://www.g2b.go.kr:8081/ep/invitation/publish/bidInfoDtl.do?bidno={source_id}"
+            # URL - 주어진 링크가 없으면 **알림 링크용**으로만 템플릿을
+            # 만든다(차수 포함). 식별에는 쓰지 않는다 - 식별은 공고번호+차수다.
+            url = clean_text(item.get("bidNtceUrl"))
+            url_is_template = not url and bool(notice_no)
+            if url_is_template:
+                url = (
+                    "http://www.g2b.go.kr:8081/ep/invitation/publish/"
+                    f"bidInfoDtl.do?bidno={notice_no}&bidseq={notice_ord}"
+                )
 
             # Summary - combine notice kind and estimated price
             ntce_kind = str(item.get("ntceKindNm", "")).strip()
@@ -297,7 +308,10 @@ class G2bCrawler(BaseCrawler):
             period_end = self._parse_datetime(bid_close)
 
             # Store full item as raw_data
-            raw_data = json.dumps(item, ensure_ascii=False)
+            payload = dict(item)
+            if url_is_template:
+                payload["url_is_template"] = True
+            raw_data = json.dumps(payload, ensure_ascii=False)
 
             announcement = RawAnnouncement(
                 source="g2b",

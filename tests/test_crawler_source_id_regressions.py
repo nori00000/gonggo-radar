@@ -8,8 +8,12 @@ Two defects were measured on 2026-09-12:
 2. ``smartfarm``: list rows link with ``href="#void"`` and submit a POST form,
    so every announcement got the URL ``https://www.smartfarmkorea.net/#void``
    and 9 of 10 rows were lost to the same collision.
+3. ``socialenterprise``: the list date is ``WRITE_DATE`` (게시일), but a single
+   date was parsed as a period, so ``period_end`` became the posting date.
+   Under 계약 v2.1 판정 4 ("마감 경과 → 제외") every live announcement would
+   vanish from the briefing the day after it was posted.
 
-Both are exercised here against saved fixtures - no network access.
+All are exercised here against saved fixtures - no network access.
 """
 
 import json
@@ -101,6 +105,88 @@ class TestSocialenterpriseSourceId:
         assert set(source_ids) >= {
             row["B_IDX"] for row in ajax_payload["resultList"][:3]
         }
+
+
+class TestSocialenterprisePeriodSemantics:
+    """socialenterprise: 게시일(WRITE_DATE)은 접수기간·마감이 아니다."""
+
+    @pytest.fixture
+    def crawler(self):
+        config = make_config("socialenterprise", "https://www.socialenterprise.or.kr")
+        with patch("alert.crawlers.base.get_config", return_value=config):
+            yield SocialenterpriseCrawler()
+
+    @pytest.fixture
+    def ajax_payload(self):
+        return json.loads(
+            (FIXTURES / "socialenterprise_board_ajax.json").read_text(encoding="utf-8")
+        )
+
+    @pytest.fixture
+    def announcements(self, crawler, ajax_payload):
+        response = MagicMock()
+        response.json.return_value = ajax_payload
+        with patch.object(crawler, "post", return_value=response):
+            items = crawler._fetch_ajax_board(
+                "https://www.socialenterprise.or.kr/homepage/bbs/ajax/boardList.do",
+                {"bsIdx": "10002", "menuId": "822"},
+                "https://www.socialenterprise.or.kr",
+            )
+        return [
+            crawler._to_announcement(item, "https://www.socialenterprise.or.kr")
+            for item in items
+        ]
+
+    def test_posting_date_never_becomes_a_deadline(self, announcements):
+        """게시일만 있는 목록은 period_end를 만들지 않는다."""
+        assert announcements
+        assert all(a.period_end is None for a in announcements)
+
+    def test_posting_date_never_becomes_a_period_start(self, announcements):
+        """게시일을 접수 시작일로 쓰지도 않는다."""
+        assert all(a.period_start is None for a in announcements)
+
+    def test_posting_date_is_preserved_in_raw_data(self, announcements):
+        """게시일 자체는 "새 소식" 판정용으로 raw_data.posted 에 남는다."""
+        posted = [json.loads(a.raw_data).get("posted") for a in announcements]
+        assert posted[0] == "2026-09-11"
+        assert all(p for p in posted)
+
+    def test_explicit_range_in_the_list_is_discarded_by_the_gate(self, crawler):
+        """13차: 이 소스는 전용 추출기가 없다 - 목록 범위도 기간이 아니다.
+
+        크롤러 파서가 무엇을 계산하든 저장 직전 관문이 두 필드를 비운다.
+        """
+        from alert.main import _finalize_periods
+
+        item = {
+            "title": "접수기간이 목록에 있는 공고",
+            "link": "/homepage/bbs/boardView.do?bsIdx=10002&bIdx=999",
+            "author": "",
+            "category": "",
+            "date": "2026-09-01 ~ 2026-09-30",
+        }
+        ann = crawler._to_announcement(item, "https://www.socialenterprise.or.kr")
+        gated = _finalize_periods(ann.source, ann)
+        assert (gated.period_start, gated.period_end) == (None, None)
+
+    def test_detail_quote_lands_as_evidence_not_as_a_period(
+        self, crawler, announcements
+    ):
+        """상세 인용은 raw_data 증거로만 남는다 - 기간은 관문이 정한다 (13차)."""
+        announcement = announcements[0]
+        assert announcement.period_end is None
+
+        crawler._apply_quotes(
+            announcement,
+            {"quote_deadline": "접수기간 2026.09.15 ~ 2026.09.30"},
+        )
+
+        assert (announcement.period_start, announcement.period_end) == (None, None)
+        payload = json.loads(announcement.raw_data)
+        assert payload["quote_deadline"] == "접수기간 2026.09.15 ~ 2026.09.30"
+        assert payload["quote_period_end"] == "2026-09-30"
+        assert payload["posted"] == "2026-09-11"   # 게시일은 지워지지 않는다
 
 
 class TestSmartfarmDetailUrl:

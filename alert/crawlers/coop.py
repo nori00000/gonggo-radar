@@ -69,7 +69,7 @@ class CoopCrawler(BaseCrawler):
             announcement = self._to_announcement(item, base_url)
             if announcement:
                 announcements.append(announcement)
-        return announcements
+        return self.enrich_with_quotes(announcements)
 
     def parse_list(self, soup: "BeautifulSoup") -> List[dict]:
         """공지사항 목록 테이블을 파싱한다.
@@ -161,8 +161,16 @@ class CoopCrawler(BaseCrawler):
                 url = f"{base_url}{self.LIST_PATH}"
                 source_id = hashlib.md5(title.encode("utf-8")).hexdigest()[:16]
 
+            # 목록의 날짜는 **게시일**이다 - 접수기간이 아니다.
+            # 게시일을 period_start 로 쓰면 "접수 시작일"로 읽혀 브리핑이
+            # 존재하지 않는 접수기간을 말하게 된다. 기간 필드는 상세 페이지의
+            # 접수/신청/마감 문구에서만 채운다(enrich_with_quotes).
+            # 게시일은 "새 소식(게시 7일 이내)" 판정용으로 raw_data에 남긴다.
             posted = self._normalize_date(item.get("date", ""))
-            raw_data = json.dumps(item, ensure_ascii=False)
+            payload = dict(item)
+            if posted:
+                payload["posted"] = posted
+            raw_data = json.dumps(payload, ensure_ascii=False)
 
             return RawAnnouncement(
                 source=self.source_name,
@@ -173,7 +181,7 @@ class CoopCrawler(BaseCrawler):
                 author="기획재정부 협동조합 포털",
                 category="공지",
                 target="",
-                period_start=posted,
+                period_start=None,
                 period_end=None,
                 raw_data=raw_data,
             )

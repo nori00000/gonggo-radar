@@ -1,5 +1,6 @@
 """Tests for alert/crawlers/forest_service.py (ForestServiceCrawler)."""
 
+import json
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -177,8 +178,10 @@ class TestForestServiceCrawler:
             assert announcement.url == "https://www.forest.go.kr/kfsweb/cop/bbs/selectBoardArticle.do?nttId=12345"
             assert announcement.author == "산림청"
             assert announcement.category == "공지사항"
-            assert announcement.period_start == "2026-04-01"
-            assert announcement.period_end == "2026-04-30"
+            # 11차(허용목록): 목록의 무라벨 범위는 기간이 아니다 - 게시일로만 남는다
+            assert announcement.period_start is None
+            assert announcement.period_end is None
+            assert json.loads(announcement.raw_data)["posted"] == "2026-04-01"
             assert announcement.source_id == "12345"
 
     def test_to_announcement_empty_title_returns_none(self, mock_forest_config):

@@ -1,5 +1,6 @@
 """Tests for FowiCrawler."""
 
+import json
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -129,8 +130,10 @@ class TestFowiCrawler:
             assert announcement.url == "https://fowi.or.kr/user/board/boardView.do?nttId=12345"
             assert announcement.author == "한국산림복지진흥원"
             assert announcement.category == "지원사업"
-            assert announcement.period_start == "2026-04-01"
-            assert announcement.period_end == "2026-05-01"
+            # 11차(허용목록): 목록의 무라벨 범위는 기간이 아니다 - 게시일로만 남는다
+            assert announcement.period_start is None
+            assert announcement.period_end is None
+            assert json.loads(announcement.raw_data)["posted"] == "2026-04-01"
 
     def test_to_announcement_missing_title(self, mock_fowi_config):
         """_to_announcement() should return None for item without title."""
@@ -343,7 +346,11 @@ class TestFowiBoardParsing:
         assert announcement.url == (
             "https://fowi.or.kr/user/bbs/bbsView.do?bbsManageId=12&bbsId=9191"
         )
-        assert announcement.period_end == "2026-09-11"
+        # 이 게시판의 날짜는 **등록일**이다 - 마감이 아니다 (6차 게이트 #1).
+        # 이전 기대치는 게시일을 period_end 로 저장하는 결함을 고정하고 있었다.
+        assert announcement.period_end is None
+        assert announcement.period_start is None
+        assert json.loads(announcement.raw_data)["posted"] == "2026-09-11"
 
     def test_fetch_end_to_end_yields_real_announcements(self, crawler):
         """fetch()가 게시글 10건을 RawAnnouncement로 돌려준다."""

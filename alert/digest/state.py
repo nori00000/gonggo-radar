@@ -51,7 +51,10 @@ STATE_KEYS = (
     "commentary",
     "preview_message_ids",
     "preview_items",
+    "preview_holds",
     "notice_message_ids",
+    "superseded_message_ids",
+    "pinned_ids",
     "approval",
     "rebuild_failed",
     "verification_broken",
@@ -64,6 +67,8 @@ STATE_KEYS = (
 
 # 미리보기별 항목 목록을 몇 회분까지 보관할지 (오래된 번호 좌표는 버린다)
 PREVIEW_ITEMS_MAX = 30
+# 밀어낸 메시지 id 이력 보관 한도 (상태 파일이 무한히 자라지 않게)
+SUPERSEDED_MAX = 60
 
 SENDING_REASON = "발송 중/미확정 상태 — 사람 확인 필요 (`/digest 해제 <주차>`)"
 NO_APPROVAL_REASON = "승인 세대가 없습니다 — 미리보기를 먼저 보내세요"
@@ -198,9 +203,17 @@ def default_state(week: str) -> Dict:
         "commentary": "",
         "preview_message_ids": [],
         "preview_items": {},
+        # V4 계약 ①: 그 미리보기가 세어 보인 **보류 항목 id** (번호 순서).
+        # `핀 n` 의 번호 좌표가 preview_items 와 같은 규율로 미리보기에 묶인다.
+        "preview_holds": {},
         # 통합 2 #2: 차단 안내의 message_id 는 미리보기와 **다른 자리**다.
         # 같은 자리에 쓰면 늦게 끝난 안내가 최신 번호 좌표를 지운다.
         "notice_message_ids": [],
+        # V4 계약 ②: 새 미리보기가 지운(또는 지우려 한) 옛 메시지 id 이력.
+        # 삭제 실패해도 진행하므로, 무엇을 지웠다고 믿는지 기록으로 남긴다.
+        "superseded_message_ids": [],
+        # V4 계약 ③: `핀 n` 으로 승격한 공고 id. weekly_digest --pins 가 읽는다.
+        "pinned_ids": [],
         "approval": None,
         "rebuild_failed": False,
         "verification_broken": False,
@@ -221,11 +234,13 @@ def normalize_state(data, week: str) -> Dict:
     state["week"] = data.get("week") or week
     if state.get("status") not in STATUSES:
         raise StateError(f"알 수 없는 status: {state.get('status')!r}")
-    for key in ("excluded_urls", "preview_message_ids", "notice_message_ids"):
+    for key in ("excluded_urls", "preview_message_ids", "notice_message_ids",
+                "superseded_message_ids", "pinned_ids"):
         if not isinstance(state.get(key), list):
             raise StateError(f"{key}가 리스트가 아님")
-    if not isinstance(state.get("preview_items"), dict):
-        raise StateError("preview_items가 객체가 아님")
+    for key in ("preview_items", "preview_holds"):
+        if not isinstance(state.get(key), dict):
+            raise StateError(f"{key}가 객체가 아님")
     return state
 
 
@@ -475,7 +490,8 @@ def new_approval_id() -> str:
     return uuid.uuid4().hex[:APPROVAL_ID_LEN]
 
 
-def record_preview_messages(state: Dict, message_ids, item_urls=None) -> Dict:
+def record_preview_messages(state: Dict, message_ids, item_urls=None,
+                            hold_ids=None) -> Dict:
     """이미 발급된 승인 세대에 **미리보기 message_id 만** 붙인다 (사이클8 #4).
 
     approval 은 건드리지 않는다 — 세대는 텔레그램 전송 **전에** 잠금 안에서 발급하고
@@ -487,13 +503,24 @@ def record_preview_messages(state: Dict, message_ids, item_urls=None) -> Dict:
     updated["preview_message_ids"] = ids
     items = dict(updated.get("preview_items") or {})
     urls = list(item_urls or [])
+    # V4 계약 ①: 보류 번호도 같은 미리보기에 묶는다 (`핀 n` 의 좌표).
+    # 라운드 2 (Codex LOW): None(= 좌표를 알 수 없음)을 []로 바꾸지 않는다.
+    # []는 "보류가 0건이었다" 는 **사실 주장**이고, None 은 "이 미리보기의 좌표를
+    # 만들지 못했다" 는 미확인이다. 둘을 섞으면 봇이 좌표 부재를 알아채지 못한다.
+    holds = dict(updated.get("preview_holds") or {})
+    hold_list = (None if hold_ids is None
+                 else [int(value) for value in hold_ids])
     for mid in ids:
         items.pop(str(mid), None)     # 재기록 시 순서를 최신으로
         items[str(mid)] = urls
-    if len(items) > PREVIEW_ITEMS_MAX:
-        for key in list(items)[: len(items) - PREVIEW_ITEMS_MAX]:
-            items.pop(key)
+        holds.pop(str(mid), None)
+        holds[str(mid)] = hold_list
+    for mapping in (items, holds):
+        if len(mapping) > PREVIEW_ITEMS_MAX:
+            for key in list(mapping)[: len(mapping) - PREVIEW_ITEMS_MAX]:
+                mapping.pop(key)
     updated["preview_items"] = items
+    updated["preview_holds"] = holds
     return updated
 
 
@@ -512,7 +539,8 @@ def record_notice_messages(state: Dict, message_ids) -> Dict:
 
 def record_preview(state: Dict, message_ids, item_urls=None,
                    approval_sha: Optional[str] = None,
-                   check_sha: Optional[str] = None) -> Dict:
+                   check_sha: Optional[str] = None,
+                   hold_ids=None) -> Dict:
     """이번 미리보기의 message_id·항목 URL·**새 승인 세대**를 기록.
 
     **status 는 절대 건드리지 않는다** (사이클2 #1) — 미리보기 전송이 발송 상태를
@@ -526,7 +554,7 @@ def record_preview(state: Dict, message_ids, item_urls=None,
     싣는다. 본문 SHA 가 같아도 렌더에 쓴 검증이 바뀌면(분류 개편으로 0건 → 수정 후
     pass) 세대가 무효가 된다.
     """
-    updated = record_preview_messages(state, message_ids, item_urls)
+    updated = record_preview_messages(state, message_ids, item_urls, hold_ids)
     updated["approval"] = (
         {
             "id": new_approval_id(),
@@ -608,6 +636,96 @@ def preview_urls(state: Optional[Dict], message_id=None) -> Optional[List[str]]:
         if isinstance(urls, list):
             return list(urls)
     return None
+
+
+def preview_hold_ids(state: Optional[Dict], message_id=None):
+    """그 미리보기가 세어 보인 보류 항목 id 목록 (번호 순서). 기록이 없으면 None."""
+    holds = (state or {}).get("preview_holds") or {}
+    if message_id is not None:
+        ids = holds.get(str(message_id))
+        return list(ids) if isinstance(ids, list) else None
+    for mid in reversed((state or {}).get("preview_message_ids") or []):
+        ids = holds.get(str(mid))
+        if isinstance(ids, list):
+            return list(ids)
+    return None
+
+
+def record_superseded(state: Dict, message_ids) -> Dict:
+    """V4 계약 ②: 새 미리보기가 밀어낸 옛 메시지 id 이력.
+
+    삭제 성공 여부와 무관하게 남긴다 — 텔레그램 삭제는 48시간 제한·권한 등으로
+    실패할 수 있고, 실패해도 진행하는 것이 규율이다. 무엇을 밀어냈다고 믿는지가
+    상태에 없으면 "왜 옛 미리보기가 아직 있나" 를 사후에 설명할 수 없다.
+    """
+    updated = dict(state)
+    history = [int(mid) for mid in (updated.get("superseded_message_ids") or [])]
+    for mid in message_ids or ():
+        value = int(mid)
+        if value not in history:
+            history.append(value)
+    updated["superseded_message_ids"] = history[-SUPERSEDED_MAX:]
+    return updated
+
+
+def set_superseded(state: Dict, message_ids) -> Dict:
+    """정리 대기 큐를 **통째로 교체**한다 (라운드 3).
+
+    `superseded_message_ids` 는 "밀어냈다고 믿지만 아직 화면에서 지우지 못한"
+    메시지의 **대기 큐**다(이력이 아니다 — 이력은 로그가 맡는다). 한 번 시도한
+    뒤에도 큐에 남기면 매 회차마다 같은 메시지에 deleteMessage 를 재발사한다.
+    그래서 완전 전송이 끝난 회차가 큐를 비우고, 미완 전송이 큐를 채운다.
+    """
+    updated = dict(state)
+    queue: List[int] = []
+    for value in message_ids or ():
+        value = int(value)
+        if value not in queue:
+            queue.append(value)
+    updated["superseded_message_ids"] = queue[-SUPERSEDED_MAX:]
+    return updated
+
+
+def superseded_message_ids(state: Optional[Dict]) -> List[int]:
+    """정리 대기 큐 (없으면 빈 목록)."""
+    return [int(value)
+            for value in ((state or {}).get("superseded_message_ids") or [])]
+
+
+def pinned_ids(state: Optional[Dict]) -> List[int]:
+    """상태의 승격 공고 id 목록 (없으면 빈 목록)."""
+    return [int(value) for value in ((state or {}).get("pinned_ids") or [])]
+
+
+def add_pinned_ids(state: Dict, ids) -> Dict:
+    """`핀 n` — 승격 id 를 중복 없이 덧붙인다 (발송 중·완료 주차는 거부)."""
+    status = state.get("status")
+    if status in FROZEN_STATUSES:
+        raise TransitionError(f"{status} 상태에서는 항목을 승격할 수 없습니다")
+    updated = dict(state)
+    existing = pinned_ids(updated)
+    for value in ids or ():
+        value = int(value)
+        if value not in existing:
+            existing.append(value)
+    updated["pinned_ids"] = existing
+    # 라운드 2 (Codex 승인 경합 미검증): 승격은 곧 본문이 바뀐다는 뜻이다.
+    # mark_rebuild_failed 와 같은 규율으로 **그 자리에서** 승인을 폐기한다 —
+    # 재조립·재검증까지의 창에서 옛 카드가 살아 있지 않게(구조로 닫는다).
+    updated["approval"] = None
+    return updated
+
+
+def drop_pinned_ids(state: Dict, ids) -> Dict:
+    """승격에 실패한 id 를 상태에서 뺀다 (같은 실패를 매 재조립마다 반복하지 않는다)."""
+    drop = {int(value) for value in (ids or ())}
+    if not drop:
+        return dict(state)
+    updated = dict(state)
+    updated["pinned_ids"] = [
+        value for value in pinned_ids(updated) if value not in drop
+    ]
+    return updated
 
 
 # ─── 잠금 (fcntl.flock — 커널이 배타성을 보장한다) ──────────────────────

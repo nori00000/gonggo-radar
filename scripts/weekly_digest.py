@@ -57,6 +57,11 @@ def main():
         action="store_true",
         help="상태 파일(YYYY-Www.state.json)의 excluded_urls를 조회 단계에서 제외",
     )
+    parser.add_argument(
+        "--pins",
+        action="store_true",
+        help="상태 파일의 pinned_ids(`핀 n` 승격)를 선정 단계에서 반영",
+    )
 
     # 사이클8 #3: argparse 는 guarded_main 보다 먼저 말한다 — argv 에 토큰 형태가
     # 있으면 **내용을 출력하지 않고** 일반 오류로 끝낸다.
@@ -118,22 +123,29 @@ def _run(args, week, out_dir):
     warnings: list[str] = []
     dropped: list[dict] = []
     dropped_urls: set[str] = set()
+    pin_ids: set[int] = set()
     stats: dict = {}
     result = None
 
     # 계약 W10: 사람이 텔레그램에서 제외한 항목은 상태 파일이 정본이다.
     # 조회 단계에서 빼므로 섹션 상한이 남은 후보로 다시 채워진다.
-    if args.exclude_state:
+    # V4 계약 ③: 승격(`핀 n`)도 같은 정본에서 읽는다 — 상태 파일 한 번만 읽는다.
+    if args.exclude_state or args.pins:
         state_path = state_mod.state_path(week, out_dir)
         try:
             state = state_mod.load_state(state_path, week)
         except state_mod.StateError as exc:
             _err(f"✗ 상태 파일 손상: {exc}")
             return 1
-        state_excluded = state_mod.excluded_urls(state)
-        if state_excluded:
-            dropped_urls.update(state_excluded)
-            _out(f"제외 상태 반영: {len(state_excluded)}건")
+        if args.exclude_state:
+            state_excluded = state_mod.excluded_urls(state)
+            if state_excluded:
+                dropped_urls.update(state_excluded)
+                _out(f"제외 상태 반영: {len(state_excluded)}건")
+        if args.pins:
+            pin_ids = set(state_mod.pinned_ids(state))
+            if pin_ids:
+                _out(f"승격 상태 반영: {len(pin_ids)}건")
 
     for attempt in range(1, MAX_RECOMPOSE_ROUNDS + 1):
         label = "다이제스트 생성" if attempt == 1 else "재조립"
@@ -147,6 +159,7 @@ def _run(args, week, out_dir):
                 warnings_out=warnings if attempt == 1 else None,
                 exclude_urls=dropped_urls or None,
                 stats_out=stats,
+                pin_ids=pin_ids or None,
             )
             # 출력 경로는 main 의 `_out`(종료 코드·리다이렉트 통일)을 따른다.
             _out(f"✓ {label}: {markdown_path}")
