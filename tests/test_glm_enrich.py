@@ -3248,3 +3248,68 @@ def test_the_superscript_unit_is_still_dropped_from_candidates():
         {"title": "제목", "detail_text": str(text)}
     ) == ["접수는 9월 22일까지 진행합니다."]
     assert glm_mod.marked_unit_count(str(text)) == 1
+
+
+# ══ V3.1 r11 — 자기닫힘 표기는 요소를 연다 ════════════════════════════════
+def test_a_self_closing_del_still_opens_the_element():
+    """Codex bypass: `<del/>` 를 무시하면 삭제된 문구가 근거로 남는다."""
+    text = http_fetch.visible_text(
+        "<article><del/>사회적기업은 지원금 300만원을 신청할 수 있습니다.</del></article>"
+    )
+    assert text == http_fetch.MARKED_SENTINEL
+    assert "300만원" not in text
+
+    candidates = glm_mod.candidate_sentences(
+        {"title": "제목", "detail_text": str(text)}
+    )
+    assert candidates == []
+
+
+def test_a_sentinel_costs_the_sentence_it_sits_in():
+    """센티넬은 **문장 경계를 만들지 않는다** — 같은 문장에 든 멀쩡한 내용도
+    함께 버려진다. 안전한 방향이지만 비용이 있다(보고서에 적었다)."""
+    text = http_fetch.visible_text(
+        "<article><del/>지원금 300만원을 신청할 수 있습니다.</del>"
+        " 접수는 9월 22일까지 진행합니다.</article>"
+    )
+    assert "300만원" not in text
+    # 센티넬과 뒤 문장이 한 단위다 → 통째로 후보에서 빠진다
+    assert glm_mod.candidate_units(str(text)) == [
+        http_fetch.MARKED_SENTINEL + " 접수는 9월 22일까지 진행합니다."
+    ]
+    assert glm_mod.candidate_sentences(
+        {"title": "제목", "detail_text": str(text)}
+    ) == []
+
+
+def test_a_marked_element_in_its_own_sentence_costs_only_that_sentence():
+    text = http_fetch.visible_text(
+        "<article>지원금은 <del>300만원</del>입니다."
+        " 접수는 9월 22일까지 진행합니다.</article>"
+    )
+    assert "300만원" not in text
+    assert glm_mod.candidate_sentences(
+        {"title": "제목", "detail_text": str(text)}
+    ) == ["접수는 9월 22일까지 진행합니다."]
+
+
+def test_a_self_closing_break_inside_a_paragraph_keeps_the_text():
+    assert http_fetch.visible_text(
+        "<article><p>첫 줄입니다<br/>둘째 줄입니다.</p></article>"
+    ) == "첫 줄입니다 둘째 줄입니다."
+
+
+@pytest.mark.parametrize("void", ["img", "input", "meta", "link", "col"])
+def test_self_closing_void_tags_do_not_open_an_element(void):
+    text = http_fetch.visible_text(
+        f"<article><p>앞부분<{void}/>뒷부분입니다.</p></article>"
+    )
+    assert text == "앞부분뒷부분입니다."
+
+
+def test_a_self_closing_div_does_not_swallow_the_rest():
+    """비 void 요소를 여는 것이 HTML 규칙이다 — 본문은 그 안에 남는다."""
+    text = http_fetch.visible_text(
+        "<article><div/>접수는 9월 22일까지 진행합니다.</div></article>"
+    )
+    assert "접수는 9월 22일까지 진행합니다." in text

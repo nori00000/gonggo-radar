@@ -163,8 +163,15 @@ class _DomBuilder(HTMLParser):
             self.overflowed = True
 
     def handle_startendtag(self, tag, attrs):
-        if tag.lower() in _BREAK_TAGS:
-            self._stack[-1].children.append(" ")
+        """`<del/>` 같은 자기닫힘 표기는 HTML 에서 **요소를 연다**.
+
+        void 요소가 아니면 `/` 는 무시되고 시작 태그로 취급된다 — 그래서
+        `<article><del/>…</del></article>` 의 본문은 `<del>` **안**이다.
+        예전에는 이 표기를 통째로 무시해 삭제된 문구가 근거로 남았다
+        (Codex r10 bypass). 분기는 `handle_starttag` 하나로 모은다 —
+        break/void 처리가 그쪽에 이미 있다.
+        """
+        self.handle_starttag(tag, attrs)
 
     def handle_endtag(self, tag):
         tag = tag.lower()
