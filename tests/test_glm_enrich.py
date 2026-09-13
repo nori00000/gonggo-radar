@@ -2562,3 +2562,172 @@ def test_a_w37_sized_fixture_fits_in_two_batches_or_fewer(monkeypatch):
     assert len(batches) <= 2
     for batch in batches:
         assert glm_mod.prompt_bytes(today, batch) <= glm_mod.PROMPT_BYTE_BUDGET
+
+
+# ══ V3.1 r6 — 분해기 보정 · 후보 하한 · 품질 필터 ═════════════════════════
+# 1. 목록 표지·날짜는 문장 끝이 아니다
+# ─────────────────────────────────────────────────────────────────────────
+def test_a_list_marker_number_does_not_end_a_sentence():
+    """W37 n=6: `… 입법예고 1.` 에서 쪼개져 조각이 후보가 됐다."""
+    assert glm_mod.split_sentences(
+        "산림재난방지법 시행령 일부개정령안 입법예고 1. 개정이유 법률이 개정되었습니다."
+    ) == ["산림재난방지법 시행령 일부개정령안 입법예고 1. 개정이유 법률이 개정되었습니다."]
+
+
+def test_a_single_letter_list_marker_does_not_end_a_sentence():
+    assert glm_mod.split_sentences(
+        "가. 지원 대상은 사회적기업입니다. 나. 접수는 9월까지입니다."
+    ) == ["가. 지원 대상은 사회적기업입니다.", "나. 접수는 9월까지입니다."]
+
+
+def test_a_short_year_date_run_does_not_split():
+    """W37 n=6: `공포, ’26.11.13.` 이 별도 문장이 됐다."""
+    assert glm_mod.split_sentences(
+        "「산림재난방지법」이 개정(’26.5.12. 공포, ’26.11.13. 시행)됨에 따라 정합니다."
+    ) == ["「산림재난방지법」이 개정(’26.5.12. 공포, ’26.11.13. 시행)됨에 따라 정합니다."]
+
+
+def test_a_spaced_date_run_does_not_split():
+    """W37 n=7: `2026. 5. 12.` 에서 인용이 잘렸다."""
+    assert glm_mod.split_sentences(
+        "법률 제21620호, 2026. 5. 12. 공포되었습니다."
+    ) == ["법률 제21620호, 2026. 5. 12. 공포되었습니다."]
+
+
+def test_a_date_with_a_weekday_suffix_does_not_split():
+    assert glm_mod.split_sentences(
+        "설명회는 2026.09.30.(수) 14시에 열립니다."
+    ) == ["설명회는 2026.09.30.(수) 14시에 열립니다."]
+
+
+def test_a_period_before_a_closing_bracket_does_not_end_a_sentence():
+    assert glm_mod.split_sentences("근거는 제7조입니다 . ) 라고 적혀 있습니다.") == [
+        "근거는 제7조입니다 . ) 라고 적혀 있습니다.",
+    ]
+
+
+def test_the_old_decimal_and_paren_cases_still_behave():
+    assert glm_mod.split_sentences("사업비 1.5억원 규모입니다.") == [
+        "사업비 1.5억원 규모입니다.",
+    ]
+    assert glm_mod.split_sentences("접수 9.30)까지 진행합니다.") == [
+        "접수 9.30)까지 진행합니다.",
+    ]
+
+
+def test_ordinary_sentences_still_split():
+    assert glm_mod.split_sentences(
+        "접수는 9월 22일까지 진행합니다. 지원금은 300만원입니다."
+    ) == ["접수는 9월 22일까지 진행합니다.", "지원금은 300만원입니다."]
+
+
+# ─── 2. 후보 하한 ─────────────────────────────────────────────────────────
+def test_one_candidate_is_not_a_choice_and_is_treated_as_none(
+    digest_fixture, tmp_path, monkeypatch
+):
+    """후보가 1개면 고르는 것이 아니다 — 묻지 않고 info 로 넘긴다."""
+    monkeypatch.setattr(
+        glm_mod, "fetch_detail_text",
+        lambda url, **kwargs: "접수는 9월 22일까지 진행합니다.",
+    )
+    _ds_present(monkeypatch, tmp_path)
+    seen = _stub_ds_calls(monkeypatch, _auto_respond)
+
+    class Args:
+        week = W13
+        db = digest_fixture["db_path"]
+        out_dir = str(digest_fixture["out_dir"])
+        dry_run = False
+        apply_json = None
+
+    assert glm_mod.run(Args()) == 0
+    payload = json.loads(
+        (digest_fixture["out_dir"] / f"{W13}.glm_input.json").read_text(encoding="utf-8")
+    )
+    assert [len(entry["candidates"]) for entry in payload["items"]] == [1, 1]
+    assert payload["no_candidates"] == [1, 2]
+    assert payload["batches"] == []
+    assert not any(_is_summary_prompt(prompt) for prompt, _ in seen)
+    assert _enrich_line_count(digest_fixture["markdown_path"]) == 0
+
+
+def test_two_candidates_are_enough_to_ask():
+    today = "2026-09-13"
+    item = _big_item(1, 2)
+    assert len(item["candidates"]) == glm_mod.MIN_CANDIDATES_TO_ASK
+    batches, skipped = glm_mod.batch_input_items(today, [item])
+    assert skipped == []
+    assert [[entry["n"] for entry in batch] for batch in batches] == [[1]]
+
+
+# ─── 3. 후보 품질 필터 ────────────────────────────────────────────────────
+def test_a_closing_greeting_is_not_a_candidate():
+    """W37 n=1 이 고른 줄 — 공고문 맺음말."""
+    detail = (
+        "혁신적인 기술과 아이디어를 보유한 창업기업의 많은 관심과 참여 바랍니다. "
+        "접수는 9월 22일까지 진행합니다."
+    )
+    assert _candidates_from(detail) == ["접수는 9월 22일까지 진행합니다."]
+
+
+def test_a_bare_date_is_not_a_candidate():
+    """W37 n=2 가 고른 줄 — 날짜 조각."""
+    detail = "2026. 9. 11. 접수는 9월 22일까지 진행합니다."
+    candidates = _candidates_from(detail)
+    assert "2026. 9. 11." not in candidates
+
+
+def test_a_numeric_only_sentence_is_not_a_candidate():
+    assert _candidates_from("2026 - 09 - 11 (12:00). 접수는 9월 22일까지 진행합니다.") == [
+        "접수는 9월 22일까지 진행합니다.",
+    ]
+
+
+@pytest.mark.parametrize("admin", [
+    "문의처는 산림청 산림정책과입니다",
+    "담당자는 홍길동 주무관입니다",
+    "※ 첨부파일을 확인해 주세요",
+])
+def test_contact_and_attachment_lines_are_not_candidates(admin):
+    detail = f"{admin}. 접수는 9월 22일까지 진행합니다."
+    assert _candidates_from(detail) == ["접수는 9월 22일까지 진행합니다."]
+
+
+def test_persona_prompt_tells_glm_what_to_prefer():
+    prompt = glm_mod.PERSONA_SYSTEM_PROMPT
+    assert "대상·요건·마감·금액·바뀌는 내용" in prompt
+    assert "인사말·맺음말" in prompt
+
+
+def test_nothing_asked_is_not_the_same_as_everything_discarded(
+    digest_fixture, tmp_path, monkeypatch
+):
+    """후보가 없어 묻지 않은 실행을 `discarded` 로 표시하지 않는다 (r6)."""
+    monkeypatch.setattr(glm_mod, "fetch_detail_text", lambda url, **kwargs: "")
+    _ds_present(monkeypatch, tmp_path)
+    _stub_ds_calls(monkeypatch, _auto_respond)
+
+    class Args:
+        week = W13
+        db = digest_fixture["db_path"]
+        out_dir = str(digest_fixture["out_dir"])
+        dry_run = False
+        apply_json = None
+
+    assert glm_mod.run(Args()) == 0
+    warnings_file = json.loads(
+        (digest_fixture["out_dir"] / f"{W13}.glm_warnings.json").read_text(
+            encoding="utf-8")
+    )
+    assert warnings_file["discarded"] is False
+    assert warnings_file["info"]["no_candidates"] == [1, 2]
+
+    check = check_digest(
+        db_path=digest_fixture["db_path"],
+        markdown_path=digest_fixture["markdown_path"],
+        output_path=None, skip_network=False,
+    )
+    preview = preview_mod.render_preview(
+        W13, digest_fixture["markdown_path"].read_text(encoding="utf-8"), check
+    )
+    assert "GLM 출력 전체 폐기" not in preview
