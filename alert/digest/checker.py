@@ -23,8 +23,9 @@ sections·holds 양쪽에서 사라졌다). 해소는 재조립뿐이다.
 프로브와 같은 UA·헤더) 앞 2,000자를 `detail_text` 로 GLM 에 넘긴다. 그 텍스트는
 **우리가 통제하지 않는 외부 입력**이고, 그것을 읽은 GLM 의 출력도 마찬가지다.
 그래서 GLM 이 낸 문장은 세 관문을 다 지난 뒤에만 md 에 들어간다: ①glm_enrich 의
-결정론 게이트(숫자·인용의 근거 부분문자열 일치, 마크다운·제어문자 형식 금지,
-n 집합 정확 일치 — 하나라도 어긋나면 그 필드는 `원문 확인`이거나 출력 전체 폐기)
+결정론 게이트(`한 줄 의미`는 **추출형 문법** — 근거에서 토큰 경계로 오려 온
+«인용»과 접속어 화이트리스트만 허용, 마크다운·URL·제어/형식문자 금지, n 집합
+정확 일치 — 하나라도 어긋나면 그 필드는 `원문 확인`이거나 출력 전체 폐기)
 ②이 파일의 정본 대조·해시 결속(보강 줄도 items.json 의 `enrich_line` 과 문자열
 동일해야 한다) ③사람의 미리보기 승인(보강 줄과 `GLM 보강 경고 N건` 이 미리보기에
 그대로 보인다). 상세 텍스트 자체는 어떤 경로로도 발송본에 실리지 않는다.
@@ -35,7 +36,7 @@ import json
 import sqlite3
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 import requests
 
 from alert.digest import blocks as blocks_mod
@@ -532,16 +533,29 @@ def glm_warnings_path(markdown_path) -> Path:
     return markdown_path.with_name(stem + GLM_WARNINGS_SUFFIX)
 
 
-def glm_warning_count(markdown_path) -> int:
-    """GLM 보강 게이트 경고 건수. 파일이 없거나 깨졌으면 0 (표시용, 게이트 아님)."""
+def glm_warning_summary(markdown_path) -> Tuple[int, bool]:
+    """(경고 건수, 출력 전체 폐기 여부). 파일이 없거나 깨졌으면 (0, False).
+
+    `discarded` 는 n 집합 위반·파싱 실패로 **아무것도 적용하지 않은** 실행이다 —
+    미리보기 문구가 "원문 확인으로 대체"와 "출력 전체 폐기"를 구분해야 한다
+    (Codex v3.1 LOW: 폐기인데 대체라고 표시했다).
+    """
     try:
         loaded = json.loads(
             glm_warnings_path(markdown_path).read_text(encoding="utf-8")
         )
     except (OSError, json.JSONDecodeError):
-        return 0
-    warnings = loaded.get("warnings") if isinstance(loaded, dict) else None
-    return len(warnings) if isinstance(warnings, list) else 0
+        return 0, False
+    if not isinstance(loaded, dict):
+        return 0, False
+    warnings = loaded.get("warnings")
+    count = len(warnings) if isinstance(warnings, list) else 0
+    return count, bool(loaded.get("discarded"))
+
+
+def glm_warning_count(markdown_path) -> int:
+    """GLM 보강 게이트 경고 건수 (표시용, 게이트 아님)."""
+    return glm_warning_summary(markdown_path)[0]
 
 def extract_item_urls(markdown_text: str, item_sections=None) -> List[str]:
     """항목 블록의 원문 URL을 문서 순서대로, 중복 없이 뽑는다.
@@ -814,6 +828,7 @@ def check_digest(
     # 사이클 9 #5: 치환 규칙이 완전한지 **생성 후** 확인한다 — 한도를 넘긴 조각과
     # 분절·유실된 URL 을 둘 다 본다(조각 길이만 보면 "URL 을 잘라 맞춘" 출력이 통과).
     kakao_problems = markdown_kakao_problems(markdown_text)
+    glm_warnings_count, glm_discarded = glm_warning_summary(markdown_path)
 
     if not network_checked:
         reason = "네트워크 미검사"
@@ -857,7 +872,8 @@ def check_digest(
         # V3.1: GLM 보강 게이트가 남긴 경고 건수 — 미리보기 상단에 표시만 한다
         # (발송 차단 아님. 경고 = "GLM 이 낸 문장을 게이트가 버렸다" 이므로 본문은
         # 이미 안전한 쪽으로 대체돼 있다. 사람은 그 사실을 알고 승인해야 한다).
-        "glm_warnings": glm_warning_count(markdown_path),
+        "glm_warnings": glm_warnings_count,
+        "glm_discarded": glm_discarded,
         "pass": (
             network_checked
             and alive_count > 0

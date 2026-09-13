@@ -214,7 +214,13 @@ def render_preview(
     # 막지는 않지만(본문은 이미 `원문 확인`으로 대체돼 있다) 사람이 알고 승인해야 한다.
     glm_warnings = check.get("glm_warnings") or 0
     if glm_warnings:
-        lines.append(f"GLM 보강 경고 {glm_warnings}건 (해당 항목은 '원문 확인'으로 대체)")
+        # r2: 폐기와 대체를 구분한다 — n 집합 위반·파싱 실패는 **아무것도 적용하지
+        # 않은** 실행이고, 그때 "원문 확인으로 대체"라고 쓰면 거짓 안내가 된다.
+        detail = (
+            "GLM 출력 전체 폐기" if check.get("glm_discarded")
+            else "해당 항목은 '원문 확인'으로 대체"
+        )
+        lines.append(f"GLM 보강 경고 {glm_warnings}건 ({detail})")
     lines.append("")
 
     # 항목 번호는 블록 파서가 정한 순서로만 붙인다 (문자열 일치 추측 금지 —

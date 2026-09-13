@@ -13,6 +13,7 @@ v2.1의 뼈대 (2026-09-13 확정안, 판정 1~9):
 import csv
 import hashlib
 import json
+import os
 import re
 import sqlite3
 import sys
@@ -1670,11 +1671,17 @@ def load_items_manifest(markdown_path) -> Optional[Dict]:
 
 
 def write_items_manifest(markdown_path, manifest: Dict) -> None:
-    """항목 정본 파일을 쓴다."""
-    items_json_path(markdown_path).write_text(
-        json.dumps(manifest, ensure_ascii=False, indent=2) + "\n",
-        encoding="utf-8",
-    )
+    """항목 정본 파일을 **원자적으로** 쓴다 (임시 파일 → os.replace).
+
+    같은 디렉토리에 쓰고 갈아끼운다 — 쓰는 도중 죽어도 반쯤 쓰인 정본이 남지
+    않는다(반쯤 쓰인 정본은 `load_items_manifest` 가 None 으로 읽고, 그러면
+    게이트가 "항목 정본 없음"으로 멈춘다).
+    """
+    path = items_json_path(markdown_path)
+    payload = json.dumps(manifest, ensure_ascii=False, indent=2) + "\n"
+    temp = path.with_name(path.name + ".tmp")
+    temp.write_text(payload, encoding="utf-8")
+    os.replace(temp, path)
 
 
 def refresh_manifest_binding(markdown_path) -> Optional[Dict]:
@@ -1697,25 +1704,37 @@ def refresh_manifest_binding(markdown_path) -> Optional[Dict]:
 
 
 def set_manifest_enrich_lines(
-    markdown_path, enrich_by_id: Dict[str, str]
+    markdown_path, enrich_by_id: Dict[str, str], clear_all: bool = False
 ) -> Optional[Dict]:
-    """정본의 `enrich_line` 필드를 갱신하고 해시를 다시 맞춘다 (V3).
+    """정본의 `enrich_line` 과 `markdown_sha256` 을 **한 번의 쓰기**로 맞춘다 (V3).
 
     호출 순서가 요점이다 — glm_enrich.py 는 **먼저** md 에 보강 줄을 써넣은
-    뒤 이 함수를 부른다. 여기서는 그 id 들의 `enrich_line` 값만 바꾸고(다른
-    항목 필드는 손대지 않는다), 마지막에 지금 md 바이트로 해시를 다시 맞춘다
-    (`refresh_manifest_binding`) — 그래야 checker 의 문자열 대조·해시 검사가
-    둘 다 새 md 를 본다.
+    뒤 이 함수를 부른다. 여기서 그 id 들의 값만 바꾸고(다른 항목 필드는 손대지
+    않는다) 지금 md 바이트로 해시를 맞춘 뒤 **한 번** 저장한다.
+
+    V3.1 r2 (Codex MEDIUM — 비원자적 디스크 커밋): 예전에는 `필드 저장` 과
+    `해시 저장`이 두 번의 쓰기였고, 그 사이에 죽으면 md 는 비었는데 정본에는
+    옛 보강이 남아 이후 재실행이 복구하지 못했다(문자열 불일치로 nightly 중단).
+    이제 쓰기는 한 번이고, `clear_all=True` 는 **조건 없이** 모든 항목의
+    `enrich_line` 을 비운다 — md 쪽이 이미 깨끗해도 정본을 치유한다.
     """
     manifest = load_items_manifest(markdown_path)
     if manifest is None:
         return None
     for entry in manifest.get("items") or []:
         key = str(entry.get("id"))
-        if key in enrich_by_id:
+        if clear_all:
+            entry["enrich_line"] = ""
+        elif key in enrich_by_id:
             entry["enrich_line"] = enrich_by_id[key] or ""
+    try:
+        manifest["markdown_sha256"] = hashlib.sha256(
+            Path(markdown_path).read_bytes()
+        ).hexdigest()
+    except OSError:
+        pass
     write_items_manifest(markdown_path, manifest)
-    return refresh_manifest_binding(markdown_path)
+    return manifest
 
 
 def item_marker(item: Dict) -> str:
@@ -1974,10 +1993,20 @@ def markdown_kakao_problems(markdown_text: str) -> List[str]:
     # 채널마다 다른 본문이 나간다 — 승인 게이트가 본 것과 받는 사람이 읽는 것이
     # 갈라진다. 사람이 md 에서 읽은 문장이 카톡에서 조용히 사라지는 쪽이,
     # 발송을 멈추는 쪽보다 나쁘다.
-    for block in blocks_mod.item_blocks(markdown_text):
-        enrich = (block.get("enrich_line") or "").strip()
-        if enrich and enrich not in joined:
-            problems.append(f"보강 줄 누락: {enrich[:40]}…")
+    #
+    # r2 (Codex MEDIUM): 판정은 **출현 수**다. 두 항목이 모두 `→ 원문 확인` 일
+    # 때 `enrich in joined` 는 하나만 살아남아도 참이라 유실을 놓쳤다.
+    enrich_counts = Counter(
+        (block.get("enrich_line") or "").strip()
+        for block in blocks_mod.item_blocks(markdown_text)
+        if (block.get("enrich_line") or "").strip()
+    )
+    for enrich, expected in sorted(enrich_counts.items()):
+        rendered = joined.count(enrich)
+        if rendered < expected:
+            problems.append(
+                f"보강 줄 누락({expected}→{rendered}): {enrich[:40]}…"
+            )
     return problems
 
 
@@ -2005,13 +2034,24 @@ def _shrink_item_block(block: str, limit: int) -> str:
 URL_TOO_LONG_NOTICE = "(URL 길이 초과 — 원문 확인)"
 
 
+def _drop_enrich_line(block: str) -> str:
+    """항목 덩어리에서 보강 줄만 뗀다 (제목·URL 은 그대로)."""
+    lines = block.split("\n")
+    if len(lines) == 3 and _is_url_line(lines[1]):
+        return "\n".join(lines[:2])
+    return block
+
+
 def _url_too_long_block(block: str, limit: int) -> str:
     """한도를 넘는 URL 줄을 표기로 대체 (오버사이즈 조각 금지 — 사이클 7 #9)."""
-    head = block.split("\n")[0]
-    room = limit - len(URL_TOO_LONG_NOTICE) - 3
+    lines = block.split("\n")
+    head = lines[0]
+    tail = lines[2:]  # V3.1 r2: 보강 줄은 살린다 (버리면 체커가 발송을 막는다)
+    tail_len = sum(len(line) + 1 for line in tail)
+    room = limit - len(URL_TOO_LONG_NOTICE) - 3 - tail_len
     if len(head) > room:
         head = head[: max(1, room - 1)] + "…"
-    return f"{head}\n  {URL_TOO_LONG_NOTICE}"
+    return "\n".join([head, f"  {URL_TOO_LONG_NOTICE}"] + tail)
 
 
 def _pack_blocks(blocks: Sequence[str], limit: int) -> List[str]:
@@ -2028,6 +2068,12 @@ def _pack_blocks(blocks: Sequence[str], limit: int) -> List[str]:
 
     for block in blocks:
         block = _shrink_item_block(block, limit)
+        if len(block) > limit and _is_item_block(block):
+            # V3.1 r2: 보강 줄 때문에 넘친 것이면 **보강 줄만** 뗀다 — 예전에는
+            # 항목 URL 을 통째로 안내 문구로 바꿔버려 원문 링크가 사라졌다.
+            trimmed = _shrink_item_block(_drop_enrich_line(block), limit)
+            if len(trimmed) <= limit:
+                block = trimmed
         if len(block) > limit:
             flush()
             if _is_item_block(block):

@@ -1,5 +1,6 @@
 """GLM 야간 요약 레인(V3) — 게이트·보강 줄 부착 테스트."""
 
+import codecs
 import json
 import sqlite3
 
@@ -26,9 +27,13 @@ def stub_detail_fetch(monkeypatch):
     monkeypatch.setattr(glm_mod, "fetch_detail_text", lambda url, **kwargs: "")
 
 
-def _label(n: int) -> str:
-    """숫자 없는 보강 문구 — 숫자 토큰 근거 게이트(B1)에 걸리지 않게 한다."""
-    return "확인 필요 " + "가나다라마바사아자차"[n - 1]
+def _label(entry) -> str:
+    """항목 제목의 첫 낱말을 오려 온 **추출형** 한 줄 의미 (r2 문법 통과).
+
+    r2 부터 `한 줄 의미`는 근거에서 오려 온 «인용» + 접속어 화이트리스트로만
+    이루어져야 한다 — 자유 문장은 어떤 것도 통과하지 못한다.
+    """
+    return "«{}» 신청".format(entry["title"].split()[0])
 
 
 def _create_table(db_path) -> None:
@@ -151,13 +156,13 @@ def test_gate_output_normal_case_applies_all_fields():
         "n": 1, "대상 태그": "사회적기업(경기)",
         "마감": "2026-09-22 «9월 22일까지»",
         "자격": "원문 확인", "금액": "300만원 «지원금 300만원»",
-        "한 줄 의미": "조달 컨설팅 신청 가능",
+        "한 줄 의미": "«9월 22일까지» 접수",
     }], ensure_ascii=False)
 
     results, warnings = glm_mod.gate_output(raw, items)
 
     assert warnings == []
-    assert results[1]["한 줄 의미"] == "조달 컨설팅 신청 가능"
+    assert results[1]["한 줄 의미"] == "«9월 22일까지» 접수"
     assert results[1]["마감"] == "2026-09-22 «9월 22일까지»"
     assert results[1]["금액"] == "300만원 «지원금 300만원»"
     assert results[1]["대상 태그"] == "사회적기업(경기)"
@@ -169,7 +174,7 @@ def test_gate_output_quote_not_substring_falls_back_and_warns():
         "n": 1, "대상 태그": "사회적기업",
         "마감": "2026-09-22 «날조된 인용문»",  # 입력 텍스트에 없는 인용
         "자격": "원문 확인", "금액": "원문 확인",
-        "한 줄 의미": "신청 가능",
+        "한 줄 의미": "«9월 22일까지» 접수",
     }], ensure_ascii=False)
 
     results, warnings = glm_mod.gate_output(raw, items)
@@ -177,7 +182,7 @@ def test_gate_output_quote_not_substring_falls_back_and_warns():
     assert results[1]["마감"] == glm_mod.FALLBACK
     assert any("마감" in w and "인용" in w for w in warnings)
     # 인용 실패가 다른 필드(한 줄 의미)까지 통째로 버리지 않는다
-    assert results[1]["한 줄 의미"] == "신청 가능"
+    assert results[1]["한 줄 의미"] == "«9월 22일까지» 접수"
 
 
 def test_gate_output_parse_failure_returns_no_results():
@@ -273,7 +278,7 @@ def test_apply_json_adds_enrich_line_without_changing_item_line(digest_fixture, 
         {
             "n": entry["n"], "대상 태그": "전체", "마감": "원문 확인",
             "자격": "원문 확인", "금액": "원문 확인",
-            "한 줄 의미": _label(entry["n"]),
+            "한 줄 의미": _label(entry),
         }
         for entry in input_payload["items"]
     ]
@@ -291,7 +296,7 @@ def test_apply_json_adds_enrich_line_without_changing_item_line(digest_fixture, 
     assert rc == 0
 
     new_markdown = markdown_path.read_text(encoding="utf-8")
-    assert "  → " + _label(1) in new_markdown
+    assert "  → " + _label(input_payload["items"][0]) in new_markdown
 
     # 항목 줄·원문 줄은 정본과 여전히 동일 문자열(편집 불가 영역 불변)
     refreshed_items = _manifest_items(markdown_path)
@@ -299,7 +304,9 @@ def test_apply_json_adds_enrich_line_without_changing_item_line(digest_fixture, 
         assert entry["line"] == original_lines[entry["id"]]
         assert entry["origin_line"] == original_origins[entry["id"]]
         assert entry["enrich_line"] == blocks_mod.enrich_line_text(
-            _label(id_to_n[entry["id"]])
+            {item["n"]: _label(item) for item in input_payload["items"]}[
+                id_to_n[entry["id"]]
+            ]
         )
 
     # blocks 파서가 보강 줄을 항목 블록의 일부로 인정한다 (산문으로 오판하지 않음)
@@ -337,7 +344,7 @@ def test_apply_json_is_idempotent(digest_fixture, tmp_path):
     fake_output = [
         {
             "n": entry["n"], "대상 태그": "전체", "마감": "원문 확인",
-            "자격": "원문 확인", "금액": "원문 확인", "한 줄 의미": "확인 가능",
+            "자격": "원문 확인", "금액": "원문 확인", "한 줄 의미": _label(entry),
         }
         for entry in input_payload["items"]
     ]
@@ -357,7 +364,7 @@ def test_apply_json_is_idempotent(digest_fixture, tmp_path):
     twice = markdown_path.read_text(encoding="utf-8")
 
     assert once == twice
-    assert once.count("확인 가능") == len(input_payload["items"])
+    assert once.count("  → «") == len(input_payload["items"])
 
 
 def test_manifest_problems_flag_hand_edited_enrich_line(digest_fixture):
@@ -475,9 +482,10 @@ def test_fetch_detail_text_reads_html_with_shared_browser_headers(monkeypatch):
     )))
     text = http_fetch.fetch_detail_text("https://example.test/a")
     assert text == "공고 본문"
-    assert session.max_redirects == http_fetch.MAX_REDIRECTS
     assert session.calls[0][1]["headers"] is http_fetch.PROBE_HEADERS
-    assert session.calls[0][1]["timeout"] == http_fetch.DETAIL_TIMEOUT
+    # 리다이렉트는 직접 따라간다 — requests 자동 추적은 중간 본문을 다 읽는다
+    assert session.calls[0][1]["allow_redirects"] is False
+    assert 0 < session.calls[0][1]["timeout"] <= http_fetch.DETAIL_TIMEOUT
 
 
 def test_fetch_detail_text_is_fail_open_on_error_status_non_html_and_exception(monkeypatch):
@@ -546,7 +554,8 @@ def test_persona_prompt_states_the_evidence_rule():
 
 
 # ─── B1. 한 줄 의미 근거 검증 (숫자 토큰 · 인용 전부) ──────────────────────
-def test_gate_summary_rejects_numbers_with_no_evidence():
+def test_gate_summary_replaces_a_fabricated_claim_with_no_quoted_span():
+    """근거에서 오려 온 «인용» 이 하나도 없는 자유 문장은 통과할 수 없다."""
     items = [_one_input_item()]
     raw = json.dumps([{
         "n": 1, "대상 태그": "전체", "마감": "원문 확인",
@@ -557,20 +566,20 @@ def test_gate_summary_rejects_numbers_with_no_evidence():
     results, warnings = glm_mod.gate_output(raw, items)
 
     assert results[1]["한 줄 의미"] == glm_mod.FALLBACK
-    assert any("근거 없는" in w and "1억" in w for w in warnings)
+    assert any("허용 밖 낱말" in w for w in warnings)
 
 
-def test_gate_summary_accepts_numbers_grounded_in_detail_text():
-    items = [_one_input_item(detail_text="사업비 1억원 규모로 9.30까지 접수")]
+def test_gate_summary_keeps_a_valid_extractive_line_from_detail_text():
+    items = [_one_input_item(detail_text="사업비 1억원, 9.30 까지 접수")]
     raw = json.dumps([{
         "n": 1, "대상 태그": "전체", "마감": "원문 확인",
         "자격": "원문 확인", "금액": "원문 확인",
-        "한 줄 의미": "1억원 규모 9.30까지",
+        "한 줄 의미": "«사업비 1억원» 신청 «9.30» 까지",
     }], ensure_ascii=False)
 
     results, warnings = glm_mod.gate_output(raw, items)
 
-    assert results[1]["한 줄 의미"] == "1억원 규모 9.30까지"
+    assert results[1]["한 줄 의미"] == "«사업비 1억원» 신청 «9.30» 까지"
     assert warnings == []
 
 
@@ -751,7 +760,7 @@ def _apply_fake_enrichment(digest_fixture, tmp_path, name="fake.json"):
         {
             "n": entry["n"], "대상 태그": "전체", "마감": "원문 확인",
             "자격": "원문 확인", "금액": "원문 확인",
-            "한 줄 의미": _label(entry["n"]),
+            "한 줄 의미": _label(entry),
         }
         for entry in payload["items"]
     ]
@@ -880,7 +889,7 @@ def test_dry_run_does_not_clear_existing_enrichment(digest_fixture, tmp_path):
 # ─── B5. 카톡 렌더 ────────────────────────────────────────────────────────
 def test_kakao_render_carries_the_enrich_line_with_the_item(digest_fixture, tmp_path):
     markdown_path = digest_fixture["markdown_path"]
-    _apply_fake_enrichment(digest_fixture, tmp_path)
+    payload = _apply_fake_enrichment(digest_fixture, tmp_path)
     text = markdown_path.read_text(encoding="utf-8")
 
     blocks = composer_mod.kakao_blocks_from_markdown(text)
@@ -890,7 +899,7 @@ def test_kakao_render_carries_the_enrich_line_with_the_item(digest_fixture, tmp_
         lines = chunk.split("\n")
         assert len(lines) == 3
         assert lines[2].strip().startswith("→")
-    assert _label(1) in composer_mod.kakao_file_text_from_markdown(text)
+    assert _label(payload["items"][0]) in composer_mod.kakao_file_text_from_markdown(text)
     assert composer_mod.markdown_kakao_problems(text) == []
 
 
@@ -960,7 +969,7 @@ def test_check_digest_counts_glm_warnings(digest_fixture):
 
 def test_preview_shows_glm_warning_count_and_enrich_line(digest_fixture, tmp_path):
     markdown_path = digest_fixture["markdown_path"]
-    _apply_fake_enrichment(digest_fixture, tmp_path)
+    payload = _apply_fake_enrichment(digest_fixture, tmp_path)
     (digest_fixture["out_dir"] / f"{W13}.glm_warnings.json").write_text(
         json.dumps({"warnings": ["n=1 한 줄 의미 근거 없는 1억"]}, ensure_ascii=False),
         encoding="utf-8",
@@ -973,7 +982,7 @@ def test_preview_shows_glm_warning_count_and_enrich_line(digest_fixture, tmp_pat
         W13, markdown_path.read_text(encoding="utf-8"), check
     )
     assert "GLM 보강 경고 1건" in preview
-    assert _label(1) in preview
+    assert _label(payload["items"][0]) in preview
 
 
 def test_preview_has_no_glm_warning_line_when_there_are_none(digest_fixture):
@@ -1107,3 +1116,597 @@ def test_build_input_items_passes_the_item_title_as_the_anchor(
     for entry in payload["items"]:
         assert seen[entry["url"]] == entry["title"]
         assert entry["detail_text"] == f"{entry['title']} 본문"
+
+
+# ══ V3.1 r2 (Codex 실검토 v3.1 수렴) ══════════════════════════════════════
+# 1. 추출형 `한 줄 의미` — 토큰 경계·문법·정규화
+# ─────────────────────────────────────────────────────────────────────────
+def test_gate_summary_rejects_a_span_cut_from_the_middle_of_a_token():
+    """근거 `사업비 11억원` 에서 `1억원` 을 오려 새 금액을 만들 수 없다."""
+    items = [_one_input_item(summary="사업비 11억원 규모")]
+    raw = json.dumps([{
+        "n": 1, "대상 태그": "전체", "마감": "원문 확인",
+        "자격": "원문 확인", "금액": "원문 확인",
+        "한 줄 의미": "«1억원» 신청",
+    }], ensure_ascii=False)
+
+    results, warnings = glm_mod.gate_output(raw, items)
+
+    assert results[1]["한 줄 의미"] == glm_mod.FALLBACK
+    assert any("토큰 경계" in w for w in warnings)
+
+
+def test_gate_summary_keeps_a_span_that_crosses_a_newline_in_the_evidence():
+    """근거의 개행을 가로지르는 정상 인용은 오거절되지 않는다 (양쪽 정규화)."""
+    items = [_one_input_item(summary="접수기간\n9월 22일까지\n신청")]
+    raw = json.dumps([{
+        "n": 1, "대상 태그": "전체", "마감": "원문 확인",
+        "자격": "원문 확인", "금액": "원문 확인",
+        "한 줄 의미": "«접수기간 9월 22일까지» 신청",
+    }], ensure_ascii=False)
+
+    results, warnings = glm_mod.gate_output(raw, items)
+
+    assert results[1]["한 줄 의미"] == "«접수기간 9월 22일까지» 신청"
+    assert warnings == []
+
+
+def test_gate_summary_rejects_a_connective_outside_the_whitelist():
+    items = [_one_input_item()]
+    raw = json.dumps([{
+        "n": 1, "대상 태그": "전체", "마감": "원문 확인",
+        "자격": "원문 확인", "금액": "원문 확인",
+        "한 줄 의미": "«9월 22일까지» 무조건 신청",
+    }], ensure_ascii=False)
+
+    results, warnings = glm_mod.gate_output(raw, items)
+
+    assert results[1]["한 줄 의미"] == glm_mod.FALLBACK
+    assert any("허용 밖 낱말" in w and "무조건" in w for w in warnings)
+
+
+def test_gate_summary_grammar_limits_span_count_and_length():
+    evidence = glm_mod.http_fetch.normalize_space("가 나 다 라 마 " + "바" * 70)
+    five_spans = " ".join(f"«{token}»" for token in "가나다라마")
+    assert "인용" in (glm_mod.gate_summary_grammar(five_spans, evidence) or "")
+    long_span = "«" + "바" * 70 + "»"
+    assert "자 초과" in (glm_mod.gate_summary_grammar(long_span, evidence) or "")
+
+
+def test_gate_summary_keeps_the_plain_fallback_string():
+    items = [_one_input_item()]
+    raw = json.dumps([{
+        "n": 1, "대상 태그": "전체", "마감": "원문 확인",
+        "자격": "원문 확인", "금액": "원문 확인", "한 줄 의미": "원문 확인",
+    }], ensure_ascii=False)
+
+    results, warnings = glm_mod.gate_output(raw, items)
+
+    assert results[1]["한 줄 의미"] == glm_mod.FALLBACK
+    assert warnings == []
+
+
+def test_persona_prompt_teaches_the_extractive_grammar():
+    prompt = glm_mod.PERSONA_SYSTEM_PROMPT
+    assert "오려 붙인다" in prompt
+    assert prompt.count("예1:") == 1 and prompt.count("예2:") == 1
+    assert "낱말 경계" in prompt
+
+
+# ─── 2. 형식 게이트 — 맨몸 URL · 양방향 제어문자 ──────────────────────────
+@pytest.mark.parametrize("bad", [
+    "https://evil.test \uc2e0\uccad",            # \ub9e8\ubab8 URL
+    "\uc2e0\uccad www.evil.test/a http://x.y",   # \uc2a4\ud0b4 \uc788\ub294 \ub9e8\ubab8 URL
+    "\uc2e0\uccad\u202e\ud655\uc778",                       # RIGHT-TO-LEFT OVERRIDE
+    "\uc2e0\uccad\u2068\ud655\uc778",                       # FIRST STRONG ISOLATE
+    "\uc2e0\uccad\u202a\ud655\uc778",                       # LEFT-TO-RIGHT EMBEDDING
+])
+def test_format_problem_rejects_bare_urls_and_bidi_controls(bad):
+    assert glm_mod.format_problem(bad) is not None
+
+
+def test_format_problem_accepts_a_plain_extractive_line():
+    assert glm_mod.format_problem("«9월 22일까지» 접수") is None
+
+
+def test_gate_headline_draft_rejects_a_bare_url_and_bidi_control():
+    assert glm_mod.gate_headline_draft("신청 2건 https://evil.test") == ("", False)
+    assert glm_mod.gate_headline_draft("\uc2e0\uccad\u202e2\uac74") == ("", False)
+
+
+# ─── 3. 제거는 외부 I/O **앞**에서 일어난다 ───────────────────────────────
+def test_clear_runs_before_the_db_query_and_http_collection(
+    digest_fixture, tmp_path, monkeypatch
+):
+    """DB 조회가 터져도 지난 보강은 이미 지워져 있다 (수집 중 종료도 같다)."""
+    markdown_path = digest_fixture["markdown_path"]
+    _apply_fake_enrichment(digest_fixture, tmp_path)
+    assert _enrich_line_count(markdown_path) == 2
+
+    def boom(*args, **kwargs):
+        raise RuntimeError("DB 조회 실패")
+
+    monkeypatch.setattr(glm_mod, "fetch_summary_raw", boom)
+    monkeypatch.setattr(
+        glm_mod, "fetch_detail_text",
+        lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("수집 실패")),
+    )
+
+    class Args:
+        week = W13
+        db = digest_fixture["db_path"]
+        out_dir = str(digest_fixture["out_dir"])
+        dry_run = False
+        apply_json = None
+
+    with pytest.raises(RuntimeError):
+        glm_mod.run(Args())
+
+    assert _enrich_line_count(markdown_path) == 0
+    assert all(
+        (entry.get("enrich_line") or "") == ""
+        for entry in _manifest_items(markdown_path)
+    )
+
+
+# ─── 4. 원자성 — 정본에만 남은 보강을 다음 실행이 치유한다 ────────────────
+def test_clear_heals_a_manifest_that_kept_enrich_lines_after_a_crash(
+    digest_fixture, tmp_path, monkeypatch
+):
+    """md 를 쓴 뒤 정본을 쓰기 전에 죽은 상태 → 다음 실행이 둘 다 비운다."""
+    import hashlib
+
+    markdown_path = digest_fixture["markdown_path"]
+    _apply_fake_enrichment(digest_fixture, tmp_path)
+
+    # 중단 창 재현: md 의 보강 줄만 지우고 정본은 그대로 둔다.
+    text = markdown_path.read_text(encoding="utf-8")
+    present = [
+        str(block["item_id"])
+        for block in blocks_mod.item_blocks(text)
+        if block.get("enrich_line")
+    ]
+    stripped, changed = blocks_mod.set_enrich_lines(
+        text, {item_id: None for item_id in present}
+    )
+    assert changed
+    markdown_path.write_text(stripped, encoding="utf-8")
+    assert any(
+        (entry.get("enrich_line") or "") for entry in _manifest_items(markdown_path)
+    )
+
+    monkeypatch.setattr(glm_mod, "DS_BIN", tmp_path / "no-such-ds")
+
+    class NoDsArgs:
+        week = W13
+        db = digest_fixture["db_path"]
+        out_dir = str(digest_fixture["out_dir"])
+        dry_run = False
+        apply_json = None
+
+    assert glm_mod.run(NoDsArgs()) == 0
+
+    manifest = load_items_manifest(markdown_path)
+    assert all((entry.get("enrich_line") or "") == "" for entry in manifest["items"])
+    assert manifest["markdown_sha256"] == hashlib.sha256(
+        markdown_path.read_bytes()
+    ).hexdigest()
+    result = check_digest(
+        db_path=digest_fixture["db_path"], markdown_path=markdown_path,
+        output_path=None, skip_network=False,
+    )
+    assert result["manifest_problems"] == []
+    assert result["pass"], result.get("reason")
+
+
+def test_write_items_manifest_is_atomic_and_leaves_no_temp_file(digest_fixture):
+    markdown_path = digest_fixture["markdown_path"]
+    manifest = load_items_manifest(markdown_path)
+    composer_mod.write_items_manifest(markdown_path, manifest)
+    json_path = composer_mod.items_json_path(markdown_path)
+    assert json_path.exists()
+    assert not json_path.with_name(json_path.name + ".tmp").exists()
+
+
+# ─── 5. HTTP — 벽시계 데드라인 · 잡 예산 · 수동 리다이렉트 · Content-Type ──
+class _Clock:
+    def __init__(self, start: float = 1000.0):
+        self.now = start
+
+    def __call__(self) -> float:
+        return self.now
+
+
+class _SeqSession:
+    """응답을 순서대로 돌려주는 세션 — 리다이렉트 홉 검증용."""
+
+    def __init__(self, responses):
+        self._responses = list(responses)
+        self.urls = []
+        self.max_redirects = None
+
+    def get(self, url, **kwargs):
+        self.urls.append(url)
+        if not self._responses:
+            raise AssertionError("예상보다 많은 요청")
+        return self._responses.pop(0)
+
+    def close(self):
+        pass
+
+
+def _redirect(location, status=302):
+    return _FakeResponse(status_code=status, headers={"Location": location})
+
+
+def _html(body: str):
+    return _FakeResponse(
+        headers={"Content-Type": "text/html; charset=utf-8"},
+        chunks=[body.encode("utf-8")],
+    )
+
+
+def test_fetch_detail_text_aborts_on_the_item_wall_clock_deadline(monkeypatch):
+    """9초마다 조금씩 보내는 서버가 read timeout 을 영원히 리셋하지 못한다."""
+    clock = _Clock()
+
+    class _Slow(_FakeResponse):
+        def iter_content(self, chunk_size=1):
+            def generate():
+                while True:
+                    clock.now += 4.0
+                    yield b"<p>a</p>"
+            return generate()
+
+    _use_session(monkeypatch, _FakeSession(
+        _Slow(headers={"Content-Type": "text/html"})
+    ))
+    assert http_fetch.fetch_detail_text(
+        "https://example.test/a", clock=clock
+    ) == ""
+    assert clock.now - 1000.0 <= http_fetch.DETAIL_TIMEOUT + 4.0
+
+
+def test_fetch_detail_text_skips_items_once_the_job_budget_is_spent(monkeypatch):
+    clock = _Clock()
+    session = _use_session(monkeypatch, _FakeSession(_html("<p>본문</p>")))
+    budget = http_fetch.FetchBudget(seconds=5, clock=clock)
+
+    assert http_fetch.fetch_detail_text(
+        "https://example.test/a", budget=budget, clock=clock
+    ) == "본문"
+
+    clock.now += 10  # 예산 소진
+    assert budget.exhausted()
+    before = len(session.calls)
+    assert http_fetch.fetch_detail_text(
+        "https://example.test/b", budget=budget, clock=clock
+    ) == ""
+    assert len(session.calls) == before  # 요청조차 하지 않는다
+
+
+def test_fetch_detail_text_follows_redirects_manually_up_to_the_limit(monkeypatch):
+    session = _SeqSession([
+        _redirect("/b"), _redirect("/c"), _html("<p>도착</p>"),
+    ])
+    monkeypatch.setattr(http_fetch.requests, "Session", lambda: session)
+    assert http_fetch.fetch_detail_text("https://example.test/a") == "도착"
+    assert session.urls == [
+        "https://example.test/a", "https://example.test/b", "https://example.test/c",
+    ]
+
+
+def test_fetch_detail_text_gives_up_after_too_many_redirects(monkeypatch):
+    session = _SeqSession([_redirect(f"/{n}") for n in range(6)])
+    monkeypatch.setattr(http_fetch.requests, "Session", lambda: session)
+    assert http_fetch.fetch_detail_text("https://example.test/a") == ""
+    assert len(session.urls) == http_fetch.MAX_REDIRECTS + 1
+
+
+def test_fetch_detail_text_refuses_a_non_http_redirect_target(monkeypatch):
+    session = _SeqSession([_redirect("ftp://example.test/a")])
+    monkeypatch.setattr(http_fetch.requests, "Session", lambda: session)
+    assert http_fetch.fetch_detail_text("https://example.test/a") == ""
+
+
+@pytest.mark.parametrize("headers", [
+    {},                                    # Content-Type 누락
+    {"Content-Type": "text/plain"},        # 평문
+    {"Content-Type": "application/json"},
+])
+def test_fetch_detail_text_requires_an_html_content_type(monkeypatch, headers):
+    _use_session(monkeypatch, _FakeSession(
+        _FakeResponse(headers=headers, chunks=[b"<p>x</p>"])
+    ))
+    assert http_fetch.fetch_detail_text("https://example.test/a") == ""
+
+
+# ─── 6. 본문 선택 — 파서 기반 ─────────────────────────────────────────────
+def test_visible_text_reaches_the_article_behind_a_huge_navigation_block():
+    """메뉴가 2,000자를 넘어도 `<article>` 본문이 창에 들어온다."""
+    nav = "<div id='gnb'>" + ("메뉴 바로가기 " * 400) + "</div>"
+    assert len(nav) > 2000
+    html_text = (
+        "<html><body>" + nav
+        + "<article><h2>공고 제목</h2><p>접수기간 9월 22일까지</p></article>"
+        + "</body></html>"
+    )
+    text = http_fetch.visible_text(html_text)
+    assert text.startswith("공고 제목")
+    assert "메뉴" not in text
+
+
+def test_visible_text_prefers_main_then_the_largest_content_container():
+    main_html = (
+        "<body><div id='gnb'>메뉴</div>"
+        "<main><p>메인 본문</p></main></body>"
+    )
+    assert http_fetch.visible_text(main_html) == "메인 본문"
+
+    container_html = (
+        "<body><div class='side'>짧음</div>"
+        "<div class='board-view'><p>게시판 본문 " + ("가" * 50) + "</p></div>"
+        "<div id='contents'>짧은 본문</div></body>"
+    )
+    assert http_fetch.visible_text(container_html).startswith("게시판 본문")
+
+
+def test_visible_text_drops_hidden_elements_and_unclosed_scripts():
+    html_text = (
+        "<body><div hidden>숨김1</div>"
+        "<div aria-hidden='true'>숨김2</div>"
+        "<div style='display:none'>숨김3</div>"
+        "<p>보이는 본문</p>"
+        "<script>var leak = '유출';"
+    )
+    text = http_fetch.visible_text(html_text)
+    assert "보이는 본문" in text
+    for hidden in ("숨김1", "숨김2", "숨김3", "유출"):
+        assert hidden not in text
+
+
+def test_visible_text_keeps_inline_markup_from_splitting_tokens():
+    assert http_fetch.visible_text("<body><p>9월 <b>22</b>일까지</p></body>") == (
+        "9월 22일까지"
+    )
+
+
+def test_visible_text_is_linear_on_pathological_input():
+    import time as _time
+
+    start = _time.monotonic()
+    http_fetch.visible_text("<" * 32000)
+    assert _time.monotonic() - start < 1.0
+
+
+def test_decode_prefers_bom_then_meta_charset_over_a_wrong_header():
+    body = "<html><head><meta charset='utf-8'></head><body><p>한글</p></body></html>"
+    raw = body.encode("utf-8")
+    # 헤더는 iso-8859-1 이라고 우기지만 meta 가 이긴다
+    assert "한글" in http_fetch._decode(raw, "text/html; charset=iso-8859-1")
+    assert "한글" in http_fetch._decode(
+        codecs.BOM_UTF8 + raw, "text/html; charset=iso-8859-1"
+    )
+
+
+# ─── 7. 카톡 — 출현별 대조 · 보강 줄만 떼기 ───────────────────────────────
+def _apply_fallback_enrichment(digest_fixture, tmp_path):
+    """두 항목 모두 `→ 원문 확인` 으로 만든다 (같은 문자열 2개)."""
+    class DryArgs:
+        week = W13
+        db = digest_fixture["db_path"]
+        out_dir = str(digest_fixture["out_dir"])
+        dry_run = True
+        apply_json = None
+
+    glm_mod.run(DryArgs())
+    payload = json.loads(
+        (digest_fixture["out_dir"] / f"{W13}.glm_input.json").read_text(encoding="utf-8")
+    )
+    fake = [
+        {
+            "n": entry["n"], "대상 태그": "전체", "마감": "원문 확인",
+            "자격": "원문 확인", "금액": "원문 확인", "한 줄 의미": "원문 확인",
+        }
+        for entry in payload["items"]
+    ]
+    path = tmp_path / "fallback.json"
+    path.write_text(json.dumps(fake, ensure_ascii=False), encoding="utf-8")
+
+    class ApplyArgs:
+        week = W13
+        db = digest_fixture["db_path"]
+        out_dir = str(digest_fixture["out_dir"])
+        dry_run = False
+        apply_json = str(path)
+
+    assert glm_mod.run(ApplyArgs()) == 0
+    return payload
+
+
+def test_markdown_kakao_problems_counts_identical_enrich_lines_per_item(
+    digest_fixture, tmp_path, monkeypatch
+):
+    """두 항목이 같은 `→ 원문 확인` 이면 하나만 사라져도 잡아야 한다."""
+    markdown_path = digest_fixture["markdown_path"]
+    _apply_fallback_enrichment(digest_fixture, tmp_path)
+    text = markdown_path.read_text(encoding="utf-8")
+    assert text.count("  → 원문 확인") == 2
+    assert composer_mod.markdown_kakao_problems(text) == []
+
+    original = composer_mod.kakao_blocks_from_markdown
+
+    def drop_one(markdown_text):
+        blocks = original(markdown_text)
+        dropped = False
+        out = []
+        for block in blocks:
+            lines = block.split("\n")
+            if not dropped and len(lines) == 3 and lines[2].strip().startswith("→"):
+                out.append("\n".join(lines[:2]))
+                dropped = True
+                continue
+            out.append(block)
+        assert dropped
+        return out
+
+    monkeypatch.setattr(composer_mod, "kakao_blocks_from_markdown", drop_one)
+    problems = composer_mod.markdown_kakao_problems(text)
+    assert any("보강 줄 누락(2→1)" in problem for problem in problems)
+
+
+def test_pack_blocks_drops_only_the_enrich_line_when_a_block_overflows():
+    """보강 줄 때문에 넘치면 **보강 줄만** 뗀다 — 원문 URL 은 살린다."""
+    url = "https://e.test/" + "x" * 17
+    block = f"제목\n  {url}\n  → 원문 확인"
+    limit = 40
+    assert len(block) > limit
+
+    chunks = composer_mod._pack_blocks([block], limit)
+
+    joined = "\n".join(chunks)
+    assert url in joined
+    assert "→ 원문 확인" not in joined
+    assert composer_mod.URL_TOO_LONG_NOTICE not in joined
+
+
+def test_url_too_long_block_keeps_the_enrich_line():
+    block = "제목\n  https://e.test/" + "x" * 200 + "\n  → 원문 확인"
+    replaced = composer_mod._url_too_long_block(block, 60)
+    assert composer_mod.URL_TOO_LONG_NOTICE in replaced
+    assert replaced.endswith("  → 원문 확인")
+
+
+# ─── 8. 미리보기 문구 · 초안 경고의 착지 ──────────────────────────────────
+def test_preview_says_discarded_when_the_whole_output_was_thrown_away(
+    digest_fixture, tmp_path
+):
+    markdown_path = digest_fixture["markdown_path"]
+    broken = tmp_path / "broken.json"
+    broken.write_text("not json", encoding="utf-8")
+
+    class BrokenArgs:
+        week = W13
+        db = digest_fixture["db_path"]
+        out_dir = str(digest_fixture["out_dir"])
+        dry_run = False
+        apply_json = str(broken)
+
+    assert glm_mod.run(BrokenArgs()) == 0
+    warnings_file = json.loads(
+        (digest_fixture["out_dir"] / f"{W13}.glm_warnings.json").read_text(
+            encoding="utf-8")
+    )
+    assert warnings_file["discarded"] is True
+
+    check = check_digest(
+        db_path=digest_fixture["db_path"], markdown_path=markdown_path,
+        output_path=None, skip_network=False,
+    )
+    assert check["glm_discarded"] is True
+    preview = preview_mod.render_preview(
+        W13, markdown_path.read_text(encoding="utf-8"), check
+    )
+    assert "GLM 출력 전체 폐기" in preview
+    assert "원문 확인'으로 대체" not in preview
+
+
+def test_preview_says_replaced_when_only_some_fields_were_gated(
+    digest_fixture, tmp_path
+):
+    markdown_path = digest_fixture["markdown_path"]
+
+    class DryArgs:
+        week = W13
+        db = digest_fixture["db_path"]
+        out_dir = str(digest_fixture["out_dir"])
+        dry_run = True
+        apply_json = None
+
+    glm_mod.run(DryArgs())
+    payload = json.loads(
+        (digest_fixture["out_dir"] / f"{W13}.glm_input.json").read_text(encoding="utf-8")
+    )
+    fake = [
+        {
+            "n": entry["n"], "대상 태그": "전체", "마감": "원문 확인",
+            "자격": "원문 확인", "금액": "원문 확인",
+            "한 줄 의미": "전액 지원 확정",   # 문법 위반 → 필드만 대체
+        }
+        for entry in payload["items"]
+    ]
+    path = tmp_path / "gated.json"
+    path.write_text(json.dumps(fake, ensure_ascii=False), encoding="utf-8")
+
+    class ApplyArgs:
+        week = W13
+        db = digest_fixture["db_path"]
+        out_dir = str(digest_fixture["out_dir"])
+        dry_run = False
+        apply_json = str(path)
+
+    assert glm_mod.run(ApplyArgs()) == 0
+    check = check_digest(
+        db_path=digest_fixture["db_path"], markdown_path=markdown_path,
+        output_path=None, skip_network=False,
+    )
+    assert check["glm_discarded"] is False
+    assert check["glm_warnings"] == 2
+    preview = preview_mod.render_preview(
+        W13, markdown_path.read_text(encoding="utf-8"), check
+    )
+    assert "원문 확인'으로 대체" in preview
+    assert "GLM 출력 전체 폐기" not in preview
+
+
+def test_a_rejected_headline_draft_is_recorded_in_the_warnings_file(
+    digest_fixture, tmp_path, monkeypatch
+):
+    """초안 형식 위반이 콘솔에만 남지 않는다 — 미리보기까지 흐른다."""
+    fake_ds = tmp_path / "ds"
+    fake_ds.write_text("#!/bin/sh\n", encoding="utf-8")
+    monkeypatch.setattr(glm_mod, "DS_BIN", fake_ds)
+
+    class DryArgs:
+        week = W13
+        db = digest_fixture["db_path"]
+        out_dir = str(digest_fixture["out_dir"])
+        dry_run = True
+        apply_json = None
+
+    glm_mod.run(DryArgs())
+    payload = json.loads(
+        (digest_fixture["out_dir"] / f"{W13}.glm_input.json").read_text(encoding="utf-8")
+    )
+    summary_output = json.dumps([
+        {
+            "n": entry["n"], "대상 태그": "전체", "마감": "원문 확인",
+            "자격": "원문 확인", "금액": "원문 확인",
+            "한 줄 의미": _label(entry),
+        }
+        for entry in payload["items"]
+    ], ensure_ascii=False)
+    calls = {"n": 0}
+
+    def fake_ds_call(prompt, timeout=None):
+        calls["n"] += 1
+        return summary_output if calls["n"] == 1 else "-->허위 문장<!--"
+
+    monkeypatch.setattr(glm_mod, "call_ds_glm", fake_ds_call)
+
+    class Args:
+        week = W13
+        db = digest_fixture["db_path"]
+        out_dir = str(digest_fixture["out_dir"])
+        dry_run = False
+        apply_json = None
+
+    assert glm_mod.run(Args()) == 0
+    text = digest_fixture["markdown_path"].read_text(encoding="utf-8")
+    assert glm_mod.GLM_DRAFT_PREFIX not in text
+    warnings_file = json.loads(
+        (digest_fixture["out_dir"] / f"{W13}.glm_warnings.json").read_text(
+            encoding="utf-8")
+    )
+    assert any("초안" in w for w in warnings_file["warnings"])
+    assert warnings_file["discarded"] is False
