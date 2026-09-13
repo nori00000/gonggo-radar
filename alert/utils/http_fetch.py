@@ -24,7 +24,7 @@ import time
 from collections import deque
 import threading
 from html.parser import HTMLParser
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 from urllib.parse import urljoin
 
 import urllib3
@@ -230,10 +230,14 @@ def _text_of(node: _Node) -> str:
             continue
         if current.tag in _DROP_TAGS or _is_hidden(current):
             continue
-        items = list(current.children)
         if current.tag in _MARKED_TAGS:
-            items = [MARKED_SENTINEL] + items + [MARKED_SENTINEL]
-        elif current.tag not in _INLINE_TAGS:
+            # r10: 내용을 **남기지 않는다**. `10<sup>4</sup>㎡` → `10￼㎡`,
+            # 세 문장짜리 `<del>` → 센티넬 하나. 표시만 남기고 지우면 삭제된
+            # 문구가 어떤 경로로도 근거가 될 수 없다.
+            parts.append(MARKED_SENTINEL)
+            continue
+        items = list(current.children)
+        if current.tag not in _INLINE_TAGS:
             items = [" "] + items + [" "]
         for child in reversed(items):
             stack.append(child)
@@ -255,6 +259,9 @@ def _measure(root: _Node) -> Dict[int, int]:
             continue
         if node.tag in _DROP_TAGS or _is_hidden(node):
             lengths[id(node)] = 0
+            continue
+        if node.tag in _MARKED_TAGS:
+            lengths[id(node)] = 1          # 센티넬 한 글자 (r10)
             continue
         if done:
             total = 0
@@ -503,20 +510,33 @@ def _header(response, name: str) -> str:
     return value or ""
 
 
-def _read_capped(response, max_bytes: int, deadline: float, clock) -> Optional[bytes]:
-    """본문을 max_bytes 까지, deadline 까지만 읽는다. 시간 초과면 None."""
+def _read_capped(
+    response, max_bytes: int, deadline: float, clock
+) -> Tuple[Optional[bytes], bool]:
+    """본문을 max_bytes 까지, deadline 까지만 읽는다.
+
+    Returns:
+        (바이트, 상한에서 끊겼는가). 시간 초과면 (None, False).
+
+    r10: **바이트 상한도 절단이다.** 512KiB 경계가 `…신청 가능|하지
+    않습니다.` 한가운데 떨어지면 글자 수 창을 넘지 않았는데도 마지막 단위가
+    불완전하다 — 그 사실을 `DetailText.truncated` 까지 전달해야 한다.
+    """
     chunks: List[bytes] = []
     size = 0
+    capped = False
     for chunk in response.stream(_READ_CHUNK, decode_content=True):
         if clock() >= deadline:
-            return None
+            return None, False
         if not chunk:
             continue
         chunks.append(chunk)
         size += len(chunk)
         if size >= max_bytes:
+            capped = True
             break  # 상한에서 멈춘다 — 남은 본문을 drain 하지 않는다
-    return b"".join(chunks)[:max_bytes]
+    raw = b"".join(chunks)
+    return raw[:max_bytes], capped or len(raw) > max_bytes
 
 
 def _fetch(url, anchor, deadline, max_bytes, limit, clock) -> DetailText:
@@ -543,11 +563,16 @@ def _fetch(url, anchor, deadline, max_bytes, limit, clock) -> DetailText:
             content_type = _header(response, "content-type").lower()
             if "html" not in content_type:
                 return DetailText("")
-            raw = _read_capped(response, max_bytes, deadline, clock)
+            raw, byte_capped = _read_capped(response, max_bytes, deadline, clock)
             if not raw:
                 return DetailText("")
-            return visible_text(
+            text = visible_text(
                 _decode(raw, content_type), limit, anchor, deadline, clock
+            )
+            # 절단 원인은 둘 — 글자 수 창(anchored_window)과 바이트 상한.
+            # 어느 쪽이든 마지막 단위는 믿을 수 없다.
+            return DetailText(
+                text, truncated=bool(text.truncated) or byte_capped
             )
         finally:
             # **close 가 먼저다**: 미소비 응답에 release_conn 을 먼저 부르면

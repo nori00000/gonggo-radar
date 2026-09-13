@@ -3172,3 +3172,79 @@ def test_the_checker_threat_model_states_the_headline_draft_is_comment_only():
     assert "GLM 초안" in doc
     assert "주석" in doc
     assert "apply_commentary.py" in doc
+
+
+# ══ V3.1 r10 — 바이트 상한도 절단 · 표시 내용은 지운다 ════════════════════
+def test_hitting_the_byte_cap_marks_the_text_as_truncated(monkeypatch):
+    """Codex: 512KiB 경계가 `…신청 가능|하지 않습니다.` 한가운데 떨어진다."""
+    tail = "사회적기업은 신청 가능하지 않습니다."
+    head = "<article>접수는 9월 22일까지 진행합니다. " + tail
+    encoded = head.encode("utf-8")
+    # 상한이 `신청 가능` 직후에 떨어지도록 바이트 수를 맞춘다
+    cut = head.index("가능") + 2
+    cap = len(head[:cut].encode("utf-8"))
+
+    _use_open(monkeypatch, _FakeResponse(
+        headers={"content-type": "text/html; charset=utf-8"},
+        chunks=[encoded],
+    ))
+    text = http_fetch.fetch_detail_text("https://example.test/a", max_bytes=cap)
+
+    assert text.truncated is True
+    assert text.endswith("신청 가능")
+    candidates = glm_mod.candidate_sentences(
+        {"title": "제목", "detail_text": str(text), "detail_truncated": True}
+    )
+    assert not any("신청 가능" in unit for unit in candidates), candidates
+    assert candidates == ["접수는 9월 22일까지 진행합니다."]
+
+
+def test_a_body_under_the_byte_cap_is_not_marked_truncated(monkeypatch):
+    body = "<article>접수는 9월 22일까지 진행합니다. 지원금은 300만원입니다.</article>"
+    _use_open(monkeypatch, _FakeResponse(
+        headers={"content-type": "text/html; charset=utf-8"},
+        chunks=[body.encode("utf-8")],
+    ))
+    text = http_fetch.fetch_detail_text("https://example.test/a")
+    assert text.truncated is False
+    assert len(glm_mod.candidate_sentences(
+        {"title": "제목", "detail_text": str(text)}
+    )) == 2
+
+
+def test_marked_content_is_removed_not_flattened():
+    """r10: 표시 요소의 텍스트는 남기지 않는다 — 센티넬 하나만."""
+    assert http_fetch.visible_text(
+        "<article>지원 면적은 10<sup>4</sup>㎡입니다.</article>"
+    ) == "지원 면적은 10" + http_fetch.MARKED_SENTINEL + "㎡입니다."
+
+
+def test_a_deleted_block_of_three_sentences_leaves_one_sentinel():
+    """Codex: `<del>` 안의 세 문장이 그대로 후보가 되면 안 된다."""
+    text = http_fetch.visible_text(
+        "<article>첫 문장입니다. "
+        "<del>둘 문장입니다. 셋 문장입니다. 넷 문장입니다.</del> "
+        "다섯 문장입니다.</article>"
+    )
+    assert text.count(http_fetch.MARKED_SENTINEL) == 1
+    for gone in ("둘 문장", "셋 문장", "넷 문장"):
+        assert gone not in text
+
+    candidates = glm_mod.candidate_sentences(
+        {"title": "제목", "detail_text": str(text)}
+    )
+    assert all(
+        http_fetch.MARKED_SENTINEL not in unit for unit in candidates
+    )
+    for gone in ("둘 문장", "셋 문장", "넷 문장"):
+        assert not any(gone in unit for unit in candidates), candidates
+
+
+def test_the_superscript_unit_is_still_dropped_from_candidates():
+    text = http_fetch.visible_text(
+        "<article>지원 면적은 10<sup>4</sup>㎡입니다. 접수는 9월 22일까지 진행합니다.</article>"
+    )
+    assert glm_mod.candidate_sentences(
+        {"title": "제목", "detail_text": str(text)}
+    ) == ["접수는 9월 22일까지 진행합니다."]
+    assert glm_mod.marked_unit_count(str(text)) == 1
