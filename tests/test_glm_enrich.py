@@ -2793,7 +2793,7 @@ def test_a_long_enumeration_yields_several_units_inside_the_window():
 
 @pytest.mark.parametrize("marker", [
     "가.", "하.", "ㄱ.", "1.", "99.", "1)", "99)", "①", "⑳", "ㅇ ", "○ ",
-    "- ", "• ", "▶", "■", "※",
+    "- ", "• ", "▶", "■", "※", "ㅁ ", "□", "▪", "◦", "▷",
 ])
 def test_every_declared_marker_starts_a_new_unit(marker):
     """표지 쪼개기는 **상한을 넘는 문장**에만 적용된다 — 긴 입력으로 확인한다."""
@@ -2866,3 +2866,45 @@ def test_a_number_inside_a_date_run_is_not_a_list_marker():
     units = glm_mod.candidate_units(body)
     assert not any(unit.startswith("12.") for unit in units), units
     assert not any(unit.startswith("13.") for unit in units), units
+
+
+# ══ V3.1 r8 — 글머리 기호 보강 · 두 덩어리 날짜 보호 ══════════════════════
+def test_the_new_bullet_markers_split_a_long_line():
+    """W37 n=1 의 실제 글머리 기호는 `ㅁ` 였다."""
+    body = (
+        "여기에 충분히 긴 설명 문장을 적어 둔다 " * 6
+        + "ㅁ 모집대상 창업 7년 이내 기업이 해당한다 ㅁ 모집분야 산림 기술 전반"
+    )
+    assert len(body) > glm_mod.MAX_CANDIDATE_CHARS
+    units = glm_mod.candidate_units(body)
+    assert "ㅁ 모집대상 창업 7년 이내 기업이 해당한다" in units
+    assert "ㅁ 모집분야 산림 기술 전반" in units
+
+
+@pytest.mark.parametrize("cued,expected", [
+    ("접수기간 2026. 9. 7. ~ 9. 30.(수) 15:00까지", "~ 로 이어진 두 덩어리 날짜"),
+    ("신청은 9. 30. 까지 받는다", "까지 가 뒤따르는 두 덩어리 날짜"),
+])
+def test_a_two_group_date_with_a_cue_is_protected(cued, expected):
+    assert glm_mod._split_at_markers(cued) == [cued], expected
+
+
+@pytest.mark.parametrize("plain", [
+    "붙임 목록은 1. 2. 순서로 정리되어 있다",
+    "제출 서류는 1. 신청서 2. 사업계획서 순이다",
+])
+def test_bare_list_numbering_is_still_a_marker(plain):
+    """단서 없는 `1. 2.` 는 날짜가 아니라 목록 번호다 — 그대로 쪼갠다."""
+    assert len(glm_mod._split_at_markers(plain)) > 1
+
+
+def test_the_w37_n1_line_survives_as_one_unit():
+    """r7 에서 `30.(수) …` 로 잘리던 줄이 통째로 한 단위가 된다."""
+    body = (
+        "여기에 충분히 긴 설명 문장을 적어 둔다 " * 5
+        + "ㅁ 모집기간 2026. 9. 7.(월) ~ 9. 30.(수) 15:00까지 "
+        + "ㅁ 모집대상 창업 7년 이내 기업"
+    )
+    units = glm_mod.candidate_units(body)
+    assert "ㅁ 모집기간 2026. 9. 7.(월) ~ 9. 30.(수) 15:00까지" in units
+    assert not any(unit.startswith("30.") for unit in units), units

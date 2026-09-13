@@ -125,6 +125,15 @@ _DATE_RUN_RE = re.compile(
     r"[\u2019']?\d{1,4}\s*[.．]\s*\d{1,2}\s*[.．]\s*\d{1,2}\s*[.．]?"
     r"(?:\s*\([^()]{1,3}\))?"
 )
+# 두 덩어리 날짜(`9. 30.`)는 그 자체로는 목록 번호와 구분되지 않는다 — 앞뒤에
+# **날짜라는 단서**가 있을 때만 날짜로 본다 (r8). 단서가 없는 `1. 2.` 는 그대로
+# 목록 번호다.
+_SHORT_DATE_RE = re.compile(
+    r"\d{1,2}\s*[.．]\s*\d{1,2}\s*[.．]?(?:\s*\([^()]{1,3}\))?"
+)
+_SHORT_DATE_BEFORE_RE = re.compile(r"(?:[~\u007e\uff5e\-]\s*|부터\s*)$")
+_SHORT_DATE_AFTER_RE = re.compile(r"^\s*(?:\([^()]{1,3}\)|까지|\d{1,2}:\d{2}|시)")
+_SHORT_DATE_CUE_WINDOW = 6
 # ─── 절(clause) 단위 쪼개기 (r7) ────────────────────────────────────────
 # 공고문은 산문이 아니라 **열거문**이다 — `1.` `가.` `나.` 는 문장 안의 장식이
 # 아니라 유일한 구분자였다(r6 실측: 한 "문장"이 최대 1,882자). 표지는 **뒤따르는**
@@ -132,7 +141,7 @@ _DATE_RUN_RE = re.compile(
 # 부분문자열이라 "원문 그대로" 보장은 그대로다.
 _MARKER_PATTERN = (
     r"(?:[가나다라마바사아자차카타파하]\.|[ㄱ-ㅎ]\.|\d{1,2}\.|\d{1,2}\)"
-    r"|[\u2460-\u2473]|ㅇ\s|○\s|-\s|•\s|▶|■|※)"
+    r"|[\u2460-\u2473]|ㅇ\s|○\s|ㅁ\s|-\s|•\s|▶|■|※|□|▪|◦|▷)"
 )
 _MARKER_SPLIT_RE = re.compile(r"(?:(?<=\s)|^)" + _MARKER_PATTERN)
 # 조각이 그래도 길면 여기서 한 번 더 자른다.
@@ -172,9 +181,27 @@ def _token_before(line: str, index: int) -> str:
     return line[start:index]
 
 
+def _has_short_date_cue(line: str, start: int, end: int) -> bool:
+    """두 덩어리 날짜를 **날짜로 볼 단서**가 앞뒤에 있는가 (r8).
+
+    앞: `~` · `-` · `부터` 바로 뒤. 뒤: `(요일)` · `까지` · 시각 표기가
+    `_SHORT_DATE_CUE_WINDOW` 자 안에. 둘 다 없으면 목록 번호로 둔다.
+    """
+    if _SHORT_DATE_BEFORE_RE.search(line[:start]):
+        return True
+    return bool(_SHORT_DATE_AFTER_RE.match(line[end:end + _SHORT_DATE_CUE_WINDOW]))
+
+
 def _date_spans(line: str) -> List[Tuple[int, int]]:
-    """`2026. 9. 11.` · `’26.11.13.` · `2026.09.30.(수)` 같은 날짜 연속체 구간."""
-    return [(m.start(), m.end()) for m in _DATE_RUN_RE.finditer(line)]
+    """날짜 연속체 구간 — 세 덩어리는 무조건, 두 덩어리는 단서가 있을 때만."""
+    spans = [(m.start(), m.end()) for m in _DATE_RUN_RE.finditer(line)]
+    for match in _SHORT_DATE_RE.finditer(line):
+        start, end = match.start(), match.end()
+        if any(left <= start < right for left, right in spans):
+            continue                       # 세 덩어리 날짜 안이면 이미 보호됨
+        if _has_short_date_cue(line, start, end):
+            spans.append((start, end))
+    return sorted(spans)
 
 
 def _is_sentence_end(
