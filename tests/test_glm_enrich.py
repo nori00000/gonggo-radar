@@ -1710,3 +1710,171 @@ def test_a_rejected_headline_draft_is_recorded_in_the_warnings_file(
     )
     assert any("초안" in w for w in warnings_file["warnings"])
     assert warnings_file["discarded"] is False
+
+
+# ══ V3.1 r3 — ds 프롬프트 상한(16,384바이트) 때문에 배치로 나눈다 ═════════
+def _big_item(n, chars, id_=None):
+    return {
+        "n": n, "id": id_ if id_ is not None else 40 + n,
+        "title": f"공고 {n}", "source_name": "기관",
+        "summary": "", "detail_text": "가" * chars,
+        "quote_deadline": "", "quote_eligibility": "원문 확인",
+        "quote_amount": "원문 확인", "url": f"https://example.com/{n}",
+    }
+
+
+def test_batch_input_items_keeps_every_prompt_under_the_byte_budget():
+    today = "2026-09-13"
+    items = [_big_item(n, 2500) for n in range(1, 6)]
+
+    batches = glm_mod.batch_input_items(today, items)
+
+    assert len(batches) > 1
+    for batch in batches:
+        assert glm_mod.prompt_bytes(today, batch) <= glm_mod.PROMPT_BYTE_BUDGET
+    # 모든 항목이 정확히 한 번씩, 문서 순서대로
+    assert [item["n"] for batch in batches for item in batch] == [1, 2, 3, 4, 5]
+
+
+def test_batch_input_items_trims_a_single_oversized_item_instead_of_dropping_it():
+    today = "2026-09-13"
+    huge = _big_item(1, 20000)
+
+    batches = glm_mod.batch_input_items(today, [huge])
+
+    assert len(batches) == 1 and len(batches[0]) == 1
+    trimmed = batches[0][0]
+    assert trimmed["n"] == 1                      # 항목이 사라지지 않았다
+    assert 0 < len(trimmed["detail_text"]) < 20000  # 뒤에서 잘렸다
+    assert huge["detail_text"].startswith(trimmed["detail_text"])
+    assert glm_mod.prompt_bytes(today, [trimmed]) <= glm_mod.PROMPT_BYTE_BUDGET
+
+
+def test_trim_item_to_budget_leaves_a_small_item_untouched():
+    today = "2026-09-13"
+    small = _big_item(1, 10)
+    assert glm_mod.trim_item_to_budget(today, small) == small
+
+
+def _stub_ds_calls(monkeypatch, responder):
+    """`call_ds_glm` 을 갈아끼우고 (프롬프트, 바이트수) 를 기록한다."""
+    seen = []
+
+    def fake(prompt, timeout=None):
+        seen.append((prompt, len(prompt.encode("utf-8"))))
+        return responder(prompt, len(seen))
+
+    monkeypatch.setattr(glm_mod, "call_ds_glm", fake)
+    return seen
+
+
+def _ds_present(monkeypatch, tmp_path):
+    fake_ds = tmp_path / "ds"
+    fake_ds.write_text("#!/bin/sh\n", encoding="utf-8")
+    monkeypatch.setattr(glm_mod, "DS_BIN", fake_ds)
+
+
+def _batch_ns(prompt):
+    payload = json.loads(prompt.split("\n\n입력\n", 1)[1])
+    return [item["n"] for item in payload["items"]]
+
+
+def _extractive_for(prompt):
+    payload = json.loads(prompt.split("\n\n입력\n", 1)[1])
+    return json.dumps([
+        {
+            "n": item["n"], "대상 태그": "전체", "마감": "원문 확인",
+            "자격": "원문 확인", "금액": "원문 확인",
+            "한 줄 의미": "«{}» 신청".format(item["title"].split()[0]),
+        }
+        for item in payload["items"]
+    ], ensure_ascii=False)
+
+
+def test_run_splits_into_batches_and_each_prompt_fits_the_cap(
+    digest_fixture, tmp_path, monkeypatch
+):
+    """W37 실패 재현: detail_text 를 실으면 한 프롬프트에 다 들어가지 않는다."""
+    monkeypatch.setattr(
+        glm_mod, "fetch_detail_text", lambda url, **kwargs: "가" * 3000
+    )
+    _ds_present(monkeypatch, tmp_path)
+    seen = _stub_ds_calls(
+        monkeypatch,
+        lambda prompt, index: _extractive_for(prompt) if index <= 2 else "한 줄 문장",
+    )
+
+    class Args:
+        week = W13
+        db = digest_fixture["db_path"]
+        out_dir = str(digest_fixture["out_dir"])
+        dry_run = False
+        apply_json = None
+
+    assert glm_mod.run(Args()) == 0
+
+    summary_calls = seen[:-1]          # 마지막은 "이번 주 한 줄" 초안 호출
+    assert len(summary_calls) == 2     # 항목 2건이 배치 2개로 갈렸다
+    for _prompt, size in seen:
+        assert size <= glm_mod.PROMPT_BYTE_BUDGET
+    assert sorted(
+        n for prompt, _ in summary_calls for n in _batch_ns(prompt)
+    ) == [1, 2]
+    assert [_batch_ns(prompt) for prompt, _ in summary_calls] == [[1], [2]]
+
+    payload = json.loads(
+        (digest_fixture["out_dir"] / f"{W13}.glm_input.json").read_text(encoding="utf-8")
+    )
+    assert payload["batches"] == [[1], [2]]
+    assert _enrich_line_count(digest_fixture["markdown_path"]) == 2
+
+
+def test_a_failing_batch_does_not_stop_the_other_batches(
+    digest_fixture, tmp_path, monkeypatch
+):
+    monkeypatch.setattr(
+        glm_mod, "fetch_detail_text", lambda url, **kwargs: "가" * 3000
+    )
+    _ds_present(monkeypatch, tmp_path)
+
+    def responder(prompt, index):
+        if index == 1:
+            return "이것은 JSON 이 아닙니다"   # 첫 배치 파싱 실패
+        if index == 2:
+            return _extractive_for(prompt)
+        return "한 줄 문장"
+
+    _stub_ds_calls(monkeypatch, responder)
+
+    class Args:
+        week = W13
+        db = digest_fixture["db_path"]
+        out_dir = str(digest_fixture["out_dir"])
+        dry_run = False
+        apply_json = None
+
+    assert glm_mod.run(Args()) == 0
+
+    # 둘째 배치만 적용된다
+    assert _enrich_line_count(digest_fixture["markdown_path"]) == 1
+    warnings_file = json.loads(
+        (digest_fixture["out_dir"] / f"{W13}.glm_warnings.json").read_text(
+            encoding="utf-8")
+    )
+    assert any(
+        "배치 1" in warning and "n=[1]" in warning
+        for warning in warnings_file["warnings"]
+    )
+    assert warnings_file["discarded"] is False
+    result = check_digest(
+        db_path=digest_fixture["db_path"],
+        markdown_path=digest_fixture["markdown_path"],
+        output_path=None, skip_network=False,
+    )
+    assert result["pass"], result.get("reason")
+
+
+def test_headline_prompt_stays_under_the_cap(digest_fixture):
+    manifest_items = _manifest_items(digest_fixture["markdown_path"])
+    prompt = glm_mod.build_headline_prompt(manifest_items)
+    assert len(prompt.encode("utf-8")) <= glm_mod.PROMPT_BYTE_BUDGET

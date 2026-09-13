@@ -334,6 +334,74 @@ def payload_for_glm(items: List[Dict]) -> List[Dict]:
     return [{k: v for k, v in item.items() if k != "id"} for item in items]
 
 
+# ─── 프롬프트 배치 (r3) ──────────────────────────────────────────────────
+# `~/bin/ds -g` 는 16,384바이트를 넘는 프롬프트를 거절한다(exit 9,
+# "prompt too large for GLM chunk lane"). W37 실측 프롬프트는 22,209바이트였다
+# — detail_text 를 공급한 순간 8건이 한 번에 들어가지 않는다. 그래서 항목을
+# **탐욕적으로** 묶어 배치마다 한 번씩 부른다. 배치 하나가 실패해도 나머지
+# 배치는 그대로 적용된다(잡 전체를 버리지 않는다).
+PROMPT_BYTE_BUDGET = 14000  # 16,384 상한에 여유를 둔다(ds 가 헤더를 덧붙인다)
+
+
+def build_summary_prompt(payload: Dict) -> str:
+    """페르소나 지시 + 입력 JSON — ds 에 실제로 들어가는 문자열."""
+    return (
+        PERSONA_SYSTEM_PROMPT
+        + "\n\n입력\n"
+        + json.dumps(payload, ensure_ascii=False)
+    )
+
+
+def prompt_bytes(today: str, items: List[Dict]) -> int:
+    """이 항목들로 만든 프롬프트의 바이트 수 (ds 가 세는 단위)."""
+    return len(build_summary_prompt(
+        {"today": today, "items": payload_for_glm(items)}
+    ).encode("utf-8"))
+
+
+def trim_item_to_budget(
+    today: str, item: Dict, budget: int = PROMPT_BYTE_BUDGET
+) -> Dict:
+    """혼자서도 예산을 넘는 항목의 `detail_text` 를 **뒤에서** 잘라 맞춘다.
+
+    항목을 조용히 빼지 않는다 — 빠진 항목은 보강도 경고도 없이 사라져서,
+    사람이 "왜 이 항목만 한 줄이 없지"를 알 길이 없다. 근거를 줄이면 추출형
+    게이트가 알아서 `원문 확인` 쪽으로 기운다(안전한 실패).
+    """
+    trimmed = dict(item)
+    if prompt_bytes(today, [trimmed]) <= budget:
+        return trimmed
+    detail = trimmed.get("detail_text") or ""
+    low, high = 0, len(detail)
+    while low < high:
+        mid = (low + high + 1) // 2
+        trimmed["detail_text"] = detail[:mid]
+        if prompt_bytes(today, [trimmed]) <= budget:
+            low = mid
+        else:
+            high = mid - 1
+    trimmed["detail_text"] = detail[:low]
+    return trimmed
+
+
+def batch_input_items(
+    today: str, input_items: List[Dict], budget: int = PROMPT_BYTE_BUDGET
+) -> List[List[Dict]]:
+    """항목을 예산 이하의 배치로 탐욕적으로 묶는다 (문서 순서 보존)."""
+    batches: List[List[Dict]] = []
+    current: List[Dict] = []
+    for item in input_items:
+        candidate = trim_item_to_budget(today, item, budget)
+        if current and prompt_bytes(today, current + [candidate]) > budget:
+            batches.append(current)
+            current = [candidate]
+        else:
+            current.append(candidate)
+    if current:
+        batches.append(current)
+    return batches
+
+
 # ─── ds 호출 ─────────────────────────────────────────────────────────────
 def call_ds_glm(prompt_text: str, timeout: int = DS_SUBPROCESS_TIMEOUT) -> Optional[str]:
     """`~/bin/ds -g` 호출(stdin 파이프 — 인자 전달 금지 규칙). 실패하면 None."""
@@ -660,8 +728,17 @@ def run(args) -> int:
         except OSError:
             pass
 
+    today = date.today().isoformat()
     input_items = build_input_items(manifest_items, args.db)
-    input_payload = {"today": date.today().isoformat(), "items": payload_for_glm(input_items)}
+    # r3: ds 의 프롬프트 상한 때문에 배치가 필요하다. 배치를 **먼저** 잡아야
+    # 잘린 detail_text 가 입력 JSON 에도 그대로 남는다(보낸 것과 기록이 같다).
+    batches = batch_input_items(today, input_items)
+    input_items = [item for batch in batches for item in batch]
+    input_payload = {
+        "today": today,
+        "items": payload_for_glm(input_items),
+        "batches": [[item["n"] for item in batch] for batch in batches],
+    }
 
     input_json_path = out_dir / f"{args.week}.glm_input.json"
     input_json_path.write_text(
@@ -674,24 +751,42 @@ def run(args) -> int:
         _out("--dry-run: ds 호출 생략")
         return 0
 
+    results: Dict[int, Dict] = {}
+    warnings: List[str] = []
+
     if args.apply_json:
+        # 다른 머신에서 **한 번에** 받은 출력을 적용하는 경로 — 배치 없이
+        # 전체 n 집합으로 한 번 검사한다.
         raw_output = Path(args.apply_json).read_text(encoding="utf-8")
         _out(f"GLM 출력(파일): {args.apply_json}")
+        results, warnings = gate_output(raw_output, input_items)
     else:
         if not DS_BIN.exists():
             _out(f"⚠️  {DS_BIN} 없음 — GLM 보강 생략")
             return 0
-        prompt = (
-            PERSONA_SYSTEM_PROMPT
-            + "\n\n입력\n"
-            + json.dumps(input_payload, ensure_ascii=False)
-        )
-        raw_output = call_ds_glm(prompt)
-        if raw_output is None:
-            _out("⚠️  ds -g 호출 실패/타임아웃 — GLM 보강 생략")
-            return 0
+        _out(f"배치 {len(batches)}개로 분할 (프롬프트 상한 {PROMPT_BYTE_BUDGET}바이트)")
+        for index, batch in enumerate(batches, start=1):
+            numbers = [item["n"] for item in batch]
+            size = prompt_bytes(today, batch)
+            _out(f"  배치 {index}/{len(batches)} n={numbers} {size}바이트")
+            raw_output = call_ds_glm(build_summary_prompt(
+                {"today": today, "items": payload_for_glm(batch)}
+            ))
+            if raw_output is None:
+                warnings.append(
+                    f"배치 {index} n={numbers} ds 호출 실패/타임아웃 — 이 배치만 미적용"
+                )
+                continue
+            # n 집합 정확 일치는 **그 배치의 집합**으로 판정한다.
+            batch_results, batch_warnings = gate_output(raw_output, batch)
+            warnings.extend(batch_warnings)
+            if not batch_results:
+                warnings.append(
+                    f"배치 {index} n={numbers} 출력 폐기 — 이 배치만 미적용"
+                )
+                continue
+            results.update(batch_results)
 
-    results, warnings = gate_output(raw_output, input_items)
     for warning in warnings:
         _out(f"  ⚠️  {warning}")
 
@@ -720,7 +815,15 @@ def run(args) -> int:
 
     # "이번 주 한 줄" 초안 — 별도 호출, 실호출 경로에서만 시도(실패해도 무시).
     if not args.apply_json:
-        headline_raw = call_ds_glm(build_headline_prompt(manifest_items))
+        headline_prompt = build_headline_prompt(manifest_items)
+        headline_size = len(headline_prompt.encode("utf-8"))
+        if headline_size > PROMPT_BYTE_BUDGET:
+            warnings.append(
+                f"이번 주 한 줄 초안 프롬프트 {headline_size}바이트 초과 — 초안 생략"
+            )
+            headline_raw = None
+        else:
+            headline_raw = call_ds_glm(headline_prompt)
         draft, draft_ok = gate_headline_draft(headline_raw or "")
         if headline_raw and not draft_ok:
             # r2 (Codex LOW): 초안 경고도 경고 파일로 간다 — 콘솔에만 남기면
