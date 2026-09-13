@@ -40,6 +40,9 @@ VERDICT_MONTHLY = "월간 종합"
 
 SECTION_COUNCIL = "협의회에서"
 SECTION_MEMBER = "회원사 소식"
+# 라운드 2: 월간호 맨 아래 인용 안내. 헤딩을 두는 이유는 구조다 — 헤딩 없는 줄은
+# 직전 섹션(항목 섹션)에 속해 `prose_lines_in_item_sections` 가 fail-closed 로 잡는다.
+SECTION_NOTICE = "인용 안내"
 
 # 발송본 형식 v2.1의 섹션 머리글 (마크다운 `## ` 뒤에 오는 문자열 = 정본)
 SECTION_HEADINGS = {
@@ -48,6 +51,7 @@ SECTION_HEADINGS = {
     SECTION_COUNCIL: "🤝 협의회에서",
     SECTION_MEMBER: "🏢 회원사 소식",
     VERDICT_MONTHLY: "📚 월간 종합",
+    SECTION_NOTICE: "ℹ️ 인용 안내",
 }
 HEADING_TO_SECTION = {heading: name for name, heading in SECTION_HEADINGS.items()}
 
@@ -116,6 +120,17 @@ SOURCE_DISPLAY_NAMES = {
     "seis": "사회적기업진흥원 통합정보",
     "mois_sse": "행정안전부 마을기업",
     "bizinfo": "기업마당",
+    # 라운드 2 — 2차 미디어(kind='media', 월간호 전용). 매체명은 **이 표가 정본**이다:
+    # checker 가 `source_display_name(DB.source)` 로 재계산해 정본과 대조하므로
+    # (`_classification_problems`), raw_data 의 publisher 를 읽으면 대조가 깨진다.
+    # 값의 출처는 P1-R 레인 보고서 §1 (등록한 소스 표).
+    "lifein": "라이프인",
+    "eroun": "이로운넷",
+    "senews": "사회적경제뉴스",
+    "kfnews": "주간 한국임업신문",
+    # 라운드 2 (b) — 월간호 기관 보도·정책 소스. mafra 는 협의회 소스 풀 밖이라
+    # 주간 분류가 배제하지만 월간호는 되살린다.
+    "mafra": "농림축산식품부",
 }
 
 # ─── 룰 v2.1 키워드 사전 (판정 ③) ────────────────────────────────────────
@@ -1011,6 +1026,30 @@ def classify_item(title: str, summary: str, source: str) -> Classification:
 #   · 마감이 있는 항목(알아두세요의 의견 마감·마감 있는 행사 포함) → 주간호 몫
 MONTHLY_HOLD_ACTIONABLE = "행동 대상 — 주간호 몫"
 MONTHLY_HOLD_DEADLINE = "마감 있음 — 주간호 몫"
+# 라운드 2: 주간호가 이미 "회원이 신청할 사업이 아니다" 라고 판정한 부류는 월간호
+# 지면에도 올리지 않는다. 1R 실측에서 월간 후보 24건 중 6건이 이 둘이었다.
+MONTHLY_HOLD_NOT_MONTHLY = "월간호 대상 아님 (노이즈·참가자 모집)"
+MONTHLY_EXCLUDED_HOLD_PREFIXES = ("노이즈 의심", "참가자 모집(B2C)")
+# 라운드 2 (c): 협의회 어휘가 맞지 않은 2차 미디어 기사는 싣지 않는다.
+MONTHLY_HOLD_NO_COUNCIL_MATCH = "협의회 어휘 없음 — 2차 미디어 제외"
+
+# 라운드 2 (b): 월간호가 기관 보도·정책 행을 되살리는 소스.
+# `mafra` 는 `COUNCIL_SOURCES` 밖이라 주간 분류가 "협의회 소스 풀 외"로 배제한다 —
+# 월간호는 그 배제를 뒤집는다(마감 없는 정책·보도자료가 이 레인의 본체이기 때문).
+MONTHLY_PRESS_SOURCES = ("forest_press", "mafra", "socialenterprise", "coop")
+# 되살리지 않는 배제 사유 — 노이즈는 어느 호에서도 노이즈다.
+MONTHLY_RESCUE_BLOCKED_PREFIXES = ("노이즈",)
+MONTHLY_RESCUE_PRESS_REASON = "월간 편입: 기관 보도·정책"
+MONTHLY_RESCUE_MEDIA_REASON = "월간 편입: 2차 미디어"
+
+# 2차 미디어 행의 종류 값 (P1-R 레인: `announcements.kind`). 컬럼이 없는 DB에서는
+# 어떤 행도 media 가 아니므로 이 경로는 그대로 잠들어 있다.
+MEDIA_KIND = "media"
+# 미디어 항목 블록 앞에 놓는 표식. 항목 마커와 **다른 줄**이다 —
+# `ITEM_MARKER_RE` 를 건드리면 blocks.parse_blocks 가 항목을 못 알아본다.
+MEDIA_MARKER = "<!-- media -->"
+# 저작권 규율: 기사에서 본문으로 옮기는 것은 제목·링크·(V3 보강의) 원문 1문장뿐이다.
+MONTHLY_FOOTER_LINE = "기사 항목은 제목·링크·원문 1문장만 인용합니다."
 
 
 def monthly_hold_reason(item: Dict) -> Optional[str]:
@@ -1019,12 +1058,77 @@ def monthly_hold_reason(item: Dict) -> Optional[str]:
     `item` 은 `_build_item` 이 만든 딕셔너리이며, 마감은 중복 병합 뒤의
     **유효 마감**(`item["deadline"]`)을 본다 — 병합 전 값으로 판정하면 복제본이
     마감 없는 항목처럼 보여 월간호로 새어 들어온다.
+
+    판정 순서 (라운드 2):
+      ① 2차 미디어 — 협의회 어휘가 맞은 것만 (기사에는 마감이 없다)
+      ② 주간 보류 사유가 노이즈 의심·참가자 모집(B2C) → 어느 호에도 싣지 않는다
+      ③ 주간 섹션 판정이 `신청하세요` → 주간호 몫
+      ④ 마감이 있음 → 주간호 몫
     """
+    # 노이즈·B2C 판정이 **먼저**다 — 미디어라고 이 관문을 건너뛰면
+    # `채용`·`참가자 모집` 기사가 월간 지면으로 들어온다.
+    if str(item.get("reason") or "").startswith(MONTHLY_EXCLUDED_HOLD_PREFIXES):
+        return MONTHLY_HOLD_NOT_MONTHLY
+    if item.get("media"):
+        if not item.get("council_match"):
+            return MONTHLY_HOLD_NO_COUNCIL_MATCH
+        if item.get("deadline"):
+            return MONTHLY_HOLD_DEADLINE
+        return None
     if item["verdict"] == VERDICT_APPLY:
         return MONTHLY_HOLD_ACTIONABLE
     if item.get("deadline"):
         return MONTHLY_HOLD_DEADLINE
     return None
+
+
+def monthly_rescue_reason(
+    source: str, title: str, classification: "Classification", meta: Dict
+) -> Optional[str]:
+    """주간 분류가 **배제**한 행을 월간호 후보로 되살릴 이유. 없으면 None.
+
+    되살림은 두 갈래뿐이고 둘 다 마감이 없을 때만 성립한다:
+      (b) `MONTHLY_PRESS_SOURCES` 의 기관 보도·정책 행으로 협의회 어휘가 맞았거나
+          (`council_match=1`) 회사 선택 경로가 이미 고른 행(`council_only=0`)
+      (c) `kind='media'` 2차 미디어 행으로 협의회 어휘가 맞은 것
+
+    노이즈는 되살리지 않는다 — 어느 호에서도 노이즈다. 배제 사유만 보면
+    충분하지 않다: 협의회 소스 풀 밖(`mafra`)은 노이즈 판정에 **닿기 전에**
+    "협의회 소스 풀 외"로 끝나므로(`classify_item` 의 ② 관문), 여기서 노이즈
+    사전을 제목에 한 번 더 적용한다.
+    """
+    if str(classification.reason or "").startswith(
+            MONTHLY_RESCUE_BLOCKED_PREFIXES):
+        return None
+    if _hits(normalize_title(title or ""), NOISE_KEYWORDS):
+        return None
+    if meta.get("period_end"):
+        return None
+    council_match = bool(meta.get("council_match"))
+    if meta.get("kind") == MEDIA_KIND:
+        return MONTHLY_RESCUE_MEDIA_REASON if council_match else None
+    if source in MONTHLY_PRESS_SOURCES and (
+            council_match or not meta.get("council_only")):
+        return MONTHLY_RESCUE_PRESS_REASON
+    return None
+
+
+def media_fields(raw_data: Optional[str], fallback_posted: str = "") -> Dict:
+    """미디어 항목이 렌더에 쓰는 값 (P1-R 보고서 §7 의 raw_data 모양).
+
+    **요약(summary)은 읽지 않는다.** 저작권 규율상 본문으로 옮기는 것은 제목·
+    링크·발행일과 V3 보강이 만든 원문 1문장뿐이다 — 피드 요약을 렌더할 길을
+    아예 만들지 않는다.
+    """
+    posted = ""
+    if raw_data:
+        try:
+            loaded = json.loads(raw_data)
+        except (TypeError, ValueError):
+            loaded = None
+        if isinstance(loaded, dict):
+            posted = str(loaded.get("posted") or "")[:10]
+    return {"media_date": posted or (fallback_posted or "")[:10]}
 
 
 # ─── 마감 처리 (판정 ④) ──────────────────────────────────────────────────
@@ -1439,6 +1543,23 @@ def _sort_notice(items: List[Dict]) -> List[Dict]:
     return sorted(items, key=lambda item: -_posted_ordinal(item))
 
 
+def _sort_monthly(items: List[Dict]) -> List[Dict]:
+    """월간 종합 (라운드 2): 협의회 점수 내림차순 → 게시일 내림차순.
+
+    협의회 점수(`announcements.council_score`)는 적재 프로파일이 매긴 값이며
+    "이 항목이 협의회 독자에게 얼마나 가까운가" 다. 게시일만으로 정렬하면 그날
+    마지막에 크롤된 것이 지면을 먹는다 — 한 달치에서는 그 차이가 커진다.
+    점수가 없는 행(옛 행·컬럼 부재)은 0.0 으로 본다.
+    """
+    return sorted(
+        items,
+        key=lambda item: (
+            -float(item.get("council_score") or 0.0),
+            -_posted_ordinal(item),
+        ),
+    )
+
+
 def kst_date(value: Optional[str]) -> Optional[date]:
     """타임스탬프 문자열을 **KST 날짜**로 (개정 v2.6 (8)).
 
@@ -1615,11 +1736,23 @@ def compose_digest_data(
             cursor, "announcements", "council_only"):
         council_sql = " AND COALESCE(council_only, 0) = 0"
 
+    # 라운드 2: 월간호만 적재 근거 컬럼을 함께 읽는다 (정렬·편입 판정에 쓴다).
+    # 없는 컬럼은 요구하지 않는다 — media 레인 이전 DB·테스트 픽스처에서도 돈다.
+    # 주간호에서는 이 목록이 비므로 SELECT 문자열이 종전과 **글자 그대로 같다**.
+    meta_columns: List[str] = []
+    if kind == KIND_MONTHLY:
+        meta_columns = [
+            name for name in ("council_score", "council_match", "council_only",
+                              "kind")
+            if _has_column(cursor, "announcements", name)
+        ]
+    meta_sql = "".join(f", {name}" for name in meta_columns)
+
     # 판정 ④의 정렬 정본. 빈 문자열도 "마감 없음"으로 취급하려고 NULLIF를 쓴다.
     cursor.execute(
         f"""
         SELECT id, source, title, summary, url, period_start, period_end,
-               created_at, raw_data
+               created_at, raw_data{meta_sql}
         FROM announcements
         WHERE created_at >= ? AND created_at < ?{exclude_sql}{council_sql}
         ORDER BY (NULLIF(period_end, '') IS NULL),
@@ -1655,11 +1788,30 @@ def compose_digest_data(
                 date_parse_failures += 1
 
         classification = classify_item(title, summary, source)
-        item = _build_item(row, classification, today)
+        # `_build_item` 은 기본 9열만 받는다 — 라운드 2의 적재 근거 열은
+        # 뒤에 붙어 오므로 잘라서 넘기고, 근거는 `meta` 로 따로 다룬다.
+        item = _build_item(row[:9], classification, today)
+        meta = dict(zip(meta_columns, row[9:]))
+        meta["period_end"] = row[6]
+        if kind == KIND_MONTHLY:
+            # 라운드 2: 적재 근거를 항목에 싣는다 — 정렬(council_score)과
+            # 미디어 판정(kind·council_match)이 이 값만 본다.
+            item["council_score"] = meta.get("council_score")
+            item["council_match"] = bool(meta.get("council_match"))
+            item["media"] = meta.get("kind") == MEDIA_KIND
+            if item["media"]:
+                item.update(media_fields(row[8], item.get("posted") or ""))
 
         if classification.verdict == VERDICT_EXCLUDE:
-            excluded.append(item)
-            continue
+            rescue = (monthly_rescue_reason(source, title, classification, meta)
+                      if kind == KIND_MONTHLY else None)
+            if rescue is None:
+                excluded.append(item)
+                continue
+            # 되살린 행은 `알아두세요` 자리에서 출발한다 — 마감이 없으므로
+            # 아래 월간 선별(monthly_hold_reason)이 그대로 통과시킨다.
+            item["verdict"] = VERDICT_NOTICE
+            item["reason"] = rescue
 
         # V4 판정 ③: 승격은 **보류 목록에 있는 항목만** 대상이다. 배제는 위에서
         # 이미 걸러졌으므로 여기 남은 것은 보류이거나 섹션 후보다.
@@ -1725,10 +1877,14 @@ def compose_digest_data(
                 holds.append(item)
                 continue
             item["verdict"] = VERDICT_MONTHLY
+            if item.get("media"):
+                # 미디어는 주간 섹션 판정과 무관한 별도 레인이다 — 편입 근거를
+                # 그 사실로 덮어쓴다(보류 주석·진단에 "섹션 판정 불명"이 남지 않게).
+                item["reason"] = MONTHLY_RESCUE_MEDIA_REASON
             monthly_candidates.append(item)
         (monthly_selected, monthly_diversity, monthly_cap, monthly_pin_cap,
          _monthly_pinned_taken) = _select_with_pins(
-            monthly_candidates, SECTION_LIMITS[VERDICT_MONTHLY], _sort_notice,
+            monthly_candidates, SECTION_LIMITS[VERDICT_MONTHLY], _sort_monthly,
             SOURCE_DIVERSITY_LIMIT,
         )
         sections[VERDICT_MONTHLY] = monthly_selected
@@ -1736,7 +1892,7 @@ def compose_digest_data(
         if pin_ids:
             baseline = _select_with_pins(
                 monthly_candidates, SECTION_LIMITS[VERDICT_MONTHLY],
-                _sort_notice, SOURCE_DIVERSITY_LIMIT, honor_pins=False)[0]
+                _sort_monthly, SOURCE_DIVERSITY_LIMIT, honor_pins=False)[0]
             demoted_ids = (
                 {item["id"] for item in baseline}
                 - {item["id"] for item in monthly_selected}
@@ -1903,7 +2059,19 @@ def _finish_digest_data(
 
 
 def item_line(item: Dict) -> str:
-    """발송본 형식 v2.1의 항목 1행 (링크는 다음 줄)."""
+    """발송본 형식 v2.1의 항목 1행 (링크는 다음 줄).
+
+    라운드 2 — 2차 미디어 항목은 `제목 — 매체명 · YYYY-MM-DD` 하나뿐이다.
+    대상 태그·마감·유사 표기를 붙이지 않고, **피드 요약은 어느 경로로도 실리지
+    않는다**(원문 인용은 V3 보강 줄 한 문장이 전부다 — 저작권 규율).
+    """
+    if item.get("media"):
+        head = sanitize_title(item["title"])
+        parts = [f"{item['org']}"]
+        if item.get("media_date"):
+            parts.append(item["media_date"])
+        return f"{head} — " + " · ".join(parts)
+
     parts = [f"{item['org']}"]
     if item["target"]:
         parts.append(f"대상: {item['target']}")
@@ -2152,6 +2320,11 @@ def render_markdown(data: Dict) -> str:
             lines.append("")
             continue
         for item in items:
+            # 라운드 2: 미디어 표식은 항목 마커 **앞**의 독립 주석 줄이다.
+            # 항목 마커(`<!-- item id=… -->`)에 끼워 넣으면 blocks.parse_blocks 가
+            # 항목을 못 알아보고, 항목 블록 안에 넣으면 정본 대조가 줄을 밀어낸다.
+            if item.get("media"):
+                lines.append(MEDIA_MARKER)
             lines.append(item_marker(item))
             lines.append(item_line(item))
             lines.append(f"  [원문]({item['url']})")
@@ -2171,6 +2344,14 @@ def render_markdown(data: Dict) -> str:
         lines.append(f"## {SECTION_HEADINGS[SECTION_MEMBER]}")
         lines.append("")
         lines.extend(_member_news_lines(data["member_news"]))
+
+    # 라운드 2: 월간호 인용 안내. 헤딩을 두는 이유는 §구조다 — 헤딩 없는 줄은
+    # 직전 섹션(항목 섹션)에 속해 게이트가 "항목 섹션에 산문" 으로 막는다.
+    if kind == KIND_MONTHLY:
+        lines.append(f"## {SECTION_HEADINGS[SECTION_NOTICE]}")
+        lines.append("")
+        lines.append(MONTHLY_FOOTER_LINE)
+        lines.append("")
 
     if data.get("holds"):
         for item in data["holds"]:
@@ -2521,6 +2702,12 @@ def kakao_blocks(data: Dict, headline: Optional[str] = None) -> List[str]:
             for content in contents:
                 # 사이클 9 #5: 회원사 소식의 긴 URL 도 같은 치환을 지난다
                 blocks.append(fit_prose_urls(f"· {company}: {content}")[0])
+        blocks.append("")
+
+    # 라운드 2: 카톡 평문도 같은 인용 안내를 싣는다 (md → kakao 렌더러와 같은 문구).
+    if kind == KIND_MONTHLY:
+        blocks.append(SECTION_HEADINGS[SECTION_NOTICE])
+        blocks.append(MONTHLY_FOOTER_LINE)
         blocks.append("")
 
     return blocks

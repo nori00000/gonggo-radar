@@ -23,18 +23,28 @@ from alert.digest.composer import (
     KIND_MONTHLY,
     KIND_WEEKLY,
     MARKER,
+    MEDIA_MARKER,
+    MONTHLY_FOOTER_LINE,
     MONTHLY_HOLD_ACTIONABLE,
     MONTHLY_HOLD_DEADLINE,
+    MONTHLY_HOLD_NOT_MONTHLY,
+    MONTHLY_HOLD_NO_COUNCIL_MATCH,
     MONTHLY_ITEM_SECTIONS,
+    MONTHLY_RESCUE_MEDIA_REASON,
+    MONTHLY_RESCUE_PRESS_REASON,
     SECTION_HEADINGS,
     SECTION_LIMITS,
+    SECTION_NOTICE,
     SOURCE_DIVERSITY_LIMIT,
     VERDICT_MONTHLY,
+    _sort_monthly,
     compose_digest,
     compose_digest_data,
     get_month_date_range,
     issue_kind,
+    item_line,
     load_items_manifest,
+    source_display_name,
 )
 from tests.test_digest import _create_announcements_table
 
@@ -55,7 +65,8 @@ MONTHLY_ROWS = (
 
 def _insert(db_path, source, title, *, source_id=None, url=None,
             period_end=None, period_start=None, created_at="2026-09-10T12:00:00",
-            summary="요약", council_only=None):
+            summary="요약", raw_data="", council_only=None, **extra):
+    """공고 1건 삽입. `extra` 는 라운드 2의 적재 근거 열(council_match·kind 등)."""
     source_id = source_id or f"{source}-{abs(hash(title)) % 10 ** 8}"
     url = url or f"https://example.com/{source_id}"
     conn = sqlite3.connect(str(db_path))
@@ -63,10 +74,13 @@ def _insert(db_path, source, title, *, source_id=None, url=None,
                "period_start", "period_end", "raw_data", "relevance_score",
                "created_at", "updated_at"]
     values = [source, source_id, title, summary, url, "기관", period_start,
-              period_end, "", 0.9, created_at, created_at]
+              period_end, raw_data, 0.9, created_at, created_at]
     if council_only is not None:
         columns.append("council_only")
         values.append(council_only)
+    for name, value in extra.items():
+        columns.append(name)
+        values.append(value)
     conn.execute(
         "INSERT INTO announcements ({}) VALUES ({})".format(
             ", ".join(columns), ", ".join("?" * len(columns))),
@@ -75,6 +89,57 @@ def _insert(db_path, source, title, *, source_id=None, url=None,
     conn.commit()
     conn.close()
     return url
+
+
+# 라운드 2 의 적재 근거 열 — media 레인이 머지되기 전 DB 에도 붙여 쓸 수 있다.
+ROUND2_COLUMNS = (
+    ("council_score", "REAL DEFAULT NULL"),
+    ("council_match", "INTEGER DEFAULT NULL"),
+    ("council_only", "INTEGER DEFAULT 0"),
+    ("kind", "TEXT DEFAULT 'gonggo'"),
+)
+
+
+def _round2_db(tmp_path, name="round2.db"):
+    """적재 근거 열까지 갖춘 빈 DB (P1-R 레인의 media 행 모양을 재현할 수 있다)."""
+    db = tmp_path / name
+    _create_announcements_table(db)
+    conn = sqlite3.connect(str(db))
+    for column, decl in ROUND2_COLUMNS:
+        conn.execute(
+            f"ALTER TABLE announcements ADD COLUMN {column} {decl}")
+    conn.commit()
+    conn.close()
+    return db
+
+
+MEDIA_SUMMARY = "피드가 준 기사 요약 본문이며 어떤 렌더에도 실려서는 안 된다."
+
+
+def _media_raw(posted="2026-09-10", summary=MEDIA_SUMMARY,
+               publisher="라이프인", link="https://lifein.news/1"):
+    """P1-R 보고서 §7 이 정한 media `raw_data` 모양 (화이트리스트 7키)."""
+    return json.dumps({
+        "title": "산림 사회적기업 현장 기사",
+        "link": link,
+        "pubDate": "Wed, 10 Sep 2026 09:00:00 +0900",
+        "posted": posted,
+        "summary": summary,
+        "publisher": publisher,
+        "license_note": "headline+link only",
+    }, ensure_ascii=False)
+
+
+def _insert_media(db, title="산림 사회적기업 현장 기사", *, source="lifein",
+                  council_match=1, posted="2026-09-10", **kwargs):
+    """media 행 1건 — kind='media', council_only=1 (P1-R 레인의 실제 모양)."""
+    return _insert(
+        db, source, title,
+        summary=MEDIA_SUMMARY,
+        raw_data=_media_raw(posted=posted),
+        council_only=1, council_match=council_match, kind="media",
+        **kwargs,
+    )
 
 
 def _monthly_db(tmp_path, rows=MONTHLY_ROWS, **kwargs):
@@ -523,3 +588,287 @@ def test_items_manifest_roundtrip_is_json(tmp_path):
     assert payload["week"] == M09
     assert all(entry["section"] == VERDICT_MONTHLY
                for entry in payload["items"])
+
+
+# ══ 라운드 2 §1 — 월간 후보 규칙 ═══════════════════════════════════════════
+@pytest.mark.parametrize("title,expected_reason", [
+    # 참가자 모집(B2C): 제목에 B2C 신호만 있고 사업자 신호가 없다
+    ("산림복지 취업아카데미 참가 모집", "참가자 모집(B2C)"),
+    # 노이즈 의심: 노이즈 어휘 + 관련성 + 기회 신호가 함께 있을 때의 주간 판정
+    ("산림 사회적기업 수상 기념 지원사업 공모", "노이즈 의심"),
+])
+def test_noise_and_b2c_holds_are_not_monthly(tmp_path, title, expected_reason):
+    """§1: 주간호가 노이즈·B2C 로 내려놓은 것은 월간호 지면에도 올리지 않는다."""
+    db = _round2_db(tmp_path)
+    _insert(db, "fowi", title, source_id="drop", period_end=None)
+    weekly_reason = compose_digest_data(
+        db_path=str(db), week_str="2026-W37")["holds"][0]["reason"]
+    assert weekly_reason.startswith(expected_reason)
+
+    data = _compose(db)
+    assert data["sections"][VERDICT_MONTHLY] == []
+    assert [hold["reason"] for hold in data["holds"]] == [
+        MONTHLY_HOLD_NOT_MONTHLY]
+
+
+def test_press_source_row_is_rescued_for_monthly(tmp_path):
+    """§1(b): 협의회 소스 풀 밖(mafra)의 보도·정책 행을 월간호가 되살린다."""
+    db = _round2_db(tmp_path)
+    url = _insert(db, "mafra", "농림축산식품 정책 방향 발표", source_id="mafra1",
+                  period_end=None, council_match=1, council_only=1)
+
+    # 주간호는 그대로 배제한다 (협의회 소스 풀 외 + council_only 가드)
+    weekly = compose_digest_data(db_path=str(db), week_str="2026-W37")
+    assert weekly["candidate_ids"] == []
+
+    data = _compose(db)
+    selected = data["sections"][VERDICT_MONTHLY]
+    assert [item["url"] for item in selected] == [url]
+    assert selected[0]["reason"] == MONTHLY_RESCUE_PRESS_REASON
+    assert selected[0]["org"] == "농림축산식품부"
+
+
+def test_press_rescue_accepts_company_selected_rows(tmp_path):
+    """§1(b): `council_match=1` 이 아니어도 회사 선택분(council_only=0)이면 된다."""
+    db = _round2_db(tmp_path)
+    url = _insert(db, "mafra", "농림축산식품 통계 기본계획 발표", source_id="mafra2",
+                  period_end=None, council_match=None, council_only=0)
+    data = _compose(db)
+    assert [item["url"] for item in data["sections"][VERDICT_MONTHLY]] == [url]
+
+
+def test_press_rescue_needs_match_or_company_selection(tmp_path):
+    """§1(b): 둘 다 아니면 되살리지 않는다 (배제 그대로)."""
+    db = _round2_db(tmp_path)
+    _insert(db, "mafra", "농림축산식품 통계 기본계획 발표", source_id="mafra3",
+            period_end=None, council_match=0, council_only=1)
+    data = _compose(db)
+    assert data["sections"][VERDICT_MONTHLY] == []
+    assert data["holds"] == []
+    assert len(data["excluded"]) == 1
+
+
+def test_press_rescue_requires_no_deadline(tmp_path):
+    """§1(b): 마감이 있으면 주간호 몫이므로 되살리지 않는다."""
+    db = _round2_db(tmp_path)
+    _insert(db, "mafra", "농림축산식품 정책 방향 발표", source_id="mafra4",
+            period_end="2026-09-30", council_match=1, council_only=1)
+    data = _compose(db)
+    assert data["sections"][VERDICT_MONTHLY] == []
+    assert data["holds"] == []
+
+
+def test_press_rescue_does_not_revive_noise(tmp_path):
+    """§1(b): 노이즈 제목은 되살리지 않는다.
+
+    `mafra` 는 협의회 소스 풀 밖이라 주간 분류가 **노이즈 판정에 닿기 전에**
+    "협의회 소스 풀 외"로 끝낸다 — 배제 사유만 보면 노이즈를 알 수 없으므로
+    되살림 함수가 제목에 노이즈 사전을 한 번 더 적용한다. 이 테스트가 그
+    이중 관문을 고정한다.
+    """
+    db = _round2_db(tmp_path)
+    _insert(db, "mafra", "농림축산식품부 인사발령 알림", source_id="mafra5",
+            period_end=None, council_match=1, council_only=1)
+    data = _compose(db)
+    assert data["sections"][VERDICT_MONTHLY] == []
+    assert data["holds"] == []
+    assert data["excluded"][0]["reason"] == "협의회 소스 풀 외"
+
+
+def test_media_noise_title_is_not_selected(tmp_path):
+    """§1(c): 협의회 어휘가 있어도 노이즈 제목의 기사는 싣지 않는다."""
+    db = _round2_db(tmp_path)
+    _insert_media(db, "사회적기업 채용 공고 안내", source_id="m9")
+    data = _compose(db)
+    assert data["sections"][VERDICT_MONTHLY] == []
+
+
+def test_notice_without_deadline_still_qualifies(tmp_path):
+    """§1(a): 주간 판정이 `알아두세요` 이고 마감이 없으면 월간호다 (1R 규칙 유지)."""
+    db = _round2_db(tmp_path)
+    url = _insert(db, "lawmaking", "산림 사회적기업 지원 조례 입법예고",
+                  source_id="notice", period_end=None)
+    data = _compose(db)
+    assert [item["url"] for item in data["sections"][VERDICT_MONTHLY]] == [url]
+
+
+def test_monthly_order_is_council_score_then_posted(tmp_path):
+    """§1: 정렬은 council_score 내림차순 → 게시일 내림차순."""
+    items = [
+        {"id": 1, "council_score": 0.5, "posted": "2026-09-01"},
+        {"id": 2, "council_score": 0.9, "posted": "2026-09-01"},
+        {"id": 3, "council_score": 0.5, "posted": "2026-09-20"},
+        {"id": 4, "council_score": None, "posted": "2026-09-30"},
+    ]
+    assert [item["id"] for item in _sort_monthly(items)] == [2, 3, 1, 4]
+
+
+def test_monthly_order_applies_to_the_real_selection(tmp_path):
+    """§1: 같은 게시일이면 협의회 점수가 높은 쪽이 먼저 실린다."""
+    db = _round2_db(tmp_path)
+    low = _insert(db, "forest_press", "산림 사회적기업 제도 개선 계획 발표",
+                  source_id="low", council_score=0.5, council_match=1)
+    high = _insert(db, "coop", "산림 협동조합 육성 정책 방향 발표",
+                   source_id="high", council_score=0.9, council_match=1)
+    data = _compose(db)
+    assert [item["url"] for item in data["sections"][VERDICT_MONTHLY]] == [
+        high, low]
+
+
+# ══ 라운드 2 §1(c)·§2 — 2차 미디어 ════════════════════════════════════════
+def test_media_row_with_council_match_is_selected(tmp_path):
+    """§1(c): `kind='media'` + `council_match=1` 행은 월간호 후보다."""
+    db = _round2_db(tmp_path)
+    url = _insert_media(db, source_id="m1")
+    data = _compose(db)
+    selected = data["sections"][VERDICT_MONTHLY]
+    assert [item["url"] for item in selected] == [url]
+    assert selected[0]["media"] is True
+    assert selected[0]["reason"] == MONTHLY_RESCUE_MEDIA_REASON
+
+
+def test_media_row_without_council_match_is_not_selected(tmp_path):
+    """§1(c): 협의회 어휘가 맞지 않은 기사는 싣지 않는다."""
+    db = _round2_db(tmp_path)
+    _insert_media(db, source_id="m2", council_match=0)
+    data = _compose(db)
+    assert data["sections"][VERDICT_MONTHLY] == []
+
+
+def test_media_row_is_not_a_weekly_candidate(tmp_path):
+    """§1(c): 주간호는 media 행을 보지 않는다 (council_only 가드 그대로)."""
+    db = _round2_db(tmp_path)
+    _insert_media(db, source_id="m3")
+    weekly = compose_digest_data(db_path=str(db), week_str="2026-W37")
+    assert weekly["candidate_ids"] == []
+
+
+def test_media_item_line_is_title_publisher_date(tmp_path):
+    """§2: `제목 — 매체명 · YYYY-MM-DD` — 대상·마감·유사 표기를 붙이지 않는다."""
+    db = _round2_db(tmp_path)
+    _insert_media(db, source_id="m4", posted="2026-09-10")
+    item = _compose(db)["sections"][VERDICT_MONTHLY][0]
+    assert item_line(item) == "산림 사회적기업 현장 기사 — 라이프인 · 2026-09-10"
+    assert source_display_name("lifein") == "라이프인"
+    assert "대상:" not in item_line(item)
+    assert "마감" not in item_line(item)
+
+
+@pytest.mark.parametrize("source,publisher", [
+    ("lifein", "라이프인"),
+    ("eroun", "이로운넷"),
+    ("senews", "사회적경제뉴스"),
+    ("kfnews", "주간 한국임업신문"),
+])
+def test_media_publisher_names(source, publisher):
+    """§2: 매체명 정본은 SOURCE_DISPLAY_NAMES 다 (checker 가 여기서 재계산한다)."""
+    assert source_display_name(source) == publisher
+
+
+def test_media_block_carries_the_media_marker(tmp_path):
+    """§2: `<!-- media -->` 는 항목 마커 **바로 앞** 독립 줄이다."""
+    db = _round2_db(tmp_path)
+    _insert_media(db, source_id="m5")
+    markdown = compose_digest(db_path=str(db), week_str=M09)
+    lines = markdown.split("\n")
+    marker_index = lines.index(MEDIA_MARKER)
+    assert lines[marker_index + 1].startswith("<!-- item id=")
+    assert lines[marker_index + 2].endswith("라이프인 · 2026-09-10")
+    assert lines[marker_index + 3].startswith("  [원문](")
+    # 표식이 있어도 항목 파서는 항목 1건을 그대로 본다
+    assert blocks_mod.item_block_count(markdown) == 1
+    assert blocks_mod.prose_lines_in_item_sections(markdown) == []
+
+
+def test_media_feed_summary_is_never_rendered(tmp_path):
+    """§2 저작권: 피드 요약은 md·kakao·미리보기 어디에도 실리지 않는다."""
+    out = tmp_path / "digests"
+    out.mkdir()
+    db = _round2_db(tmp_path)
+    _insert_media(db, source_id="m6")
+    md = out / f"{M09}.md"
+    compose_digest(db_path=str(db), week_str=M09, output_path=md)
+    markdown = md.read_text(encoding="utf-8")
+    kakao = (out / f"{M09}.kakao.txt").read_text(encoding="utf-8")
+    preview = preview_mod.render_preview(M09, markdown, {"pass": True})
+    for rendered in (markdown, kakao, preview):
+        assert MEDIA_SUMMARY not in rendered
+    manifest = load_items_manifest(md)
+    assert MEDIA_SUMMARY not in json.dumps(manifest, ensure_ascii=False)
+
+
+def test_media_enrichment_line_is_the_only_quote(tmp_path):
+    """§2: V3 보강이 준 원문 1문장만 인용된다 (있을 때만)."""
+    out = tmp_path / "digests"
+    out.mkdir()
+    db = _round2_db(tmp_path)
+    _insert_media(db, source_id="m7")
+    md = out / f"{M09}.md"
+    compose_digest(db_path=str(db), week_str=M09, output_path=md)
+    markdown = md.read_text(encoding="utf-8")
+    # 보강 전: 항목은 제목 줄 + 링크 줄 두 줄뿐이다
+    block = blocks_mod.item_blocks(markdown)[0]
+    assert not (block.get("enrich_line") or "")
+    # 보강 후: 같은 덩어리의 셋째 줄로 실린다 (카톡 렌더도 같은 규칙)
+    item_id = block["item_id"]
+    enriched = blocks_mod.set_enrich_lines(
+        markdown, {str(item_id): "  → «원문에서 옮긴 한 문장»"})[0]
+    md.write_text(enriched, encoding="utf-8")
+    kakao = composer_kakao(enriched)
+    assert "→ «원문에서 옮긴 한 문장»" in kakao
+    assert MEDIA_SUMMARY not in kakao
+
+
+def composer_kakao(markdown_text):
+    from alert.digest.composer import kakao_file_text_from_markdown
+
+    return kakao_file_text_from_markdown(markdown_text)
+
+
+def test_media_digest_passes_the_checker(tmp_path):
+    """§2: 미디어 항목이 실린 월간호도 정본 대조·게이트를 그대로 통과한다."""
+    out = tmp_path / "digests"
+    out.mkdir()
+    db = _round2_db(tmp_path)
+    _insert_media(db, source_id="m8")
+    _insert(db, "forest_press", "산림 사회적기업 정책 방향 발표",
+            source_id="p8", council_match=1)
+    md = out / f"{M09}.md"
+    compose_digest(db_path=str(db), week_str=M09, output_path=md)
+    result = check_digest(db_path=str(db), markdown_path=md,
+                          output_path=md.with_suffix(".check.json"))
+    assert result["pass"] is True, result["reason"]
+    assert result["item_blocks"] == 2
+    assert result["manifest_problems"] == []
+    assert result["prose_in_item_sections"] == []
+
+
+# ══ 라운드 2 §3 — 인용 안내 푸터 ══════════════════════════════════════════
+def test_monthly_footer_line(tmp_path):
+    """§3: 월간호 md·카톡에 인용 안내 한 줄이 실리고 게이트를 막지 않는다."""
+    out = tmp_path / "digests"
+    out.mkdir()
+    db = _monthly_db(tmp_path)
+    md = out / f"{M09}.md"
+    compose_digest(db_path=str(db), week_str=M09, output_path=md)
+    markdown = md.read_text(encoding="utf-8")
+    assert MONTHLY_FOOTER_LINE == "기사 항목은 제목·링크·원문 1문장만 인용합니다."
+    assert f"## {SECTION_HEADINGS[SECTION_NOTICE]}" in markdown
+    assert MONTHLY_FOOTER_LINE in markdown
+    assert MONTHLY_FOOTER_LINE in (
+        out / f"{M09}.kakao.txt").read_text(encoding="utf-8")
+    assert blocks_mod.prose_lines_in_item_sections(markdown) == []
+    result = check_digest(db_path=str(db), markdown_path=md, output_path=None)
+    assert result["pass"] is True, result["reason"]
+    assert MONTHLY_HEADING in result["item_sections"]
+    assert SECTION_HEADINGS[SECTION_NOTICE] in result["commentary_sections"]
+
+
+def test_weekly_markdown_has_no_footer(tmp_path):
+    """§3: 주간호는 그대로다 — 인용 안내도 미디어 표식도 없다."""
+    db = tmp_path / "weekly.db"
+    _create_announcements_table(db)
+    markdown = compose_digest(db_path=str(db), week_str="2026-W37")
+    assert MONTHLY_FOOTER_LINE not in markdown
+    assert MEDIA_MARKER not in markdown
+    assert SECTION_HEADINGS[SECTION_NOTICE] not in markdown
