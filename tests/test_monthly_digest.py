@@ -872,3 +872,66 @@ def test_weekly_markdown_has_no_footer(tmp_path):
     assert MONTHLY_FOOTER_LINE not in markdown
     assert MEDIA_MARKER not in markdown
     assert SECTION_HEADINGS[SECTION_NOTICE] not in markdown
+
+
+# ══ 라운드 2 — media 레인 병합 후 정합 ═════════════════════════════════════
+def test_media_kind_matches_the_media_lane_constant():
+    """`composer.MEDIA_KIND` 는 P1-R 레인의 정본(`models.SOURCE_KIND_MEDIA`)과 같다.
+
+    두 레인이 문자열을 따로 들고 있으면 한쪽만 바뀌는 날 월간호가 조용히
+    미디어를 못 알아본다 (`kind` 비교는 이 값 하나로만 이뤄진다).
+    """
+    from alert.models import SOURCE_KIND_MEDIA
+
+    from alert.digest.composer import MEDIA_KIND
+
+    assert MEDIA_KIND == SOURCE_KIND_MEDIA == "media"
+
+
+def test_media_selected_on_the_real_migrated_schema(tmp_path):
+    """§1(c)·§2: **실제 마이그레이션 스키마**(migration 10)에서도 그대로 돈다.
+
+    앞의 테스트들은 ALTER 로 열을 붙인 픽스처를 쓴다. 이 테스트는 레포의
+    `run_migrations` 가 만든 스키마에 media 행을 넣어, 컬럼 이름·기본값이
+    두 레인 사이에서 어긋나지 않았음을 실행으로 확인한다.
+    """
+    from alert.migrations import run_migrations
+
+    out = tmp_path / "digests"
+    out.mkdir()
+    db = tmp_path / "migrated.db"
+    _create_announcements_table(db)
+    conn = sqlite3.connect(str(db))
+    run_migrations(conn, vec_available=False)
+    conn.close()
+
+    url = _insert_media(db, source_id="real-1", posted="2026-09-08")
+    _insert(db, "forest_press", "산림 사회적기업 정책 방향 발표",
+            source_id="real-2", council_match=1, council_score=0.8)
+
+    md = out / f"{M09}.md"
+    compose_digest(db_path=str(db), week_str=M09, output_path=md)
+    markdown = md.read_text(encoding="utf-8")
+
+    # 선정: 미디어 1 + 기관 보도 1
+    data = _compose(db)
+    selected = data["sections"][VERDICT_MONTHLY]
+    assert url in [item["url"] for item in selected]
+    media_item = next(item for item in selected if item["url"] == url)
+    assert media_item["media"] is True
+    assert media_item["reason"] == MONTHLY_RESCUE_MEDIA_REASON
+
+    # 렌더: 표식 + 제목·매체명·발행일 + 링크, 요약 없음, 푸터 있음
+    assert MEDIA_MARKER in markdown
+    assert "산림 사회적기업 현장 기사 — 라이프인 · 2026-09-08" in markdown
+    assert MEDIA_SUMMARY not in markdown
+    assert MONTHLY_FOOTER_LINE in markdown
+
+    # 게이트: 정본 대조·상한·산문 검사 모두 통과
+    result = check_digest(db_path=str(db), markdown_path=md, output_path=None)
+    assert result["pass"] is True, result["reason"]
+    assert result["manifest_problems"] == []
+
+    # 주간호는 여전히 media 를 보지 않는다
+    weekly = compose_digest_data(db_path=str(db), week_str="2026-W37")
+    assert url not in json.dumps(weekly, ensure_ascii=False, default=str)
