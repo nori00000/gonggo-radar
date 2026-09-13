@@ -28,6 +28,7 @@
 import json
 import os
 import re
+import hashlib
 import sqlite3
 import subprocess
 import sys
@@ -107,6 +108,8 @@ _NUMBER_TOKEN_RE = re.compile(
 MIN_CANDIDATE_CHARS = 12
 MAX_CANDIDATE_CHARS = 160
 MAX_CANDIDATES = 12
+# 12개를 넘을 때 문서 순서로 **무조건** 보장하는 앞부분 (r9).
+_HEAD_IN_DOCUMENT_ORDER = 8
 # 후보가 이보다 적으면 묻지 않고 넘긴다. r7: 1 — `pick: 0` 이 "쓸 것 없음"을
 # 이미 표현하므로, 후보가 하나여도 물어볼 값이 있다.
 MIN_CANDIDATES_TO_ASK = 1
@@ -406,19 +409,22 @@ def build_input_items(
             )
         except Exception:  # noqa: BLE001 — 수집 실패는 항목 단위로만 흡수한다
             detail_text = ""
+        truncated = bool(getattr(detail_text, "truncated", False))
         item = {
             "n": index,
             "id": entry.get("id"),
             "title": entry.get("title") or "",
             "source_name": entry.get("org") or "",
             "summary": summary,
-            "detail_text": detail_text or "",
+            "detail_text": str(detail_text or ""),
+            "detail_truncated": truncated,
             "quote_deadline": entry.get("period_end") or "",
             "quote_eligibility": quotes["quote_eligibility"],
             "quote_amount": quotes["quote_amount"],
             "url": url,
         }
         item["candidates"] = candidate_sentences(item)
+        item["marked_dropped"] = marked_unit_count(item["detail_text"])
         items.append(item)
     return items
 
@@ -490,6 +496,14 @@ def candidate_units(text: str) -> List[str]:
     return [unit for unit in trimmed if unit]
 
 
+def marked_unit_count(text: str) -> int:
+    """`<sup>`·`<del>` 처럼 평탄화하면 뜻이 바뀌는 표시가 든 단위 수 (r9)."""
+    return sum(
+        1 for unit in candidate_units(text)
+        if http_fetch.MARKED_SENTINEL in unit
+    )
+
+
 def candidate_sentences(item: Dict) -> List[str]:
     """이 항목에서 **고를 수 있는** 문장 목록 (결정론적 추출, r5).
 
@@ -502,9 +516,15 @@ def candidate_sentences(item: Dict) -> List[str]:
     인용 필드는 조각이라 문장이 아니다.
     """
     title = summary_normalize(str(item.get("title") or ""))
+    units = candidate_units(str(item.get("detail_text") or ""))
+    # r9 HIGH: 창이 잘렸으면 **마지막 단위는 무조건 버린다**. 그 단위는 문장이
+    # 끝나기 전에 끊긴 것일 수 있고, 잘린 자리에 부정이 있으면 뜻이 뒤집힌다
+    # (`…신청 가능|하지 않습니다.` → `사회적기업은 신청 가능`).
+    if item.get("detail_truncated") and units:
+        units = units[:-1]
     candidates: List[str] = []
     seen = set()
-    for sentence in candidate_units(str(item.get("detail_text") or "")):
+    for sentence in units:
         if not MIN_CANDIDATE_CHARS <= len(sentence) <= MAX_CANDIDATE_CHARS:
             continue
         # 끝 종결 문자는 떼고 제목과 대조한다 — `…공고.` 가 제목 `…공고` 를
@@ -527,6 +547,9 @@ def candidate_sentences(item: Dict) -> List[str]:
             continue
         if _ADMIN_OPENER_RE.match(sentence):
             continue
+        # r9 HIGH: 지수·취소선이 든 단위는 평탄화하면 뜻이 바뀐다 — 버린다.
+        if http_fetch.MARKED_SENTINEL in sentence:
+            continue
         # 형식 게이트를 통과하지 못하는 문장은 **후보가 되기 전에** 버린다 —
         # 고르고 나서 버리면 사람에게는 "왜 하필 이 항목만" 으로 보인다.
         if format_problem(sentence):
@@ -537,11 +560,15 @@ def candidate_sentences(item: Dict) -> List[str]:
         candidates.append(sentence)
     if len(candidates) <= MAX_CANDIDATES:
         return candidates
-    # r7: 12개를 넘으면 **무엇을 보여줄지**를 결정론으로 고른다 — 대상·요건·
-    # 마감·금액·변경 내용을 말하는 단위를 앞세우고, 그 안에서는 문서 순서.
-    preferred = [unit for unit in candidates if _PRIORITY_RE.search(unit)]
-    rest = [unit for unit in candidates if not _PRIORITY_RE.search(unit)]
-    return (preferred + rest)[:MAX_CANDIDATES]
+    # r9 LOW: 앞 8개는 **문서 순서 그대로** 보장하고, 남은 자리(4개)는 뒤쪽의
+    # 핵심어 단위에 준다 — 뒤늦게 나온 관련 문장이 앞쪽 다수에 밀려 통째로
+    # 사라지던 것을 막는다(r7 은 핵심어 단위를 전부 앞세워 같은 문제가 났다).
+    head = candidates[:_HEAD_IN_DOCUMENT_ORDER]
+    tail = [
+        unit for unit in candidates[_HEAD_IN_DOCUMENT_ORDER:]
+        if _PRIORITY_RE.search(unit)
+    ]
+    return head + tail[:MAX_CANDIDATES - _HEAD_IN_DOCUMENT_ORDER]
 
 
 def gate_pick(value, candidate_count: int) -> Tuple[Optional[int], str]:
@@ -596,6 +623,21 @@ def payload_for_glm(items: List[Dict]) -> List[Dict]:
 # **탐욕적으로** 묶어 배치마다 한 번씩 부른다. 배치 하나가 실패해도 나머지
 # 배치는 그대로 적용된다(잡 전체를 버리지 않는다).
 PROMPT_BYTE_BUDGET = 14000  # 16,384 상한에 여유를 둔다(ds 가 헤더를 덧붙인다)
+
+
+def batches_signature(today: str, batches: List[List[Dict]]) -> str:
+    """**실제로 보낸 것**의 지문 (r9). 적용 파일이 이 값을 들고 와야 한다.
+
+    후보 목록은 수집 시점마다 달라진다 — 번호만 들고 온 출력 파일을 다른 수집
+    결과에 적용하면 `pick=1` 이 전혀 다른 문장을 가리킨다. 그래서 적용 경로는
+    지문이 같을 때만 진행한다.
+    """
+    payload = {
+        "today": today,
+        "batches": [payload_for_glm(batch) for batch in batches],
+    }
+    serialized = json.dumps(payload, ensure_ascii=False, sort_keys=True)
+    return hashlib.sha256(serialized.encode("utf-8")).hexdigest()
 
 
 def build_summary_prompt(payload: Dict) -> str:
@@ -993,6 +1035,21 @@ def run(args) -> int:
         _err(f"다이제스트 없음: {markdown_path} — GLM 보강 생략")
         return 0
 
+    # r9: 중단 창 복구. `.bak` 이 남아 있으면 md 를 쓴 뒤 정본을 쓰기 전에
+    # 죽은 실행이다 — **무엇보다 먼저** md 를 되돌린다(그 다음의 제거 단계가
+    # 정본까지 맞춘다). dry-run 은 본문을 건드리지 않으므로 건너뛴다.
+    startup_warnings: List[str] = []
+    backup_path = markdown_path.with_name(markdown_path.name + ".bak")
+    if backup_path.exists() and not args.dry_run:
+        try:
+            os.replace(backup_path, markdown_path)
+            startup_warnings.append(
+                "중단된 실행의 .bak 발견 — md 를 복구했습니다"
+            )
+            _out("⚠️  중단된 실행의 .bak 발견 — md 를 복구했습니다")
+        except OSError as exc:
+            startup_warnings.append(f".bak 복구 실패: {redact(exc)}")
+
     manifest = load_items_manifest(markdown_path)
     if manifest is None:
         _err("항목 정본 없음(<week>.items.json) — GLM 보강 생략")
@@ -1014,7 +1071,7 @@ def run(args) -> int:
     # 예전에는 DB 조회·8건 HTTP 수집·입력 JSON 저장을 모두 마친 **뒤**에 지웠고,
     # 그 사이에 DB 예외가 나거나 수집 중 잡이 죽으면 지난 보강이 그대로 남았다.
     # `--dry-run` 은 본문을 읽기만 하므로 여기서도 아무것도 지우지 않는다.
-    warnings: List[str] = []
+    warnings: List[str] = list(startup_warnings)
     if not args.dry_run:
         cleared, clear_warnings = clear_previous_enrichment(
             markdown_path, item_sections)
@@ -1041,14 +1098,23 @@ def run(args) -> int:
         if len(item.get("candidates") or []) >= MIN_CANDIDATES_TO_ASK
     ]
     batches, skipped = batch_input_items(today, sendable)
+    sent_items = [item for batch in batches for item in batch]
+    input_sha = batches_signature(today, batches)
     input_payload = {
         "today": today,
-        "items": payload_for_glm(input_items),
+        # r9: **보낸 그대로** 기록한다 (배치·절단이 반영된 항목 목록).
+        "items": payload_for_glm(sent_items),
         "batches": [[item["n"] for item in batch] for batch in batches],
+        # 적용 파일이 이 지문을 들고 와야 한다 (r9)
+        "input_sha": input_sha,
         # 제목·인용만으로 예산을 넘겨 ds 에 보내지 못한 항목 (r4)
         "skipped": [item["n"] for item in skipped],
         # 후보 문장이 없어 고를 것이 없는 항목 (r5)
         "no_candidates": no_candidates,
+        # 지수·취소선이 들어 평탄화하면 뜻이 바뀌는 단위를 버린 항목 (r9)
+        "marked_dropped": [
+            item["n"] for item in input_items if item.get("marked_dropped")
+        ],
     }
 
     input_json_path = out_dir / f"{args.week}.glm_input.json"
@@ -1076,14 +1142,27 @@ def run(args) -> int:
         # 전체 n 집합으로 한 번 검사한다.
         raw_output = Path(args.apply_json).read_text(encoding="utf-8")
         _out(f"GLM 출력(파일): {args.apply_json}")
-        asked = True
-        results, applied_warnings = gate_output(raw_output, input_items)
-        warnings.extend(applied_warnings)
-        field_warnings.extend(applied_warnings)
+        loaded = _parse_json_array(raw_output)
+        if not isinstance(loaded, dict) or loaded.get("input_sha") != input_sha:
+            # r9: 번호만 든 출력 파일을 **다른 수집 결과**에 적용하면 pick 이
+            # 엉뚱한 문장을 가리킨다. 지문이 다르면 적용하지 않는다.
+            warnings.append(
+                "적용 파일의 input_sha 가 이번 입력과 다름 — 적용하지 않음"
+            )
+        else:
+            asked = True
+            results, applied_warnings = gate_output(
+                json.dumps(loaded.get("results") or [], ensure_ascii=False),
+                sent_items,
+            )
+            warnings.extend(applied_warnings)
+            field_warnings.extend(applied_warnings)
+    elif not DS_BIN.exists():
+        # r9: 여기서 바로 return 하면 **시작 단계 경고**(.bak 복구 등)가
+        # 경고 파일에 기록되지 않는다 — 흐름을 끊지 않고 배치만 건너뛴다.
+        _out(f"⚠️  {DS_BIN} 없음 — GLM 보강 생략")
+        warnings.append(f"{DS_BIN} 없음 — GLM 보강 생략")
     else:
-        if not DS_BIN.exists():
-            _out(f"⚠️  {DS_BIN} 없음 — GLM 보강 생략")
-            return 0
         _out(f"배치 {len(batches)}개로 분할 (프롬프트 상한 {PROMPT_BYTE_BUDGET}바이트)")
         for index, batch in enumerate(batches, start=1):
             numbers = [item["n"] for item in batch]
@@ -1186,7 +1265,7 @@ def run(args) -> int:
                 else:
                     _out("✓ 이번 주 한 줄 GLM 초안 갱신")
 
-    if warnings or no_candidates:
+    if warnings or no_candidates or input_payload["marked_dropped"]:
         # `discarded` = 출력 전체를 버려 **아무것도 적용하지 않은** 실행
         # (n 집합 위반·파싱 실패). 미리보기 문구가 대체와 폐기를 구분한다.
         warn_path.write_text(
@@ -1202,7 +1281,10 @@ def run(args) -> int:
                     # 일부 배치만 미적용된 실행 — 대체도 전체 폐기도 아니다
                     "partial_batches": failed_batches,
                     # 경고가 아닌 사실 기록 (r5)
-                    "info": {"no_candidates": no_candidates},
+                    "info": {
+                        "no_candidates": no_candidates,
+                        "marked_dropped": input_payload["marked_dropped"],
+                    },
                 },
                 ensure_ascii=False, indent=2,
             ) + "\n",

@@ -91,6 +91,11 @@ _INLINE_TAGS = frozenset({
     "strong", "sub", "sup", "time", "u", "var",
 })
 _BREAK_TAGS = frozenset({"br", "hr"})
+# 이 요소들은 **평탄화하면 뜻이 바뀐다**: `10<sup>4</sup>㎡` → `104㎡`(지수 소실),
+# `<del>취소</del>` → 취소선이 사라져 삭제된 문구가 근거가 된다. 내용을 지우지
+# 않고 **표시**만 해 두고, 후보 추출이 표시된 단위를 통째로 버린다 (r9 HIGH).
+MARKED_SENTINEL = "\ufffc"
+_MARKED_TAGS = frozenset({"sup", "sub", "del", "s", "strike"})
 # 열린 `<p>` 를 암시적으로 닫는 블록 요소들 (HTML 파싱 규칙 "in body").
 _P_CLOSING_TAGS = frozenset({
     "address", "article", "aside", "blockquote", "details", "div", "dl",
@@ -226,7 +231,9 @@ def _text_of(node: _Node) -> str:
         if current.tag in _DROP_TAGS or _is_hidden(current):
             continue
         items = list(current.children)
-        if current.tag not in _INLINE_TAGS:
+        if current.tag in _MARKED_TAGS:
+            items = [MARKED_SENTINEL] + items + [MARKED_SENTINEL]
+        elif current.tag not in _INLINE_TAGS:
             items = [" "] + items + [" "]
         for child in reversed(items):
             stack.append(child)
@@ -322,6 +329,22 @@ def content_text(root: _Node) -> str:
     return _clean(_text_of(body if body is not None else root))
 
 
+class DetailText(str):
+    """수집한 상세 텍스트 + **창이 잘렸는지** 여부.
+
+    `str` 그대로 쓰이지만 `.truncated` 를 달고 다닌다. 잘린 창의 **마지막
+    단위**는 문장이 끝나기 전에 끊긴 것일 수 있고, 그 자리에 부정이 있으면
+    뜻이 뒤집힌다(`…신청 가능|하지 않습니다.`) — 호출자가 그 단위를 버린다.
+    """
+
+    truncated = False
+
+    def __new__(cls, value: str = "", truncated: bool = False):
+        text = super().__new__(cls, value)
+        text.truncated = bool(truncated)
+        return text
+
+
 def normalize_space(text: str) -> str:
     """공백 정규화 — 앵커·근거 대조는 양쪽이 **같은 규칙**을 지나야 맞는다."""
     return " ".join((text or "").split())
@@ -329,10 +352,14 @@ def normalize_space(text: str) -> str:
 
 def anchored_window(
     text: str, anchor: str = "", limit: int = DETAIL_TEXT_CHARS
-) -> str:
-    """본문에서 `anchor`(제목)가 **마지막으로** 나오는 자리부터 limit 자."""
+) -> DetailText:
+    """본문에서 `anchor`(제목)가 **마지막으로** 나오는 자리부터 limit 자.
+
+    `.truncated` 는 **창이 본문 끝에 닿지 못했는지**다 (r9 HIGH).
+    """
     if not text:
-        return ""
+        return DetailText("")
+    start = 0
     needle = normalize_space(anchor)
     if needle:
         index = text.rfind(needle)
@@ -340,8 +367,9 @@ def anchored_window(
             partial = needle[:ANCHOR_PARTIAL_CHARS]
             index = text.rfind(partial) if partial else -1
         if index >= 0:
-            return text[index:index + limit]
-    return text[:limit]
+            start = index
+    window = text[start:start + limit]
+    return DetailText(window, truncated=start + limit < len(text))
 
 
 def visible_text(
@@ -350,27 +378,27 @@ def visible_text(
     anchor: str = "",
     deadline: Optional[float] = None,
     clock=time.monotonic,
-) -> str:
+) -> DetailText:
     """HTML → 본문 컨테이너의 보이는 텍스트 중 앵커 기준 limit 자.
 
     `deadline` 이 주어지면 **파싱 도중에도** 벽시계를 본다 — 거대한 입력이
     파서 안에서 시간을 다 쓰는 경로를 막는다(넘기면 빈 문자열).
     """
     if not html_text:
-        return ""
+        return DetailText("")
     builder = _DomBuilder()
     try:
         for start in range(0, len(html_text), _FEED_CHUNK):
             if deadline is not None and clock() >= deadline:
-                return ""
+                return DetailText("")
             builder.feed(html_text[start:start + _FEED_CHUNK])
         builder.close()
     except Exception:  # noqa: BLE001 — 깨진 HTML 은 근거 없음으로 본다
-        return ""
+        return DetailText("")
     if builder.overflowed:
-        return ""
+        return DetailText("")
     if deadline is not None and clock() >= deadline:
-        return ""
+        return DetailText("")
     return anchored_window(content_text(builder.root), anchor, limit)
 
 
@@ -491,11 +519,11 @@ def _read_capped(response, max_bytes: int, deadline: float, clock) -> Optional[b
     return b"".join(chunks)[:max_bytes]
 
 
-def _fetch(url, anchor, deadline, max_bytes, limit, clock) -> str:
+def _fetch(url, anchor, deadline, max_bytes, limit, clock) -> DetailText:
     current = str(url)
     for _hop in range(MAX_REDIRECTS + 1):
         if clock() >= deadline:
-            return ""
+            return DetailText("")
         response = _open(current)
         try:
             status = getattr(response, "status", 0)
@@ -504,20 +532,20 @@ def _fetch(url, anchor, deadline, max_bytes, limit, clock) -> str:
                 # Location 없는 3xx 는 실패다 — 같은 URL 을 다시 부르면 홉을
                 # 낭비하며 같은 응답을 반복한다(Codex r3).
                 if not location:
-                    return ""
+                    return DetailText("")
                 target = urljoin(current, location)
                 if not _is_http_url(target):
-                    return ""
+                    return DetailText("")
                 current = target
                 continue
             if not 200 <= status < 300:
-                return ""
+                return DetailText("")
             content_type = _header(response, "content-type").lower()
             if "html" not in content_type:
-                return ""
+                return DetailText("")
             raw = _read_capped(response, max_bytes, deadline, clock)
             if not raw:
-                return ""
+                return DetailText("")
             return visible_text(
                 _decode(raw, content_type), limit, anchor, deadline, clock
             )
@@ -532,7 +560,7 @@ def _fetch(url, anchor, deadline, max_bytes, limit, clock) -> str:
                         method()
                     except Exception:  # noqa: BLE001
                         pass
-    return ""
+    return DetailText("")
 
 
 def fetch_detail_text(
@@ -543,7 +571,7 @@ def fetch_detail_text(
     limit: int = DETAIL_TEXT_CHARS,
     budget: Optional[FetchBudget] = None,
     clock=time.monotonic,
-) -> str:
+) -> DetailText:
     """URL 의 본문 중 `anchor`(항목 제목) 기준 한 창. **실패는 빈 문자열**.
 
     수집 전체를 **데몬 스레드**에 넣고 벽시계로 잘라낸다 — 첫 청크가 오기
@@ -553,9 +581,9 @@ def fetch_detail_text(
     남아 돌 수는 있다).
     """
     if not _is_http_url(url):
-        return ""
+        return DetailText("")
     if budget is not None and budget.exhausted():
-        return ""
+        return DetailText("")
     deadline = clock() + timeout
     if budget is not None:
         deadline = min(deadline, budget.deadline)
@@ -574,5 +602,5 @@ def fetch_detail_text(
         # 시간이 끝났다. 스레드는 **버린다** — 데몬이므로 인터프리터 종료를
         # 막지 않는다(ThreadPoolExecutor 는 shutdown(wait=False) 여도 atexit
         # 에서 join 해 프로세스가 워커를 기다렸다 — Codex r3 실측).
-        return ""
-    return holder.get("text", "")
+        return DetailText("")
+    return holder.get("text") or DetailText("")

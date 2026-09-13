@@ -43,15 +43,30 @@ def _label(entry, pick: int = 1) -> str:
     return "«{}»".format(entry["candidates"][pick - 1]["text"])
 
 
-def _pick_output(payload_items, pick: int = 1) -> str:
-    """`pick` 만 돌려주는 가짜 GLM 출력."""
-    return json.dumps([
+def _pick_results(payload_items, pick: int = 1):
+    return [
         {
             "n": entry["n"], "pick": pick, "대상 태그": "전체",
             "마감": "원문 확인", "자격": "원문 확인", "금액": "원문 확인",
         }
         for entry in payload_items
-    ], ensure_ascii=False)
+    ]
+
+
+def _pick_output(payload_items, pick: int = 1) -> str:
+    """ds 가 돌려주는 모양 — 결과 배열 그대로."""
+    return json.dumps(_pick_results(payload_items, pick), ensure_ascii=False)
+
+
+def _apply_file(payload, pick: int = 1, input_sha=None) -> str:
+    """`--apply-json` 파일 모양 — 입력 지문을 함께 들고 다닌다 (r9)."""
+    return json.dumps(
+        {
+            "input_sha": payload["input_sha"] if input_sha is None else input_sha,
+            "results": _pick_results(payload["items"], pick),
+        },
+        ensure_ascii=False,
+    )
 
 
 def _create_table(db_path) -> None:
@@ -296,7 +311,7 @@ def test_apply_json_adds_enrich_line_without_changing_item_line(digest_fixture, 
     )
     fake_output_path = tmp_path / "fake_glm_output.json"
     fake_output_path.write_text(
-        _pick_output(input_payload["items"]), encoding="utf-8")
+        _apply_file(input_payload), encoding="utf-8")
 
     class ApplyArgs:
         week = W13
@@ -356,7 +371,7 @@ def test_apply_json_is_idempotent(digest_fixture, tmp_path):
     )
     fake_output_path = tmp_path / "fake.json"
     fake_output_path.write_text(
-        _pick_output(input_payload["items"]), encoding="utf-8")
+        _apply_file(input_payload), encoding="utf-8")
 
     class ApplyArgs:
         week = W13
@@ -606,7 +621,7 @@ def test_format_violation_never_reaches_the_markdown(
         texts = [candidate["text"] for candidate in entry["candidates"]]
         assert texts == ["접수는 9월 22일까지 진행합니다."]
     output_path = tmp_path / "bad_format.json"
-    output_path.write_text(_pick_output(payload["items"]), encoding="utf-8")
+    output_path.write_text(_apply_file(payload), encoding="utf-8")
 
     class ApplyArgs:
         week = W13
@@ -684,7 +699,7 @@ def _apply_fake_enrichment(digest_fixture, tmp_path, name="fake.json"):
         (digest_fixture["out_dir"] / f"{W13}.glm_input.json").read_text(encoding="utf-8")
     )
     output_path = tmp_path / name
-    output_path.write_text(_pick_output(payload["items"]), encoding="utf-8")
+    output_path.write_text(_apply_file(payload), encoding="utf-8")
 
     class ApplyArgs:
         week = W13
@@ -785,7 +800,7 @@ def test_failed_rerun_drops_the_stale_headline_draft_and_warnings(
     # 지난 실행의 경고도 남지 않는다 — 이번 실행이 낸 경고만 있다
     warnings_now = json.loads(warn_path.read_text(encoding="utf-8"))["warnings"]
     assert "지난 실행 경고" not in warnings_now
-    assert any("파싱 실패" in w for w in warnings_now)
+    assert any("input_sha" in w for w in warnings_now)
 
 
 def test_dry_run_does_not_clear_existing_enrichment(digest_fixture, tmp_path):
@@ -1436,8 +1451,25 @@ def test_preview_says_discarded_when_the_whole_output_was_thrown_away(
     digest_fixture, tmp_path
 ):
     markdown_path = digest_fixture["markdown_path"]
+
+    class DryArgs:
+        week = W13
+        db = digest_fixture["db_path"]
+        out_dir = str(digest_fixture["out_dir"])
+        dry_run = True
+        apply_json = None
+
+    glm_mod.run(DryArgs())
+    payload = json.loads(
+        (digest_fixture["out_dir"] / f"{W13}.glm_input.json").read_text(encoding="utf-8")
+    )
     broken = tmp_path / "broken.json"
-    broken.write_text("not json", encoding="utf-8")
+    # 지문은 맞지만 결과가 배열이 아니다 → 물어보고 **전부 버린** 실행
+    broken.write_text(
+        json.dumps({"input_sha": payload["input_sha"], "results": "배열이 아님"},
+                   ensure_ascii=False),
+        encoding="utf-8",
+    )
 
     class BrokenArgs:
         week = W13
@@ -1481,16 +1513,8 @@ def test_preview_says_replaced_when_only_some_fields_were_gated(
     payload = json.loads(
         (digest_fixture["out_dir"] / f"{W13}.glm_input.json").read_text(encoding="utf-8")
     )
-    fake = [
-        {
-            "n": entry["n"], "대상 태그": "전체", "마감": "원문 확인",
-            "자격": "원문 확인", "금액": "원문 확인",
-            "pick": 99,               # 범위 밖 → 그 항목만 보강 줄 없음
-        }
-        for entry in payload["items"]
-    ]
     path = tmp_path / "gated.json"
-    path.write_text(json.dumps(fake, ensure_ascii=False), encoding="utf-8")
+    path.write_text(_apply_file(payload, pick=99), encoding="utf-8")
 
     class ApplyArgs:
         week = W13
@@ -2183,7 +2207,7 @@ def test_a_failed_manifest_write_rolls_the_markdown_back(
         (digest_fixture["out_dir"] / f"{W13}.glm_input.json").read_text(encoding="utf-8")
     )
     output_path = tmp_path / "ok.json"
-    output_path.write_text(_pick_output(payload["items"]), encoding="utf-8")
+    output_path.write_text(_apply_file(payload), encoding="utf-8")
 
     real = composer_mod.set_manifest_enrich_lines
     calls = {"n": 0}
@@ -2498,14 +2522,17 @@ def test_a_fabricated_sentence_in_the_glm_output_is_ignored_entirely(
     payload = json.loads(
         (digest_fixture["out_dir"] / f"{W13}.glm_input.json").read_text(encoding="utf-8")
     )
-    fake = [
-        {
-            "n": entry["n"], "pick": 1, "대상 태그": "전체", "마감": "원문 확인",
-            "자격": "원문 확인", "금액": "원문 확인",
-            "한 줄 의미": "전 기업 1억원 지급 확정",   # 무시되어야 한다
-        }
-        for entry in payload["items"]
-    ]
+    fake = {
+        "input_sha": payload["input_sha"],
+        "results": [
+            {
+                "n": entry["n"], "pick": 1, "대상 태그": "전체",
+                "마감": "원문 확인", "자격": "원문 확인", "금액": "원문 확인",
+                "한 줄 의미": "전 기업 1억원 지급 확정",   # 무시되어야 한다
+            }
+            for entry in payload["items"]
+        ],
+    }
     path = tmp_path / "fabricated.json"
     path.write_text(json.dumps(fake, ensure_ascii=False), encoding="utf-8")
 
@@ -2819,7 +2846,7 @@ def test_a_long_fragment_splits_on_secondary_separators():
     assert all(len(unit) <= glm_mod.MAX_CANDIDATE_CHARS for unit in units)
 
 
-def test_keyword_units_are_offered_first_when_there_are_more_than_twelve():
+def test_the_first_eight_units_keep_document_order_and_late_keywords_fill_the_rest():
     plain = [
         f"{index}) 이 문단은 아무 핵심어도 담고 있지 않은 설명 문장이다 여기에 꼬리를 붙인다"
         for index in range(1, 13)
@@ -2833,11 +2860,12 @@ def test_keyword_units_are_offered_first_when_there_are_more_than_twelve():
     item = {"title": "제목", "detail_text": body}
     candidates = glm_mod.candidate_sentences(item)
 
-    assert len(candidates) == glm_mod.MAX_CANDIDATES
-    assert candidates[0].startswith("13)")
-    assert candidates[1].startswith("14)")
-    # 핵심어 단위 뒤에는 문서 순서가 유지된다
-    assert candidates[2].startswith("1)")
+    # 앞 8개는 문서 순서 그대로
+    assert [c[:2] for c in candidates[:8]] == [f"{i})" for i in range(1, 9)]
+    # 남은 자리는 **뒤쪽의 핵심어 단위**가 가져간다
+    assert candidates[8].startswith("13)")
+    assert candidates[9].startswith("14)")
+    assert len(candidates) == 10
 
 
 def test_document_order_is_kept_when_twelve_or_fewer_units():
@@ -2908,3 +2936,239 @@ def test_the_w37_n1_line_survives_as_one_unit():
     units = glm_mod.candidate_units(body)
     assert "ㅁ 모집기간 2026. 9. 7.(월) ~ 9. 30.(수) 15:00까지" in units
     assert not any(unit.startswith("30.") for unit in units), units
+
+
+# ══ V3.1 r9 (Codex 선택 설계 검토 수렴) ═══════════════════════════════════
+# 1. HIGH — 창이 잘리면 마지막 단위를 버린다
+# ─────────────────────────────────────────────────────────────────────────
+_NEGATION = "사회적기업은 신청 가능하지 않습니다."
+
+
+def test_anchored_window_reports_whether_it_reached_the_end():
+    body = "가" * 30 + _NEGATION
+    full = http_fetch.anchored_window(body, "", limit=len(body))
+    assert full.truncated is False
+    cut = http_fetch.anchored_window(body, "", limit=len(body) - 6)
+    assert cut.truncated is True
+
+
+def test_a_truncated_window_drops_its_last_unit():
+    """Codex HIGH: `…신청 가능|하지 않습니다.` 가 `… 신청 가능` 으로 남았다."""
+    head = "접수는 9월 22일까지 진행합니다. "
+    body = head + _NEGATION
+    cut_at = body.index("가능") + 2          # 부정 바로 앞에서 자른다
+    truncated = http_fetch.anchored_window(body, "", limit=cut_at)
+    assert truncated.truncated is True
+    assert truncated.endswith("신청 가능")
+
+    item = {
+        "title": "제목",
+        "detail_text": str(truncated),
+        "detail_truncated": True,
+    }
+    candidates = glm_mod.candidate_sentences(item)
+    assert not any("신청 가능" in unit for unit in candidates), candidates
+    assert candidates == ["접수는 9월 22일까지 진행합니다."]
+
+
+def test_an_untruncated_window_keeps_its_last_unit():
+    item = {
+        "title": "제목",
+        "detail_text": "접수는 9월 22일까지 진행합니다. " + _NEGATION,
+        "detail_truncated": False,
+    }
+    assert _NEGATION in glm_mod.candidate_sentences(item)
+
+
+# ─── 2. HIGH — 지수·취소선은 평탄화하면 뜻이 바뀐다 ───────────────────────
+def test_superscript_markup_makes_a_unit_ineligible():
+    """Codex HIGH: `10<sup>4</sup>㎡` → `104㎡` 로 통과했다."""
+    text = http_fetch.visible_text(
+        "<article>지원 면적은 10<sup>4</sup>㎡입니다. 접수는 9월 22일까지 진행합니다.</article>"
+    )
+    assert http_fetch.MARKED_SENTINEL in text
+    candidates = glm_mod.candidate_sentences(
+        {"title": "제목", "detail_text": str(text)}
+    )
+    assert candidates == ["접수는 9월 22일까지 진행합니다."]
+    assert glm_mod.marked_unit_count(str(text)) == 1
+
+
+@pytest.mark.parametrize("tag", ["sup", "sub", "del", "s", "strike"])
+def test_struck_and_scripted_text_never_becomes_evidence(tag):
+    text = http_fetch.visible_text(
+        f"<article>신청은 <{tag}>불가</{tag}> 합니다 여기까지가 한 문장이다."
+        "접수는 9월 22일까지 진행합니다.</article>"
+    )
+    candidates = glm_mod.candidate_sentences(
+        {"title": "제목", "detail_text": str(text)}
+    )
+    assert all(http_fetch.MARKED_SENTINEL not in unit for unit in candidates)
+    assert all("불가" not in unit for unit in candidates), candidates
+
+
+# ─── 3. MEDIUM — 적용 파일은 입력 지문을 들고 와야 한다 ───────────────────
+def test_an_apply_file_with_a_stale_input_sha_is_refused(
+    digest_fixture, tmp_path
+):
+    markdown_path = digest_fixture["markdown_path"]
+
+    class DryArgs:
+        week = W13
+        db = digest_fixture["db_path"]
+        out_dir = str(digest_fixture["out_dir"])
+        dry_run = True
+        apply_json = None
+
+    glm_mod.run(DryArgs())
+    payload = json.loads(
+        (digest_fixture["out_dir"] / f"{W13}.glm_input.json").read_text(encoding="utf-8")
+    )
+    stale = tmp_path / "stale.json"
+    stale.write_text(_apply_file(payload, input_sha="0" * 64), encoding="utf-8")
+
+    class ApplyArgs:
+        week = W13
+        db = digest_fixture["db_path"]
+        out_dir = str(digest_fixture["out_dir"])
+        dry_run = False
+        apply_json = str(stale)
+
+    assert glm_mod.run(ApplyArgs()) == 0
+    assert _enrich_line_count(markdown_path) == 0
+    warnings_file = json.loads(
+        (digest_fixture["out_dir"] / f"{W13}.glm_warnings.json").read_text(
+            encoding="utf-8")
+    )
+    assert any("input_sha" in w for w in warnings_file["warnings"])
+
+
+def test_the_input_json_records_exactly_what_was_sent(digest_fixture):
+    class DryArgs:
+        week = W13
+        db = digest_fixture["db_path"]
+        out_dir = str(digest_fixture["out_dir"])
+        dry_run = True
+        apply_json = None
+
+    glm_mod.run(DryArgs())
+    payload = json.loads(
+        (digest_fixture["out_dir"] / f"{W13}.glm_input.json").read_text(encoding="utf-8")
+    )
+    sent = [entry["n"] for entry in payload["items"]]
+    assert sent == [n for batch in payload["batches"] for n in batch]
+    assert len(payload["input_sha"]) == 64
+
+
+def test_batches_signature_changes_when_the_candidates_change():
+    today = "2026-09-13"
+    first = [[_big_item(1, 3)]]
+    second = [[_big_item(1, 4)]]
+    assert glm_mod.batches_signature(today, first) != glm_mod.batches_signature(
+        today, second
+    )
+
+
+# ─── 4. MEDIUM — 중단 창 복구 (.bak) ──────────────────────────────────────
+def test_a_leftover_bak_is_restored_before_anything_else(
+    digest_fixture, tmp_path, monkeypatch
+):
+    """md 를 쓴 뒤 정본을 쓰기 전에 죽은 실행을 다음 실행이 되돌린다."""
+    markdown_path = digest_fixture["markdown_path"]
+    original = markdown_path.read_text(encoding="utf-8")
+
+    backup = markdown_path.with_name(markdown_path.name + ".bak")
+    backup.write_text(original, encoding="utf-8")
+    markdown_path.write_text(
+        original.replace("## ✅", "## ✅ 손상된 본문"), encoding="utf-8"
+    )
+    assert markdown_path.read_text(encoding="utf-8") != original
+
+    monkeypatch.setattr(glm_mod, "DS_BIN", tmp_path / "no-such-ds")
+
+    class Args:
+        week = W13
+        db = digest_fixture["db_path"]
+        out_dir = str(digest_fixture["out_dir"])
+        dry_run = False
+        apply_json = None
+
+    assert glm_mod.run(Args()) == 0
+    assert markdown_path.read_text(encoding="utf-8") == original
+    assert not backup.exists()
+    warnings_file = json.loads(
+        (digest_fixture["out_dir"] / f"{W13}.glm_warnings.json").read_text(
+            encoding="utf-8")
+    )
+    assert any(".bak" in w for w in warnings_file["warnings"])
+    result = check_digest(
+        db_path=digest_fixture["db_path"], markdown_path=markdown_path,
+        output_path=None, skip_network=False,
+    )
+    assert result["pass"], result.get("reason")
+    assert result["manifest_problems"] == []
+
+
+# ─── 5. MEDIUM — Codex 가 든 두 덩어리 날짜 문자열 ────────────────────────
+def test_the_codex_two_group_date_string_stays_one_unit():
+    line = "가. 접수기간: 2026. 9. 1. ~ 9. 30. (수) 18시까지 온라인 신청"
+    assert glm_mod._split_at_markers(line) == [line]
+
+
+def test_the_codex_date_string_inside_a_long_sentence_is_not_chopped():
+    body = (
+        "여기에 충분히 긴 설명 문장을 적어 둔다 " * 5
+        + "가. 접수기간: 2026. 9. 1. ~ 9. 30. (수) 18시까지 온라인 신청 "
+        + "나. 제출 서류는 신청서와 사업계획서다"
+    )
+    units = glm_mod.candidate_units(body)
+    assert "가. 접수기간: 2026. 9. 1. ~ 9. 30. (수) 18시까지 온라인 신청" in units
+    assert not any(unit.startswith("30.") for unit in units), units
+
+
+# ─── 6. LOW — 뒤늦은 관련 문장이 살아남는다 ───────────────────────────────
+def test_a_late_keyword_unit_survives_the_cap():
+    plain = [
+        f"{index}) 이 문단은 회의실 위치를 안내하는 문장이며 핵심어가 없다"
+        for index in range(1, 13)
+    ]
+    late = "13) 신청 자격 요건은 다음과 같이 완화한다 여기에 설명이 붙는다"
+    item = {"title": "제목", "detail_text": " ".join(plain + [late])}
+
+    candidates = glm_mod.candidate_sentences(item)
+
+    assert candidates[-1].startswith("13)")
+    assert [c[:2] for c in candidates[:8]] == [f"{i})" for i in range(1, 9)]
+
+
+def test_the_codex_thirteen_sentence_case_is_documented():
+    """Codex LOW 재현 — 앞 12문장이 모두 핵심어를 담으면 13번째는 여전히 밀린다.
+
+    앞 8개는 문서 순서로 보장되고 남은 4자리는 9~12번이 가져간다. 이 순서는
+    결정론이지만 **관련성 보장은 아니다** — 보고서에 그대로 적는다.
+    """
+    plain = [
+        f"{index}) 지원센터 제1회의실 위치를 안내합니다 여기에 설명이 붙는다"
+        for index in range(1, 13)
+    ]
+    late = "13) 사회적기업은 이번 사업에 참여할 수 없습니다 여기에 설명이 붙는다"
+    item = {"title": "제목", "detail_text": " ".join(plain + [late])}
+
+    candidates = glm_mod.candidate_sentences(item)
+
+    assert not any(c.startswith("13)") for c in candidates)
+    assert len(candidates) == glm_mod.MAX_CANDIDATES
+    assert all(
+        candidate.startswith(f"{index})")
+        for index, candidate in enumerate(candidates, start=1)
+    )
+
+
+# ─── 7. LOW — 초안은 사람만 보는 주석이다 (문서화) ────────────────────────
+def test_the_checker_threat_model_states_the_headline_draft_is_comment_only():
+    from alert.digest import checker as checker_mod
+
+    doc = checker_mod.__doc__ or ""
+    assert "GLM 초안" in doc
+    assert "주석" in doc
+    assert "apply_commentary.py" in doc
