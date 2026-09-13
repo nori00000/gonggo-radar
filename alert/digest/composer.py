@@ -1443,6 +1443,17 @@ def _select_with_pins(
             pinned_taken)
 
 
+def _has_column(cursor, table: str, column: str) -> bool:
+    """``table`` 에 ``column`` 이 있는가 (SQLite 전용, 읽기만)."""
+    try:
+        return any(
+            row[1] == column
+            for row in cursor.execute(f"PRAGMA table_info({table})").fetchall()
+        )
+    except Exception:                       # noqa: BLE001 - 스키마 조회 실패는 "없음"
+        return False
+
+
 def compose_digest_data(
     db_path: str,
     week_str: Optional[str] = None,
@@ -1484,13 +1495,20 @@ def compose_digest_data(
     if exclude_list:
         exclude_sql = " AND url NOT IN (%s)" % ", ".join("?" * len(exclude_list))
 
+    # 관찰 모드 가드 (P0 계약 §A 불변 조건 2): 협의회 프로파일 **단독**으로
+    # 적재된 행은 후보에 넣지 않는다 - P0 에서 브리핑 동작은 바뀌지 않는다.
+    # 컬럼이 없는 DB(마이그레이션 전·테스트 픽스처)는 거를 것이 없다.
+    council_sql = ""
+    if _has_column(cursor, "announcements", "council_only"):
+        council_sql = " AND COALESCE(council_only, 0) = 0"
+
     # 판정 ④의 정렬 정본. 빈 문자열도 "마감 없음"으로 취급하려고 NULLIF를 쓴다.
     cursor.execute(
         f"""
         SELECT id, source, title, summary, url, period_start, period_end,
                created_at, raw_data
         FROM announcements
-        WHERE created_at >= ? AND created_at < ?{exclude_sql}
+        WHERE created_at >= ? AND created_at < ?{exclude_sql}{council_sql}
         ORDER BY (NULLIF(period_end, '') IS NULL),
                  NULLIF(period_end, ''),
                  created_at DESC

@@ -2,7 +2,7 @@
 
 import sqlite3
 import pytest
-from alert.migrations import run_migrations
+from alert.migrations import MIGRATIONS, run_migrations
 
 
 @pytest.fixture
@@ -65,8 +65,8 @@ class TestMigrations:
 
         # Second run should apply 0 new migrations
         assert count2 == 0
-        # First run should apply 4 migrations
-        assert count1 == 6
+        # First run should apply every declared migration
+        assert count1 == len(MIGRATIONS)
 
     def test_without_vec(self, base_conn):
         """vec_available=False should NOT create vec_announcements virtual table."""
@@ -87,4 +87,4 @@ class TestMigrations:
         assert "schema_version" in tables
 
         rows = base_conn.execute("SELECT * FROM schema_version ORDER BY version").fetchall()
-        assert len(rows) == 6  # 6 migrations
+        assert len(rows) == len(MIGRATIONS)

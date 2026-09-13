@@ -120,6 +120,26 @@ MIGRATIONS: List[Tuple[int, str, List[str]]] = [
             "CREATE INDEX IF NOT EXISTS idx_ann_legacy ON announcements(legacy);",
         ]
     ),
+    # P0 계약 §A - 협의회 적재 프로파일의 측정 컬럼.
+    # ``council_only`` 는 3개 측정 컬럼과 성격이 다르다: **회사 경로가 고르지
+    # 않았는데 협의회 매치라서 저장된 행**을 표시한다. 회사 알림 쿼리
+    # (``Database.get_unnotified``)와 브리핑 후보 쿼리가 이 플래그 하나로
+    # 그 행들을 건너뛴다 - 불변 조건 1·2를 지키는 유일한 관문이다.
+    # 기존 행은 전부 기본값 0 이므로 전후 동작이 같다.
+    (
+        7,
+        "Add council profile observation columns to announcements",
+        [
+            "ALTER TABLE announcements ADD COLUMN council_score REAL DEFAULT 0.0;",
+            "ALTER TABLE announcements ADD COLUMN council_tags TEXT DEFAULT '{}';",
+            "ALTER TABLE announcements ADD COLUMN council_match INTEGER DEFAULT 0;",
+            "ALTER TABLE announcements ADD COLUMN council_only INTEGER DEFAULT 0;",
+            "CREATE INDEX IF NOT EXISTS idx_ann_council_match"
+            " ON announcements(council_match);",
+            "CREATE INDEX IF NOT EXISTS idx_ann_council_only"
+            " ON announcements(council_only);",
+        ]
+    ),
 ]
 
 

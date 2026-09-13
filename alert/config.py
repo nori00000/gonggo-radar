@@ -104,6 +104,24 @@ class KeywordsConfig:
 
 
 @dataclass
+class CouncilProfileConfig:
+    """협의회 적재 프로파일 어휘 (P0 계약 §A).
+
+    회사 프로파일(:class:`KeywordsConfig`)과 **독립**이다. ``sources`` 가 비면
+    프로파일 전체가 비활성이 된다 - 킬 스위치가 설정 한 줄이다.
+
+    ``eligibility``/``region`` 은 ``태그 -> 표기 변형 목록`` 매핑이다. YAML 에
+    평평한 목록으로 써도 ``{어휘: [어휘]}`` 로 받아 준다.
+    """
+
+    sources: list[str] = field(default_factory=list)
+    must_match: list[str] = field(default_factory=list)
+    eligibility: Dict[str, list[str]] = field(default_factory=dict)
+    region: Dict[str, list[str]] = field(default_factory=dict)
+    exclude: list[str] = field(default_factory=list)
+
+
+@dataclass
 class ScheduleConfig:
     """Scheduler settings."""
 
@@ -194,6 +212,7 @@ class AppConfig:
     keywords: KeywordsConfig = field(default_factory=KeywordsConfig)
     schedule: ScheduleConfig = field(default_factory=ScheduleConfig)
     knowledge: KnowledgeConfig = field(default_factory=KnowledgeConfig)
+    council_profile: CouncilProfileConfig = field(default_factory=CouncilProfileConfig)
 
     # Convenience: absolute path to data directory
     @property
@@ -240,6 +259,40 @@ def _build_knowledge_config(raw: Dict[str, Any]) -> KnowledgeConfig:
         history=HistoryConfig(**history_raw) if history_raw else HistoryConfig(),
         research=ResearchConfig(**research_raw) if research_raw else ResearchConfig(),
         n8n=N8nConfig(**n8n_raw) if n8n_raw else N8nConfig(),
+    )
+
+
+def _normalize_tag_table(raw: Any) -> Dict[str, list[str]]:
+    """``태그 -> 표기 변형`` 표를 정규화한다.
+
+    YAML 이 목록이면 각 항목을 제 이름의 태그로 본다. 매핑이면 값이 문자열인
+    경우도 한 원소 목록으로 편다.
+    """
+    if not raw:
+        return {}
+    if isinstance(raw, list):
+        return {str(item): [str(item)] for item in raw}
+    table: Dict[str, list[str]] = {}
+    for tag, aliases in dict(raw).items():
+        if aliases is None:
+            table[str(tag)] = [str(tag)]
+        elif isinstance(aliases, (list, tuple)):
+            table[str(tag)] = [str(a) for a in aliases]
+        else:
+            table[str(tag)] = [str(aliases)]
+    return table
+
+
+def _build_council_profile(raw: Dict[str, Any]) -> CouncilProfileConfig:
+    """``council_profile:`` 블록을 읽는다. 블록이 없으면 빈(=비활성) 프로파일."""
+    if not raw:
+        return CouncilProfileConfig()
+    return CouncilProfileConfig(
+        sources=list(raw.get("sources", []) or []),
+        must_match=list(raw.get("must_match", []) or []),
+        eligibility=_normalize_tag_table(raw.get("eligibility")),
+        region=_normalize_tag_table(raw.get("region")),
+        exclude=list(raw.get("exclude", []) or []),
     )
 
 
@@ -342,6 +395,7 @@ def _build_config() -> AppConfig:
             timezone=schedule_raw.get("timezone", "Asia/Seoul"),
         ),
         knowledge=_build_knowledge_config(knowledge_raw),
+        council_profile=_build_council_profile(raw.get("council_profile", {})),
     )
 
     _load_env_secrets(cfg)

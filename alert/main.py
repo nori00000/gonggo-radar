@@ -13,6 +13,7 @@ from datetime import datetime
 from typing import List, Dict, Any, Optional, Tuple
 
 from .config import get_config
+from .council import score_item
 from .db import Database
 from .analyzer import KeywordAnalyzer, ClaudeAnalyzer
 from .models import RawAnnouncement, AnalyzedAnnouncement
@@ -231,6 +232,66 @@ def select_for_storage(
         return analyzed, True
 
     return keyword_analyzer.analyze_batch(raw_announcements), False
+
+
+def apply_council_profile(
+    profile: Any,
+    source: str,
+    raw_items: List[RawAnnouncement],
+    selected: List[AnalyzedAnnouncement],
+    analyze: Any,
+) -> List[AnalyzedAnnouncement]:
+    """협의회 프로파일을 적용한다 - **회사 선택 결과는 건드리지 않는다**.
+
+    두 가지 일만 한다:
+
+    1. 회사 경로가 이미 고른 항목(``selected``)에는 측정값(council_score·
+       council_tags·council_match)만 붙인다. ``relevance_score``·
+       ``relevance_reason``·``matched_keywords`` 는 읽지도 쓰지도 않는다.
+    2. 회사 경로가 버렸지만 ``council_match=1`` 인 항목은 **별도 목록**으로
+       돌려준다. 이 항목의 회사 점수는 계산값(임계 미달) 그대로 두고
+       ``council_only=1`` 을 세워 알림·브리핑 쿼리가 집지 않게 한다.
+
+    계약 §A 불변 조건 1이 여기서 갈린다: 이 함수는 ``selected`` 의 원소를
+    **더하거나 빼지 않는다**.
+
+    Args:
+        profile: :class:`alert.config.CouncilProfileConfig`.
+        source: 소스 이름.
+        raw_items: 중복 제거를 마친 신규 원본 항목 전량.
+        selected: 회사 경로(:func:`select_for_storage`)가 고른 저장 대상.
+        analyze: 회사 키워드 분석 함수 (``KeywordAnalyzer.analyze``).
+
+    Returns:
+        협의회 프로파일 **단독**으로 저장할 항목 목록 (``council_only=1``).
+    """
+    if not profile or not getattr(profile, "sources", None):
+        return []
+
+    selected_by_id = {ann.source_id: ann for ann in selected}
+    extras: List[AnalyzedAnnouncement] = []
+
+    for raw in raw_items:
+        verdict = score_item(
+            profile, source, raw.title, raw.summary, raw.target, raw.category
+        )
+        chosen = selected_by_id.get(raw.source_id)
+        if chosen is not None:
+            chosen.council_score = verdict.score
+            chosen.council_tags = verdict.tags_json()
+            chosen.council_match = verdict.match
+            chosen.council_only = 0
+            continue
+        if not verdict.match:
+            continue
+        extra = analyze(raw)
+        extra.council_score = verdict.score
+        extra.council_tags = verdict.tags_json()
+        extra.council_match = verdict.match
+        extra.council_only = 1
+        extras.append(extra)
+
+    return extras
 
 
 def run_pipeline(test_mode: bool = False) -> None:
@@ -472,12 +533,33 @@ def run_pipeline(test_mode: bool = False) -> None:
             # Stage 4: Save to database
             # ---------------------------------------------------------------------------
 
+            # ── 협의회 적재 프로파일 (관찰 모드, 계약 §A) ────────────
+            # 회사 선택 결과에는 측정값만 붙고, 회사가 버린 협의회 매치만
+            # 따로 저장된다. 지식 레이어·알림에는 넘기지 않는다.
+            council_extra = apply_council_profile(
+                config.council_profile,
+                crawler_name,
+                new_raw,
+                analyzed,
+                keyword_analyzer.analyze,
+            )
+
             for ann in analyzed:
                 row_id = db.insert_announcement(ann)
                 if row_id:  # int is truthy, None is falsy
                     ann.id = row_id
                     all_new_announcements.append(ann)
                     logger.debug(f"Saved new announcement: {ann.title} (id={row_id}, score={ann.relevance_score:.2f})")
+
+            council_saved = 0
+            for ann in council_extra:
+                if db.insert_announcement(ann):
+                    council_saved += 1
+            if council_extra:
+                logger.info(
+                    f"{crawler_name}: 협의회 단독 적재 {council_saved}/"
+                    f"{len(council_extra)}건 (회사 알림·브리핑 경로 제외)"
+                )
 
             # Record run statistics
             run_stats[crawler_name] = {

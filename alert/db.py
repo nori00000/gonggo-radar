@@ -290,8 +290,10 @@ class Database:
                     (source, source_id, title, summary, url, author, category,
                      target, period_start, period_end, relevance_score,
                      relevance_reason, matched_keywords, is_notified,
-                     raw_data, created_at, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?)
+                     raw_data, created_at, updated_at,
+                     council_score, council_tags, council_match, council_only)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?,
+                        ?, ?, ?, ?)
                 """)
             params = (
                 ann.source, ann.source_id, ann.title, ann.summary, ann.url,
@@ -299,6 +301,10 @@ class Database:
                 ann.period_end, ann.relevance_score, ann.relevance_reason,
                 json.dumps(ann.matched_keywords, ensure_ascii=False),
                 ann.raw_data, now, now,
+                getattr(ann, "council_score", 0.0),
+                getattr(ann, "council_tags", "{}"),
+                getattr(ann, "council_match", 0),
+                getattr(ann, "council_only", 0),
             )
             if self._backend == "postgresql":
                 cur = self._conn.cursor()
@@ -322,6 +328,9 @@ class Database:
                    SET relevance_score  = ?,
                        relevance_reason = ?,
                        matched_keywords = ?,
+                       council_score    = ?,
+                       council_tags     = ?,
+                       council_match    = ?,
                        updated_at       = ?
                  WHERE id = ?
                 """),
@@ -329,6 +338,9 @@ class Database:
                     ann.relevance_score,
                     ann.relevance_reason,
                     json.dumps(ann.matched_keywords, ensure_ascii=False),
+                    getattr(ann, "council_score", 0.0),
+                    getattr(ann, "council_tags", "{}"),
+                    getattr(ann, "council_match", 0),
                     now,
                     row["id"],
                 ),
@@ -344,12 +356,17 @@ class Database:
 
         옛 규칙으로 저장된 행(``legacy``)은 아무 것도 주장할 수 없으므로
         제외한다 (15차 게이트).
+
+        협의회 프로파일 **단독**으로 저장된 행(``council_only``)도 제외한다.
+        회사 경로가 고르지 않은 항목이 알림으로 새면 계약 불변 조건 1이
+        깨진다 (P0 계약 §A). 기존 행은 전부 0 이라 동작이 바뀌지 않는다.
         """
         rows = self._conn.execute(
             """
             SELECT * FROM announcements
              WHERE is_notified = 0
                AND legacy = 0
+               AND council_only = 0
                AND (period_end IS NULL OR period_end = '' OR period_end >= date('now'))
              ORDER BY relevance_score DESC, created_at DESC
             """

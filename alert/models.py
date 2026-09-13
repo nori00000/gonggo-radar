@@ -32,6 +32,13 @@ class AnalyzedAnnouncement(RawAnnouncement):
     matched_keywords: list = field(default_factory=list)
     id: Optional[int] = None
 
+    # 협의회 적재 프로파일 측정값 (P0 계약 §A). 회사 점수와 독립이며,
+    # council_only=1 은 "회사 경로가 고르지 않은 행" 이라는 뜻이다.
+    council_score: float = 0.0
+    council_tags: str = "{}"
+    council_match: int = 0
+    council_only: int = 0
+
 
 @dataclass
 class Keyword:
