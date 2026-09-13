@@ -668,6 +668,30 @@ def record_superseded(state: Dict, message_ids) -> Dict:
     return updated
 
 
+def set_superseded(state: Dict, message_ids) -> Dict:
+    """정리 대기 큐를 **통째로 교체**한다 (라운드 3).
+
+    `superseded_message_ids` 는 "밀어냈다고 믿지만 아직 화면에서 지우지 못한"
+    메시지의 **대기 큐**다(이력이 아니다 — 이력은 로그가 맡는다). 한 번 시도한
+    뒤에도 큐에 남기면 매 회차마다 같은 메시지에 deleteMessage 를 재발사한다.
+    그래서 완전 전송이 끝난 회차가 큐를 비우고, 미완 전송이 큐를 채운다.
+    """
+    updated = dict(state)
+    queue: List[int] = []
+    for value in message_ids or ():
+        value = int(value)
+        if value not in queue:
+            queue.append(value)
+    updated["superseded_message_ids"] = queue[-SUPERSEDED_MAX:]
+    return updated
+
+
+def superseded_message_ids(state: Optional[Dict]) -> List[int]:
+    """정리 대기 큐 (없으면 빈 목록)."""
+    return [int(value)
+            for value in ((state or {}).get("superseded_message_ids") or [])]
+
+
 def pinned_ids(state: Optional[Dict]) -> List[int]:
     """상태의 승격 공고 id 목록 (없으면 빈 목록)."""
     return [int(value) for value in ((state or {}).get("pinned_ids") or [])]

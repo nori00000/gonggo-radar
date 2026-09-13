@@ -5593,7 +5593,8 @@ def test_notify_deletes_previous_preview_and_notice(tmp_path, monkeypatch):
 
     assert deleted == [1000, 1001]
     state = state_mod.load_state(state_path, "2026-W37")
-    assert state["superseded_message_ids"] == [1000, 1001]
+    # 라운드 3: 큐는 **정리 대기**다 — 시도가 끝났으므로 비운다(재발사 금지).
+    assert state["superseded_message_ids"] == []
     assert state["preview_message_ids"] == [2014]       # 새 좌표만 남는다
 
 
@@ -5612,7 +5613,9 @@ def test_notify_delete_failure_does_not_stop_preview(tmp_path, monkeypatch):
     assert _run_notify(monkeypatch, notify_digest, md) == 0
     assert deleted == [1000]
     state = state_mod.load_state(state_path, "2026-W37")
-    assert state["superseded_message_ids"] == [1000]
+    # 삭제 실패는 대개 영구적이다(48시간 초과·권한 없음) — 한 번 시도하고 비운다.
+    # 다시 큐에 남기면 회차마다 같은 메시지에 deleteMessage 를 재발사한다.
+    assert state["superseded_message_ids"] == []
     assert state_mod.approval_of(state)["id"]           # 승인은 정상 발급
 
 
@@ -5753,8 +5756,10 @@ def test_notify_keeps_old_preview_on_partial_send(tmp_path, monkeypatch):
     assert len(calls) == 2                 # 두 번째에서 깨졌다
     assert deleted == []                   # 옛 미리보기·안내 모두 살아 있다
     state = state_mod.load_state(state_path, "2026-W37")
-    # 도착해 버린 새 조각은 superseded 후보로만 적는다 (지우지는 않는다)
-    assert state["superseded_message_ids"] == [3000]
+    # 도착해 버린 새 조각 + **상태에서 사라질 옛 좌표**가 정리 대기 큐로 간다.
+    # 잠금 ①의 승인 초안 발급이 preview_message_ids 를 이미 비웠으므로, 큐로
+    # 옮기지 않으면 옛 미리보기를 가리키는 좌표가 어디에도 남지 않는다 (라운드 3).
+    assert state["superseded_message_ids"] == [3000, 1000, 1001]
     assert state["approval"] is None       # 반쪽 미리보기는 승인 대상이 아니다
 
 
@@ -5782,4 +5787,165 @@ def test_notify_deletes_only_after_every_chunk_arrives(tmp_path, monkeypatch):
     assert deleted == [1000, 1001]
     state = state_mod.load_state(state_path, "2026-W37")
     assert state["preview_message_ids"] == [3000, 3001]
-    assert state["superseded_message_ids"] == [1000, 1001]
+    assert state["superseded_message_ids"] == []        # 라운드 3: 큐를 비운다
+
+
+# ══ V4 라운드 3 (Codex MEDIUM): 중복 message_id 는 전송 실패다 ═══════════
+def test_notify_treats_duplicate_message_ids_as_failure(tmp_path, monkeypatch):
+    """같은 id 를 두 번 받으면 실제 도착은 하나뿐인데 **개수만** 맞는다.
+
+    라운드 2 의 `len(message_ids) == len(chunks)` 는 이것을 완전 전송으로 오판해
+    옛 미리보기를 지웠다. 결과를 믿을 수 없으므로 삭제도 승인 카드도 없다.
+    """
+    from scripts import notify_digest
+
+    annotated, _ = apply_headline(SAMPLE_MD, "확정 의견")
+    md = _write_digest(tmp_path, annotated)
+    state_path = state_mod.state_path_for_markdown(md)
+    state_mod.save_state(state_path, dict(
+        state_mod.default_state("2026-W37"),
+        preview_message_ids=[1000], notice_message_ids=[1001]))
+
+    deleted = []
+    _delete_stub(monkeypatch, notify_digest, deleted)
+    _two_chunk_preview(monkeypatch)
+    # 두 조각 모두 같은 id 를 돌려준다
+    _notify_stubs(monkeypatch, notify_digest,
+                  lambda token, chat, thread, text: (True, 3000, ""))
+    monkeypatch.setattr(
+        "sys.argv", ["notify_digest.py", str(md), "--db", _db_for(md)])
+    assert notify_digest.main() == 2
+
+    assert deleted == []                               # 아무것도 지우지 않았다
+    state = state_mod.load_state(state_path, "2026-W37")
+    assert state["approval"] is None                   # 승인 카드도 없다
+    assert state["preview_message_ids"] == []          # 좌표를 만들지 않았다
+    assert 3000 in state["superseded_message_ids"]     # 정리 대기 큐로
+
+
+def test_notify_rejects_missing_message_id(tmp_path, monkeypatch):
+    """message_id 가 없는 성공 응답도 결과를 믿을 수 없다 (같은 fail-closed)."""
+    from scripts import notify_digest
+
+    annotated, _ = apply_headline(SAMPLE_MD, "확정 의견")
+    md = _write_digest(tmp_path, annotated)
+    state_path = state_mod.state_path_for_markdown(md)
+    state_mod.save_state(state_path, dict(
+        state_mod.default_state("2026-W37"), preview_message_ids=[1000]))
+
+    deleted = []
+    _delete_stub(monkeypatch, notify_digest, deleted)
+    _notify_stubs(monkeypatch, notify_digest,
+                  lambda token, chat, thread, text: (True, None, ""))
+    monkeypatch.setattr(
+        "sys.argv", ["notify_digest.py", str(md), "--db", _db_for(md)])
+    assert notify_digest.main() == 2
+    assert deleted == []
+    state = state_mod.load_state(state_path, "2026-W37")
+    assert state["approval"] is None
+
+
+# ══ V4 라운드 3: 미완 전송의 **후속 회수** ══════════════════════════════
+def test_partial_delivery_is_cleaned_up_by_next_successful_run(
+    tmp_path, monkeypatch
+):
+    """1회차가 반쪽 전송으로 남긴 조각을 2회차 완전 전송이 지운다.
+
+    Codex 재게이트의 미확인 항목: "3000 만 도착하고 실패 → 다음 실행 성공 →
+    3000 삭제 여부". 큐를 읽어 삭제 대상으로 삼는 경로가 없었다.
+    """
+    from scripts import notify_digest
+
+    annotated, _ = apply_headline(SAMPLE_MD, "확정 의견")
+    md = _write_digest(tmp_path, annotated)
+    state_path = state_mod.state_path_for_markdown(md)
+    state_mod.save_state(state_path, dict(
+        state_mod.default_state("2026-W37"),
+        preview_message_ids=[1000],
+        preview_items={"1000": ["https://example.com/a"]},
+        notice_message_ids=[1001]))
+    monkeypatch.setattr(
+        "sys.argv", ["notify_digest.py", str(md), "--db", _db_for(md)])
+
+    # ── 1회차: 2조각 중 1조각만 도착 ────────────────────────────────────
+    deleted = []
+    _delete_stub(monkeypatch, notify_digest, deleted)
+    _two_chunk_preview(monkeypatch)
+    calls = []
+
+    def flaky(token, chat, thread, text):
+        calls.append(text)
+        return (True, 3000, "") if len(calls) == 1 else (False, None, "API 실패")
+
+    _notify_stubs(monkeypatch, notify_digest, flaky)
+    assert notify_digest.main() == 2
+    assert deleted == []
+    queued = state_mod.load_state(state_path, "2026-W37")
+    assert queued["superseded_message_ids"] == [3000, 1000, 1001]
+
+    # ── 2회차: 완전 전송 → 큐를 회수한다 ────────────────────────────────
+    # monkeypatch.undo() 는 쓰지 않는다 — autouse 픽스처가 같은 monkeypatch 로
+    # 건 스텁(check_url_alive)까지 풀려 2회차가 "죽은 링크"로 차단된다.
+    # 필요한 것만 덮어쓴다: 이번엔 한 조각, 전송은 성공.
+    deleted2 = []
+    seen2 = []
+    monkeypatch.setattr(preview_mod, "chunk_text",
+                        lambda text, limit=None: ["조각 1"])
+    _delete_stub(monkeypatch, notify_digest, deleted2)
+    _notify_stubs(
+        monkeypatch, notify_digest,
+        lambda token, chat, thread, text: (seen2.append(text),
+                                           (True, 4000, ""))[1])
+    assert notify_digest.main() == 0
+
+    assert not any("⚠️" in text for text in seen2), seen2
+    # 반쪽 조각(3000)과 옛 좌표(1000·1001)를 함께 회수한다.
+    # 1001 은 상태(notice_message_ids)와 큐 양쪽에 있지만 한 번만 지운다.
+    assert sorted(deleted2) == [1000, 1001, 3000]
+    assert len(deleted2) == len(set(deleted2))
+    assert 3000 in deleted2
+    state = state_mod.load_state(state_path, "2026-W37")
+    assert state["superseded_message_ids"] == []
+    assert state["preview_message_ids"] == [4000]
+    assert state_mod.approval_of(state)["id"]
+
+
+def test_block_notice_does_not_consume_cleanup_queue(tmp_path, monkeypatch):
+    """차단 안내는 안내만 밀어낸다 — 미리보기 좌표도 큐도 건드리지 않는다."""
+    from scripts import notify_digest
+
+    annotated, _ = apply_headline(SAMPLE_MD, "확정 의견")
+    md = _write_digest(tmp_path, annotated,
+                       dict(PASS_CHECK, **{"pass": False, "reason": "생존 항목 없음"}))
+    state_path = state_mod.state_path_for_markdown(md)
+    state_mod.save_state(state_path, dict(
+        state_mod.default_state("2026-W37"),
+        preview_message_ids=[1000],
+        preview_items={"1000": ["https://example.com/a"]},
+        notice_message_ids=[1001],
+        superseded_message_ids=[900]))
+
+    deleted = []
+    _delete_stub(monkeypatch, notify_digest, deleted)
+    _notify_stubs(monkeypatch, notify_digest,
+                  lambda token, chat, thread, text: (True, 2020, ""))
+    monkeypatch.setattr(
+        "sys.argv", ["notify_digest.py", str(md), "--db", _db_for(md)])
+    assert notify_digest.main() == 0
+
+    assert deleted == [1001]                   # 안내만
+    state = state_mod.load_state(state_path, "2026-W37")
+    assert state["preview_message_ids"] == [1000]
+    assert state["superseded_message_ids"] == [900]     # 큐는 그대로
+
+
+def test_set_superseded_replaces_and_bounds(tmp_path):
+    """큐 교체 헬퍼: 통째로 갈아 끼우고 상한을 지킨다 (덧붙이기와 짝)."""
+    state = state_mod.default_state("2026-W37")
+    state = state_mod.record_superseded(state, [1, 2, 3])
+    assert state_mod.superseded_message_ids(state) == [1, 2, 3]
+    state = state_mod.set_superseded(state, [9])
+    assert state["superseded_message_ids"] == [9]
+    state = state_mod.set_superseded(state, range(state_mod.SUPERSEDED_MAX + 5))
+    assert len(state["superseded_message_ids"]) == state_mod.SUPERSEDED_MAX
+    assert state_mod.set_superseded(state, [])["superseded_message_ids"] == []
