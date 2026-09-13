@@ -20,22 +20,38 @@ W13 = "2026-W13"
 W13_CREATED_AT = "2026-03-26T12:00:00"
 
 
+def _stub_detail(url, **kwargs) -> str:
+    """항목마다 후보 두 문장을 주는 가짜 상세 본문 (URL 은 넣지 않는다)."""
+    tag = str(url).rstrip("/").rsplit("/", 1)[-1] or "x"
+    return (
+        f"{tag} 공고는 사회적기업 대상 지원사업입니다. "
+        f"{tag} 접수는 9월 22일까지 진행합니다."
+    )
+
+
 @pytest.fixture(autouse=True)
 def stub_detail_fetch(monkeypatch):
     """상세 텍스트 수집은 **절대 실호출하지 않는다** — 기본 스텁은 빈 문자열이다.
 
     개별 테스트가 근거 텍스트를 공급하려면 같은 이름을 다시 갈아끼운다.
     """
-    monkeypatch.setattr(glm_mod, "fetch_detail_text", lambda url, **kwargs: "")
+    monkeypatch.setattr(glm_mod, "fetch_detail_text", _stub_detail)
 
 
-def _label(entry) -> str:
-    """항목 제목을 그대로 옮긴 **추출형** 한 줄 의미 (r3b 문법 통과).
+def _label(entry, pick: int = 1) -> str:
+    """r5: md 에 들어갈 문자열 = **우리가 뽑은 후보 문장** 그대로."""
+    return "«{}»".format(entry["candidates"][pick - 1]["text"])
 
-    r3b 부터 `한 줄 의미`는 «구절» **하나**이거나 정확히 `원문 확인` 이다 —
-    인용 밖에는 한 글자도 올 수 없다.
-    """
-    return "«{}»".format(entry["title"])
+
+def _pick_output(payload_items, pick: int = 1) -> str:
+    """`pick` 만 돌려주는 가짜 GLM 출력."""
+    return json.dumps([
+        {
+            "n": entry["n"], "pick": pick, "대상 태그": "전체",
+            "마감": "원문 확인", "자격": "원문 확인", "금액": "원문 확인",
+        }
+        for entry in payload_items
+    ], ensure_ascii=False)
 
 
 def _create_table(db_path) -> None:
@@ -143,12 +159,14 @@ def _one_input_item(n=1, **overrides):
         "id": 46,
         "title": "테스트 공고",
         "summary": "9월 22일까지 접수합니다. 지원금 300만원.",
+        "detail_text": "이 사업은 9월 22일까지 접수합니다. 지원금 300만원을 지급합니다.",
         "quote_deadline": "2026-09-22",
         "quote_eligibility": "원문 확인",
         "quote_amount": "원문 확인",
         "url": "https://example.com/x",
     }
     item.update(overrides)
+    item["candidates"] = glm_mod.candidate_sentences(item)
     return item
 
 
@@ -158,13 +176,13 @@ def test_gate_output_normal_case_applies_all_fields():
         "n": 1, "대상 태그": "사회적기업(경기)",
         "마감": "2026-09-22 «9월 22일까지»",
         "자격": "원문 확인", "금액": "300만원 «지원금 300만원»",
-        "한 줄 의미": "«9월 22일까지 접수합니다»",
+        "pick": 1,
     }], ensure_ascii=False)
 
     results, warnings = glm_mod.gate_output(raw, items)
 
     assert warnings == []
-    assert results[1]["한 줄 의미"] == "«9월 22일까지 접수합니다»"
+    assert results[1]["한 줄 의미"] == "«{}»".format(items[0]["candidates"][0])
     assert results[1]["마감"] == "2026-09-22 «9월 22일까지»"
     assert results[1]["금액"] == "300만원 «지원금 300만원»"
     assert results[1]["대상 태그"] == "사회적기업(경기)"
@@ -175,16 +193,15 @@ def test_gate_output_quote_not_substring_falls_back_and_warns():
     raw = json.dumps([{
         "n": 1, "대상 태그": "사회적기업",
         "마감": "2026-09-22 «날조된 인용문»",  # 입력 텍스트에 없는 인용
-        "자격": "원문 확인", "금액": "원문 확인",
-        "한 줄 의미": "«9월 22일까지 접수합니다»",
+        "자격": "원문 확인", "금액": "원문 확인", "pick": 1,
     }], ensure_ascii=False)
 
     results, warnings = glm_mod.gate_output(raw, items)
 
     assert results[1]["마감"] == glm_mod.FALLBACK
     assert any("마감" in w and "인용" in w for w in warnings)
-    # 인용 실패가 다른 필드(한 줄 의미)까지 통째로 버리지 않는다
-    assert results[1]["한 줄 의미"] == "«9월 22일까지 접수합니다»"
+    # 인용 실패가 고른 문장까지 통째로 버리지 않는다
+    assert results[1]["한 줄 의미"] == "«{}»".format(items[0]["candidates"][0])
 
 
 def test_gate_output_parse_failure_returns_no_results():
@@ -248,9 +265,10 @@ def test_dry_run_writes_input_json_without_touching_markdown(digest_fixture):
     # GLM 에 보내는 페이로드에는 내부 부기 필드(id)가 없다
     assert "id" not in payload["items"][0]
     assert set(payload["items"][0]) == {
-        "n", "title", "source_name", "summary", "detail_text",
-        "quote_deadline", "quote_eligibility", "quote_amount", "url",
+        "n", "title", "source_name", "url", "quote_deadline", "candidates",
     }
+    # 원문 상세는 프롬프트에 **나가지 않는다** — 고를 후보만 나간다
+    assert "detail_text" not in payload["items"][0]
 
 
 # ─── --apply-json: 가짜 출력 적용 → 정본·checker 가 → 줄을 허용 ───────────
@@ -276,16 +294,9 @@ def test_apply_json_adds_enrich_line_without_changing_item_line(digest_fixture, 
     input_payload = json.loads(
         (digest_fixture["out_dir"] / f"{W13}.glm_input.json").read_text(encoding="utf-8")
     )
-    fake_output = [
-        {
-            "n": entry["n"], "대상 태그": "전체", "마감": "원문 확인",
-            "자격": "원문 확인", "금액": "원문 확인",
-            "한 줄 의미": _label(entry),
-        }
-        for entry in input_payload["items"]
-    ]
     fake_output_path = tmp_path / "fake_glm_output.json"
-    fake_output_path.write_text(json.dumps(fake_output, ensure_ascii=False), encoding="utf-8")
+    fake_output_path.write_text(
+        _pick_output(input_payload["items"]), encoding="utf-8")
 
     class ApplyArgs:
         week = W13
@@ -343,15 +354,9 @@ def test_apply_json_is_idempotent(digest_fixture, tmp_path):
     input_payload = json.loads(
         (digest_fixture["out_dir"] / f"{W13}.glm_input.json").read_text(encoding="utf-8")
     )
-    fake_output = [
-        {
-            "n": entry["n"], "대상 태그": "전체", "마감": "원문 확인",
-            "자격": "원문 확인", "금액": "원문 확인", "한 줄 의미": _label(entry),
-        }
-        for entry in input_payload["items"]
-    ]
     fake_output_path = tmp_path / "fake.json"
-    fake_output_path.write_text(json.dumps(fake_output, ensure_ascii=False), encoding="utf-8")
+    fake_output_path.write_text(
+        _pick_output(input_payload["items"]), encoding="utf-8")
 
     class ApplyArgs:
         week = W13
@@ -536,7 +541,7 @@ def test_build_input_items_carries_detail_text_into_the_payload(
 ):
     monkeypatch.setattr(
         glm_mod, "fetch_detail_text",
-        lambda url, **kwargs: f"상세 본문 {url} 지원금 300만원",
+        lambda url, **kwargs: "이 사업은 지원금 300만원을 지급합니다.",
     )
 
     class Args:
@@ -551,60 +556,12 @@ def test_build_input_items_carries_detail_text_into_the_payload(
         (digest_fixture["out_dir"] / f"{W13}.glm_input.json").read_text(encoding="utf-8")
     )
     for entry in payload["items"]:
-        assert entry["detail_text"].startswith("상세 본문 https://")
-        assert "300만원" in entry["detail_text"]
-
-
-def test_persona_prompt_states_the_evidence_rule():
-    assert "detail_text" in glm_mod.PERSONA_SYSTEM_PROMPT
-    assert "추정 금지" in glm_mod.PERSONA_SYSTEM_PROMPT
-    assert "원문 확인" in glm_mod.PERSONA_SYSTEM_PROMPT
+        texts = [candidate["text"] for candidate in entry["candidates"]]
+        assert texts, entry
+        assert any("300만원" in text for text in texts)
 
 
 # ─── B1. 한 줄 의미 근거 검증 (숫자 토큰 · 인용 전부) ──────────────────────
-def test_gate_summary_replaces_a_fabricated_claim_with_no_quoted_span():
-    """근거에서 오려 온 «인용» 이 하나도 없는 자유 문장은 통과할 수 없다."""
-    items = [_one_input_item()]
-    raw = json.dumps([{
-        "n": 1, "대상 태그": "전체", "마감": "원문 확인",
-        "자격": "원문 확인", "금액": "원문 확인",
-        "한 줄 의미": "전 기업 1억원 지급 확정",
-    }], ensure_ascii=False)
-
-    results, warnings = glm_mod.gate_output(raw, items)
-
-    assert results[1]["한 줄 의미"] == glm_mod.FALLBACK
-    assert any("인용 0개" in w for w in warnings)
-
-
-def test_gate_summary_keeps_a_valid_extractive_line_from_detail_text():
-    items = [_one_input_item(detail_text="사업비 1억원, 9.30 까지 접수합니다")]
-    raw = json.dumps([{
-        "n": 1, "대상 태그": "전체", "마감": "원문 확인",
-        "자격": "원문 확인", "금액": "원문 확인",
-        "한 줄 의미": "«사업비 1억원, 9.30 까지 접수합니다»",
-    }], ensure_ascii=False)
-
-    results, warnings = glm_mod.gate_output(raw, items)
-
-    assert results[1]["한 줄 의미"] == "«사업비 1억원, 9.30 까지 접수합니다»"
-    assert warnings == []
-
-
-def test_gate_summary_checks_every_quote_not_only_the_first():
-    items = [_one_input_item()]
-    raw = json.dumps([{
-        "n": 1, "대상 태그": "전체", "마감": "원문 확인",
-        "자격": "원문 확인", "금액": "원문 확인",
-        "한 줄 의미": "«지원금 300만원» «날조»",
-    }], ensure_ascii=False)
-
-    results, warnings = glm_mod.gate_output(raw, items)
-
-    assert results[1]["한 줄 의미"] == glm_mod.FALLBACK
-    assert any("인용 2개" in w for w in warnings)
-
-
 def test_gate_quoted_field_checks_every_quote_not_only_the_first():
     items = [_one_input_item()]
     raw = json.dumps([{
@@ -619,53 +576,19 @@ def test_gate_quoted_field_checks_every_quote_not_only_the_first():
     assert any("마감" in w and "인용" in w for w in warnings)
 
 
-def test_number_tokens_keeps_the_unit_with_the_digits():
-    assert glm_mod.number_tokens("9.30까지 300만원, 2026-09-30 마감 1억") == [
-        "9.30", "300만원", "2026-09-30", "1억",
-    ]
-
-
 # ─── B2. 형식 게이트 (저장 전 · 필드 단위 대체) ───────────────────────────
-@pytest.mark.parametrize("bad", [
-    "[\ub9c1\ud06c](https://evil.test)",        # 마크다운 링크
-    "**\uc804\uc561 \uc9c0\uc6d0**",                  # 강조
-    "_\uac15\uc870_",                          # 밑줄 강조
-    "<b>\uc2e0\uccad</b>",                     # 꺾쇠
-    "\ud655\uc778\u0000\ud544\uc694",                    # NUL 제어문자
-    "\ud655\uc778\u2028\ud544\uc694",                    # 줄 구분자
-    "\ud655\uc778\u00a0\ud544\uc694",                    # NBSP
-    "\ud655\uc778\u200b\ud544\uc694",                    # 제로폭 공백
-])
-def test_gate_summary_replaces_non_plaintext_before_saving(bad):
-    items = [_one_input_item()]
-    raw = json.dumps([{
-        "n": 1, "대상 태그": "전체", "마감": "원문 확인",
-        "자격": "원문 확인", "금액": "원문 확인", "한 줄 의미": bad,
-    }], ensure_ascii=False)
-
-    results, warnings = glm_mod.gate_output(raw, items)
-
-    assert results[1]["한 줄 의미"] == glm_mod.FALLBACK
-    assert any("한 줄 의미" in w for w in warnings)
-
-
-def test_gate_summary_still_replaces_overlong_text_after_normalization():
-    items = [_one_input_item()]
-    raw = json.dumps([{
-        "n": 1, "대상 태그": "전체", "마감": "원문 확인",
-        "자격": "원문 확인", "금액": "원문 확인",
-        "한 줄 의미": "확인\n" + "가" * 130,
-    }], ensure_ascii=False)
-
-    results, warnings = glm_mod.gate_output(raw, items)
-
-    assert results[1]["한 줄 의미"] == glm_mod.FALLBACK
-    assert any("초과" in w for w in warnings)
-
-
-def test_format_violation_never_reaches_the_markdown(digest_fixture, tmp_path):
-    """저장 **전에** 필드를 대체하므로 링크·제어문자가 본문에 남지 않는다."""
+def test_format_violation_never_reaches_the_markdown(
+    digest_fixture, tmp_path, monkeypatch
+):
+    """r5: 형식 위반 문장은 **후보가 되기 전에** 탈락한다."""
     markdown_path = digest_fixture["markdown_path"]
+    monkeypatch.setattr(
+        glm_mod, "fetch_detail_text",
+        lambda url, **kwargs: (
+            "신청은 [여기](https://evil.test) 에서 진행합니다. "
+            "접수는 9월 22일까지 진행합니다."
+        ),
+    )
 
     class DryArgs:
         week = W13
@@ -678,16 +601,12 @@ def test_format_violation_never_reaches_the_markdown(digest_fixture, tmp_path):
     payload = json.loads(
         (digest_fixture["out_dir"] / f"{W13}.glm_input.json").read_text(encoding="utf-8")
     )
-    fake = [
-        {
-            "n": entry["n"], "대상 태그": "전체", "마감": "원문 확인",
-            "자격": "원문 확인", "금액": "원문 확인",
-            "한 줄 의미": "[신청](https://evil.test)",
-        }
-        for entry in payload["items"]
-    ]
+    # 링크가 든 문장은 후보 목록에 아예 없다
+    for entry in payload["items"]:
+        texts = [candidate["text"] for candidate in entry["candidates"]]
+        assert texts == ["접수는 9월 22일까지 진행합니다."]
     output_path = tmp_path / "bad_format.json"
-    output_path.write_text(json.dumps(fake, ensure_ascii=False), encoding="utf-8")
+    output_path.write_text(_pick_output(payload["items"]), encoding="utf-8")
 
     class ApplyArgs:
         week = W13
@@ -699,7 +618,7 @@ def test_format_violation_never_reaches_the_markdown(digest_fixture, tmp_path):
     assert glm_mod.run(ApplyArgs()) == 0
     text = markdown_path.read_text(encoding="utf-8")
     assert "evil.test" not in text
-    assert f"  → {glm_mod.FALLBACK}" in text
+    assert "  → «접수는 9월 22일까지 진행합니다.»" in text
     result = check_digest(
         db_path=digest_fixture["db_path"], markdown_path=markdown_path,
         output_path=None, skip_network=False,
@@ -764,16 +683,8 @@ def _apply_fake_enrichment(digest_fixture, tmp_path, name="fake.json"):
     payload = json.loads(
         (digest_fixture["out_dir"] / f"{W13}.glm_input.json").read_text(encoding="utf-8")
     )
-    fake = [
-        {
-            "n": entry["n"], "대상 태그": "전체", "마감": "원문 확인",
-            "자격": "원문 확인", "금액": "원문 확인",
-            "한 줄 의미": _label(entry),
-        }
-        for entry in payload["items"]
-    ]
     output_path = tmp_path / name
-    output_path.write_text(json.dumps(fake, ensure_ascii=False), encoding="utf-8")
+    output_path.write_text(_pick_output(payload["items"]), encoding="utf-8")
 
     class ApplyArgs:
         week = W13
@@ -1102,7 +1013,7 @@ def test_build_input_items_passes_the_item_title_as_the_anchor(
 
     def _stub(url, anchor="", **kwargs):
         seen[url] = anchor
-        return f"{anchor} 본문"
+        return "이 공고는 사회적기업 대상 지원사업으로 진행합니다."
 
     monkeypatch.setattr(glm_mod, "fetch_detail_text", _stub)
 
@@ -1120,98 +1031,14 @@ def test_build_input_items_passes_the_item_title_as_the_anchor(
     assert seen
     for entry in payload["items"]:
         assert seen[entry["url"]] == entry["title"]
-        assert entry["detail_text"] == f"{entry['title']} 본문"
+        assert [candidate["text"] for candidate in entry["candidates"]] == [
+            "이 공고는 사회적기업 대상 지원사업으로 진행합니다."
+        ]
 
 
 # ══ V3.1 r2 (Codex 실검토 v3.1 수렴) ══════════════════════════════════════
 # 1. 추출형 `한 줄 의미` — 토큰 경계·문법·정규화
 # ─────────────────────────────────────────────────────────────────────────
-def test_gate_summary_rejects_a_span_cut_from_the_middle_of_a_token():
-    """근거 `사업비 11억원` 에서 `1억원` 을 오려 새 금액을 만들 수 없다."""
-    items = [_one_input_item(summary="사업비 11억원 규모입니다")]
-    raw = json.dumps([{
-        "n": 1, "대상 태그": "전체", "마감": "원문 확인",
-        "자격": "원문 확인", "금액": "원문 확인",
-        "한 줄 의미": "«1억원 규모입니다»",
-    }], ensure_ascii=False)
-
-    results, warnings = glm_mod.gate_output(raw, items)
-
-    assert results[1]["한 줄 의미"] == glm_mod.FALLBACK
-    assert any("완결 문장과 다른 인용" in w for w in warnings)
-
-
-def test_a_span_crossing_an_evidence_newline_is_rejected_in_r4():
-    """r4: 개행은 **단단한 문장 경계**다 — 줄을 가로지른 인용은 문장이 아니다.
-
-    r3b 에서는 통과시켰다(공백 합침 뒤 부분문자열이었으므로). r4 는 목록·표의
-    줄바꿈이 서로 다른 주장을 가르기 때문에 이 방향을 뒤집었다.
-    """
-    items = [_one_input_item(summary="접수기간\n9월 22일까지 신청하세요")]
-    raw = json.dumps([{
-        "n": 1, "대상 태그": "전체", "마감": "원문 확인",
-        "자격": "원문 확인", "금액": "원문 확인",
-        "한 줄 의미": "«접수기간 9월 22일까지 신청하세요»",
-    }], ensure_ascii=False)
-
-    results, warnings = glm_mod.gate_output(raw, items)
-
-    assert results[1]["한 줄 의미"] == glm_mod.FALLBACK
-    assert any("완결 문장과 다른 인용" in w for w in warnings)
-
-    # 한 줄 안의 완결 문장은 그대로 통과한다
-    ok_items = [_one_input_item(summary="접수기간\n9월 22일까지 신청하세요")]
-    ok_raw = json.dumps([{
-        "n": 1, "대상 태그": "전체", "마감": "원문 확인",
-        "자격": "원문 확인", "금액": "원문 확인",
-        "한 줄 의미": "«9월 22일까지 신청하세요»",
-    }], ensure_ascii=False)
-    ok_results, ok_warnings = glm_mod.gate_output(ok_raw, ok_items)
-    assert ok_results[1]["한 줄 의미"] == "«9월 22일까지 신청하세요»"
-    assert ok_warnings == []
-
-
-def test_gate_summary_rejects_any_character_outside_the_span():
-    """r3b: 구절 밖에는 조사 한 글자도 올 수 없다."""
-    items = [_one_input_item()]
-    raw = json.dumps([{
-        "n": 1, "대상 태그": "전체", "마감": "원문 확인",
-        "자격": "원문 확인", "금액": "원문 확인",
-        "한 줄 의미": "«9월 22일까지 접수합니다» 무조건 신청",
-    }], ensure_ascii=False)
-
-    results, warnings = glm_mod.gate_output(raw, items)
-
-    assert results[1]["한 줄 의미"] == glm_mod.FALLBACK
-    assert any("인용 밖 글자" in w and "무조건" in w for w in warnings)
-
-
-def test_gate_summary_grammar_requires_exactly_one_whole_sentence():
-    sentences = ["가나다라마바사아 문장입니다.", "바" * 130]
-    grammar = glm_mod.gate_summary_grammar
-    assert grammar("«가나다라마바사아 문장입니다»", sentences) is None
-    assert grammar("«가나다라마바사아 문장입니다.»", sentences) is None
-    assert "인용 2개" in (grammar("«가나다» «라마바»", sentences) or "")
-    assert "인용 0개" in (grammar("상시 접수", sentences) or "")
-    assert "8자 이상" in (grammar("«가나다»", sentences) or "")
-    # 120자를 넘는 문장은 애초에 인용 대상이 아니다
-    assert "120자 이하" in (grammar("«" + "바" * 130 + "»", sentences) or "")
-
-
-def test_gate_summary_keeps_the_plain_fallback_string():
-    items = [_one_input_item()]
-    raw = json.dumps([{
-        "n": 1, "대상 태그": "전체", "마감": "원문 확인",
-        "자격": "원문 확인", "금액": "원문 확인", "한 줄 의미": "원문 확인",
-    }], ensure_ascii=False)
-
-    results, warnings = glm_mod.gate_output(raw, items)
-
-    assert results[1]["한 줄 의미"] == glm_mod.FALLBACK
-    assert warnings == []
-
-
-
 # ─── 2. 형식 게이트 — 맨몸 URL · 양방향 제어문자 ──────────────────────────
 @pytest.mark.parametrize("bad", [
     "https://evil.test \uc2e0\uccad",            # \ub9e8\ubab8 URL
@@ -1510,8 +1337,16 @@ def test_decode_prefers_bom_then_meta_charset_over_a_wrong_header():
 
 
 # ─── 7. 카톡 — 출현별 대조 · 보강 줄만 떼기 ───────────────────────────────
-def _apply_fallback_enrichment(digest_fixture, tmp_path):
-    """두 항목 모두 `→ 원문 확인` 으로 만든다 (같은 문자열 2개)."""
+def _apply_identical_enrichment(digest_fixture):
+    """두 항목에 **같은** 보강 줄을 박는다 (출현 수 대조용)."""
+    return _set_enrich_lines_directly(
+        digest_fixture["markdown_path"],
+        ["«접수는 9월 22일까지 진행합니다.»"] * 2,
+    )
+
+
+def _unused_apply_fallback(digest_fixture, tmp_path):
+    """(사용 안 함) 예전 생성형 경로의 픽스처."""
     class DryArgs:
         week = W13
         db = digest_fixture["db_path"]
@@ -1549,9 +1384,8 @@ def test_markdown_kakao_problems_counts_identical_enrich_lines_per_item(
 ):
     """두 항목이 같은 `→ 원문 확인` 이면 하나만 사라져도 잡아야 한다."""
     markdown_path = digest_fixture["markdown_path"]
-    _apply_fallback_enrichment(digest_fixture, tmp_path)
-    text = markdown_path.read_text(encoding="utf-8")
-    assert text.count("  → 원문 확인") == 2
+    text = _apply_identical_enrichment(digest_fixture)
+    assert text.count("  → «접수는 9월 22일까지 진행합니다.»") == 2
     assert composer_mod.markdown_kakao_problems(text) == []
 
     original = composer_mod.kakao_blocks_from_markdown
@@ -1651,7 +1485,7 @@ def test_preview_says_replaced_when_only_some_fields_were_gated(
         {
             "n": entry["n"], "대상 태그": "전체", "마감": "원문 확인",
             "자격": "원문 확인", "금액": "원문 확인",
-            "한 줄 의미": "전액 지원 확정",   # 문법 위반 → 필드만 대체
+            "pick": 99,               # 범위 밖 → 그 항목만 보강 줄 없음
         }
         for entry in payload["items"]
     ]
@@ -1698,14 +1532,7 @@ def test_a_rejected_headline_draft_is_recorded_in_the_warnings_file(
     payload = json.loads(
         (digest_fixture["out_dir"] / f"{W13}.glm_input.json").read_text(encoding="utf-8")
     )
-    summary_output = json.dumps([
-        {
-            "n": entry["n"], "대상 태그": "전체", "마감": "원문 확인",
-            "자격": "원문 확인", "금액": "원문 확인",
-            "한 줄 의미": _label(entry),
-        }
-        for entry in payload["items"]
-    ], ensure_ascii=False)
+    summary_output = _pick_output(payload["items"])
     calls = {"n": 0}
 
     def fake_ds_call(prompt, timeout=None):
@@ -1733,50 +1560,58 @@ def test_a_rejected_headline_draft_is_recorded_in_the_warnings_file(
 
 
 # ══ V3.1 r3 — ds 프롬프트 상한(16,384바이트) 때문에 배치로 나눈다 ═════════
-def _big_item(n, chars, id_=None):
-    return {
+def _many_sentences(count: int, tag: str = "가") -> str:
+    """후보로 뽑힐 만한 완결 문장 `count` 개."""
+    return " ".join(
+        f"{tag}{index}번 사업은 사회적기업 대상 지원사업으로 진행합니다."
+        for index in range(count)
+    )
+
+
+def _big_item(n, sentences, id_=None):
+    item = {
         "n": n, "id": id_ if id_ is not None else 40 + n,
         "title": f"산림 지원사업 참여기업 모집 공고 {n}", "source_name": "기관",
-        "summary": "", "detail_text": "가" * chars,
+        "summary": "", "detail_text": _many_sentences(sentences, tag=f"제{n}"),
         "quote_deadline": "", "quote_eligibility": "원문 확인",
         "quote_amount": "원문 확인", "url": f"https://example.com/{n}",
     }
+    item["candidates"] = glm_mod.candidate_sentences(item)
+    return item
 
 
 def test_batch_input_items_keeps_every_prompt_under_the_byte_budget():
     today = "2026-09-13"
-    items = [_big_item(n, 2500) for n in range(1, 6)]
+    items = [_big_item(n, 40) for n in range(1, 6)]
+    budget = 5000   # 후보만 보내므로 프롬프트가 작다 — 쪼개려면 예산을 줄인다
 
-    batches, skipped = glm_mod.batch_input_items(today, items)
+    batches, skipped = glm_mod.batch_input_items(today, items, budget=budget)
 
     assert skipped == []
     assert len(batches) > 1
     for batch in batches:
-        assert glm_mod.prompt_bytes(today, batch) <= glm_mod.PROMPT_BYTE_BUDGET
+        assert glm_mod.prompt_bytes(today, batch) <= budget
     # 모든 항목이 정확히 한 번씩, 문서 순서대로
     assert [item["n"] for batch in batches for item in batch] == [1, 2, 3, 4, 5]
 
 
-def test_batch_input_items_trims_whole_sentences_instead_of_dropping_the_item():
-    """r4: 절단은 **문장 단위**다 — 글자 수로 자르면 없던 주장이 만들어진다."""
+def test_batch_input_items_trims_whole_candidates_instead_of_dropping_the_item():
+    """r5: 절단은 **후보 단위**다 — 후보 자체가 원문의 완결 문장이다."""
     today = "2026-09-13"
-    huge = _big_item(1, 0)
-    huge["detail_text"] = " ".join(f"{'가' * 100}{n} 문장입니다." for n in range(60))
+    item = _big_item(1, 40)
+    assert len(item["candidates"]) == glm_mod.MAX_CANDIDATES
+    budget = glm_mod.prompt_bytes(today, [item]) - 200
 
-    batches, skipped = glm_mod.batch_input_items(today, [huge])
+    batches, skipped = glm_mod.batch_input_items(today, [item], budget=budget)
 
     assert skipped == []
     assert len(batches) == 1 and len(batches[0]) == 1
     trimmed = batches[0][0]
     assert trimmed["n"] == 1                      # 항목이 사라지지 않았다
-    assert 0 < len(trimmed["detail_text"]) < len(huge["detail_text"])
-    assert glm_mod.prompt_bytes(today, [trimmed]) <= glm_mod.PROMPT_BYTE_BUDGET
-    # 남은 텍스트의 모든 문장이 원문의 완결 문장 그대로다
-    original = set(glm_mod.split_sentences(huge["detail_text"]))
-    assert all(
-        sentence in original
-        for sentence in glm_mod.split_sentences(trimmed["detail_text"])
-    )
+    assert 0 < len(trimmed["candidates"]) < len(item["candidates"])
+    assert glm_mod.prompt_bytes(today, [trimmed]) <= budget
+    # 남은 후보는 원래 목록의 앞부분 그대로다
+    assert trimmed["candidates"] == item["candidates"][:len(trimmed["candidates"])]
 
 
 def test_trim_item_to_budget_leaves_a_small_item_untouched():
@@ -1808,16 +1643,20 @@ def _batch_ns(prompt):
     return [item["n"] for item in payload["items"]]
 
 
+def _is_summary_prompt(prompt: str) -> bool:
+    """요약(고르기) 프롬프트인가 — 초안 프롬프트와 모양이 다르다."""
+    return '"candidates"' in prompt
+
+
 def _extractive_for(prompt):
+    """프롬프트에 실린 후보 중 1번을 고르는 가짜 GLM 출력 (r5)."""
     payload = json.loads(prompt.split("\n\n입력\n", 1)[1])
-    return json.dumps([
-        {
-            "n": item["n"], "대상 태그": "전체", "마감": "원문 확인",
-            "자격": "원문 확인", "금액": "원문 확인",
-            "한 줄 의미": "«{}»".format(item["title"]),
-        }
-        for item in payload["items"]
-    ], ensure_ascii=False)
+    return _pick_output(payload["items"])
+
+
+def _auto_respond(prompt, index):
+    """요약 프롬프트면 pick 을 돌려주고, 초안 프롬프트면 한 문장."""
+    return _extractive_for(prompt) if _is_summary_prompt(prompt) else "한 줄 문장"
 
 
 def test_run_splits_into_batches_and_each_prompt_fits_the_cap(
@@ -1825,12 +1664,14 @@ def test_run_splits_into_batches_and_each_prompt_fits_the_cap(
 ):
     """W37 실패 재현: detail_text 를 실으면 한 프롬프트에 다 들어가지 않는다."""
     monkeypatch.setattr(
-        glm_mod, "fetch_detail_text", lambda url, **kwargs: "가" * 3000
+        glm_mod, "fetch_detail_text",
+        lambda url, **kwargs: _many_sentences(12, tag=url[-1]),
     )
+    monkeypatch.setattr(glm_mod, "PROMPT_BYTE_BUDGET", 3900)
     _ds_present(monkeypatch, tmp_path)
     seen = _stub_ds_calls(
         monkeypatch,
-        lambda prompt, index: _extractive_for(prompt) if index <= 2 else "한 줄 문장",
+        _auto_respond,
     )
 
     class Args:
@@ -1862,16 +1703,21 @@ def test_a_failing_batch_does_not_stop_the_other_batches(
     digest_fixture, tmp_path, monkeypatch
 ):
     monkeypatch.setattr(
-        glm_mod, "fetch_detail_text", lambda url, **kwargs: "가" * 3000
+        glm_mod, "fetch_detail_text",
+        lambda url, **kwargs: _many_sentences(12, tag=url[-1]),
     )
+    monkeypatch.setattr(glm_mod, "PROMPT_BYTE_BUDGET", 3900)
     _ds_present(monkeypatch, tmp_path)
 
+    state = {"summary_calls": 0}
+
     def responder(prompt, index):
-        if index == 1:
+        if not _is_summary_prompt(prompt):
+            return "한 줄 문장"
+        state["summary_calls"] += 1
+        if state["summary_calls"] == 1:
             return "이것은 JSON 이 아닙니다"   # 첫 배치 파싱 실패
-        if index == 2:
-            return _extractive_for(prompt)
-        return "한 줄 문장"
+        return _extractive_for(prompt)
 
     _stub_ds_calls(monkeypatch, responder)
 
@@ -1912,100 +1758,6 @@ def test_headline_prompt_stays_under_the_cap(digest_fixture):
 # ══ V3.1 r3b (Codex 실검토 3회차 수렴) ════════════════════════════════════
 # 1. 한 구절만 허용하는 문법 — Codex 가 뚫은 4행이 전부 막혀야 한다
 # ─────────────────────────────────────────────────────────────────────────
-def _summary_verdict(evidence: str, line: str):
-    """(값, 통과, 사유) — 근거 **한 필드**를 문장으로 쪼개 직접 판정한다."""
-    return glm_mod._gate_summary(line, glm_mod.split_sentences(evidence))
-
-
-def test_connectives_alone_cannot_assert_anything():
-    """Codex 1행: 근거 `접수는 9월에만` 인데 출력 `상시 접수` 가 통과했다."""
-    value, ok, reason = _summary_verdict("접수는 9월에만 진행합니다.", "상시 접수")
-    assert (value, ok) == (glm_mod.FALLBACK, False)
-    assert "인용 0개" in reason
-
-
-def test_two_spans_cannot_be_welded_into_a_new_predicate():
-    """Codex 2행: `«신청» «불가»` — 다른 문장의 술어를 결합했다."""
-    value, ok, reason = _summary_verdict(
-        "신청 가능. 환불 불가.", "«신청 가능합니다» «환불 불가합니다»"
-    )
-    assert (value, ok) == (glm_mod.FALLBACK, False)
-    assert "인용 2개" in reason
-
-
-def test_a_number_cannot_be_cut_out_of_a_sentence():
-    """Codex 3행: 근거 `사업비 1.5억원` 에서 `«5억원 …»` 을 오릴 수 없다."""
-    evidence = "사업비 1.5억원 규모로 접수합니다."
-    value, ok, reason = _summary_verdict(evidence, "«5억원 규모로 접수합니다»")
-    assert (value, ok) == (glm_mod.FALLBACK, False)
-    assert "완결 문장과 다른 인용" in reason
-    assert _summary_verdict(evidence, "«사업비 1.5억원 규모로 접수합니다»") == (
-        "«사업비 1.5억원 규모로 접수합니다»", True, ""
-    )
-
-
-def test_a_thousands_separator_cannot_become_a_boundary():
-    """Codex r3 1행: `사업비 1,500만원 지원` → `«500만원 지원»` 이 통과했다."""
-    evidence = "사업비 1,500만원 지원합니다."
-    value, ok, reason = _summary_verdict(evidence, "«500만원 지원합니다»")
-    assert (value, ok) == (glm_mod.FALLBACK, False)
-    assert "완결 문장과 다른 인용" in reason
-    # 쉼표가 든 문장을 통째로 옮기면 통과한다
-    assert _summary_verdict(evidence, "«사업비 1,500만원 지원합니다»") == (
-        "«사업비 1,500만원 지원합니다»", True, ""
-    )
-
-
-def test_a_sentence_cannot_be_cut_before_its_negation():
-    """Codex r3 2행: `…신청 가능 여부는 아직 미정입니다` → `«… 신청 가능»`."""
-    evidence = "사회적기업 신청 가능 여부는 아직 미정입니다."
-    value, ok, reason = _summary_verdict(evidence, "«사회적기업 신청 가능»")
-    assert (value, ok) == (glm_mod.FALLBACK, False)
-    assert "완결 문장과 다른 인용" in reason
-
-
-def test_a_span_cannot_straddle_two_fields():
-    """Codex r3 3행: 제목 끝 + 상세 앞이 한 문장처럼 이어 붙던 경로."""
-    items = [_one_input_item(
-        title="신청 불가 대상: 사회적기업",
-        summary="",
-        detail_text="신청 가능 기간은 9월 22일까지입니다.",
-    )]
-    raw = json.dumps([{
-        "n": 1, "대상 태그": "전체", "마감": "원문 확인",
-        "자격": "원문 확인", "금액": "원문 확인",
-        "한 줄 의미": "«사회적기업 신청 가능 기간은 9월 22일까지입니다»",
-    }], ensure_ascii=False)
-
-    results, warnings = glm_mod.gate_output(raw, items)
-
-    assert results[1]["한 줄 의미"] == glm_mod.FALLBACK
-    assert any("완결 문장과 다른 인용" in w for w in warnings)
-
-
-def test_superscript_and_full_width_glyphs_are_left_alone():
-    """Codex r3 4행: NFKC 가 `10⁴㎡` 를 `104m2` 로 바꿔 수치를 변조했다."""
-    evidence = "지원 면적 10\u2074\u33a1입니다."
-    value, ok, reason = _summary_verdict(evidence, "«지원 면적 104m2입니다»")
-    assert (value, ok) == (glm_mod.FALLBACK, False)
-    assert "완결 문장과 다른 인용" in reason
-    # 원문 글자 그대로면 통과하고, 저장되는 값도 원문 글자 그대로다
-    assert _summary_verdict(evidence, "«지원 면적 10\u2074\u33a1입니다»") == (
-        "«지원 면적 10\u2074\u33a1입니다»", True, ""
-    )
-
-
-def test_full_width_asterisks_do_not_slip_past_the_format_gate():
-    """Codex r3 4행 후반: `＊…＊` 가 정규화 뒤 `*…*` 로 저장됐다."""
-    evidence = "\uff0a누구나 가능\uff0a"
-    value, ok, _reason = _summary_verdict(evidence, "«\uff0a누구나 가능\uff0a»")
-    # NFKC 를 쓰지 않으므로 전각 별표는 전각 그대로 남고, 마크다운 문자가
-    # 만들어지지 않는다 — 저장된 값에 ASCII `*` 가 없다.
-    assert "*" not in value
-    if ok:
-        assert value == "«\uff0a누구나 가능\uff0a»"
-
-
 def test_summary_normalize_collapses_whitespace_and_nothing_else():
     """r4: 정규화는 공백 합침뿐 — 글자를 바꾸지 않는다(NFKC 삭제)."""
     assert glm_mod.summary_normalize("  가   나  ") == "가 나"
@@ -2200,14 +1952,7 @@ def test_preview_says_only_the_headline_draft_was_discarded(
     payload = json.loads(
         (digest_fixture["out_dir"] / f"{W13}.glm_input.json").read_text(encoding="utf-8")
     )
-    summary_output = json.dumps([
-        {
-            "n": entry["n"], "대상 태그": "전체", "마감": "원문 확인",
-            "자격": "원문 확인", "금액": "원문 확인",
-            "한 줄 의미": _label(entry),
-        }
-        for entry in payload["items"]
-    ], ensure_ascii=False)
+    summary_output = _pick_output(payload["items"])
     calls = {"n": 0}
 
     def fake_ds_call(prompt, timeout=None):
@@ -2268,11 +2013,6 @@ def test_split_sentences_keeps_numeric_runs_together():
     ]
 
 
-def test_sentence_forms_allow_dropping_the_trailing_terminator():
-    assert glm_mod.sentence_forms("접수합니다.") == ("접수합니다.", "접수합니다")
-    assert glm_mod.sentence_forms("접수합니다") == ("접수합니다",)
-
-
 def test_evidence_sentences_keeps_the_fields_apart():
     item = _one_input_item(
         title="신청 불가 대상: 사회적기업",
@@ -2285,14 +2025,6 @@ def test_evidence_sentences_keeps_the_fields_apart():
     assert not any(
         "사회적기업 신청 가능" in sentence for sentence in sentences
     )
-
-
-def test_persona_prompt_teaches_the_whole_sentence_rule():
-    prompt = glm_mod.PERSONA_SYSTEM_PROMPT
-    assert "문장 하나를 통째로" in prompt
-    assert "문장 일부" in prompt and "두 문장" in prompt
-    assert "8~120자" in prompt
-    assert prompt.count("예1:") == 1 and prompt.count("예2:") == 1
 
 
 # ─── 3. 절단·건너뛰기 ─────────────────────────────────────────────────────
@@ -2313,7 +2045,7 @@ def test_run_warns_about_a_skipped_item_and_never_sends_it(
     digest_fixture, tmp_path, monkeypatch
 ):
     monkeypatch.setattr(
-        glm_mod, "fetch_detail_text", lambda url, **kwargs: "가" * 200
+        glm_mod, "fetch_detail_text", lambda url, **kwargs: _many_sentences(3)
     )
     _ds_present(monkeypatch, tmp_path)
     # 페르소나 지시만으로도 넘는 예산 — 어떤 항목도 보낼 수 없다
@@ -2450,16 +2182,8 @@ def test_a_failed_manifest_write_rolls_the_markdown_back(
     payload = json.loads(
         (digest_fixture["out_dir"] / f"{W13}.glm_input.json").read_text(encoding="utf-8")
     )
-    fake = [
-        {
-            "n": entry["n"], "대상 태그": "전체", "마감": "원문 확인",
-            "자격": "원문 확인", "금액": "원문 확인",
-            "한 줄 의미": _label(entry),
-        }
-        for entry in payload["items"]
-    ]
     output_path = tmp_path / "ok.json"
-    output_path.write_text(json.dumps(fake, ensure_ascii=False), encoding="utf-8")
+    output_path.write_text(_pick_output(payload["items"]), encoding="utf-8")
 
     real = composer_mod.set_manifest_enrich_lines
     calls = {"n": 0}
@@ -2512,16 +2236,21 @@ def test_preview_reports_a_partially_applied_run_distinctly(
     digest_fixture, tmp_path, monkeypatch
 ):
     monkeypatch.setattr(
-        glm_mod, "fetch_detail_text", lambda url, **kwargs: "가" * 3000
+        glm_mod, "fetch_detail_text",
+        lambda url, **kwargs: _many_sentences(12, tag=url[-1]),
     )
+    monkeypatch.setattr(glm_mod, "PROMPT_BYTE_BUDGET", 3900)
     _ds_present(monkeypatch, tmp_path)
 
+    state = {"summary_calls": 0}
+
     def responder(prompt, index):
-        if index == 1:
+        if not _is_summary_prompt(prompt):
+            return "한 줄 문장"
+        state["summary_calls"] += 1
+        if state["summary_calls"] == 1:
             return None                      # 배치 1 ds 실패
-        if index == 2:
-            return _extractive_for(prompt)   # 배치 2 정상
-        return "한 줄 문장"
+        return _extractive_for(prompt)       # 배치 2 정상
 
     _stub_ds_calls(monkeypatch, responder)
 
@@ -2586,3 +2315,250 @@ def test_kakao_check_catches_two_items_swapping_their_enrich_lines(
     monkeypatch.setattr(composer_mod, "kakao_blocks_from_markdown", swap)
     problems = composer_mod.markdown_kakao_problems(text)
     assert any("보강 줄 불일치" in problem for problem in problems)
+
+
+# ══ V3.1 r5 — 생성이 아니라 선택 ═══════════════════════════════════════════
+# 1. 후보 추출 (결정론)
+# ─────────────────────────────────────────────────────────────────────────
+def _candidates_from(detail, title="어떤 공고 제목"):
+    return glm_mod.candidate_sentences({"title": title, "detail_text": detail})
+
+
+def test_candidates_come_from_the_detail_text_in_document_order():
+    detail = (
+        "첫 번째 문장은 사회적기업 지원 내용입니다. "
+        "두 번째 문장은 접수 방법을 설명합니다. "
+        "세 번째 문장은 문의처를 안내합니다."
+    )
+    assert _candidates_from(detail) == [
+        "첫 번째 문장은 사회적기업 지원 내용입니다.",
+        "두 번째 문장은 접수 방법을 설명합니다.",
+        "세 번째 문장은 문의처를 안내합니다.",
+    ]
+
+
+def test_candidates_drop_sentences_equal_to_or_inside_the_title():
+    title = "2026년 산림형 예비사회적기업 지정 계획 공고 안내입니다"
+    detail = "2026년 산림형 예비사회적기업 지정 계획 공고. 접수는 9월 22일까지 진행합니다."
+    assert _candidates_from(detail, title=title) == [
+        "접수는 9월 22일까지 진행합니다.",
+    ]
+
+
+@pytest.mark.parametrize("meta", [
+    "작성자 : 서울인천센터",
+    "조회수 338 입니다",
+    "등록일 2026/09/11 입니다",
+    "첨부파일을 내려받으세요",
+    "본문 바로가기 메뉴입니다",
+    "로그인 후 이용하세요",
+    "회원가입 후 신청하세요",
+    "다운로드 링크를 누르세요",
+    "이전글 보기입니다",
+    "다음글 보기입니다",
+    "목록으로 돌아가기",
+    "공유 버튼을 누르세요",
+    "프린트 하기 메뉴입니다",
+])
+def test_candidates_drop_page_furniture(meta):
+    detail = f"{meta}. 접수는 9월 22일까지 진행합니다."
+    assert _candidates_from(detail) == ["접수는 9월 22일까지 진행합니다."]
+
+
+def test_candidates_drop_short_long_blank_and_duplicate_sentences():
+    short = "가" * (glm_mod.MIN_CANDIDATE_CHARS - 5)
+    long = "나" * (glm_mod.MAX_CANDIDATE_CHARS + 1)
+    good = "접수는 9월 22일까지 진행합니다."
+    detail = f"{short}. {long}. {good} {good} ■■■■■■■■■■■■■■."
+    assert _candidates_from(detail) == [good]
+
+
+def test_candidates_are_capped_and_keep_the_first_ones():
+    detail = _many_sentences(30)
+    candidates = _candidates_from(detail)
+    assert len(candidates) == glm_mod.MAX_CANDIDATES
+    assert candidates == glm_mod.split_sentences(detail)[:glm_mod.MAX_CANDIDATES]
+
+
+def test_a_sentence_that_fails_the_format_gate_never_becomes_a_candidate():
+    detail = (
+        "신청은 https://evil.test 에서 진행합니다. "
+        "접수는 9월 22일까지 진행합니다."
+    )
+    assert _candidates_from(detail) == ["접수는 9월 22일까지 진행합니다."]
+
+
+# ─── 2. 프롬프트: 원문 상세는 나가지 않는다 ───────────────────────────────
+def test_the_prompt_carries_numbered_candidates_and_no_raw_detail():
+    today = "2026-09-13"
+    item = _big_item(1, 5)
+    prompt = glm_mod.build_summary_prompt(
+        {"today": today, "items": glm_mod.payload_for_glm([item])}
+    )
+    assert '"candidates"' in prompt
+    assert '"k": 1' in prompt or '"k":1' in prompt
+    assert "detail_text" not in prompt
+    assert item["candidates"][0] in prompt
+
+
+def test_persona_prompt_asks_for_a_choice_not_a_sentence():
+    prompt = glm_mod.PERSONA_SYSTEM_PROMPT
+    assert "쓰는 것이 아니라 고르는 것" in prompt
+    assert "가장 먼저 알아야 할 한 문장" in prompt
+    assert "적합한 문장이 없으면" in prompt
+    assert '"pick"' in prompt or "`pick`" in prompt
+    assert "한 줄 의미" not in prompt
+
+
+# ─── 3. pick 검증 ─────────────────────────────────────────────────────────
+def _pick_verdict(pick, candidate_count=3):
+    return glm_mod.gate_pick(pick, candidate_count)
+
+
+def test_gate_pick_accepts_zero_and_valid_indices():
+    assert _pick_verdict(0) == (0, "")
+    assert _pick_verdict(1) == (1, "")
+    assert _pick_verdict(3) == (3, "")
+
+
+@pytest.mark.parametrize("bad", [True, False, "1", 1.0, None, [1]])
+def test_gate_pick_rejects_non_integers(bad):
+    picked, reason = _pick_verdict(bad)
+    assert picked is None
+    assert "정수가 아님" in reason
+
+
+@pytest.mark.parametrize("bad", [-1, 4, 99])
+def test_gate_pick_rejects_out_of_range(bad):
+    picked, reason = _pick_verdict(bad)
+    assert picked is None
+    assert "범위 밖" in reason
+
+
+def test_pick_zero_means_no_enrich_line():
+    items = [_one_input_item()]
+    raw = json.dumps([{
+        "n": 1, "pick": 0, "대상 태그": "전체", "마감": "원문 확인",
+        "자격": "원문 확인", "금액": "원문 확인",
+    }], ensure_ascii=False)
+
+    results, warnings = glm_mod.gate_output(raw, items)
+
+    assert results[1]["한 줄 의미"] == ""
+    assert warnings == []
+
+
+def test_an_invalid_pick_leaves_the_item_without_an_enrich_line():
+    items = [_one_input_item()]
+    raw = json.dumps([{
+        "n": 1, "pick": 99, "대상 태그": "전체", "마감": "원문 확인",
+        "자격": "원문 확인", "금액": "원문 확인",
+    }], ensure_ascii=False)
+
+    results, warnings = glm_mod.gate_output(raw, items)
+
+    assert results[1]["한 줄 의미"] == ""
+    assert any("범위 밖" in w and "보강 줄 없음" in w for w in warnings)
+
+
+def test_the_markdown_can_only_contain_a_candidate_sentence(
+    digest_fixture, tmp_path
+):
+    """GLM 출력에서 오는 것은 번호뿐이다 — 문자열은 우리 목록에서만 나온다."""
+    markdown_path = digest_fixture["markdown_path"]
+    payload = _apply_fake_enrichment(digest_fixture, tmp_path)
+
+    text = markdown_path.read_text(encoding="utf-8")
+    enrich_lines = [
+        (block.get("enrich_line") or "").strip()
+        for block in blocks_mod.item_blocks(text)
+        if block.get("enrich_line")
+    ]
+    assert len(enrich_lines) == 2
+    allowed = {
+        "→ «{}»".format(candidate["text"])
+        for entry in payload["items"]
+        for candidate in entry["candidates"]
+    }
+    assert set(enrich_lines) <= allowed
+
+
+def test_a_fabricated_sentence_in_the_glm_output_is_ignored_entirely(
+    digest_fixture, tmp_path
+):
+    """출력에 문장을 써 보내도 md 에는 들어가지 않는다 — 번호만 읽는다."""
+    class DryArgs:
+        week = W13
+        db = digest_fixture["db_path"]
+        out_dir = str(digest_fixture["out_dir"])
+        dry_run = True
+        apply_json = None
+
+    glm_mod.run(DryArgs())
+    payload = json.loads(
+        (digest_fixture["out_dir"] / f"{W13}.glm_input.json").read_text(encoding="utf-8")
+    )
+    fake = [
+        {
+            "n": entry["n"], "pick": 1, "대상 태그": "전체", "마감": "원문 확인",
+            "자격": "원문 확인", "금액": "원문 확인",
+            "한 줄 의미": "전 기업 1억원 지급 확정",   # 무시되어야 한다
+        }
+        for entry in payload["items"]
+    ]
+    path = tmp_path / "fabricated.json"
+    path.write_text(json.dumps(fake, ensure_ascii=False), encoding="utf-8")
+
+    class ApplyArgs:
+        week = W13
+        db = digest_fixture["db_path"]
+        out_dir = str(digest_fixture["out_dir"])
+        dry_run = False
+        apply_json = str(path)
+
+    assert glm_mod.run(ApplyArgs()) == 0
+    text = digest_fixture["markdown_path"].read_text(encoding="utf-8")
+    assert "1억원" not in text
+    assert "  → «{}»".format(payload["items"][0]["candidates"][0]["text"]) in text
+
+
+# ─── 4. 후보 0건 항목은 보내지 않는다 ─────────────────────────────────────
+def test_items_without_candidates_are_never_sent_and_recorded_as_info(
+    digest_fixture, tmp_path, monkeypatch
+):
+    monkeypatch.setattr(glm_mod, "fetch_detail_text", lambda url, **kwargs: "")
+    _ds_present(monkeypatch, tmp_path)
+    seen = _stub_ds_calls(monkeypatch, _auto_respond)
+
+    class Args:
+        week = W13
+        db = digest_fixture["db_path"]
+        out_dir = str(digest_fixture["out_dir"])
+        dry_run = False
+        apply_json = None
+
+    assert glm_mod.run(Args()) == 0
+    payload = json.loads(
+        (digest_fixture["out_dir"] / f"{W13}.glm_input.json").read_text(encoding="utf-8")
+    )
+    assert payload["no_candidates"] == [1, 2]
+    assert payload["batches"] == []
+    assert not any(_is_summary_prompt(prompt) for prompt, _ in seen)
+
+    warnings_file = json.loads(
+        (digest_fixture["out_dir"] / f"{W13}.glm_warnings.json").read_text(
+            encoding="utf-8")
+    )
+    assert warnings_file["info"]["no_candidates"] == [1, 2]
+    assert _enrich_line_count(digest_fixture["markdown_path"]) == 0
+
+
+def test_a_w37_sized_fixture_fits_in_two_batches_or_fewer(monkeypatch):
+    """r5 의 프롬프트는 작다 — W37 규모(8건)가 두 배치 안에 들어간다."""
+    today = "2026-09-13"
+    items = [_big_item(n, 30) for n in range(1, 9)]
+    batches, skipped = glm_mod.batch_input_items(today, items)
+    assert skipped == []
+    assert len(batches) <= 2
+    for batch in batches:
+        assert glm_mod.prompt_bytes(today, batch) <= glm_mod.PROMPT_BYTE_BUDGET
