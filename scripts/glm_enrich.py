@@ -105,10 +105,11 @@ _NUMBER_TOKEN_RE = re.compile(
 # 정규화는 공백 합침뿐이다 — NFKC 는 쓰지 않는다(글자를 바꾸지 않는다).
 # 후보 문장의 경계값 (r5). 너무 짧으면 의미가 없고, 너무 길면 한 줄이 아니다.
 MIN_CANDIDATE_CHARS = 12
-MAX_CANDIDATE_CHARS = 120
+MAX_CANDIDATE_CHARS = 160
 MAX_CANDIDATES = 12
-# 후보가 이보다 적으면 "고르는" 것이 아니다 — 묻지 않고 넘긴다 (r6).
-MIN_CANDIDATES_TO_ASK = 2
+# 후보가 이보다 적으면 묻지 않고 넘긴다. r7: 1 — `pick: 0` 이 "쓸 것 없음"을
+# 이미 표현하므로, 후보가 하나여도 물어볼 값이 있다.
+MIN_CANDIDATES_TO_ASK = 1
 # 본문이 아니라 페이지 살림살이인 줄 — 후보에서 뺀다.
 _META_LINE_RE = re.compile(
     r"작성자|조회수|등록일|작성일|첨부|바로가기|로그인|회원가입|다운로드|"
@@ -124,6 +125,29 @@ _DATE_RUN_RE = re.compile(
     r"[\u2019']?\d{1,4}\s*[.．]\s*\d{1,2}\s*[.．]\s*\d{1,2}\s*[.．]?"
     r"(?:\s*\([^()]{1,3}\))?"
 )
+# ─── 절(clause) 단위 쪼개기 (r7) ────────────────────────────────────────
+# 공고문은 산문이 아니라 **열거문**이다 — `1.` `가.` `나.` 는 문장 안의 장식이
+# 아니라 유일한 구분자였다(r6 실측: 한 "문장"이 최대 1,882자). 표지는 **뒤따르는**
+# 내용에 속하므로 앞이 아니라 **뒤 조각에 붙여** 자른다. 각 조각은 여전히 원문의
+# 부분문자열이라 "원문 그대로" 보장은 그대로다.
+_MARKER_PATTERN = (
+    r"(?:[가나다라마바사아자차카타파하]\.|[ㄱ-ㅎ]\.|\d{1,2}\.|\d{1,2}\)"
+    r"|[\u2460-\u2473]|ㅇ\s|○\s|-\s|•\s|▶|■|※)"
+)
+_MARKER_SPLIT_RE = re.compile(r"(?:(?<=\s)|^)" + _MARKER_PATTERN)
+# 조각이 그래도 길면 여기서 한 번 더 자른다.
+_SECONDARY_SEPARATORS = (" / ", ";", " - ")
+# 표지만 남은 꼬리 (attach-forward 에서는 생기지 않아야 한다 — 방어용).
+# 표지는 **공백 뒤(또는 문자열 처음)** 에 홀로 선 것만이다 — 이 조건이 없으면
+# `진행합니다.` 의 `다.` 까지 표지로 보고 잘라낸다.
+_TRAILING_MARKER_RE = re.compile(
+    r"(?:(?<=\s)|^)(?:[가나다라마바사아자차카타파하]|[ㄱ-ㅎ]|\d{1,2})[.)]\s*$"
+)
+# 후보가 12개를 넘을 때 **먼저 보여줄** 것을 고르는 키워드 (결정론).
+_PRIORITY_RE = re.compile(
+    r"대상|요건|자격|마감|기간|접수|지원|금액|만원|억원|완화|신설|폐지|의무"
+)
+
 # 후보 품질 필터 (r6) — 문장이긴 하지만 독자에게 줄 것이 없는 줄.
 _NUMERIC_ONLY_RE = re.compile(r"^[^가-힣a-zA-Z]+$")
 _CLOSING_BOILERPLATE_RE = re.compile(r"(바랍니다|부탁드립니다)[.。．]?$")
@@ -387,6 +411,58 @@ def evidence_sentences(item: Dict) -> List[str]:
     return sentences
 
 
+def _split_at_markers(text: str) -> List[str]:
+    """목록 표지 **앞에서** 자르고 표지는 뒤 조각에 붙인다.
+
+    날짜 연속체 안의 숫자는 표지가 아니다 — `2026. 5. 12. 공포` 의 `12.` 를
+    표지로 보면 `12. 공포, 2026.` 같은 조각이 생긴다. 문장 분해기가 이미
+    지키는 규칙(r6 (b))을 여기서도 똑같이 지킨다.
+    """
+    spans = _date_spans(text)
+    starts = [
+        match.start() for match in _MARKER_SPLIT_RE.finditer(text)
+        if not any(start <= match.start() < stop for start, stop in spans)
+    ]
+    if not starts:
+        return [text]
+    bounds = sorted({0, len(text)} | set(starts))
+    pieces = [text[left:right].strip() for left, right in zip(bounds, bounds[1:])]
+    return [piece for piece in pieces if piece]
+
+
+def _split_long_fragment(text: str) -> List[str]:
+    """표지로도 안 줄어든 조각을 구분자로 한 번 더 자른다. 안 되면 버린다."""
+    for separator in _SECONDARY_SEPARATORS:
+        if separator not in text:
+            continue
+        pieces = [piece.strip() for piece in text.split(separator)]
+        pieces = [piece for piece in pieces if piece]
+        if pieces and all(len(piece) >= MIN_CANDIDATE_CHARS for piece in pieces):
+            return pieces
+    return []
+
+
+def candidate_units(text: str) -> List[str]:
+    """원문 → 후보 **단위**(절) 목록. 문서 순서를 지킨다.
+
+    r6 문장 분해를 먼저 돌리고, 상한을 넘는 문장만 표지에서 쪼갠다 —
+    보통의 산문 문장은 그대로 한 단위다.
+    """
+    units: List[str] = []
+    for sentence in split_sentences(text):
+        if len(sentence) <= MAX_CANDIDATE_CHARS:
+            units.append(sentence)
+            continue
+        for fragment in _split_at_markers(sentence):
+            if len(fragment) <= MAX_CANDIDATE_CHARS:
+                units.append(fragment)
+            else:
+                units.extend(_split_long_fragment(fragment))
+    # 표지만 남은 꼬리는 버린다(attach-forward 에서는 생기지 않아야 한다).
+    trimmed = [_TRAILING_MARKER_RE.sub("", unit).strip() for unit in units]
+    return [unit for unit in trimmed if unit]
+
+
 def candidate_sentences(item: Dict) -> List[str]:
     """이 항목에서 **고를 수 있는** 문장 목록 (결정론적 추출, r5).
 
@@ -401,7 +477,7 @@ def candidate_sentences(item: Dict) -> List[str]:
     title = summary_normalize(str(item.get("title") or ""))
     candidates: List[str] = []
     seen = set()
-    for sentence in evidence_sentences({"detail_text": item.get("detail_text")}):
+    for sentence in candidate_units(str(item.get("detail_text") or "")):
         if not MIN_CANDIDATE_CHARS <= len(sentence) <= MAX_CANDIDATE_CHARS:
             continue
         # 끝 종결 문자는 떼고 제목과 대조한다 — `…공고.` 가 제목 `…공고` 를
@@ -432,9 +508,13 @@ def candidate_sentences(item: Dict) -> List[str]:
             continue
         seen.add(sentence)
         candidates.append(sentence)
-        if len(candidates) >= MAX_CANDIDATES:
-            break
-    return candidates
+    if len(candidates) <= MAX_CANDIDATES:
+        return candidates
+    # r7: 12개를 넘으면 **무엇을 보여줄지**를 결정론으로 고른다 — 대상·요건·
+    # 마감·금액·변경 내용을 말하는 단위를 앞세우고, 그 안에서는 문서 순서.
+    preferred = [unit for unit in candidates if _PRIORITY_RE.search(unit)]
+    rest = [unit for unit in candidates if not _PRIORITY_RE.search(unit)]
+    return (preferred + rest)[:MAX_CANDIDATES]
 
 
 def gate_pick(value, candidate_count: int) -> Tuple[Optional[int], str]:

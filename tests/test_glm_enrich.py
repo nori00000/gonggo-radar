@@ -2622,10 +2622,10 @@ def test_ordinary_sentences_still_split():
 
 
 # ─── 2. 후보 하한 ─────────────────────────────────────────────────────────
-def test_one_candidate_is_not_a_choice_and_is_treated_as_none(
+def test_a_single_candidate_is_still_offered(
     digest_fixture, tmp_path, monkeypatch
 ):
-    """후보가 1개면 고르는 것이 아니다 — 묻지 않고 info 로 넘긴다."""
+    """r7: 하한이 1이다 — 후보가 하나여도 묻는다(`pick: 0` 이 거절 수단)."""
     monkeypatch.setattr(
         glm_mod, "fetch_detail_text",
         lambda url, **kwargs: "접수는 9월 22일까지 진행합니다.",
@@ -2645,15 +2645,15 @@ def test_one_candidate_is_not_a_choice_and_is_treated_as_none(
         (digest_fixture["out_dir"] / f"{W13}.glm_input.json").read_text(encoding="utf-8")
     )
     assert [len(entry["candidates"]) for entry in payload["items"]] == [1, 1]
-    assert payload["no_candidates"] == [1, 2]
-    assert payload["batches"] == []
-    assert not any(_is_summary_prompt(prompt) for prompt, _ in seen)
-    assert _enrich_line_count(digest_fixture["markdown_path"]) == 0
+    assert payload["no_candidates"] == []
+    assert payload["batches"] == [[1, 2]]
+    assert any(_is_summary_prompt(prompt) for prompt, _ in seen)
+    assert _enrich_line_count(digest_fixture["markdown_path"]) == 2
 
 
-def test_two_candidates_are_enough_to_ask():
+def test_a_single_candidate_item_is_batched():
     today = "2026-09-13"
-    item = _big_item(1, 2)
+    item = _big_item(1, 1)
     assert len(item["candidates"]) == glm_mod.MIN_CANDIDATES_TO_ASK
     batches, skipped = glm_mod.batch_input_items(today, [item])
     assert skipped == []
@@ -2731,3 +2731,138 @@ def test_nothing_asked_is_not_the_same_as_everything_discarded(
         W13, digest_fixture["markdown_path"].read_text(encoding="utf-8"), check
     )
     assert "GLM 출력 전체 폐기" not in preview
+
+
+# ══ V3.1 r7 — 단위는 문장이 아니라 절(clause) ═════════════════════════════
+_N8_TEXT = (
+    "가. 산림복지서비스제공자 등록 취소 기준 완화 - 산림복지서비스제공자 등록 기준에 "
+    "해당되는 인력의 사망·실종 또는 퇴직으로 인하여 등록기준에 미달되는 기간이 60일 "
+    "이내인 경우에는 등록 취소 제외 나. 산림복지지구 지정·변경 관련 사전 절차 면제 "
+    "사항 규정 - 산림복지지구 면적을 100분의 10 범위에서 변경하는 경우에는 사전에 "
+    "관계 행정기관의 장과 협의하지 아니할 수 있도록 함 다. 시행일 규정 - 이 영은 "
+    "공포 후 3개월이 경과한 날부터 시행한다"
+)
+
+
+def test_an_enumeration_splits_with_the_marker_attached_to_what_follows():
+    """r6 이 `… 등록 취소 제외 나.` 로 끝내던 것이 `나. …` 로 시작하는 단위가 된다."""
+    units = glm_mod.candidate_units(_N8_TEXT)
+    assert any(unit.startswith("가. 산림복지서비스제공자 등록 취소 기준 완화")
+               for unit in units)
+    assert any(unit.startswith("나. 산림복지지구 지정·변경 관련 사전 절차 면제")
+               for unit in units)
+    assert len(units) > 1
+
+
+def test_no_unit_ends_with_a_bare_list_marker():
+    """attach-forward 이므로 `… 나.` 로 끝나는 단위는 생길 수 없다."""
+    units = glm_mod.candidate_units(_N8_TEXT)
+    for unit in units:
+        assert not glm_mod._TRAILING_MARKER_RE.search(unit), unit
+
+
+def test_a_trailing_marker_on_a_short_sentence_is_stripped():
+    """상한 안이라 쪼개지지 않는 문장이 표지로 끝나면 그 표지는 뗀다."""
+    units = glm_mod.candidate_units("등록 기준에 미달되는 경우에는 취소를 제외한다 나.")
+    assert units == ["등록 기준에 미달되는 경우에는 취소를 제외한다"]
+
+
+def test_an_ordinary_verb_ending_is_not_mistaken_for_a_marker():
+    assert glm_mod.candidate_units("접수는 9월 22일까지 진행합니다.") == [
+        "접수는 9월 22일까지 진행합니다.",
+    ]
+
+
+def test_a_long_enumeration_yields_several_units_inside_the_window():
+    """r6 이 1,882자 한 덩어리로 버리던 길이대."""
+    body = " ".join(
+        f"{marker}. 제{index}호 지원 대상 요건을 다음과 같이 완화한다 "
+        f"기존 기준에 미달되는 기간이 60일 이내인 경우에는 취소 대상에서 제외한다"
+        for index, marker in enumerate("가나다라마바사아자차카타파하", start=1)
+    )
+    assert len(body) > glm_mod.MAX_CANDIDATE_CHARS * 5
+    units = glm_mod.candidate_units(body)
+    assert len(units) >= 5
+    assert all(
+        glm_mod.MIN_CANDIDATE_CHARS <= len(unit) <= glm_mod.MAX_CANDIDATE_CHARS
+        for unit in units
+    )
+    # 모든 단위는 원문의 부분문자열이다
+    assert all(unit in body for unit in units)
+
+
+@pytest.mark.parametrize("marker", [
+    "가.", "하.", "ㄱ.", "1.", "99.", "1)", "99)", "①", "⑳", "ㅇ ", "○ ",
+    "- ", "• ", "▶", "■", "※",
+])
+def test_every_declared_marker_starts_a_new_unit(marker):
+    """표지 쪼개기는 **상한을 넘는 문장**에만 적용된다 — 긴 입력으로 확인한다."""
+    head = "머리 문장은 이만큼 길게 적어 둔다 " * 8
+    tail = "뒤 조각도 충분히 길게 적어 둔다 여기서부터가 새 단위다"
+    body = f"{head}{marker}{tail}"
+    assert len(body) > glm_mod.MAX_CANDIDATE_CHARS
+    units = glm_mod.candidate_units(body)
+    assert any(unit.startswith(marker.strip()) for unit in units), units
+
+
+def test_a_fragment_that_cannot_be_split_further_is_dropped():
+    monster = "가" * 400
+    assert glm_mod.candidate_units(monster) == []
+
+
+def test_a_long_fragment_splits_on_secondary_separators():
+    piece = "지원 대상 요건을 완화하여 적용한다 " * 3
+    body = f"{piece.strip()} / {piece.strip()} / {piece.strip()}"
+    assert len(body) > glm_mod.MAX_CANDIDATE_CHARS
+    units = glm_mod.candidate_units(body)
+    assert len(units) == 3
+    assert all(len(unit) <= glm_mod.MAX_CANDIDATE_CHARS for unit in units)
+
+
+def test_keyword_units_are_offered_first_when_there_are_more_than_twelve():
+    plain = [
+        f"{index}) 이 문단은 아무 핵심어도 담고 있지 않은 설명 문장이다 여기에 꼬리를 붙인다"
+        for index in range(1, 13)
+    ]
+    keyworded = [
+        "13) 지원 대상 요건은 다음과 같이 완화한다 여기에 자세한 설명이 붙는다",
+        "14) 접수 기간은 다음과 같이 정한다 여기에 자세한 설명이 붙는다",
+    ]
+    body = " ".join(plain + keyworded)
+    assert len(body) > glm_mod.MAX_CANDIDATE_CHARS
+    item = {"title": "제목", "detail_text": body}
+    candidates = glm_mod.candidate_sentences(item)
+
+    assert len(candidates) == glm_mod.MAX_CANDIDATES
+    assert candidates[0].startswith("13)")
+    assert candidates[1].startswith("14)")
+    # 핵심어 단위 뒤에는 문서 순서가 유지된다
+    assert candidates[2].startswith("1)")
+
+
+def test_document_order_is_kept_when_twelve_or_fewer_units():
+    """12개 이하면 핵심어 정렬을 하지 않는다 — 문서 순서 그대로."""
+    filler = "여기에 충분히 긴 설명 문장을 적어 둔다 " * 4
+    item = {
+        "title": "제목",
+        "detail_text": (
+            f"1) 아무 핵심어 없는 설명이다 {filler}"
+            f"2) 지원 대상 요건을 완화하는 내용이다 {filler}"
+        ),
+    }
+    candidates = glm_mod.candidate_sentences(item)
+    assert len(candidates) <= glm_mod.MAX_CANDIDATES
+    assert [c[:2] for c in candidates] == ["1)", "2)"]
+
+
+def test_a_number_inside_a_date_run_is_not_a_list_marker():
+    """`2026. 5. 12. 공포` 의 `12.` 를 표지로 보면 `12. 공포, 2026.` 이 생긴다."""
+    filler = "여기에 충분히 긴 설명 문장을 적어 둔다 " * 5
+    body = (
+        f"{filler}「산림복지 진흥에 관한 법률」이 개정(법률 제21620호, "
+        f"2026. 5. 12. 공포, 2026. 11. 13. 시행)됨에 따라 규정한다"
+    )
+    assert len(body) > glm_mod.MAX_CANDIDATE_CHARS
+    units = glm_mod.candidate_units(body)
+    assert not any(unit.startswith("12.") for unit in units), units
+    assert not any(unit.startswith("13.") for unit in units), units
