@@ -57,20 +57,29 @@ class EpisCrawler(BaseCrawler):
             return []
 
         announcements: List[RawAnnouncement] = []
+        seen_source_ids: set = set()
         base_url = self.get_base_url() or self.BASE_URL
 
+        # 게시판 두 개를 **각각** 수집한다. 예전에는 첫 게시판에 항목이
+        # 있으면 break 해서 입찰/공모가 한 번도 수집되지 않았다 (라운드 2
+        # MEDIUM). 같은 글이 두 게시판에 겹쳐 뜨면 source_id 로 거른다.
         for board_path in self.BOARD_PATHS:
             url = f"{base_url}{board_path}"
             self.logger.info(f"Fetching from EPIS announcement board: {url}")
 
             items = self._fetch_board_listing(url)
-            if items:
-                self.logger.info(f"Successfully fetched {len(items)} items from {url}")
-                for item in items:
-                    announcement = self._to_announcement(item, base_url)
-                    if announcement:
-                        announcements.append(announcement)
-                break
+            if not items:
+                continue
+
+            self.logger.info(f"Successfully fetched {len(items)} items from {url}")
+            for item in items:
+                announcement = self._to_announcement(item, base_url)
+                if announcement is None:
+                    continue
+                if announcement.source_id in seen_source_ids:
+                    continue
+                seen_source_ids.add(announcement.source_id)
+                announcements.append(announcement)
 
         return announcements
 
@@ -178,6 +187,7 @@ class EpisCrawler(BaseCrawler):
             item = {
                 "title": title,
                 "link": link,
+                "board_key": board_key,
                 "author": "",
                 "category": sort_cell.get_text(strip=True) if sort_cell else "",
                 # 기간을 만들 수 있는 소스가 아니다 - 날짜를 date 로 올리지
@@ -483,7 +493,29 @@ class EpisCrawler(BaseCrawler):
             if not title:
                 return None
 
-            link = self._normalize_url(item.get("link", ""), base_url)
+            raw_link = (item.get("link") or "").strip()
+            if raw_link.lower().startswith("javascript:"):
+                # 이 게시판의 목록 href 는 전부 ``javascript:void(0);`` 이고
+                # 실제 이동은 ``goView('<pstSn>')`` 가 한다. 폴백 전략이 그
+                # href 를 그대로 올리면 URL 이 ``…/javascript:void(0);`` 가
+                # 되고 모든 행의 id 가 충돌한다 (라운드 2 HIGH). goView id 를
+                # 건질 수 있으면 본문 URL 로 복구하고, 못 건지면 버린다.
+                recovered = self.GOVIEW_PATTERN.search(raw_link)
+                if not recovered:
+                    self.logger.warning(
+                        "epis: javascript 링크에서 goView id 를 얻지 못해 "
+                        f"항목을 건너뛴다: {title[:40]!r} ({raw_link!r})"
+                    )
+                    return None
+                board_key = (item.get("board_key") or "").strip()
+                raw_link = f"/bbs/view.do?pstSn={recovered.group(1)}"
+                if board_key:
+                    raw_link = (
+                        f"/bbs/view.do?key={board_key}"
+                        f"&pstSn={recovered.group(1)}"
+                    )
+
+            link = self._normalize_url(raw_link, base_url)
             source_id = self._extract_post_id(link)
 
             if not source_id:
@@ -492,8 +524,13 @@ class EpisCrawler(BaseCrawler):
             author = item.get("author", "").strip()
             category = item.get("category", "").strip()
 
-            date_str = item.get("date", "").strip()
-            period_start, period_end = self._parse_period(date_str)
+            # epis 는 ``PERIOD_EXTRACTORS`` 에 없다 = 기간을 만들 수 없는
+            # 소스다. 목록에 기간 칸이 있어도(입찰/공모 게시판) 두 필드는
+            # **무조건 None** 이고, 날짜 문자열은 raw_data 근거로만 남는다.
+            # 폴백 표 파서가 기간 칸을 집어 period 를 채우던 경로를 여기서
+            # 끊는다 (라운드 2 HIGH).
+            period_start = None
+            period_end = None
 
             raw_data = json.dumps(item, ensure_ascii=False)
 

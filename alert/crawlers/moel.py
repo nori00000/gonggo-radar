@@ -4,7 +4,7 @@ import json
 import re
 from typing import List, Optional
 from .base import BaseCrawler
-from .date_labels import posted_date
+from .date_labels import header_labels, posted_date
 from ..models import RawAnnouncement
 
 try:
@@ -16,28 +16,24 @@ except ImportError:
 class MoelCrawler(BaseCrawler):
     """고용노동부(moel.go.kr) 공지사항 게시판 크롤러.
 
-    대상 URL:
-        - https://www.moel.go.kr/news/notice/noticeList.do (공지사항, bbs_id=9)
+    대상: https://www.moel.go.kr/news/notice/noticeList.do (공지사항, bbs_id=9)
 
     2026-09-15 실측: 목록은 서버 렌더링 정적 HTML(``table.tstyle_list``)이다.
     제목 링크는 ``strong.b_tit > a[href*="bbs_seq="]`` 이고, 같은 행의 첨부
-    다운로드 링크도 ``bbs_seq`` 를 쓰므로 **제목 링크만** 골라야 한다.
-    링크 텍스트에는 ``[공고]`` 머리표가 붙고 ``title`` 속성에는 머리표 없는
-    제목이 들어 있다 - 제목은 속성에서, 분류는 머리표에서 읽는다.
-
-    기간: 이 소스는 **전용 추출기가 없다**. 목록의 ``등록일`` 은 게시일이므로
-    기간 두 필드를 만들지 않고 ``raw_data.posted`` 로만 남긴다 (13차 규칙).
+    다운로드 링크도 ``bbs_seq`` 를 쓰므로 **제목 링크만** 골라야 한다. 링크
+    텍스트에는 ``[공고]`` 머리표가 붙고 ``title`` 속성에는 머리표 없는 제목이
+    들어 있다 - 제목은 속성에서, 분류는 머리표에서 읽는다.
+    기간: **전용 추출기가 없다**. ``등록일`` 은 게시일이므로 기간 두 필드를
+    만들지 않고 ``raw_data.posted`` 로만 남긴다 (13차 규칙).
     """
 
     BASE_URL = "https://www.moel.go.kr"
-
     LIST_PATH = "/news/notice/noticeList.do"
     VIEW_PATH = "/news/notice/noticeView.do?bbs_seq={seq}"
 
     BBS_SEQ_PATTERN = re.compile(r"[?&]bbs_seq=(\d+)")
     # 링크 텍스트 앞머리의 분류 머리표: "[공고] ...", "[포상대상자공개] ..."
     CATEGORY_PATTERN = re.compile(r"^\s*\[([^\]]{1,20})\]\s*")
-    FULL_DATE_PATTERN = re.compile(r"\d{4}[-./]\d{1,2}[-./]\d{1,2}")
 
     def __init__(self):
         super().__init__(source_name="moel")
@@ -63,38 +59,39 @@ class MoelCrawler(BaseCrawler):
             return []
 
         response.encoding = response.apparent_encoding or "utf-8"
-        soup = BeautifulSoup(response.text, "html.parser")
-
-        items = self.parse_list(soup)
+        items = self.parse_list(BeautifulSoup(response.text, "html.parser"))
         if not items:
             self.logger.warning(
                 f"Could not parse board listing from {url}. "
                 "HTML structure may have changed."
             )
             return []
-
         self.logger.info(f"Parsed {len(items)} items from {url}")
 
-        announcements: List[RawAnnouncement] = []
-        for item in items:
-            announcement = self._to_announcement(item, base_url)
-            if announcement:
-                announcements.append(announcement)
-        return announcements
+        announcements = [self._to_announcement(i, base_url) for i in items]
+        return [a for a in announcements if a is not None]
 
     def parse_list(self, soup: "BeautifulSoup") -> List[dict]:
-        """공지사항 목록 표를 파싱한다.
-
-        Args:
-            soup: 목록 페이지
-
-        Returns:
-            ``{"bbs_seq", "title", "category", "author", "date"}`` 딕셔너리 목록
+        """공지사항 목록 표를 파싱한다 (``soup``: 목록 페이지). 항목 키는
+        bbs_seq·title·category·author·date.
         """
         items: List[dict] = []
         seen_ids = set()
 
-        for row in soup.select("table.tstyle_list tbody tr"):
+        table = soup.select_one("table.tstyle_list")
+        if table is None:
+            return items
+
+        # 칸 번호는 **표 헤더**에서 읽는다. 라벨도 헤더도 못 찾으면 날짜를
+        # 포기한다 - "날짜처럼 보이는 아무 칸" 으로 되짚으면 제목 칸이 날짜만
+        # 담고 있을 때 그게 게시일이 된다 (라운드 2 MEDIUM).
+        labels = header_labels(table)
+        columns = {
+            name: (labels.index(name) if name in labels else -1)
+            for name in ("등록일", "담당부서")
+        }
+
+        for row in table.select("tbody tr"):
             a_tag = row.select_one("strong.b_tit a")
             if a_tag is None:
                 continue
@@ -121,38 +118,43 @@ class MoelCrawler(BaseCrawler):
                 "bbs_seq": bbs_seq,
                 "title": title,
                 "category": category,
-                "author": self._cell_text(row, "담당부서"),
-                "date": self._cell_text(row, "등록일"),
+                "author": self._cell_text(row, "담당부서", columns, a_tag),
+                "date": self._cell_text(row, "등록일", columns, a_tag),
                 # 이 표의 날짜 칸은 표 헤더가 "등록일" 이다 = 게시일
                 "date_label": "등록일",
             })
 
         return items
 
-    def _cell_text(self, row, aria_label: str) -> str:
-        """행에서 ``aria-label`` 로 지정된 칸의 텍스트를 읽는다.
+    @staticmethod
+    def _cell_text(row, aria_label: str, columns: dict, title_link) -> str:
+        """``aria_label`` 이 가리키는 칸의 텍스트를 읽는다 (못 찾으면 "").
 
-        고용노동부 표는 모든 ``td`` 에 ``aria-label`` 을 달아 두므로 칸 순서에
-        기대지 않고 라벨로 고른다. 라벨이 없으면 등록일만 날짜 모양으로
-        되짚어 찾는다.
+        근거는 **둘 뿐**이다: ``aria-label`` 속성(고용노동부 표는 모든 ``td``
+        에 달아 둔다), 아니면 ``columns`` 가 헤더에서 센 칸 번호. 제목 칸
+        (``title_link`` 이 든 칸)은 어떤 경우에도 후보가 아니다 - 제목이
+        날짜 하나뿐인 공고가 있으면 "날짜처럼 보이는 첫 칸" 규칙이 그 제목을
+        게시일로 만든다 (라운드 2 MEDIUM).
         """
+        cells = row.find_all("td")
+        title_cell = title_link.find_parent("td") if title_link is not None else None
+
         cell = row.find("td", attrs={"aria-label": aria_label})
-        if cell is not None:
+        if cell is not None and cell is not title_cell:
             return cell.get_text(" ", strip=True)
-        if aria_label != "등록일":
-            return ""
-        for candidate in row.find_all("td"):
-            text = candidate.get_text(" ", strip=True)
-            if self.FULL_DATE_PATTERN.fullmatch(text):
-                return text
+
+        index = columns.get(aria_label, -1)
+        if 0 <= index < len(cells):
+            candidate = cells[index]
+            if candidate is not title_cell:
+                return candidate.get_text(" ", strip=True)
+
         return ""
 
     @classmethod
     def _extract_bbs_seq(cls, href: str) -> str:
-        """``/news/notice/noticeView.do?bbs_seq=20260900480`` 에서 번호를 뽑는다."""
-        if not href:
-            return ""
-        match = cls.BBS_SEQ_PATTERN.search(href)
+        """``…/noticeView.do?bbs_seq=20260900480`` 에서 번호를 뽑는다."""
+        match = cls.BBS_SEQ_PATTERN.search(href or "")
         return match.group(1) if match else ""
 
     def _to_announcement(self, item: dict, base_url: str) -> Optional[RawAnnouncement]:
@@ -171,8 +173,7 @@ class MoelCrawler(BaseCrawler):
                 source_id = hashlib.md5(title.encode("utf-8")).hexdigest()[:16]
 
             # 목록 날짜는 **등록일**이다 - 접수기간이 아니다. 전용 추출기가
-            # 없는 소스이므로 기간 두 필드는 항상 None 이고, 날짜는 "새 소식"
-            # 판정에 쓸 수 있게 raw_data.posted 로만 남는다.
+            # 없으므로 기간 두 필드는 항상 None 이고, 날짜는 raw_data.posted 다.
             payload = dict(item)
             posted = posted_date(item.get("date", ""))
             if posted:
