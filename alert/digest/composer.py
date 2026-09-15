@@ -1072,6 +1072,8 @@ MONTHLY_FOOTER_LINE = "기사 항목은 제목·링크·원문 1문장만 인용
 # 두 번째 관문을 세운다.
 MONTHLY_HOLD_MEDIA_NOISE = "미디어 노이즈"
 MONTHLY_HOLD_MEDIA_CAP = "미디어 상한"
+# 라운드 6: 기관 보도·정책도 같은 두 갈래 관문을 지난다 — 어휘만 다르다.
+MONTHLY_HOLD_PRESS_NOISE = "보도 노이즈"
 # 5칸 중 기사에 내줄 수 있는 최대 칸 수. 나머지는 공고·제도 몫이다.
 MONTHLY_MEDIA_LIMIT = 2
 
@@ -1091,18 +1093,60 @@ def _council_profile():
         return None
 
 
+def _gate_vocab(cue_field: str, exclude_field: str
+                ) -> Tuple[Tuple[str, ...], Tuple[str, ...]]:
+    """설정에서 (단서, 제외어). 못 읽으면 **빈 단서**(= 전면 차단)."""
+    profile = _council_profile()
+    if not profile:
+        return (), ()
+    return (
+        tuple(getattr(profile, cue_field, None) or ()),
+        tuple(getattr(profile, exclude_field, None) or ()),
+    )
+
+
+def _gate_reason(
+    title: str,
+    cues: Sequence[str],
+    excludes: Sequence[str],
+    noise_reason: str,
+) -> Optional[str]:
+    """2차 관문의 공통 판정 — 미디어와 기관 보도가 같은 기계를 쓴다.
+
+    ① 제외어가 제목에 있으면 내린다 ② 단서가 **하나도** 없으면 내린다.
+    판정은 제목만 본다 — 요약은 저작권상 렌더하지 않으므로 판정 근거로도 쓰지
+    않는다(본문에 실리지 않는 것으로 실을지 말지를 정하면 근거가 보이지 않는다).
+    """
+    text = normalize_title(title or "")
+    for term in excludes:
+        if term and term in text:
+            return noise_reason
+    if not any(cue and cue in text for cue in cues):
+        return noise_reason
+    return None
+
+
+def press_gate_vocab() -> Tuple[Tuple[str, ...], Tuple[str, ...]]:
+    """규칙 (b) 기관 보도·정책의 2차 관문 어휘 (라운드 6)."""
+    return _gate_vocab("press_action_cues", "press_exclude")
+
+
+def press_gate_reason(
+    title: str,
+    cues: Sequence[str] = (),
+    excludes: Sequence[str] = (),
+) -> Optional[str]:
+    """기관 보도·정책을 월간 지면에서 내릴 이유. 실을 수 있으면 None."""
+    return _gate_reason(title, cues, excludes, MONTHLY_HOLD_PRESS_NOISE)
+
+
 def media_gate_vocab() -> Tuple[Tuple[str, ...], Tuple[str, ...]]:
     """(행동·제도 단서, 제외어). 설정을 못 읽으면 **빈 단서**(= 전면 차단).
 
     비어 있을 때 통과시키면 관문이 없는 것과 같다 — 2차 관문의 기본값은
     fail-closed 다. 설정 한 줄을 비우는 것이 미디어 킬 스위치가 된다.
     """
-    profile = _council_profile()
-    cues = tuple(getattr(profile, "media_action_cues", None) or ()) if profile \
-        else ()
-    excludes = tuple(getattr(profile, "media_exclude", None) or ()) if profile \
-        else ()
-    return cues, excludes
+    return _gate_vocab("media_action_cues", "media_exclude")
 
 
 def media_gate_reason(
@@ -1117,13 +1161,7 @@ def media_gate_reason(
     판정은 제목만 본다 — 요약은 저작권상 렌더하지 않으므로 판정 근거로도 쓰지
     않는다(본문에 실리지 않는 것으로 실을지 말지를 정하면 근거가 보이지 않는다).
     """
-    text = normalize_title(title or "")
-    for term in excludes:
-        if term and term in text:
-            return MONTHLY_HOLD_MEDIA_NOISE
-    if not any(cue and cue in text for cue in cues):
-        return MONTHLY_HOLD_MEDIA_NOISE
-    return None
+    return _gate_reason(title, cues, excludes, MONTHLY_HOLD_MEDIA_NOISE)
 
 
 # 마감 단서 — DB 가 비어 있어도 **사람 눈에는 보이는** 마감 표기 (라운드 3).
@@ -1200,7 +1238,12 @@ def monthly_hold_reason(item: Dict) -> Optional[str]:
         return item.get("media_gate")
     if item["verdict"] == VERDICT_APPLY:
         return MONTHLY_HOLD_ACTIONABLE
-    if item.get("monthly_rule") in (MONTHLY_RULE_NOTICE, MONTHLY_RULE_PRESS):
+    if item.get("monthly_rule") == MONTHLY_RULE_PRESS:
+        # 라운드 6: 기관 보도자료도 적재 통과만으로는 부족하다 — 산림 어휘를
+        # 언제나 갖고 있어 홍보성 보도(기술 개발·이달의 임산물·업무협약)가
+        # 그대로 올라온다. 미디어와 같은 두 갈래 관문을 지난다.
+        return item.get("press_gate")
+    if item.get("monthly_rule") == MONTHLY_RULE_NOTICE:
         return None
     return MONTHLY_HOLD_NOT_ELIGIBLE
 
@@ -1787,6 +1830,91 @@ def week_bounds(week_str: str) -> Tuple[str, str]:
     return week_start, end_exclusive
 
 
+def _sort_within_rule(items: List[Dict]) -> List[Dict]:
+    """한 규칙 안의 순서: 게시일 내림차순 → id (라운드 6).
+
+    `council_score` 를 쓰지 않는 이유는 P2-X H2 와 같다 — gonggo 행의 다수가
+    NULL 이라 `or 0.0` 이 그것을 0점으로 만들고, 점수 보유 자체가 편향이다.
+    `id` 는 결정적이고 지면 의미가 없다(동률 안에서만 쓰인다).
+    """
+    return sorted(
+        items,
+        key=lambda item: (-_posted_ordinal(item), int(item.get("id") or 0)),
+    )
+
+
+def _select_monthly_round_robin(
+    candidates: List[Dict],
+    limit: int,
+    diversity_limit: Optional[int] = None,
+    honor_pins: bool = True,
+) -> Tuple[List[Dict], List[Dict], List[Dict], List[Dict], int]:
+    """월간 지면 선정 — **규칙 라운드로빈** (라운드 6).
+
+    `_select_with_pins` 는 정렬 상위부터 상한을 채운다. 1순위 키가 규칙 순위
+    (a<b<c)인 지금, 그 방식은 앞선 규칙이 지면을 **다 먹는다**: 2026-M09 실연에서
+    (b) 기관 보도가 5칸을 전부 차지하고 기사는 0칸이었다. 규칙 순위는 "무엇이 더
+    중요한가" 를 말할 뿐 "지면을 독식하라" 는 뜻이 아니다.
+
+    그래서 자리를 a → b → c → a → b … 순으로 **돌아가며** 채운다. 소진된 규칙은
+    건너뛴다. 규칙 안의 순서는 `_sort_within_rule`(게시일 내림차순 → id)이고,
+    규칙을 모르는 항목은 맨 뒤 바구니에서 마지막에 차례를 받는다(fail-closed).
+
+    반환·의미는 `_select_with_pins` 와 같다 — 호출부(다양성·상한·핀 밀림 기록)가
+    그대로 쓴다. 다른 점 하나: **선정 결과를 다시 정렬하지 않는다.** 라운드로빈
+    순서가 곧 지면 순서다(다시 정렬하면 a 가 전부 앞으로 몰려 교차가 사라진다).
+    """
+    pinned = [item for item in candidates
+              if honor_pins and item.get("pinned")]
+    regular = [item for item in candidates
+               if not (honor_pins and item.get("pinned"))]
+
+    selected: List[Dict] = []
+    pin_overflow: List[Dict] = []
+    per_source: Counter = Counter()
+    # 핀은 **먼저** 자리를 잡고 다양성 상한을 타지 않는다 (주간호와 같은 규율).
+    for item in _sort_monthly(pinned):
+        if len(selected) >= limit:
+            pin_overflow.append(item)
+            continue
+        per_source[item["source"]] += 1
+        selected.append(item)
+    pinned_taken = len(selected)
+
+    buckets: Dict[int, List[Dict]] = {}
+    for item in regular:
+        buckets.setdefault(_monthly_rule_rank(item), []).append(item)
+    queues = [_sort_within_rule(buckets[rank]) for rank in sorted(buckets)]
+    cursors = [0] * len(queues)
+
+    diversity_skipped: List[Dict] = []
+    while len(selected) < limit:
+        progressed = False
+        for index, queue in enumerate(queues):
+            if len(selected) >= limit:
+                break
+            # 이 규칙에서 자리 하나를 채운다 — 다양성에 걸리면 다음 후보로.
+            while cursors[index] < len(queue):
+                item = queue[cursors[index]]
+                cursors[index] += 1
+                if (diversity_limit is not None
+                        and per_source[item["source"]] >= diversity_limit):
+                    diversity_skipped.append(item)
+                    continue
+                per_source[item["source"]] += 1
+                selected.append(item)
+                progressed = True
+                break
+        if not progressed:
+            break
+
+    cap_overflow: List[Dict] = []
+    for index, queue in enumerate(queues):
+        cap_overflow.extend(queue[cursors[index]:])
+
+    return selected, diversity_skipped, cap_overflow, pin_overflow, pinned_taken
+
+
 def _select_with_pins(
     candidates: List[Dict],
     limit: int,
@@ -1923,9 +2051,11 @@ def compose_digest_data(
         ]
     meta_sql = "".join(f", {name}" for name in meta_columns)
 
-    # 라운드 5: 미디어 2차 관문 어휘는 조립 한 번에 **한 번만** 읽는다.
+    # 라운드 5·6: 2차 관문 어휘는 조립 한 번에 **한 번만** 읽는다.
     media_cues, media_excludes = (
         media_gate_vocab() if kind == KIND_MONTHLY else ((), ()))
+    press_cues, press_excludes = (
+        press_gate_vocab() if kind == KIND_MONTHLY else ((), ()))
 
     # 판정 ④의 정렬 정본. 빈 문자열도 "마감 없음"으로 취급하려고 NULLIF를 쓴다.
     cursor.execute(
@@ -1986,6 +2116,9 @@ def compose_digest_data(
                 item["media_gate"] = media_gate_reason(
                     title, media_cues, media_excludes)
                 item.update(media_fields(row[8], item.get("posted") or ""))
+            elif item["monthly_rule"] == MONTHLY_RULE_PRESS:
+                item["press_gate"] = press_gate_reason(
+                    title, press_cues, press_excludes)
 
         if classification.verdict == VERDICT_EXCLUDE:
             rescue = (monthly_rescue_reason(source, title, classification, meta)
@@ -2083,16 +2216,16 @@ def compose_digest_data(
         monthly_candidates = [item for item in monthly_candidates
                               if id(item) not in media_overflow]
         (monthly_selected, monthly_diversity, monthly_cap, monthly_pin_cap,
-         _monthly_pinned_taken) = _select_with_pins(
-            monthly_candidates, SECTION_LIMITS[VERDICT_MONTHLY], _sort_monthly,
+         _monthly_pinned_taken) = _select_monthly_round_robin(
+            monthly_candidates, SECTION_LIMITS[VERDICT_MONTHLY],
             SOURCE_DIVERSITY_LIMIT,
         )
         sections[VERDICT_MONTHLY] = monthly_selected
         demoted_ids: Set = set()
         if pin_ids:
-            baseline = _select_with_pins(
+            baseline = _select_monthly_round_robin(
                 monthly_candidates, SECTION_LIMITS[VERDICT_MONTHLY],
-                _sort_monthly, SOURCE_DIVERSITY_LIMIT, honor_pins=False)[0]
+                SOURCE_DIVERSITY_LIMIT, honor_pins=False)[0]
             demoted_ids = (
                 {item["id"] for item in baseline}
                 - {item["id"] for item in monthly_selected}

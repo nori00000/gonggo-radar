@@ -137,6 +137,14 @@ class CouncilProfileConfig:
     # fail-closed 다(어휘를 못 읽었는데 통과시키면 관문이 없는 것과 같다).
     media_action_cues: list[str] = field(default_factory=list)
     media_exclude: list[str] = field(default_factory=list)
+    # P1' 라운드 6 - 규칙 (b) 기관 보도·정책의 **월간호 2차 관문** 어휘.
+    # 미디어와 같은 문제가 기관 보도자료에도 있다: 산림청 보도자료는 산림
+    # 어휘를 언제나 갖고 있어 적재를 통과하지만, 기술 개발·이달의 임산물·
+    # 업무협약 같은 홍보성 보도에는 회원이 움직일 일이 없다.
+    # 미디어 어휘와 **분리**한다 - 두 부류의 노이즈 유형이 다르기 때문이다
+    # (미디어는 사설·칼럼, 보도는 선정·개발·행사). 비면 fail-closed.
+    press_action_cues: list[str] = field(default_factory=list)
+    press_exclude: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -329,6 +337,8 @@ def _build_council_profile(raw: Dict[str, Any]) -> CouncilProfileConfig:
         exclude=list(raw.get("exclude", []) or []),
         media_action_cues=list(raw.get("media_action_cues", []) or []),
         media_exclude=list(raw.get("media_exclude", []) or []),
+        press_action_cues=list(raw.get("press_action_cues", []) or []),
+        press_exclude=list(raw.get("press_exclude", []) or []),
     )
 
 

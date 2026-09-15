@@ -51,6 +51,7 @@ from alert.digest.composer import (
     issue_kind,
     media_gate_reason,
     media_gate_vocab,
+    press_gate_vocab,
     item_line,
     monthly_rule,
     load_items_manifest,
@@ -64,10 +65,10 @@ MONTHLY_HEADING = SECTION_HEADINGS[VERDICT_MONTHLY]
 # 월간호 후보의 표준형: 협의회 소스 + 산림 관련성 + 제도 신호 + 마감 없음.
 # (마감이 있으면 §2 규칙에 따라 주간호 몫으로 내려간다.)
 MONTHLY_ROWS = (
-    ("forest_press", "산림 사회적기업 성장 정책 방향 발표"),
+    ("forest_press", "산림 사회적기업 성장 지원 계획 발표"),
     ("kofpi", "임업 사회적협동조합 통계 기본계획 발표"),
     ("fowi", "산림복지 사회적기업 제도 개선 계획 발표"),
-    ("coop", "산림 협동조합 육성 정책 발표"),
+    ("coop", "산림 협동조합 육성 지원 계획 발표"),
     ("socialenterprise", "사회적기업 산림 분야 시행 제도 발표"),
     ("seis", "사회적협동조합 산촌 정책 기본계획 발표"),
 )
@@ -214,9 +215,9 @@ def test_compose_window_is_the_month(tmp_path):
     """§2: 그 달에 posted 된 것만 후보다 (앞뒤 달은 창 밖)."""
     db = tmp_path / "window.db"
     _create_announcements_table(db)
-    inside = _insert(db, "forest_press", "산림 사회적기업 정책 방향 발표",
+    inside = _insert(db, "forest_press", "산림 사회적기업 지원 계획 발표",
                      source_id="in", created_at="2026-09-30T23:00:00")
-    _insert(db, "forest_press", "산림 사회적기업 제도 개선 발표",
+    _insert(db, "forest_press", "산림 사회적기업 제도 개선 지원 발표",
             source_id="before", created_at="2026-08-31T23:00:00")
     _insert(db, "forest_press", "산림 사회적기업 시행 계획 발표",
             source_id="after", created_at="2026-10-01T00:30:00")
@@ -275,7 +276,7 @@ def test_monthly_cap_is_five(tmp_path):
 def test_monthly_source_diversity_limit(tmp_path):
     """§2: 같은 소스(기관) 최대 2건 — 3번째부터 다양성 사유로 보류."""
     rows = tuple(
-        ("forest_press", f"산림 사회적기업 정책 방향 {n}차 발표")
+        ("forest_press", f"산림 사회적기업 지원 계획 {n}차 발표")
         for n in range(1, 5)
     )
     data = _compose(_monthly_db(tmp_path, rows))
@@ -629,7 +630,7 @@ def test_noise_and_b2c_holds_are_not_monthly(tmp_path, title, expected_reason):
 def test_press_source_row_is_rescued_for_monthly(tmp_path):
     """§1(b): 협의회 소스 풀 밖(mafra)의 보도·정책 행을 월간호가 되살린다."""
     db = _round2_db(tmp_path)
-    url = _insert(db, "mafra", "농림축산식품 정책 방향 발표", source_id="mafra1",
+    url = _insert(db, "mafra", "농림축산식품 제도 개정 입법예고", source_id="mafra1",
                   period_end=None, council_match=1, council_only=1)
 
     # 주간호는 그대로 배제한다 (협의회 소스 풀 외 + council_only 가드)
@@ -646,7 +647,7 @@ def test_press_source_row_is_rescued_for_monthly(tmp_path):
 def test_press_rescue_accepts_company_selected_rows(tmp_path):
     """§1(b): `council_match=1` 이 아니어도 회사 선택분(council_only=0)이면 된다."""
     db = _round2_db(tmp_path)
-    url = _insert(db, "mafra", "농림축산식품 통계 기본계획 발표", source_id="mafra2",
+    url = _insert(db, "mafra", "농림축산식품 통계 기본계획 지원", source_id="mafra2",
                   period_end=None, council_match=None, council_only=0)
     data = _compose(db)
     assert [item["url"] for item in data["sections"][VERDICT_MONTHLY]] == [url]
@@ -655,7 +656,7 @@ def test_press_rescue_accepts_company_selected_rows(tmp_path):
 def test_press_rescue_needs_match_or_company_selection(tmp_path):
     """§1(b): 둘 다 아니면 되살리지 않는다 (배제 그대로)."""
     db = _round2_db(tmp_path)
-    _insert(db, "mafra", "농림축산식품 통계 기본계획 발표", source_id="mafra3",
+    _insert(db, "mafra", "농림축산식품 통계 기본계획 지원", source_id="mafra3",
             period_end=None, council_match=0, council_only=1)
     data = _compose(db)
     assert data["sections"][VERDICT_MONTHLY] == []
@@ -666,7 +667,7 @@ def test_press_rescue_needs_match_or_company_selection(tmp_path):
 def test_press_rescue_requires_no_deadline(tmp_path):
     """§1(b): 마감이 있으면 주간호 몫이므로 되살리지 않는다."""
     db = _round2_db(tmp_path)
-    _insert(db, "mafra", "농림축산식품 정책 방향 발표", source_id="mafra4",
+    _insert(db, "mafra", "농림축산식품 제도 개정 입법예고", source_id="mafra4",
             period_end="2026-09-30", council_match=1, council_only=1)
     data = _compose(db)
     assert data["sections"][VERDICT_MONTHLY] == []
@@ -756,16 +757,24 @@ def test_monthly_unknown_rule_sorts_last(tmp_path):
     assert [item["id"] for item in _sort_monthly(items)] == [2, 1]
 
 
-def test_monthly_order_applies_to_the_real_selection(tmp_path):
-    """§1: 같은 게시일이면 협의회 점수가 높은 쪽이 먼저 실린다."""
+def test_monthly_within_rule_order_is_posted_then_id(tmp_path):
+    """§2(라운드 6): 규칙 안의 순서는 게시일 내림차순 → id 다.
+
+    `council_score` 는 쓰지 않는다 — gonggo 행의 다수가 NULL 이라 `or 0.0` 이
+    그것을 0점으로 만들고(P2-X H2 실측), 점수 보유 자체가 편향된 값이다.
+    `id` 는 결정적이고 지면 의미가 없다(동률 안에서만 쓰인다).
+    """
     db = _round2_db(tmp_path)
-    low = _insert(db, "forest_press", "산림 사회적기업 제도 개선 계획 발표",
-                  source_id="low", council_score=0.5, council_match=1)
-    high = _insert(db, "coop", "산림 협동조합 육성 정책 방향 발표",
-                   source_id="high", council_score=0.9, council_match=1)
+    older = _insert(db, "forest_press", "산림 사회적기업 제도 개선 계획 발표",
+                    source_id="older", council_score=0.9, council_match=1,
+                    period_start="2026-09-05")
+    newer = _insert(db, "coop", "산림 협동조합 육성 지원 계획 발표",
+                    source_id="newer", council_score=0.1, council_match=1,
+                    period_start="2026-09-20")
     data = _compose(db)
+    # 둘 다 규칙 (b) — 점수가 낮아도 **게시일이 늦은 쪽**이 앞이다
     assert [item["url"] for item in data["sections"][VERDICT_MONTHLY]] == [
-        high, low]
+        newer, older]
 
 
 # ══ 라운드 2 §1(c)·§2 — 2차 미디어 ════════════════════════════════════════
@@ -884,7 +893,7 @@ def test_media_digest_passes_the_checker(tmp_path):
     out.mkdir()
     db = _round2_db(tmp_path)
     _insert_media(db, source_id="m8")
-    _insert(db, "forest_press", "산림 사회적기업 정책 방향 발표",
+    _insert(db, "forest_press", "산림 사회적기업 지원 계획 발표",
             source_id="p8", council_match=1)
     md = out / f"{M09}.md"
     compose_digest(db_path=str(db), week_str=M09, output_path=md)
@@ -1105,11 +1114,11 @@ def test_press_rule_admits_without_a_rescue(tmp_path):
     db = _round2_db(tmp_path)
     from alert.digest.composer import classify_item
 
-    url = _insert(db, "coop", "산림 협동조합 협력 사례", source_id="press-hold",
+    url = _insert(db, "coop", "산림 협동조합 협력 지원 기준 안내", source_id="press-hold",
                   period_end=None, council_match=1, council_only=1)
     # 주간 분류는 `보류/섹션 판정 불명` 이다 (배제가 아니므로 되살림 경로가 아니다)
-    assert classify_item("산림 협동조합 협력 사례", "요약", "coop").reason == \
-        "섹션 판정 불명"
+    assert classify_item("산림 협동조합 협력 지원 기준 안내", "요약",
+                         "coop").reason == "섹션 판정 불명"
     data = _compose(db)
     assert [item["url"] for item in data["sections"][VERDICT_MONTHLY]] == [url]
     assert data["sections"][VERDICT_MONTHLY][0]["monthly_rule"] == \
@@ -1120,7 +1129,7 @@ def test_deadline_cue_beats_every_admission_rule(tmp_path):
     """§3+§4: 규칙에 맞아도 마감 단서가 있으면 내려간다 (미디어 포함)."""
     db = _round2_db(tmp_path)
     _insert_media(db, "사회적기업 지원사업 신청기간 안내", source_id="cue-media")
-    _insert(db, "mafra", "농림축산식품 정책 발표 (~9.30.)", source_id="cue-press",
+    _insert(db, "mafra", "농림축산식품 제도 개정 지원 (~9.30.)", source_id="cue-press",
             period_end=None, council_match=1, council_only=1)
     data = _compose(db)
     assert data["sections"][VERDICT_MONTHLY] == []
@@ -1147,7 +1156,11 @@ def _run_monthly_job(tmp_path, now, extra_env=None):
         encoding="utf-8",
     )
     stub.chmod(0o755)
-    env = dict(os.environ, MONTHLY_JOB_NOW=now, GONGGO_PYTHON=str(stub))
+    # 잡 전역 뮤텍스(P2-X H4)는 건너뛴다 — 잠금은 `${ROOT}/digests/.job.lock` 을
+    # 만들므로, 그대로 두면 테스트가 **레포 워킹트리에 파일을 남긴다.**
+    # `GONGGO_JOB_LOCK_HELD` 는 잡 자신이 재실행을 구분하려고 쓰는 손잡이다.
+    env = dict(os.environ, MONTHLY_JOB_NOW=now, GONGGO_PYTHON=str(stub),
+               GONGGO_JOB_LOCK_HELD="1")
     env.update(extra_env or {})
     proc = subprocess.run(
         ["bash", str(root / "scripts" / "monthly_job.sh")],
@@ -1203,7 +1216,8 @@ def test_monthly_job_explicit_key_skips_the_guard(tmp_path):
     proc = subprocess.run(
         ["bash", str(root / "scripts" / "monthly_job.sh"), "2026-M07"],
         capture_output=True, text=True, cwd=str(root),
-        env=dict(os.environ, GONGGO_PYTHON=str(stub), MONTHLY_JOB_NOW="2026-10-02"),
+        env=dict(os.environ, GONGGO_PYTHON=str(stub),
+                 MONTHLY_JOB_NOW="2026-10-02", GONGGO_JOB_LOCK_HELD="1"),
     )
     calls = log.read_text(encoding="utf-8").splitlines()
     assert calls[0].startswith("scripts/monthly_digest.py 2026-M07")
@@ -1521,3 +1535,216 @@ def test_monthly_order_id_never_outranks_the_editorial_keys(tmp_path):
         {"id": 99, "monthly_rule": "a", "posted": "2026-09-01"},
     ]
     assert [item["id"] for item in _sort_monthly(items)] == [99, 1]
+
+
+# ══ 라운드 6 — 기관 보도 2차 관문 + 규칙 라운드로빈 ═══════════════════════
+def test_press_gate_vocab_comes_from_config():
+    """§1: 어휘 정본은 config 이고 미디어 어휘와 **분리**돼 있다."""
+    from alert.config import get_config
+    from alert.digest.composer import media_gate_vocab, press_gate_vocab
+
+    cues, excludes = press_gate_vocab()
+    profile = get_config(reload=True).council_profile
+    assert cues == tuple(profile.press_action_cues)
+    assert excludes == tuple(profile.press_exclude)
+    for term in ("제도", "시행", "개정", "지원", "공모", "모집", "지정", "인증",
+                 "계획", "기본법", "예산안", "입법예고", "설명회", "기준",
+                 "신고", "등록", "의무", "완화", "폐지"):
+        assert term in cues, term
+    for term in ("선정", "기술 개발", "기술개발", "개발", "행사", "기념",
+                 "이달의", "행보", "태세", "점검", "간담회", "시상", "수상",
+                 "임명", "취임", "방문", "캠페인"):
+        assert term in excludes, term
+    # 두 관문은 서로 다른 어휘를 쓴다 (노이즈 유형이 다르다)
+    media_cues, media_excludes = media_gate_vocab()
+    assert cues != media_cues and excludes != media_excludes
+
+
+def test_press_gate_is_fail_closed_without_vocab():
+    """§1: 어휘를 못 읽으면 어떤 기관 보도도 통과하지 못한다."""
+    from alert.digest.composer import MONTHLY_HOLD_PRESS_NOISE, press_gate_reason
+
+    assert press_gate_reason("산림 제도 개정 입법예고", (), ()) == \
+        MONTHLY_HOLD_PRESS_NOISE
+
+
+@pytest.mark.parametrize("title", [
+    # 2026-M09 실연이 지면에 올린 홍보성 보도 (계약이 지정한 재현)
+    "상수리나무 '수형목 식별' 핵심 DNA 기술 개발",
+    "산림청, 9월 이달의 임산물로 오미자 선정",
+    # 같은 부류
+    "산림청-한국수목원정원관리원 업무협약 기념식",
+    "박은식 청장, 재선충병 현장 점검",
+    "산림 사랑 캠페인 개최",
+    "산림주간 행사 안내",
+])
+def test_press_noise_titles_are_held(title):
+    """§1: 선정·개발·행사·의전 보도는 내린다."""
+    from alert.digest.composer import MONTHLY_HOLD_PRESS_NOISE, press_gate_reason
+
+    cues, excludes = press_gate_vocab()
+    assert press_gate_reason(title, cues, excludes) == MONTHLY_HOLD_PRESS_NOISE
+
+
+@pytest.mark.parametrize("title", [
+    # 계약이 지정한 재현
+    "협동조합연합회등의 명칭 사용 기준 안내",
+    # 같은 부류
+    "「농지법 시행령」 일부개정령안 입법예고",
+    "산림복지 전문업 등록 의무 완화",
+    "사회적기업 인증 절차 폐지",
+    "임업 예산안 설명회",
+])
+def test_press_action_titles_pass(title):
+    """§1: 제도·기준·신고·등록 같은 행동 단서가 있으면 통과한다."""
+    from alert.digest.composer import press_gate_reason
+
+    cues, excludes = press_gate_vocab()
+    assert press_gate_reason(title, cues, excludes) is None
+
+
+def test_press_exclude_beats_an_action_cue():
+    """§1: 제외어가 있으면 단서가 있어도 내린다 (`이달의 … 지정`)."""
+    from alert.digest.composer import MONTHLY_HOLD_PRESS_NOISE, press_gate_reason
+
+    cues, excludes = press_gate_vocab()
+    assert press_gate_reason("9월 이달의 임산물 지정", cues, excludes) == \
+        MONTHLY_HOLD_PRESS_NOISE
+
+
+@pytest.mark.parametrize("title,held", [
+    ("상수리나무 '수형목 식별' 핵심 DNA 기술 개발", True),
+    ("산림청, 9월 이달의 임산물로 오미자 선정", True),
+    ("협동조합연합회등의 명칭 사용 기준 안내", False),
+])
+def test_press_gate_end_to_end(tmp_path, title, held):
+    """§1 종단: 실연이 올렸던 두 제목은 내려가고, 기준 안내는 남는다."""
+    from alert.digest.composer import MONTHLY_HOLD_PRESS_NOISE
+
+    db = _round2_db(tmp_path)
+    _insert(db, "forest_press", title, source_id="press-e2e",
+            council_match=1, council_only=1)
+    data = _compose(db)
+    if held:
+        assert data["sections"][VERDICT_MONTHLY] == []
+        assert [hold["reason"] for hold in data["holds"]] == [
+            MONTHLY_HOLD_PRESS_NOISE]
+    else:
+        assert len(data["sections"][VERDICT_MONTHLY]) == 1
+
+
+def test_press_gate_does_not_touch_the_weekly_issue(tmp_path):
+    """§1: 2차 관문은 월간 경로 전용이다."""
+    db = _round2_db(tmp_path)
+    _insert(db, "forest_press", "산림 사회적기업 제도 개선 발표",
+            source_id="weekly-press", period_end=None, council_only=0)
+    weekly = compose_digest_data(db_path=str(db), week_str="2026-W37")
+    assert len(weekly["sections"]["알아두세요"]) == 1
+
+
+def test_press_gate_vocab_is_not_used_by_the_loading_profile():
+    """§1: 적재 채점은 이 어휘를 보지 않는다."""
+    import inspect
+
+    from alert import council
+
+    source = inspect.getsource(council)
+    assert "press_action_cues" not in source
+    assert "press_exclude" not in source
+
+
+# ── 규칙 라운드로빈 ───────────────────────────────────────────────────────
+def _seed_rules(db, notices=0, presses=0, medias=0, posted_base=10):
+    """규칙별 후보를 만든다 — 소스를 벌려 다양성 상한이 섞이지 않게."""
+    notice_sources = ("lawmaking", "kofpi", "fowi", "seis")
+    press_sources = ("forest_press", "coop", "mafra", "socialenterprise")
+    media_sources = ("lifein", "eroun", "senews", "kfnews")
+    for index in range(notices):
+        _insert(db, notice_sources[index], f"산림 사회적기업 제도 개정 고시 {index}",
+                source_id=f"a{index}",
+                created_at=f"2026-09-{posted_base + index:02d}T12:00:00")
+    for index in range(presses):
+        _insert(db, press_sources[index], f"산림 사회적기업 지원 계획 {index}",
+                source_id=f"b{index}", council_match=1, council_only=1,
+                created_at=f"2026-09-{posted_base + index:02d}T12:00:00")
+    for index in range(medias):
+        _insert_media(db, f"산림 사회적기업 지원사업 공고 {index}",
+                      source=media_sources[index], source_id=f"c{index}",
+                      created_at=f"2026-09-{posted_base + index:02d}T12:00:00")
+
+
+def _rules_of(data):
+    return [item["monthly_rule"]
+            for item in data["sections"][VERDICT_MONTHLY]]
+
+
+def test_round_robin_fills_slots_across_rules(tmp_path):
+    """§2: 세 규칙에 3건씩이면 지면은 a, b, c, a, b 다."""
+    from alert.digest.composer import (
+        MONTHLY_RULE_MEDIA, MONTHLY_RULE_NOTICE, MONTHLY_RULE_PRESS)
+
+    db = _round2_db(tmp_path)
+    _seed_rules(db, notices=3, presses=3, medias=3)
+    assert _rules_of(_compose(db)) == [
+        MONTHLY_RULE_NOTICE, MONTHLY_RULE_PRESS, MONTHLY_RULE_MEDIA,
+        MONTHLY_RULE_NOTICE, MONTHLY_RULE_PRESS,
+    ]
+
+
+def test_round_robin_skips_an_exhausted_rule(tmp_path):
+    """§2: 미디어가 없으면 a, b, a, b, a 로 채운다."""
+    from alert.digest.composer import MONTHLY_RULE_NOTICE, MONTHLY_RULE_PRESS
+
+    db = _round2_db(tmp_path)
+    _seed_rules(db, notices=3, presses=3, medias=0)
+    assert _rules_of(_compose(db)) == [
+        MONTHLY_RULE_NOTICE, MONTHLY_RULE_PRESS,
+        MONTHLY_RULE_NOTICE, MONTHLY_RULE_PRESS,
+        MONTHLY_RULE_NOTICE,
+    ]
+
+
+def test_round_robin_does_not_let_one_rule_take_the_page(tmp_path):
+    """§2 회귀: 규칙 순위 정렬이 (b)로 5칸을 다 먹던 것이 이 변경의 이유다."""
+    from alert.digest.composer import MONTHLY_RULE_MEDIA, MONTHLY_RULE_PRESS
+
+    db = _round2_db(tmp_path)
+    _seed_rules(db, notices=0, presses=4, medias=3)
+    rules = _rules_of(_compose(db))
+    assert rules == [
+        MONTHLY_RULE_PRESS, MONTHLY_RULE_MEDIA,
+        MONTHLY_RULE_PRESS, MONTHLY_RULE_MEDIA,
+        MONTHLY_RULE_PRESS,
+    ]
+    assert rules.count(MONTHLY_RULE_MEDIA) == 2      # 미디어 상한은 그대로
+
+
+def test_round_robin_keeps_the_media_cap(tmp_path):
+    """§2: 라운드로빈이어도 기사는 2칸까지다."""
+    db = _round2_db(tmp_path)
+    _seed_rules(db, notices=1, presses=1, medias=4)
+    selected = _compose(db)["sections"][VERDICT_MONTHLY]
+    assert sum(1 for item in selected if item.get("media")) == 2
+
+
+def test_round_robin_keeps_the_source_cap(tmp_path):
+    """§2: 같은 소스 2건 상한도 그대로다."""
+    db = _round2_db(tmp_path)
+    for index in range(4):
+        _insert(db, "forest_press", f"산림 사회적기업 지원 계획 {index}",
+                source_id=f"same{index}", council_match=1, council_only=1,
+                created_at=f"2026-09-{10 + index:02d}T12:00:00")
+    data = _compose(db)
+    selected = data["sections"][VERDICT_MONTHLY]
+    assert len(selected) == SOURCE_DIVERSITY_LIMIT == 2
+    assert HOLD_REASON_DIVERSITY in {hold["reason"] for hold in data["holds"]}
+
+
+def test_round_robin_page_order_is_not_resorted(tmp_path):
+    """§2: 라운드로빈 순서가 곧 지면 순서다 (다시 정렬하면 교차가 사라진다)."""
+    from alert.digest.composer import MONTHLY_RULE_MEDIA, MONTHLY_RULE_NOTICE
+
+    db = _round2_db(tmp_path)
+    _seed_rules(db, notices=2, presses=0, medias=2)
+    rules = _rules_of(_compose(db))
+    assert rules[0] == MONTHLY_RULE_NOTICE and rules[1] == MONTHLY_RULE_MEDIA
