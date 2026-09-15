@@ -25,7 +25,7 @@ from __future__ import annotations
 
 import ssl
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Sequence
 
 import requests
 from requests.adapters import HTTPAdapter
@@ -85,8 +85,26 @@ class _ContextAdapter(HTTPAdapter):
 
 def apply_tls_policy(session: requests.Session,
                      legacy_security_level: bool = False,
-                     extra_ca_file: Optional[Path] = None) -> ssl.SSLContext:
-    """세션의 https 경로에 사이트별 TLS 정책을 붙이고 컨텍스트를 돌려준다."""
+                     extra_ca_file: Optional[Path] = None,
+                     prefixes: Sequence[str] = ()) -> ssl.SSLContext:
+    """세션의 **지정한 호스트 접두**에만 사이트별 TLS 정책을 붙인다.
+
+    라운드 2 (Codex MEDIUM): 예전에는 ``https://`` 전체에 어댑터를 걸었다.
+    그 세션이 다른 호스트로 요청하거나 **교차 호스트 리다이렉트**를 타면 그쪽에도
+    SECLEVEL 완화·추가 CA 가 따라간다. 예외는 그 사이트에만 주는 것이 계약이다.
+
+    requests 의 어댑터 선택은 **가장 긴 접두 우선**이므로, 호스트 접두를 걸어도
+    나머지 https 요청은 세션 기본 어댑터(표준 정책)로 간다.
+
+    Args:
+        prefixes: `https://www.semas.or.kr/` 처럼 **호스트까지 포함한** 접두.
+            비어 있으면 아무것도 붙이지 않고 컨텍스트만 돌려준다 — 전역
+            ``https://`` 로 폴백하지 않는다(그 폴백이 바로 이 결함이었다).
+    """
     context = build_context(legacy_security_level, extra_ca_file)
-    session.mount("https://", _ContextAdapter(context))
+    for prefix in prefixes:
+        if not prefix.startswith("https://") or prefix == "https://":
+            raise ValueError(
+                f"TLS 정책 접두는 호스트를 포함해야 합니다: {prefix!r}")
+        session.mount(prefix, _ContextAdapter(context))
     return context

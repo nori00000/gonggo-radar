@@ -1718,6 +1718,11 @@ def _sort_monthly(items: List[Dict]) -> List[Dict]:
     `council_score` 는 **동률 시에만** 본다 — 같은 규칙·같은 게시일 안에서
     협의회에 더 가까운 것을 앞으로. 이 자리에서는 NULL 편향이 지면을 뒤집지
     못한다(이미 같은 규칙·같은 날짜다).
+
+    라운드 2 (Codex LOW): 마지막 키는 `id` 다. 세 키가 모두 같으면 `sorted` 는
+    입력 순서를 유지하는데, 입력 순서는 SQL 결과 순서라서 **같은 데이터로도
+    지면이 달라질 수 있었다.** id 는 결정적이고 지면 의미가 없다(동률 안에서만
+    쓰이므로 편집 판단을 바꾸지 않는다).
     """
     return sorted(
         items,
@@ -1725,6 +1730,7 @@ def _sort_monthly(items: List[Dict]) -> List[Dict]:
             _monthly_rule_rank(item),
             -_posted_ordinal(item),
             -float(item.get("council_score") or 0.0),
+            int(item.get("id") or 0),
         ),
     )
 

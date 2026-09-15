@@ -37,6 +37,10 @@ class BaseCrawler(abc.ABC):
     # TLS: 검증을 끄는 손잡이는 없다 — `alert/crawlers/tls.py` 참조.
     TLS_LEGACY_SECURITY_LEVEL = False   # True 면 SECLEVEL=1 (semas)
     TLS_EXTRA_CA_FILE: Optional[str] = None   # alert/certs/ 안의 파일명 (ggeea)
+    # 그 정책이 붙을 **호스트 접두** (라운드 2, Codex MEDIUM). 비면 정책을 쓰지
+    # 않는다 — `https://` 전역 폴백은 없다. 교차 호스트 리다이렉트까지 예외가
+    # 따라가는 것을 막는 유일한 자리다.
+    TLS_PREFIXES: Tuple[str, ...] = ()
     # 재시도·타임아웃: None 이면 config.yaml 의 전역값을 쓴다.
     CONNECT_TIMEOUT: Optional[float] = None
     READ_TIMEOUT: Optional[float] = None
@@ -72,12 +76,18 @@ class BaseCrawler(abc.ABC):
 
         # P2-X: 사이트별 TLS 정책 — 그 크롤러의 세션에만 붙는다.
         if self.TLS_LEGACY_SECURITY_LEVEL or self.TLS_EXTRA_CA_FILE:
+            if not self.TLS_PREFIXES:
+                raise ValueError(
+                    f"{type(self).__name__}: TLS 정책을 선언했으면 "
+                    "TLS_PREFIXES 로 적용 호스트를 한정해야 합니다"
+                )
             from .tls import CERTS_DIR, apply_tls_policy
             apply_tls_policy(
                 self.session,
                 legacy_security_level=self.TLS_LEGACY_SECURITY_LEVEL,
                 extra_ca_file=(CERTS_DIR / self.TLS_EXTRA_CA_FILE
                                if self.TLS_EXTRA_CA_FILE else None),
+                prefixes=self.TLS_PREFIXES,
             )
 
         # 이미 인용을 받은 공고의 source_id. 파이프라인이 DB에서 읽어 넣어

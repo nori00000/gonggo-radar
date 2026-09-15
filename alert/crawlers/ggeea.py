@@ -34,6 +34,8 @@ class GgeeaCrawler(BaseCrawler):
     # 실측 2026-09-15: 번들 적용 후 `200 / 114408바이트`, 검증 그대로.
     # 발급 CA 가 바뀌면 이 파일은 무용지물이 되고 다시 `접속 실패` 로 잡힌다.
     TLS_EXTRA_CA_FILE = "ggeea-intermediate.pem"
+    # 보조 번들은 이 호스트에만 (라운드 2).
+    TLS_PREFIXES = ("https://www.ggeea.or.kr/",)
     BOARD_PATHS = [
         "/bbs/board.php?bo_table=notice",  # 공지사항
         "/news",                            # 사업공고

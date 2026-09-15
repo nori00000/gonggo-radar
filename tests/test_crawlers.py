@@ -1274,8 +1274,12 @@ class TestCrawlSingleStatus:
         assert "RuntimeError" in second
         assert "crawl failed (see log above)" not in (first + second)
 
-    def test_partial_failure_is_still_success(self, mock_crawler_config):
-        """한 건이라도 가져왔으면 성공이다 — 부분 수집은 정상 운영이다."""
+    def test_partial_failure_is_recorded_as_partial(self, mock_crawler_config):
+        """라운드 2 (Codex LOW): 게시판 A 실패 + B 성공 = `partial` + 사유 보존.
+
+        라운드 1 은 이것을 `success`/`error_message=""` 로 적었다 — 그 소스의
+        절반이 이력에서 조용히 사라졌다.
+        """
         real_request = requests.Session.request
 
         def selective(self, method, url, **kwargs):
@@ -1286,7 +1290,8 @@ class TestCrawlSingleStatus:
         with patch.object(requests.Session, "request", selective):
             name, raw, status, error = self._run(
                 _PartialCrawler, mock_crawler_config)
-        assert status == "success" and error == "" and len(raw) == 1
+        assert status == "partial" and len(raw) == 1
+        assert "timeout" in error and "dead" in error
 
     def test_empty_but_healthy_source_stays_success(self, mock_crawler_config):
         """진짜 무공고는 오류가 아니다 — 사유가 없으면 success."""
@@ -1440,7 +1445,8 @@ class TestSemasSecurityLevel:
         from alert.crawlers.semas import SemasCrawler
         from alert.crawlers.tls import LEGACY_CIPHERS, _ContextAdapter
 
-        adapter = SemasCrawler().session.get_adapter("https://www.semas.or.kr")
+        adapter = SemasCrawler().session.get_adapter(
+            "https://www.semas.or.kr/web/board/webBoardList.kmdc")
         assert isinstance(adapter, _ContextAdapter)
         ctx = adapter._ssl_context
         assert ctx.verify_mode == ssl.CERT_REQUIRED and ctx.check_hostname
@@ -1485,7 +1491,7 @@ class TestGgeeaCertBundle:
         from alert.crawlers.ggeea import GgeeaCrawler
         from alert.crawlers.tls import _ContextAdapter
 
-        adapter = GgeeaCrawler().session.get_adapter("https://www.ggeea.or.kr")
+        adapter = GgeeaCrawler().session.get_adapter("https://www.ggeea.or.kr/")
         assert isinstance(adapter, _ContextAdapter)
         ctx = adapter._ssl_context
         assert ctx.verify_mode == ssl.CERT_REQUIRED and ctx.check_hostname
@@ -1537,3 +1543,70 @@ class TestSlowSourceRetryPolicy:
             with patch("alert.crawlers.base.time.sleep"):
                 assert crawler.get("https://www.ipet.re.kr/x") is None
         assert seen["timeout"] == (5.0, 8.0)
+
+
+# ---------------------------------------------------------------------------
+# 라운드 2 (Codex MEDIUM) — TLS 예외는 **그 호스트에만** 붙는다
+# ---------------------------------------------------------------------------
+
+class TestTlsPolicyIsHostScoped:
+
+    def test_other_hosts_on_the_same_session_get_the_default_adapter(self):
+        """같은 세션이라도 다른 호스트는 표준 정책으로 간다.
+
+        라운드 1 은 `https://` 전체에 어댑터를 걸었다 — 교차 호스트 리다이렉트를
+        타면 SECLEVEL 완화·추가 CA 가 그쪽까지 따라갔다.
+        """
+        from requests.adapters import HTTPAdapter
+
+        from alert.crawlers.ggeea import GgeeaCrawler
+        from alert.crawlers.semas import SemasCrawler
+        from alert.crawlers.tls import _ContextAdapter
+
+        for cls, own, foreign in (
+            (SemasCrawler, "https://www.semas.or.kr/web/board/x",
+             "https://attacker.example.com/x"),
+            (GgeeaCrawler, "https://www.ggeea.or.kr/board",
+             "https://www.semas.or.kr/x"),
+        ):
+            session = cls().session
+            assert isinstance(session.get_adapter(own), _ContextAdapter)
+            other = session.get_adapter(foreign)
+            assert isinstance(other, HTTPAdapter)
+            assert not isinstance(other, _ContextAdapter)
+
+    def test_declared_prefixes_include_the_host(self):
+        from alert.crawlers.ggeea import GgeeaCrawler
+        from alert.crawlers.semas import SemasCrawler
+
+        assert SemasCrawler.TLS_PREFIXES == ("https://www.semas.or.kr/",)
+        assert GgeeaCrawler.TLS_PREFIXES == ("https://www.ggeea.or.kr/",)
+
+    def test_a_bare_https_prefix_is_refused(self):
+        """`https://` 전역 마운트는 값 오류다 — 이 결함의 재발을 막는다."""
+        import requests
+
+        from alert.crawlers.tls import apply_tls_policy
+
+        with pytest.raises(ValueError):
+            apply_tls_policy(requests.Session(), legacy_security_level=True,
+                             prefixes=("https://",))
+        with pytest.raises(ValueError):
+            apply_tls_policy(requests.Session(), legacy_security_level=True,
+                             prefixes=("www.semas.or.kr",))
+
+    def test_declaring_a_policy_without_prefixes_is_refused(
+        self, mock_crawler_config
+    ):
+        """정책만 켜고 호스트를 안 적으면 크롤러 생성 자체가 실패한다."""
+
+        class _Unscoped(BaseCrawler):
+            TLS_LEGACY_SECURITY_LEVEL = True
+
+            def fetch(self):
+                return []
+
+        with patch("alert.crawlers.base.get_config",
+                   return_value=mock_crawler_config):
+            with pytest.raises(ValueError):
+                _Unscoped(source_name="test_source")

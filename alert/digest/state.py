@@ -374,10 +374,49 @@ def update_state_locked(state_path_, week: str, mutate,
     return apply_state(state_path_, current, new, escape=escape)
 
 
-def can_send(state: Dict) -> Tuple[bool, str]:
+NEWER_ISSUE_REASON = (
+    "더 새로운 호({})가 이미 있습니다 — 그 호의 미리보기로 승인하세요")
+
+
+def newer_weekly_issue(out_dir, week) -> Optional[str]:
+    """이 주간호보다 **새로운** 주간호가 실재하는가 (라운드 2, Codex MEDIUM).
+
+    H5 의 만료는 잠금 경합으로 건너뛸 수 있다(그 호를 다른 작성자가 쥐고 있으면).
+    그때 옛 카드가 `draft` 인 채 남고, 상태만 보는 `can_send` 는 그것을 통과시킨다.
+    이 함수는 **디스크의 사실**로 같은 결론을 낸다 — 만료가 실패해도 막힌다.
+
+    "새로운 호" 는 `draft`·`annotated`·`sent` 중 하나여야 한다. `expired` 는
+    이미 죽었고, `held`·`sending` 은 그 호가 아직 지면을 대표한다고 볼 수 없다.
+
+    Returns:
+        가장 새로운 그런 호의 키, 없으면 ``None``.
+    """
+    if issue_kind(week) != KIND_WEEKLY:
+        return None
+    try:
+        candidates = sorted(Path(out_dir).glob("*.state.json"), reverse=True)
+    except OSError:
+        return None
+    for path in candidates:
+        key = path.name[: -len(".state.json")]
+        if issue_kind(key) != KIND_WEEKLY or key <= week:
+            continue
+        try:
+            other = load_state(path, key)
+        except StateError:
+            continue
+        if other.get("status") in ("draft", "annotated", "sent"):
+            return key
+    return None
+
+
+def can_send(state: Dict, newer_issue: Optional[str] = None) -> Tuple[bool, str]:
     """발송 가능한가. status=sent는 불변이고, sending은 사람 확인 전까지 막는다.
 
     사이클4 #3·#4: 재조립 실패·검증 무효화 실패 플래그가 있으면 발송하지 않는다.
+
+    라운드 2: ``newer_issue`` 가 주어지면(= 더 새로운 주간호가 디스크에 있다)
+    이 호는 발송하지 않는다. 만료가 잠금 경합으로 생략된 경우의 안전망이다.
     """
     status = state.get("status")
     if status == "sent":
@@ -389,6 +428,8 @@ def can_send(state: Dict) -> Tuple[bool, str]:
     # 경우에도 옛 카드는 무력하다.
     if status == "expired":
         return False, EXPIRED_REASON
+    if newer_issue:
+        return False, NEWER_ISSUE_REASON.format(newer_issue)
     if state.get("verification_broken"):
         return False, VERIFICATION_BROKEN_REASON
     if state.get("rebuild_failed"):

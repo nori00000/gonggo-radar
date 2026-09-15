@@ -177,7 +177,7 @@ def _crawl_single(
 
     Returns:
         ``(crawler_name, raw_announcements, status, error_message)``
-        status: "success" | "disabled" | "error".
+        status: "success" | "partial" | "disabled" | "error".
         error_message 는 **그 소스의** 사유다 — 전역값 복사가 아니다.
     """
     try:
@@ -191,6 +191,13 @@ def _crawl_single(
         if not raw and errors:
             logger.error(f"{crawler_name}: 수집 0건 + 실패 사유 있음 — {errors}")
             return crawler_name, [], "error", errors
+        if errors:
+            # 라운드 2 (Codex LOW): 게시판 A 는 죽고 B 만 살아 있는 상태를
+            # `success` 로 적으면 **그 소스의 절반이 조용히 사라진다.**
+            # 파이프라인은 성공처럼 진행하되(수집분은 진짜다) 이력에는 사유를
+            # 남긴다 — `partial` 은 "돌긴 돌았는데 일부는 못 가져왔다" 다.
+            logger.warning(f"{crawler_name}: 부분 실패 — {errors}")
+            return crawler_name, raw, "partial", errors
         return crawler_name, raw, "success", ""
     except Exception as e:
         logger.error(f"{crawler_name}: {e}")
@@ -586,7 +593,8 @@ def run_pipeline(test_mode: bool = False) -> None:
     if detail_quota is not None:
         detail_pending: List[RawAnnouncement] = []
         for _name, (_anns, _status, _error) in crawl_results.items():
-            if _status != "success" or not wants_period_detail(_name):
+            # 라운드 2: `partial` 은 수집분이 진짜이므로 상세 근거 대상이다.
+            if _status not in ("success", "partial") or not wants_period_detail(_name):
                 continue
             try:
                 for _sid, _evidence in db.get_detail_evidence(_name).items():
@@ -738,7 +746,8 @@ def run_pipeline(test_mode: bool = False) -> None:
                     "total_fetched": total_fetched,
                     "new_count": 0,
                     "relevant_count": 0,
-                    "status": "success",
+                    "status": status,
+                    "error_message": error_message,
                 }
                 continue
 
@@ -931,7 +940,8 @@ def run_pipeline(test_mode: bool = False) -> None:
                 "total_fetched": total_fetched,
                 "new_count": new_count,
                 "relevant_count": relevant_count,
-                "status": "success",
+                "status": status,              # "success" 또는 "partial"
+                "error_message": error_message,
             }
 
             logger.info(
@@ -1031,7 +1041,8 @@ def run_pipeline(test_mode: bool = False) -> None:
             total=stats["total_fetched"],
             new=stats["new_count"],
             relevant=stats["relevant_count"],
-            notified=notified_count if stats["status"] == "success" else 0,
+            notified=(notified_count
+                      if stats["status"] in ("success", "partial") else 0),
             status=stats["status"],
             error_msg=stats.get("error_message", ""),
         )

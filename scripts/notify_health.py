@@ -66,7 +66,9 @@ def main(argv=None) -> int:
 
     body = f"{HEADER}\n\n{summary[:MAX_SUMMARY_CHARS]}"
     if args.report:
-        body += f"\n\n자세히: {args.report}"
+        # 라운드 2 (Codex LOW): 텔레그램 본문에 **절대경로를 싣지 않는다**.
+        # `redact()` 는 경로를 가리지 않으므로 여기서 파일명만 남긴다.
+        body += f"\n\n자세히: digests/observe/{Path(args.report).name}"
 
     if args.dry_run:
         _out("[DRY-RUN] 안내 1건")

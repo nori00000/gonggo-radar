@@ -860,6 +860,22 @@ class TestHealthJobWiring:
         printed = capsys.readouterr().out
         assert "[DRY-RUN]" in printed and "실패: semas" in printed
 
+    def test_notify_health_never_leaks_an_absolute_path(self, tmp_path, capsys):
+        """라운드 2 (Codex LOW): 텔레그램 본문에 절대경로가 실리지 않는다.
+
+        `redact()` 는 경로를 가리지 않는다 — 파일명만 남긴다.
+        """
+        from scripts import notify_health
+
+        summary = tmp_path / "s.txt"
+        summary.write_text("[2026-09-13] 소스 5\n", encoding="utf-8")
+        report = tmp_path / "observe" / "health-2026-09-13.md"
+        assert notify_health.main(
+            [str(summary), "--report", str(report), "--dry-run"]) == 0
+        printed = capsys.readouterr().out
+        assert str(tmp_path) not in printed
+        assert "digests/observe/health-2026-09-13.md" in printed
+
     def test_notify_health_refuses_an_empty_summary(self, tmp_path):
         from scripts import notify_health
 

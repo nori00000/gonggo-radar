@@ -470,7 +470,8 @@ def collect_db_stats(db_path: str, recent_runs: int = RECENT_RUNS) -> Dict[str, 
                 entry["runs"].append(
                     (started_at, int(fetched or 0), int(new_count or 0), status or "")
                 )
-            if status == "success" and not entry["last_success"]:
+            # 라운드 2: `partial`(부분 실패)도 "그때는 닿았다" 는 증거다.
+            if status in ("success", "partial") and not entry["last_success"]:
                 entry["last_success"] = started_at
 
         cursor = conn.execute(

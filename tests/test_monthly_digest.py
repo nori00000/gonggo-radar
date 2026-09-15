@@ -1396,3 +1396,128 @@ def test_media_gate_vocab_is_not_used_by_the_loading_profile():
     source = inspect.getsource(council)
     assert "media_action_cues" not in source
     assert "media_exclude" not in source
+
+
+# ══ 라운드 2 (Codex MEDIUM) — 잡 잠금 대기 초과 시 월간 회차 재예약 ══════
+def _monthly_root(tmp_path):
+    """monthly_job.sh + job_lock.py 를 스텁 파이썬과 함께 임시 루트에 놓는다."""
+    import shutil
+    from pathlib import Path
+
+    src = Path(__file__).resolve().parent.parent
+    root = tmp_path / "repo"
+    (root / "scripts").mkdir(parents=True)
+    (root / "digests").mkdir()
+    for name in ("monthly_job.sh", "job_lock.py"):
+        shutil.copy(src / "scripts" / name, root / "scripts" / name)
+    log = tmp_path / "argv.log"
+    stub = root / "scripts" / "py"
+    stub.write_text(
+        "#!/bin/sh\nprintf '%s\\n' \"$*\" >> " + f"'{log}'\n" + "exit 0\n",
+        encoding="utf-8")
+    stub.chmod(0o755)
+    return root, stub, log
+
+
+def _run_monthly(root, stub, env_extra):
+    import os
+    import subprocess
+
+    env = dict(os.environ, GONGGO_PYTHON=str(stub),
+               GONGGO_JOB_LOCK_TIMEOUT="1")
+    env.update(env_extra)
+    proc = subprocess.run(
+        ["bash", str(root / "scripts" / "monthly_job.sh")],
+        capture_output=True, text=True, env=env, cwd=str(root))
+    return proc
+
+
+def test_monthly_job_records_a_retry_when_the_lock_is_busy(tmp_path):
+    """잠금 대기 초과(75) → digests/.monthly_retry 기록 + 안내 1건."""
+    import fcntl
+
+    root, stub, log = _monthly_root(tmp_path)
+    holder = open(root / "digests" / ".job.lock", "w")
+    fcntl.flock(holder, fcntl.LOCK_EX)
+    try:
+        proc = _run_monthly(root, stub, {"MONTHLY_JOB_NOW": "2026-10-01"})
+    finally:
+        holder.close()
+
+    assert proc.returncode == 75
+    retry = (root / "digests" / ".monthly_retry").read_text(encoding="utf-8")
+    assert retry.split() == ["2026-10-01", "2026-M09"]
+    assert "재예약" in proc.stderr
+    # 안내는 notify_health 채널로 나간다 (스텁 파이썬이 argv 를 적는다)
+    calls = log.read_text(encoding="utf-8")
+    assert "scripts/notify_health.py" in calls
+
+
+def test_monthly_job_honors_the_retry_on_a_non_thursday(tmp_path):
+    """재예약 표식이 살아 있으면 요일·일자 가드를 건너뛴다."""
+    root, stub, log = _monthly_root(tmp_path)
+    (root / "digests" / ".monthly_retry").write_text(
+        "2026-10-01 2026-M09\n", encoding="utf-8")
+    # 2026-10-05 는 월요일이고 일자 5 — 평소라면 "목요일이 아님" 으로 skip
+    proc = _run_monthly(root, stub, {"MONTHLY_JOB_NOW": "2026-10-05"})
+    assert "재예약 집행: 2026-M09" in proc.stdout
+    assert "skip" not in proc.stdout
+    calls = log.read_text(encoding="utf-8").splitlines()
+    assert calls and calls[0].startswith("scripts/monthly_digest.py 2026-M09")
+
+
+def test_monthly_job_drops_a_stale_retry_marker(tmp_path):
+    """7일을 넘긴 표식은 지우고 평소 가드로 돌아간다."""
+    root, stub, log = _monthly_root(tmp_path)
+    (root / "digests" / ".monthly_retry").write_text(
+        "2026-10-01 2026-M09\n", encoding="utf-8")
+    proc = _run_monthly(root, stub, {"MONTHLY_JOB_NOW": "2026-10-20"})
+    assert "만료됐습니다" in proc.stderr
+    assert not (root / "digests" / ".monthly_retry").exists()
+    assert "skip" in proc.stdout and "목요일이 아님" in proc.stdout
+
+
+def test_monthly_job_retry_window_is_seven_days(tmp_path):
+    """경계: 정확히 7일째는 집행하고 8일째는 버린다."""
+    for now, honored in (("2026-10-08", True), ("2026-10-09", False)):
+        root, stub, log = _monthly_root(tmp_path / now)
+        (root / "digests" / ".monthly_retry").write_text(
+            "2026-10-01 2026-M09\n", encoding="utf-8")
+        proc = _run_monthly(root, stub, {"MONTHLY_JOB_NOW": now})
+        assert ("재예약 집행" in proc.stdout) is honored, (now, proc.stdout)
+
+
+def test_monthly_job_still_runs_normally_without_a_marker(tmp_path):
+    """표식이 없으면 종전 동작 그대로 (첫째 목요일에만)."""
+    root, stub, log = _monthly_root(tmp_path)
+    proc = _run_monthly(root, stub, {"MONTHLY_JOB_NOW": "2026-10-01"})
+    calls = log.read_text(encoding="utf-8").splitlines()
+    assert calls and calls[0].startswith("scripts/monthly_digest.py 2026-M09")
+    assert not (root / "digests" / ".monthly_retry").exists()
+
+
+def test_monthly_order_is_deterministic_regardless_of_input_order(tmp_path):
+    """라운드 2 (Codex LOW): 세 키가 같아도 입력 순서가 지면을 바꾸지 않는다.
+
+    마지막 키가 `id` 라서 같은 데이터는 언제나 같은 순서를 낸다.
+    """
+    items = [
+        {"id": 7, "monthly_rule": "b", "council_score": 0.5,
+         "posted": "2026-09-10"},
+        {"id": 3, "monthly_rule": "b", "council_score": 0.5,
+         "posted": "2026-09-10"},
+        {"id": 5, "monthly_rule": "b", "council_score": 0.5,
+         "posted": "2026-09-10"},
+    ]
+    forward = [item["id"] for item in _sort_monthly(items)]
+    backward = [item["id"] for item in _sort_monthly(list(reversed(items)))]
+    assert forward == backward == [3, 5, 7]
+
+
+def test_monthly_order_id_never_outranks_the_editorial_keys(tmp_path):
+    """id 는 **동률 안에서만** 쓰인다 — 규칙·게시일을 뒤집지 않는다."""
+    items = [
+        {"id": 1, "monthly_rule": "c", "posted": "2026-09-30"},
+        {"id": 99, "monthly_rule": "a", "posted": "2026-09-01"},
+    ]
+    assert [item["id"] for item in _sort_monthly(items)] == [99, 1]

@@ -250,6 +250,39 @@ def main():
         return 1
     finally:
         state_mod.release_lock(handle)
+        # H5 (라운드 2): 잠금 경합으로 밀린 만료를 여기서도 다시 시도한다.
+        # 이 호의 잠금을 **푼 뒤**다 — 잠금을 겹쳐 쥐지 않는다.
+        retry_pending_expiry(markdown_path.parent)
+
+
+def retry_pending_expiry(out_dir) -> list:
+    """`.expire_pending` 에 남은 호의 만료를 다시 시도한다 (라운드 2).
+
+    notify 회차가 잠금 경합으로 건너뛴 호는 다음 회차를 기다려야 한다. 재검토는
+    보통 notify 보다 자주 돌므로, 여기서 한 번 더 시도하면 옛 카드가 열린 채로
+    남는 창이 짧아진다. **회수(텔레그램 삭제)는 하지 않는다** — 이 스크립트는
+    네트워크를 타지 않는다. 회수는 다음 notify 회차 몫이다.
+
+    실패는 전부 경고다 — 재검증 결과를 바꾸지 않는다.
+    """
+    from scripts.notify_digest import expire_stale_issues, read_expire_pending
+
+    pending = read_expire_pending(out_dir)
+    if not pending:
+        return []
+    # 밀린 호들보다 새로운 호 하나를 기준으로 스윕하면 그 호들이 전부 대상이 된다.
+    newest = max(pending)
+    try:
+        return expire_stale_issues(out_dir, _next_week_key(newest))
+    except Exception as exc:        # noqa: BLE001 — 재검증을 실패시키지 않는다
+        _err(f"⚠️  만료 재시도 실패(진행함): {redact(exc)}")
+        return []
+
+
+def _next_week_key(week: str) -> str:
+    """`2026-W37` → `2026-W38` (53주차면 다음 해 W01). 스윕 기준점용."""
+    year, num = int(week[:4]), int(week[6:])
+    return f"{year}-W{num + 1:02d}" if num < 53 else f"{year + 1}-W01"
 
 
 def guarded_main():

@@ -534,8 +534,13 @@ def _send_locked(
         )
         return 0
 
-    # ⑪ 상태 — 발송 가능 여부(sent·sending·차단 플래그)
-    allowed, reason = state_mod.can_send(state)
+    # ⑪ 상태 — 발송 가능 여부(sent·sending·만료·차단 플래그)
+    # 라운드 2 (Codex MEDIUM): 상태만 보면 "만료됐어야 하는데 잠금 경합으로 만료를
+    # 못 한 호" 가 통과한다. **디스크에 더 새로운 주간호가 있으면** 이 호는 지면을
+    # 대표하지 않는다 — 상태와 무관하게 막는다.
+    allowed, reason = state_mod.can_send(
+        state, newer_issue=state_mod.newer_weekly_issue(
+            markdown_path.parent, week))
     if not allowed:
         _err(f"✗ 발송 거부: {reason}")
         if reason == state_mod.SENDING_REASON:

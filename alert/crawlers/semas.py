@@ -31,6 +31,9 @@ class SemasCrawler(BaseCrawler):
     # 인증서 검증·호스트명 확인은 그대로다(`verify=False` 아님).
     # 실측 2026-09-15: SECLEVEL=1 로 `200 / 61278바이트`, 기본값으로는 SSLError.
     TLS_LEGACY_SECURITY_LEVEL = True
+    # 완화는 이 호스트에만 (라운드 2): 다른 호스트로 새는 리다이렉트를 타도
+    # 그쪽은 표준 정책이다.
+    TLS_PREFIXES = ("https://www.semas.or.kr/",)
 
     BOARD_PATHS = [
         "/web/board/webBoardList.kmdc?bCd=1",   # 공지사항 (bCd=1)

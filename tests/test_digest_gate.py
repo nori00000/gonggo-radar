@@ -6144,7 +6144,7 @@ def _write_state(tmp_path, week, status, previews=(), notices=()):
 
 def test_expire_stale_issues_expires_only_older_open_weeklies(tmp_path):
     """새 주간호가 나면 **더 오래된 열린 주간호**만 만료된다."""
-    from scripts.weekly_digest import expire_stale_issues
+    from scripts.notify_digest import expire_stale_issues
 
     _write_state(tmp_path, "2026-W35", "draft", previews=[2038], notices=[2040])
     _write_state(tmp_path, "2026-W36", "annotated", previews=[2050])
@@ -6174,7 +6174,7 @@ def test_expire_stale_issues_expires_only_older_open_weeklies(tmp_path):
 
 def test_expire_stale_issues_does_nothing_for_a_monthly_issue(tmp_path):
     """월간호 조립은 주간호를 만료시키지 않는다."""
-    from scripts.weekly_digest import expire_stale_issues
+    from scripts.notify_digest import expire_stale_issues
 
     _write_state(tmp_path, "2026-W36", "draft", previews=[1])
     assert expire_stale_issues(tmp_path, "2026-M09") == []
@@ -6184,7 +6184,7 @@ def test_expire_stale_issues_does_nothing_for_a_monthly_issue(tmp_path):
 
 def test_expire_stale_issues_skips_a_locked_issue(tmp_path):
     """다른 작성자가 쥔 호는 **기다리지 않고** 건너뛴다 (교착 방지)."""
-    from scripts.weekly_digest import expire_stale_issues
+    from scripts.notify_digest import expire_stale_issues, read_expire_pending
 
     _write_state(tmp_path, "2026-W36", "draft", previews=[1])
     handle = state_mod.acquire_lock(state_mod.lock_path("2026-W36", tmp_path))
@@ -6194,12 +6194,108 @@ def test_expire_stale_issues_skips_a_locked_issue(tmp_path):
         state_mod.release_lock(handle)
     assert state_mod.load_state(
         tmp_path / "2026-W36.state.json", "2026-W36")["status"] == "draft"
+    # 라운드 2: 건너뛴 호는 **적힌다** — 다음 회차가 다시 시도한다.
+    assert read_expire_pending(tmp_path) == ["2026-W36"]
+
+
+def test_expire_pending_is_retried_and_cleared(tmp_path):
+    """라운드 2: 잠금이 풀린 다음 회차가 밀린 호를 만료시키고 목록을 비운다."""
+    from scripts.notify_digest import (
+        expire_stale_issues, read_expire_pending, write_expire_pending)
+
+    _write_state(tmp_path, "2026-W36", "draft", previews=[1])
+    write_expire_pending(tmp_path, ["2026-W36"])
+    assert expire_stale_issues(tmp_path, "2026-W37") == ["2026-W36"]
+    assert read_expire_pending(tmp_path) == []
+    assert state_mod.load_state(
+        tmp_path / "2026-W36.state.json", "2026-W36")["status"] == "expired"
+
+
+def test_expire_pending_file_is_removed_when_empty(tmp_path):
+    from scripts.notify_digest import (
+        expire_pending_path, read_expire_pending, write_expire_pending)
+
+    write_expire_pending(tmp_path, ["2026-W36"])
+    assert expire_pending_path(tmp_path).is_file()
+    write_expire_pending(tmp_path, [])
+    assert not expire_pending_path(tmp_path).exists()
+    assert read_expire_pending(tmp_path) == []
+
+
+def test_expire_pending_ignores_a_corrupt_file(tmp_path):
+    """손상된 목록은 빈 목록이다 — 만료 경로가 그것 때문에 죽지 않는다."""
+    from scripts.notify_digest import expire_pending_path, read_expire_pending
+
+    expire_pending_path(tmp_path).write_text("{not json", encoding="utf-8")
+    assert read_expire_pending(tmp_path) == []
+    expire_pending_path(tmp_path).write_text('["쓰레기"]', encoding="utf-8")
+    assert read_expire_pending(tmp_path) == []
+
+
+def test_recheck_retries_pending_expiry(tmp_path):
+    """라운드 2: 재검토 회차도 밀린 만료를 다시 시도한다 (네트워크 없음)."""
+    from scripts.notify_digest import read_expire_pending, write_expire_pending
+    from scripts.recheck_digest import retry_pending_expiry
+
+    _write_state(tmp_path, "2026-W35", "draft", previews=[1])
+    _write_state(tmp_path, "2026-W36", "annotated", previews=[2])
+    write_expire_pending(tmp_path, ["2026-W35", "2026-W36"])
+    assert sorted(retry_pending_expiry(tmp_path)) == ["2026-W35", "2026-W36"]
+    assert read_expire_pending(tmp_path) == []
+    for week in ("2026-W35", "2026-W36"):
+        assert state_mod.load_state(
+            tmp_path / f"{week}.state.json", week)["status"] == "expired"
+
+
+def test_recheck_retry_is_a_noop_without_pending(tmp_path):
+    from scripts.recheck_digest import retry_pending_expiry
+
+    _write_state(tmp_path, "2026-W36", "draft", previews=[1])
+    assert retry_pending_expiry(tmp_path) == []
+    assert state_mod.load_state(
+        tmp_path / "2026-W36.state.json", "2026-W36")["status"] == "draft"
+
+
+# ─── 라운드 2: 더 새로운 호가 있으면 옛 카드는 발송되지 않는다 ──────────
+def test_newer_weekly_issue_finds_a_live_successor(tmp_path):
+    _write_state(tmp_path, "2026-W38", "draft", previews=[1])
+    assert state_mod.newer_weekly_issue(tmp_path, "2026-W37") == "2026-W38"
+
+
+@pytest.mark.parametrize("status", ["draft", "annotated", "sent"])
+def test_newer_weekly_issue_counts_live_statuses(tmp_path, status):
+    _write_state(tmp_path, "2026-W38", status, previews=[1])
+    assert state_mod.newer_weekly_issue(tmp_path, "2026-W37") == "2026-W38"
+
+
+@pytest.mark.parametrize("status", ["expired", "held", "sending"])
+def test_newer_weekly_issue_ignores_dead_or_uncertain_successors(
+    tmp_path, status
+):
+    """만료된 호·보류된 호·발송 중인 호는 "지면을 대표하는 새 호" 가 아니다."""
+    _write_state(tmp_path, "2026-W38", status, previews=[1])
+    assert state_mod.newer_weekly_issue(tmp_path, "2026-W37") is None
+
+
+def test_newer_weekly_issue_ignores_monthly_and_older(tmp_path):
+    _write_state(tmp_path, "2026-M09", "draft", previews=[1])
+    _write_state(tmp_path, "2026-W36", "draft", previews=[2])
+    assert state_mod.newer_weekly_issue(tmp_path, "2026-W37") is None
+    assert state_mod.newer_weekly_issue(tmp_path, "2026-M09") is None
+
+
+def test_can_send_refuses_when_a_newer_issue_exists():
+    """만료가 잠금 경합으로 생략돼도 옛 카드는 발송되지 않는다."""
+    state = state_mod.default_state("2026-W37")
+    ok, reason = state_mod.can_send(state, newer_issue="2026-W38")
+    assert ok is False and "2026-W38" in reason
+    assert state_mod.can_send(state)[0] is True     # 대조군
 
 
 def test_drain_expired_queues_recalls_and_clears(tmp_path, monkeypatch):
     """만료 호의 회수 큐는 다음 notify 회차가 실제로 비운다."""
     from scripts import notify_digest
-    from scripts.weekly_digest import expire_stale_issues
+    from scripts.notify_digest import expire_stale_issues
 
     _write_state(tmp_path, "2026-W36", "draft", previews=[2038], notices=[2040])
     expire_stale_issues(tmp_path, "2026-W37")
@@ -6221,7 +6317,7 @@ def test_drain_expired_queues_recalls_and_clears(tmp_path, monkeypatch):
 def test_drain_expired_queues_keeps_ids_that_failed_to_delete(tmp_path, monkeypatch):
     """지우지 못한 id 는 큐에 남는다 — 다음 회차가 다시 시도한다."""
     from scripts import notify_digest
-    from scripts.weekly_digest import expire_stale_issues
+    from scripts.notify_digest import expire_stale_issues
 
     _write_state(tmp_path, "2026-W36", "draft", previews=[2038], notices=[2040])
     expire_stale_issues(tmp_path, "2026-W37")
@@ -6330,3 +6426,70 @@ def test_digest_and_monthly_jobs_share_one_lock_path():
         assert '--lock "${ROOT}/digests/.job.lock"' in text
         assert 'scripts/job_lock.py' in text
         assert 'GONGGO_JOB_LOCK_TIMEOUT:-1200' in text
+
+
+# ─── 라운드 2 H5: 만료는 새 미리보기 게시가 확인된 뒤에만 ────────────────
+def _notify_with(monkeypatch, md, send_result):
+    """notify_digest 를 텔레그램 스텁으로 돌린다. 삭제된 id 목록을 함께 돌려준다."""
+    from scripts import notify_digest
+
+    deleted = []
+    monkeypatch.setattr(
+        notify_digest, "resolve_target", lambda topic_key="council": (-100, 2011))
+    monkeypatch.setattr(notify_digest, "resolve_token", lambda: "123:FAKE")
+    monkeypatch.setattr(notify_digest, "send_chunk", send_result)
+    monkeypatch.setattr(
+        notify_digest, "delete_message",
+        lambda token, chat, mid: (deleted.append(mid) or True, ""))
+    monkeypatch.setattr(
+        "sys.argv", ["notify_digest.py", str(md), "--db", _db_for(md)])
+    return notify_digest.main(), deleted
+
+
+def test_expiry_runs_only_after_the_new_preview_is_posted(tmp_path, monkeypatch):
+    """게시 성공: 옛 호가 만료되고 그 카드가 회수된다."""
+    md = _write_digest(tmp_path)
+    _write_state(tmp_path, "2026-W36", "draft", previews=[900], notices=[901])
+
+    rc, deleted = _notify_with(
+        monkeypatch, md, lambda token, chat, thread, text: (True, 2014, ""))
+    assert rc == 0
+    w36 = state_mod.load_state(tmp_path / "2026-W36.state.json", "2026-W36")
+    assert w36["status"] == "expired"
+    assert deleted == [900, 901]
+
+
+def test_old_issue_survives_when_the_preview_fails_to_post(tmp_path, monkeypatch):
+    """전송 실패: 옛 호는 **그대로 유효**하다 — 편집자에게 아무것도 남지 않는 것을 막는다.
+
+    라운드 1 은 조립 성공만 보고 미리 만료시켜서, 이 회차에서 W36 이 이미 죽었다.
+    """
+    md = _write_digest(tmp_path)
+    _write_state(tmp_path, "2026-W36", "draft", previews=[900], notices=[901])
+    approval_before = state_mod.approval_of(
+        state_mod.load_state(tmp_path / "2026-W36.state.json", "2026-W36"))
+
+    rc, deleted = _notify_with(
+        monkeypatch, md,
+        lambda token, chat, thread, text: (False, None, "네트워크 오류"))
+    assert rc != 0
+    w36 = state_mod.load_state(tmp_path / "2026-W36.state.json", "2026-W36")
+    assert w36["status"] == "draft"
+    assert state_mod.approval_of(w36) == approval_before
+    assert deleted == []
+
+
+def test_old_issue_survives_when_only_a_blocking_notice_is_sent(
+    tmp_path, monkeypatch
+):
+    """차단 안내만 나간 회차도 만료하지 않는다 — 승인 가능한 미리보기가 아니다."""
+    md = _write_digest(tmp_path, check=dict(PASS_CHECK, **{
+        "pass": False, "reason": "검증 미통과"}))
+    _write_state(tmp_path, "2026-W36", "draft", previews=[900])
+
+    rc, deleted = _notify_with(
+        monkeypatch, md, lambda token, chat, thread, text: (True, 2014, ""))
+    assert rc == 0
+    assert state_mod.load_state(
+        tmp_path / "2026-W36.state.json", "2026-W36")["status"] == "draft"
+    assert deleted == []

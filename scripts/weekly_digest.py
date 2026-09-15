@@ -119,70 +119,13 @@ def compose_issue(args, week):
     finally:
         state_mod.release_lock(handle)
 
-    # H5: 새 주간호가 **실제로 생겼을 때만** 옛 호를 만료시킨다. 생성이 실패한
-    # 뒤에 만료시키면 편집자에게 아무 미리보기도 남지 않는다(생성 실패에
-    # 미리보기를 보내지 않는 digest_job.sh 규율과 같은 이유).
-    # 이 호의 잠금은 이미 풀렸다 — 잠금을 겹쳐 쥐지 않는다.
-    if rc == 0:
-        expire_stale_issues(out_dir, week)
+    # H5 (라운드 2, Codex MEDIUM): **여기서 만료시키지 않는다.**
+    # 라운드 1 은 조립 성공 직후 옛 호를 만료시켰다. 그러면 조립은 됐는데 검증
+    # 또는 텔레그램 전송이 실패한 회차에서 **옛 호는 이미 무효**가 되고 새 미리보기는
+    # 오지 않는다 — 편집자에게 아무것도 남지 않는다. 만료·회수는 새 미리보기가
+    # **실제로 게시된 것을 확인한 뒤**(`scripts/notify_digest.py` 의
+    # `expire_stale_issues`) 일어난다.
     return rc
-
-
-def expire_stale_issues(out_dir, week) -> list:
-    """H5: 새 호가 나왔으니 **더 오래된 열린 호**를 만료시킨다.
-
-    감사 V §3-b 가 증명한 구멍: 호 키에서 파생된 산출물만 있고 옛 호를 정리하는
-    경로가 **아예 없었다**. W38 이 생겨도 W37 의 `draft` 상태와 텔레그램 카드
-    2038 은 영원히 살아 있었다.
-
-    하는 일: ``digests/`` 의 주간호 상태 파일 중 이 호보다 **오래되고**
-    ``draft``/``annotated``/``held`` 인 것을 ``expired`` 로 바꾸고, 그 호의
-    미리보기·안내 message_id 를 그 호의 **정리 대기 큐**
-    (``superseded_message_ids``)로 옮긴다. 회수(삭제)는 기존 큐 소비 경로가 한다.
-
-    안전 규율:
-      · 주간호에서만 돈다 (월간호는 자기 계열을 따로 가진다).
-      · 잠금은 **비차단**이다 — 다른 작성자가 그 호를 쥐고 있으면 건너뛴다.
-        잠금을 기다리면 두 호의 잠금이 겹쳐 교착이 가능해진다.
-      · 어떤 실패도 생성 잡을 실패시키지 않는다 (경고 한 줄).
-
-    Returns:
-        만료시킨 호 키 목록.
-    """
-    if state_mod.issue_kind(week) != state_mod.KIND_WEEKLY:
-        return []
-    out_dir = Path(out_dir)
-    expired: list = []
-    try:
-        candidates = sorted(out_dir.glob("*.state.json"))
-    except OSError as exc:
-        _err(f"⚠️  옛 호 정리 실패(진행함): {redact(exc)}")
-        return []
-    for path in candidates:
-        key = path.name[: -len(".state.json")]
-        if state_mod.issue_kind(key) != state_mod.KIND_WEEKLY:
-            continue
-        if key >= week:                 # 같은 호·미래 호는 건드리지 않는다
-            continue
-        try:
-            handle = state_mod.acquire_lock(
-                state_mod.lock_path(key, out_dir), blocking=False)
-        except (state_mod.LockBusy, OSError) as exc:
-            _err(f"⚠️  {key} 만료 건너뜀(다른 작성자): {redact(exc)}")
-            continue
-        try:
-            current = state_mod.load_state(path, key)
-            if current.get("status") not in state_mod.EXPIRABLE_STATUSES:
-                continue
-            state_mod.update_state_locked(path, key, state_mod.mark_expired)
-        except (state_mod.StateError, state_mod.TransitionError, OSError) as exc:
-            _err(f"⚠️  {key} 만료 실패(진행함): {redact(exc)}")
-            continue
-        finally:
-            state_mod.release_lock(handle)
-        expired.append(key)
-        _out(f"✓ 옛 호 만료: {key} — 미리보기·안내를 회수 큐로 넘겼습니다")
-    return expired
 
 
 def _run(args, week, out_dir):

@@ -32,16 +32,69 @@ DB="${GONGGO_DB:-alert/data/announcements.db}"
 # fcntl.flock 을 쥔 채 이 스크립트를 다시 exec 한다(잠금은 exec 를 넘어 산다).
 # 대기 한도 20분, 못 얻으면 로그 한 줄 + exit 75(EX_TEMPFAIL).
 # 잠금 파이썬은 venv 가 아니라 시스템 파이썬이다 — venv 가 깨져도 뮤텍스는 선다.
+#
+# 라운드 2 (Codex MEDIUM): 월간 잡은 `exec` 하지 **않는다**. 주간 잡이 23:00~23:55
+# 돌면 월간(23:30)은 대기하다 exit 75 로 끝나고, launchd 는 다음 목요일에야 다시
+# 깨운다 — 그 달의 월간호가 통째로 사라진다. 자식으로 돌려 75 를 잡아 **재예약
+# 표식**(digests/.monthly_retry)을 남기고 운영자에게 한 줄 알린다.
+RETRY_FILE="${ROOT}/digests/.monthly_retry"
+RETRY_MAX_DAYS="${GONGGO_MONTHLY_RETRY_DAYS:-7}"
+
 if [ -z "${GONGGO_JOB_LOCK_HELD:-}" ]; then
   export GONGGO_JOB_LOCK_HELD=1
-  exec "${GONGGO_LOCK_PYTHON:-/usr/bin/python3}" "${ROOT}/scripts/job_lock.py" \
+  LOCK_RC=0
+  "${GONGGO_LOCK_PYTHON:-/usr/bin/python3}" "${ROOT}/scripts/job_lock.py" \
     --lock "${ROOT}/digests/.job.lock" \
     --timeout "${GONGGO_JOB_LOCK_TIMEOUT:-1200}" \
-    -- /bin/bash "${SELF}" "$@"
+    -- /bin/bash "${SELF}" "$@" || LOCK_RC=$?
+  if [ "${LOCK_RC}" -eq 75 ]; then
+    # MONTHLY_JOB_NOW 는 테스트 전용 손잡이다 (운영에서는 비어 있다).
+    if [ -n "${MONTHLY_JOB_NOW:-}" ]; then
+      RETRY_TODAY="${MONTHLY_JOB_NOW}"
+      RETRY_DEFAULT="$(date -j -v-1m -f "%Y-%m-%d" "${MONTHLY_JOB_NOW}" "+%Y-M%m")"
+    else
+      RETRY_TODAY="$(date "+%Y-%m-%d")"
+      RETRY_DEFAULT="$(date -v-1m "+%Y-M%m")"
+    fi
+    RETRY_MONTH="${1:-${RETRY_DEFAULT}}"
+    mkdir -p "${ROOT}/digests"
+    printf '%s %s\n' "${RETRY_TODAY}" "${RETRY_MONTH}" > "${RETRY_FILE}"
+    echo "잡 잠금 대기 초과 — ${RETRY_FILE} 에 재예약(${RETRY_MAX_DAYS}일 안에 다음 실행이 집행)" >&2
+    NOTE="$(mktemp)"
+    printf '%s\n' "⏳ 월간 종합호 ${RETRY_MONTH} 이 잡 잠금 대기로 이번 회차를 건너뛰었습니다 — ${RETRY_MAX_DAYS}일 안의 다음 실행이 이어받습니다" > "${NOTE}"
+    "${PY}" "${ROOT}/scripts/notify_health.py" "${NOTE}" || \
+      echo "재예약 안내 전송 실패(진행함)" >&2
+    rm -f "${NOTE}"
+  fi
+  exit "${LOCK_RC}"
+fi
+
+# 라운드 2: 재예약 표식이 살아 있으면(기록일로부터 RETRY_MAX_DAYS 안) **요일·일자
+# 가드를 건너뛰고** 그때 못 돈 달을 조립한다. 표식이 오래됐으면 지우고 평소대로 간다.
+RETRY_MONTH=""
+if [ "$#" -eq 0 ] && [ -f "${RETRY_FILE}" ]; then
+  RETRY_STAMP=""; RETRY_KEY=""
+  read -r RETRY_STAMP RETRY_KEY < "${RETRY_FILE}" || true
+  if [ -n "${MONTHLY_JOB_NOW:-}" ]; then
+    NOW_EPOCH="$(date -j -f "%Y-%m-%d" "${MONTHLY_JOB_NOW}" "+%s")"
+  else
+    NOW_EPOCH="$(date "+%s")"
+  fi
+  STAMP_EPOCH="$(date -j -f "%Y-%m-%d" "${RETRY_STAMP:-1970-01-01}" "+%s" 2>/dev/null || echo 0)"
+  AGE_DAYS=$(( (NOW_EPOCH - STAMP_EPOCH) / 86400 ))
+  if [ -n "${RETRY_KEY}" ] && [ "${AGE_DAYS}" -ge 0 ] && [ "${AGE_DAYS}" -le "$((10#${RETRY_MAX_DAYS}))" ]; then
+    RETRY_MONTH="${RETRY_KEY}"
+    echo "=== monthly_job 재예약 집행: ${RETRY_MONTH} (표식 ${RETRY_STAMP}, ${AGE_DAYS}일 전) ==="
+  else
+    echo "재예약 표식이 만료됐습니다(${RETRY_STAMP}) — 지우고 평소 가드로 진행" >&2
+    rm -f "${RETRY_FILE}"
+  fi
 fi
 
 # 인자로 호 키를 직접 주면(재실행·수동 조립) 날짜 가드를 건너뛴다.
-if [ "$#" -eq 0 ]; then
+if [ -n "${RETRY_MONTH}" ]; then
+  MONTH="${RETRY_MONTH}"
+elif [ "$#" -eq 0 ]; then
   # MONTHLY_JOB_NOW 는 **테스트 전용** 손잡이다 (YYYY-MM-DD). 운영에서는 비어 있다.
   NOW="${MONTHLY_JOB_NOW:-}"
   if [ -n "${NOW}" ]; then
@@ -102,4 +155,10 @@ fi
 NOTIFY_RC=0
 "${PY}" scripts/notify_digest.py "${MD}" --db "${DB}" || NOTIFY_RC=$?
 echo "notify_digest exit=${NOTIFY_RC}"
+
+# 라운드 2: 여기까지 왔으면 이 달은 조립·게시를 마쳤다 — 재예약 표식을 지운다.
+if [ "${NOTIFY_RC}" -eq 0 ] && [ -f "${RETRY_FILE}" ]; then
+  rm -f "${RETRY_FILE}"
+  echo "재예약 표식 해제: ${RETRY_FILE}"
+fi
 exit "${NOTIFY_RC}"
