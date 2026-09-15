@@ -6011,6 +6011,46 @@ def test_gate_contract_approval_fields_match_record_preview():
     assert set(state["approval"]) == set(state_mod.APPROVAL_FIELDS)
 
 
+def test_gate_contract_matches_the_homelab_bot_copy():
+    """교차 레포 드리프트 — 봇의 내장 사본이 이 정본과 같아야 한다 (H3).
+
+    homelab-orchestration 의 `bin/hq_digest_gate.py` 는 이 파일을 읽되, 배포 전
+    상태를 위해 **내장 사본**도 들고 있다. 그 사본이 여기서 갈라지면 봇은 배포된
+    정본과 대조하다 명령을 거부한다(fail-closed) — 그 상황을 배포 전에 잡는다.
+
+    봇 레포가 이 기계에 없으면 이 테스트는 할 일이 없다. 그때는 봇 쪽 골든 테스트가
+    같은 대조를 반대 방향으로 한다 — 두 레포 중 한쪽만 있어도 비교가 성립한다.
+    """
+    import ast
+    import os
+
+    roots = [os.environ.get("HOMELAB_ROOT") or "",
+             os.path.expanduser("~/projects/homelab-orchestration")]
+    bots = [Path(root) / "bin" / "hq_digest_gate.py"
+            for root in roots if root]
+    bot = next((path for path in bots if path.is_file()), None)
+    if bot is None:
+        pytest.skip("homelab-orchestration 이 이 기계에 없다 — 봇 쪽에서 대조한다")
+
+    tree = ast.parse(bot.read_text(encoding="utf-8"))
+    embedded = None
+    for node in ast.walk(tree):
+        if (isinstance(node, ast.Assign)
+                and any(getattr(target, "id", None) == "GATE_CONTRACT_EMBEDDED"
+                        for target in node.targets)):
+            embedded = ast.literal_eval(node.value)
+            break
+    if embedded is None:
+        pytest.skip("봇에 GATE_CONTRACT_EMBEDDED 가 아직 없다 (계약 도입 전 사본)")
+
+    def payload(contract):
+        # 밑줄로 시작하는 최상위 키(`_note`)는 설명이지 계약이 아니다.
+        return {key: value for key, value in contract.items()
+                if not key.startswith("_")}
+
+    assert payload(embedded) == payload(state_mod.load_gate_contract())
+
+
 def test_gate_contract_missing_file_is_fail_closed(tmp_path):
     """계약 파일이 없으면 예외다 — 계약을 모르면 상태 기계를 돌리지 않는다."""
     with pytest.raises(state_mod.GateContractError):
