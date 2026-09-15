@@ -305,4 +305,10 @@ epis 가 10 → **24** 로 는 것이 MEDIUM 1 수정의 실표면 증거다(공
 
 ## 라운드 2 커밋
 
-`ROUND2_HASH`
+`6c4c18e54dde896db985a606b31f97d2b829d1b2`
+`fix(sources): P2-S 라운드 2 - epis 폴백이 기간·javascript URL 을 만들던 구멍 (Codex 게이트)`
+
+브랜치 `feat/source-repair` 커밋 순서:
+`8ffbae6`(base) → `4274e04`(라운드 1 코드) → `d852f27`(라운드 1 보고서) →
+`149c31f`(merge main `7484a0c`) → `6c4c18e`(라운드 2). 푸시 없음.
+
