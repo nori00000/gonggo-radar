@@ -707,15 +707,53 @@ def test_notice_without_deadline_still_qualifies(tmp_path):
     assert [item["url"] for item in data["sections"][VERDICT_MONTHLY]] == [url]
 
 
-def test_monthly_order_is_council_score_then_posted(tmp_path):
-    """§1: 정렬은 council_score 내림차순 → 게시일 내림차순."""
+def test_monthly_order_is_rule_then_posted(tmp_path):
+    """P2-X H2: 1순위는 허용 목록 규칙(a<b<c), 2순위가 게시일 내림차순."""
     items = [
-        {"id": 1, "council_score": 0.5, "posted": "2026-09-01"},
-        {"id": 2, "council_score": 0.9, "posted": "2026-09-01"},
-        {"id": 3, "council_score": 0.5, "posted": "2026-09-20"},
-        {"id": 4, "council_score": None, "posted": "2026-09-30"},
+        {"id": 1, "monthly_rule": "c", "council_score": 0.9,
+         "posted": "2026-09-30"},
+        {"id": 2, "monthly_rule": "b", "council_score": 0.5,
+         "posted": "2026-09-01"},
+        {"id": 3, "monthly_rule": "a", "council_score": None,
+         "posted": "2026-09-01"},
+        {"id": 4, "monthly_rule": "a", "council_score": None,
+         "posted": "2026-09-20"},
     ]
-    assert [item["id"] for item in _sort_monthly(items)] == [2, 3, 1, 4]
+    assert [item["id"] for item in _sort_monthly(items)] == [4, 3, 2, 1]
+
+
+def test_monthly_order_uses_council_score_only_to_break_ties(tmp_path):
+    """P2-X H2: council_score 는 규칙·게시일이 같을 때만 순서를 만든다."""
+    items = [
+        {"id": 1, "monthly_rule": "a", "council_score": 0.2,
+         "posted": "2026-09-10"},
+        {"id": 2, "monthly_rule": "a", "council_score": 0.8,
+         "posted": "2026-09-10"},
+    ]
+    assert [item["id"] for item in _sort_monthly(items)] == [2, 1]
+
+
+def test_monthly_null_score_gonggo_outranks_scored_media(tmp_path):
+    """P2-X H2 회귀(감사 V H-2 iii): 점수 없는 공고가 채점된 기사보다 앞선다.
+
+    옛 키(-council_score 1순위)에서는 NULL→0.0 침몰로 기사가 먼저 왔다.
+    """
+    items = [
+        {"id": 1, "monthly_rule": "c", "council_score": 0.7,
+         "posted": "2026-09-30"},
+        {"id": 2, "monthly_rule": "a", "council_score": None,
+         "posted": "2026-09-01"},
+    ]
+    assert [item["id"] for item in _sort_monthly(items)] == [2, 1]
+
+
+def test_monthly_unknown_rule_sorts_last(tmp_path):
+    """P2-X H2: 규칙을 모르는 항목은 맨 뒤 (fail-closed)."""
+    items = [
+        {"id": 1, "posted": "2026-09-30"},
+        {"id": 2, "monthly_rule": "c", "posted": "2026-09-01"},
+    ]
+    assert [item["id"] for item in _sort_monthly(items)] == [2, 1]
 
 
 def test_monthly_order_applies_to_the_real_selection(tmp_path):

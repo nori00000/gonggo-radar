@@ -1688,19 +1688,43 @@ def _sort_notice(items: List[Dict]) -> List[Dict]:
     return sorted(items, key=lambda item: -_posted_ordinal(item))
 
 
-def _sort_monthly(items: List[Dict]) -> List[Dict]:
-    """월간 종합 (라운드 2): 협의회 점수 내림차순 → 게시일 내림차순.
+# 월간 허용 목록 규칙의 지면 순위 (P2-X H2). 값이 작을수록 앞이다.
+MONTHLY_RULE_RANK = {
+    MONTHLY_RULE_NOTICE: 0,     # (a) 주간 판정이 `알아두세요` — 공고·제도
+    MONTHLY_RULE_PRESS: 1,      # (b) 기관 보도·정책
+    MONTHLY_RULE_MEDIA: 2,      # (c) 2차 미디어 — 언제나 맨 뒤
+}
+MONTHLY_RULE_RANK_UNKNOWN = 3   # 규칙을 모르는 항목은 맨 뒤 (fail-closed)
 
-    협의회 점수(`announcements.council_score`)는 적재 프로파일이 매긴 값이며
-    "이 항목이 협의회 독자에게 얼마나 가까운가" 다. 게시일만으로 정렬하면 그날
-    마지막에 크롤된 것이 지면을 먹는다 — 한 달치에서는 그 차이가 커진다.
-    점수가 없는 행(옛 행·컬럼 부재)은 0.0 으로 본다.
+
+def _monthly_rule_rank(item: Dict) -> int:
+    """지면 순위 a<b<c. 규칙이 없으면 맨 뒤."""
+    return MONTHLY_RULE_RANK.get(item.get("monthly_rule"), MONTHLY_RULE_RANK_UNKNOWN)
+
+
+def _sort_monthly(items: List[Dict]) -> List[Dict]:
+    """월간 종합 (P2-X H2): 규칙 순위(a<b<c) → 게시일 내림차순 → 협의회 점수.
+
+    라운드 2 의 1순위 키는 `council_score` 였다. 감사 V(H-2 iii)가 실측으로
+    뒤집었다: 9월 창의 gonggo 149행 중 **109행이 council_score NULL** 이고
+    `float(... or 0.0)` 이 그것을 0.0 으로 만든다. 반면 media 99행은 전원
+    점수를 갖는다 — 점수 보유 자체가 편향된 값이었고, 그 결과 채점된 기사가
+    채점되지 않은 공고 전부를 앞질렀다.
+
+    그래서 1순위를 **허용 목록 규칙**으로 바꾼다. 규칙은 항목이 왜 이 지면에
+    들어왔는지를 말하는 편집 판단이고(공고·제도 → 기관 보도 → 2차 기사),
+    NULL 이 없다. 그 다음이 게시일 내림차순이다.
+
+    `council_score` 는 **동률 시에만** 본다 — 같은 규칙·같은 게시일 안에서
+    협의회에 더 가까운 것을 앞으로. 이 자리에서는 NULL 편향이 지면을 뒤집지
+    못한다(이미 같은 규칙·같은 날짜다).
     """
     return sorted(
         items,
         key=lambda item: (
-            -float(item.get("council_score") or 0.0),
+            _monthly_rule_rank(item),
             -_posted_ordinal(item),
+            -float(item.get("council_score") or 0.0),
         ),
     )
 
