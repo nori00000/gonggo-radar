@@ -30,6 +30,8 @@ from typing import Any, Dict, List, Mapping, Optional, Sequence
 __all__ = [
     "CouncilDrop",
     "CouncilVerdict",
+    "KIND_GONGGO",
+    "KIND_MEDIA",
     "SCORE_MUST_MATCH",
     "SCORE_PER_TAG",
     "TAG_SCORE_CAP",
@@ -41,6 +43,12 @@ __all__ = [
 # ---------------------------------------------------------------------------
 # 점수 규칙 — 회사 analyzer 와 **같은 모양, 다른 저장소**
 # ---------------------------------------------------------------------------
+
+# 소스 종류 (alert.main.SOURCE_KIND_* 와 같은 문자열). 여기에 둔 것은 이 모듈이
+# 순수 함수 묶음이라 alert.main 을 import 할 수 없기 때문이다 — 값이 갈라지면
+# ``test_council_profile`` 의 대조 테스트가 red 가 된다.
+KIND_GONGGO = "gonggo"
+KIND_MEDIA = "media"
 
 SCORE_MUST_MATCH = 0.5   # must_match 가 하나라도 맞으면 기본점
 SCORE_PER_TAG = 0.05     # eligibility/region 태그 1개당 가산
@@ -185,6 +193,7 @@ def score_item(
     summary: str = "",
     target: str = "",
     category: str = "",
+    kind: str = KIND_GONGGO,
 ) -> CouncilVerdict:
     """협의회 프로파일로 한 항목을 채점한다 — 순수 함수.
 
@@ -199,6 +208,8 @@ def score_item(
         summary: 요약.
         target: 지원대상.
         category: 분류.
+        kind: 소스 종류 (``"gonggo"`` 또는 ``"media"``). ``media`` 면 must_match
+            를 **제목에서만** 본다 (아래 참조).
 
     Returns:
         :class:`CouncilVerdict`. ``match=1`` 이면 협의회 적재 대상이다.
@@ -214,7 +225,15 @@ def score_item(
     if excluded:
         return CouncilVerdict(reason=f"제외 키워드: {excluded}")
 
-    must_hits = _matched_terms(haystacks, getattr(profile, "must_match", None) or ())
+    # H6 (감사 V §2·H-3): 2차 미디어의 must_match 는 **제목만** 본다.
+    # media RSS 의 ``summary`` 는 전원 정확히 200자 기사 리드다(실측). 그 안에
+    # 협의회 어휘가 하나만 있어도 0.5점이 붙어 kfnews 적재분 73/73(100%)이
+    # 통과했다 — 인사기사의 직함 문자열(`산림복지국 산지정책과장`)까지 가산점을
+    # 벌었다. 기사 리드는 "이 기사가 협의회 것인가" 의 근거가 아니다.
+    # 제목만 보는 것은 월간호 렌더 규율과도 같다(요약은 렌더되지 않는다).
+    # 제외어·태그는 종전대로 네 필드를 본다 — 제외는 넓게, 포함은 좁게.
+    must_haystacks = [haystacks[0]] if kind == KIND_MEDIA else haystacks
+    must_hits = _matched_terms(must_haystacks, getattr(profile, "must_match", None) or ())
     eligibility = _matched_tags(haystacks, getattr(profile, "eligibility", None) or {})
     region = _matched_tags(haystacks, getattr(profile, "region", None) or {})
 

@@ -2059,3 +2059,126 @@ class TestLlmEvaluatedFlag:
         assert results["f1"].llm_evaluated is True
         assert results["f2"].llm_evaluated is False
         assert results["f2"].relevance_score == pytest.approx(0.4)
+
+
+# ---------------------------------------------------------------------------
+# P2-X H6. 2차 미디어의 must_match 는 제목만 본다
+# ---------------------------------------------------------------------------
+
+# 감사 V §2-b 의 id=176 실물 — 본문(200자 기사 리드)에 협의회 어휘가 셋 들어 있고
+# 제목에는 `산림청장`(직함)뿐인 인사 기사. 옛 규칙에서 0.6점으로 적재됐다.
+PERSONNEL_TITLE = "도재영 제33대 중부지방산림청장 취임"
+PERSONNEL_BODY = (
+    "산림청은 22일 도재영 신임 중부지방산림청장이 취임했다고 밝혔다. "
+    "도 청장은 1995년 공직에 입문해 산림복지국 산지정책과장, "
+    "기획조정관실 혁신행정담당관을 역임한 산림정책에 정통한 인물이다."
+)
+
+# 같은 감사의 id=174 — 제목에 협의회 어휘가 **0개**, 본문에만 3개.
+NO_VOCAB_TITLE = "현장 중계석 / 국가유산청장 및 관련 공무원 고발 기자회견"
+NO_VOCAB_BODY = "산림청과 임업계, 목재산업계가 참석한 가운데 기자회견이 열렸다."
+
+
+class TestMediaMustMatchIsTitleOnly:
+    """``kind='media'`` 행의 must_match 는 **제목만** 본다 (감사 V H-3)."""
+
+    def test_personnel_notice_body_terms_no_longer_count(self, profile):
+        """인사 기사 본문의 `산림복지`·`산지` 가 더는 어휘로 세어지지 않는다.
+
+        감사 V 가 집은 실물이다: 본문의 직함 문자열("산림복지국 산지정책과장")이
+        어휘 3개로 세어져 가산점을 벌었다. 제목만 보면 1개다.
+        (이 제목은 `중부지방산림청장` 안에 `산림` 을 품고 있어 매치 자체는
+        남는다 — 죽는 것은 **본문에서 번 점수**다.)
+        """
+        gonggo = council.score_item(
+            profile, "kfnews", PERSONNEL_TITLE, PERSONNEL_BODY,
+            kind=council.KIND_GONGGO,
+        )
+        media = council.score_item(
+            profile, "kfnews", PERSONNEL_TITLE, PERSONNEL_BODY,
+            kind=council.KIND_MEDIA,
+        )
+        assert gonggo.reason == "협의회 어휘 3개"
+        assert media.reason == "협의회 어휘 1개"
+
+    def test_headline_without_vocabulary_is_rejected(self, profile):
+        """제목에 어휘가 0개인 기사는 본문이 무엇이든 미매치 (감사 V id=174)."""
+        v = council.score_item(
+            profile, "kfnews", NO_VOCAB_TITLE, NO_VOCAB_BODY,
+            kind=council.KIND_MEDIA,
+        )
+        assert v.match == 0
+        assert v.score < council.SCORE_MUST_MATCH
+        assert v.reason == "협의회 어휘 없음"
+        # 대조군: 같은 입력이 gonggo 로는 본문에서 매치한다.
+        assert council.score_item(
+            profile, "kfnews", NO_VOCAB_TITLE, NO_VOCAB_BODY,
+            kind=council.KIND_GONGGO,
+        ).match == 1
+
+    def test_media_title_with_vocabulary_still_matches(self, profile):
+        """제목에 협의회 어휘가 있는 기사는 그대로 통과한다."""
+        v = council.score_item(
+            profile, "kfnews",
+            "'13년 숙원' 사회연대경제기본법, 국회 문턱 넘었다",
+            "국회는 본회의에서 법안을 의결했다.",
+            kind=council.KIND_MEDIA,
+        )
+        assert v.match == 1
+
+    def test_media_exclude_still_reads_every_field(self, profile):
+        """제외어는 좁아지지 않는다 — 본문의 제외어도 여전히 항목을 버린다."""
+        v = council.score_item(
+            profile, "kfnews", "산림 사회적기업 지원 확대",
+            "남부지방산림청은 호우 안전관리를 강화한다고 밝혔다.",
+            kind=council.KIND_MEDIA,
+        )
+        assert v.match == 0
+        assert v.reason.startswith("제외 키워드")
+
+    def test_media_tags_still_read_every_field(self, profile):
+        """태그(자격·지역)도 네 필드를 본다 — 제목 매치 뒤 가산은 그대로."""
+        v = council.score_item(
+            profile, "kfnews", "산림 협동조합 정책 발표",
+            "경기도와 강원도 협동조합이 참여한다.",
+            kind=council.KIND_MEDIA,
+        )
+        assert v.match == 1
+        assert set(v.tags.get("region", [])) >= {"강원", "경기"}
+
+    def test_default_kind_is_gonggo(self, profile):
+        """kind 를 안 주면 종전 동작이다 — 호출부를 다 고치지 않아도 안전하다."""
+        assert council.score_item(
+            profile, "kfnews", NO_VOCAB_TITLE, NO_VOCAB_BODY
+        ).match == 1
+
+    def test_kind_constants_match_the_pipeline(self):
+        """council 의 종류 문자열이 alert.main 의 것과 같다 (드리프트 방지)."""
+        assert council.KIND_MEDIA == main_mod.SOURCE_KIND_MEDIA
+        assert council.KIND_GONGGO == main_mod.SOURCE_KIND_DEFAULT
+
+    def test_pipeline_passes_source_kind_into_scoring(
+        self, profile, company_analyzer
+    ):
+        """``apply_council_profile`` 이 media 를 media 로 채점한다 (배선 회귀).
+
+        이 테스트가 없으면 ``score_item`` 만 고치고 호출부를 잊어도 green 이다.
+        """
+        item = RawAnnouncement(
+            source="kfnews",
+            source_id="m174",
+            title=NO_VOCAB_TITLE,
+            url="https://example.org/174",
+            summary=NO_VOCAB_BODY,
+        )
+        _extras, drops, _unmatched = apply_council_profile(
+            profile, "kfnews", [item], [], company_analyzer.analyze,
+            source_kind=main_mod.SOURCE_KIND_MEDIA,
+        )
+        assert [d.source_id for d in drops] == ["m174"]
+
+        _extras2, drops2, _unmatched2 = apply_council_profile(
+            profile, "kfnews", [item], [], company_analyzer.analyze,
+            source_kind=main_mod.SOURCE_KIND_DEFAULT,
+        )
+        assert drops2 == []

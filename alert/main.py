@@ -369,7 +369,8 @@ def apply_council_profile(
 
     for raw in raw_items:
         verdict = score_item(
-            profile, source, raw.title, raw.summary, raw.target, raw.category
+            profile, source, raw.title, raw.summary, raw.target, raw.category,
+            kind=source_kind,
         )
         chosen = selected_by_id.get(raw.source_id)
         if chosen is not None:
