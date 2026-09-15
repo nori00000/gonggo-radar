@@ -159,7 +159,12 @@ smes     enabled= False safe_fetch= [] requests= 0
 
 ## 커밋
 
-`COMMIT_HASH_PLACEHOLDER`
+`4274e04f27a43a6f444d22ee29e683fa48185c05`
+`feat(sources): P2-S 소스 정비 - mois_sse·smes 비활성화, epis 경로 교체, moel·mss 신규`
+(브랜치 `feat/source-repair`, base `8ffbae6`)
+
+위 커밋이 코드·테스트·픽스처 전부다. 이 보고서에 해시를 적는 커밋은 그 뒤에
+따로 온다 - 같은 커밋 안에 자기 해시를 적을 수 없다.
 
 ## 남는 것 (이 레인 밖)
 
