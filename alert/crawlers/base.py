@@ -29,6 +29,20 @@ from .detail_quotes import (
 class BaseCrawler(abc.ABC):
     """All crawlers inherit from this."""
 
+    # ── 사이트별 손잡이 (P2-X, 감사 V §4) ────────────────────────────────
+    # 전부 **클래스 속성**이고 기본값은 "종전 그대로" 다. 한 소스의 고장을
+    # 고치려고 설정 전역값(config.yaml 의 timeout/retry)을 흔들면 멀쩡한
+    # 소스 30여 개의 동작이 같이 바뀐다.
+    #
+    # TLS: 검증을 끄는 손잡이는 없다 — `alert/crawlers/tls.py` 참조.
+    TLS_LEGACY_SECURITY_LEVEL = False   # True 면 SECLEVEL=1 (semas)
+    TLS_EXTRA_CA_FILE: Optional[str] = None   # alert/certs/ 안의 파일명 (ggeea)
+    # 재시도·타임아웃: None 이면 config.yaml 의 전역값을 쓴다.
+    CONNECT_TIMEOUT: Optional[float] = None
+    READ_TIMEOUT: Optional[float] = None
+    RETRY_COUNT: Optional[int] = None
+    RETRY_DELAY: Optional[float] = None
+
     # 13차: 기간은 **크롤러가 만들지 않는다**. ``period_start``/
     # ``period_end`` 는 DB 도달 직전의 관문
     # (``alert.main._finalize_periods``)이 단독으로 정한다 - 크롤러가
@@ -43,8 +57,11 @@ class BaseCrawler(abc.ABC):
 
         crawler_cfg = self.config.crawler
         self.timeout = crawler_cfg.timeout
-        self.retry_count = crawler_cfg.retry_count
-        self.retry_delay = crawler_cfg.retry_delay
+        # P2-X: 소스별 재시도 정책 (기본은 전역값 그대로).
+        self.retry_count = (crawler_cfg.retry_count if self.RETRY_COUNT is None
+                            else int(self.RETRY_COUNT))
+        self.retry_delay = (crawler_cfg.retry_delay if self.RETRY_DELAY is None
+                            else float(self.RETRY_DELAY))
         self.user_agent = crawler_cfg.user_agent
 
         self.session = requests.Session()
@@ -52,6 +69,16 @@ class BaseCrawler(abc.ABC):
             "User-Agent": self.user_agent,
             "Accept": "application/json, text/html, application/xml, */*",
         })
+
+        # P2-X: 사이트별 TLS 정책 — 그 크롤러의 세션에만 붙는다.
+        if self.TLS_LEGACY_SECURITY_LEVEL or self.TLS_EXTRA_CA_FILE:
+            from .tls import CERTS_DIR, apply_tls_policy
+            apply_tls_policy(
+                self.session,
+                legacy_security_level=self.TLS_LEGACY_SECURITY_LEVEL,
+                extra_ca_file=(CERTS_DIR / self.TLS_EXTRA_CA_FILE
+                               if self.TLS_EXTRA_CA_FILE else None),
+            )
 
         # 이미 인용을 받은 공고의 source_id. 파이프라인이 DB에서 읽어 넣어
         # 주면 그 항목은 요청 예산을 쓰지 않는다 (Codex 재검토 #11).
@@ -87,7 +114,7 @@ class BaseCrawler(abc.ABC):
         Returns:
             Response object if successful, None if all retries failed
         """
-        kwargs.setdefault("timeout", self.timeout)
+        kwargs.setdefault("timeout", self.request_timeout())
 
         last_error: Optional[BaseException] = None
         for attempt in range(1, self.retry_count + 1):
@@ -127,6 +154,25 @@ class BaseCrawler(abc.ABC):
         head = "; ".join(self.fetch_errors[:limit])
         extra = len(self.fetch_errors) - limit
         return head + (f" (외 {extra}건)" if extra > 0 else "")
+
+    def request_timeout(self):
+        """이 크롤러의 타임아웃 (P2-X).
+
+        ``CONNECT_TIMEOUT``/``READ_TIMEOUT`` 을 선언한 크롤러는
+        ``(연결, 읽기)`` 튜플을 쓴다. 감사 V §4 의 ipet 실측 근거:
+        **응답할 때는 1초 안에 응답하고, 응답하지 않을 때는 45초를 기다려도
+        오지 않는다.** 긴 단일 타임아웃 × 적은 재시도는 런 시간만 먹고
+        성공률을 올리지 않는다 — 짧은 읽기 타임아웃 × 잦은 재시도가 같은
+        성공률을 훨씬 싸게 낸다.
+        """
+        if self.CONNECT_TIMEOUT is None and self.READ_TIMEOUT is None:
+            return self.timeout
+        return (
+            float(self.CONNECT_TIMEOUT if self.CONNECT_TIMEOUT is not None
+                  else self.timeout),
+            float(self.READ_TIMEOUT if self.READ_TIMEOUT is not None
+                  else self.timeout),
+        )
 
     def get(self, url: str, **kwargs) -> Optional[requests.Response]:
         """Perform GET request with retry logic."""

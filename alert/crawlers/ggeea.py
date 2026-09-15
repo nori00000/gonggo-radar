@@ -25,6 +25,15 @@ class GgeeaCrawler(BaseCrawler):
     """
 
     BASE_URL = "https://www.ggeea.or.kr"
+
+    # P2-X (감사 V §4): 서버가 **중간 인증서를 보내지 않는다**
+    # (`openssl s_client -showcerts` → 인증서 1장). 브라우저는 AIA 로 스스로
+    # 메우지만 Python `ssl` 은 메우지 않아 `unable to get local issuer
+    # certificate` 로 끝났다. 없는 사슬 한 칸을 **기본 신뢰 저장소에 더해서**
+    # 채운다 — 저장소를 대체하지 않는다(alert/certs/README.md).
+    # 실측 2026-09-15: 번들 적용 후 `200 / 114408바이트`, 검증 그대로.
+    # 발급 CA 가 바뀌면 이 파일은 무용지물이 되고 다시 `접속 실패` 로 잡힌다.
+    TLS_EXTRA_CA_FILE = "ggeea-intermediate.pem"
     BOARD_PATHS = [
         "/bbs/board.php?bo_table=notice",  # 공지사항
         "/news",                            # 사업공고

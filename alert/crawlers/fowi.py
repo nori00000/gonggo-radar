@@ -31,6 +31,16 @@ class FowiCrawler(BaseCrawler):
     """
 
     BASE_URL = "https://fowi.or.kr"
+
+    # P2-X (감사 V §4): source_health 프로브가 ReadTimeout 으로 잡았지만
+    # **상시 실패가 아니다** — 09-14 까지 12행을 적재했고, 2026-09-15 재측정에서는
+    # (연결 5초, 읽기 12초)로 8/8 성공했다. 상시 실패로 단정할 근거가 없으므로
+    # 경로·파서는 건드리지 않고 타임아웃·재시도만 ipet 과 같은 모양으로 둔다:
+    # 짧은 읽기 타임아웃 + 잦은 재시도(간헐 장애에 강하고 런 시간을 덜 먹는다).
+    CONNECT_TIMEOUT = 5.0
+    READ_TIMEOUT = 12.0
+    RETRY_COUNT = 4
+    RETRY_DELAY = 2.0
     BOARD_PATHS = [
         "/user/bbs/bbsList.do?bbsManageId=12",  # 공지사항
         "/user/bbs/bbsList.do?bbsManageId=25",   # 입찰공고

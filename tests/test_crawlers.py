@@ -1364,3 +1364,176 @@ def test_run_pipeline_wires_the_per_source_error_message_into_run_history():
         and "error_message" in ast.unparse(keyword.value)
         for call in inserts for keyword in call.keywords
     ), "insert_run 이 error_message 를 넘기지 않는다"
+
+
+# ---------------------------------------------------------------------------
+# P2-X 오류 4종 — 검증을 끄지 않고 고친다 (감사 V §4)
+# ---------------------------------------------------------------------------
+
+class TestSiteTlsPolicy:
+    """`alert/crawlers/tls.py` — 사이트별 TLS 정책."""
+
+    def test_context_keeps_verification_on(self):
+        import ssl
+
+        from alert.crawlers.tls import build_context
+
+        ctx = build_context(legacy_security_level=True)
+        assert ctx.verify_mode == ssl.CERT_REQUIRED
+        assert ctx.check_hostname is True
+
+    def test_extra_ca_adds_to_the_default_store(self):
+        """번들은 기본 저장소를 **대체하지 않고 더한다**."""
+        from alert.crawlers.tls import CERTS_DIR, build_context
+
+        base = len(build_context().get_ca_certs())
+        widened = len(build_context(
+            extra_ca_file=CERTS_DIR / "ggeea-intermediate.pem").get_ca_certs())
+        assert widened == base + 1
+
+    def test_missing_bundle_is_fail_closed(self):
+        """선언한 번들이 없으면 예외다 — 조용히 검증을 낮추지 않는다."""
+        from alert.crawlers.tls import CERTS_DIR, CertsNotFound, build_context
+
+        with pytest.raises(CertsNotFound):
+            build_context(extra_ca_file=CERTS_DIR / "없는번들.pem")
+
+    def test_module_never_disables_verification(self):
+        """코드에 CERT_NONE·verify=False·check_hostname=False 가 없다.
+
+        문자열·주석이 아니라 **실행되는 코드**를 본다(AST) — 이 모듈의 존재
+        이유가 "검증을 끄지 않고 고친다" 이므로 그 성질을 여기서 고정한다.
+        """
+        import ast
+        from pathlib import Path
+
+        tree = ast.parse((Path(__file__).resolve().parent.parent
+                          / "alert" / "crawlers" / "tls.py")
+                         .read_text(encoding="utf-8"))
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Attribute):
+                assert node.attr != "CERT_NONE", "검증을 끄는 상수가 있다"
+            if isinstance(node, ast.keyword) and node.arg in (
+                    "verify", "check_hostname"):
+                assert not (isinstance(node.value, ast.Constant)
+                            and node.value.value is False)
+            if isinstance(node, ast.Assign):
+                for target in node.targets:
+                    if (isinstance(target, ast.Attribute)
+                            and target.attr == "check_hostname"):
+                        assert not (isinstance(node.value, ast.Constant)
+                                    and node.value.value is False)
+
+
+class TestSemasSecurityLevel:
+    """semas — 클라이언트 SECLEVEL 이 원인, 검증 유지한 채 고친다."""
+
+    def test_crawler_declares_legacy_security_level(self):
+        from alert.crawlers.semas import SemasCrawler
+
+        assert SemasCrawler.TLS_LEGACY_SECURITY_LEVEL is True
+        assert SemasCrawler.TLS_EXTRA_CA_FILE is None
+
+    def test_session_context_lowers_ciphers_but_not_trust(self):
+        import ssl
+
+        from alert.crawlers.semas import SemasCrawler
+        from alert.crawlers.tls import LEGACY_CIPHERS, _ContextAdapter
+
+        adapter = SemasCrawler().session.get_adapter("https://www.semas.or.kr")
+        assert isinstance(adapter, _ContextAdapter)
+        ctx = adapter._ssl_context
+        assert ctx.verify_mode == ssl.CERT_REQUIRED and ctx.check_hostname
+        plain = ssl.create_default_context()
+        assert len(ctx.get_ciphers()) > len(plain.get_ciphers())
+        assert LEGACY_CIPHERS == "DEFAULT@SECLEVEL=1"
+
+
+class TestGgeeaCertBundle:
+    """ggeea — 서버가 보내지 않는 중간 인증서를 번들로 채운다."""
+
+    def test_crawler_declares_the_bundle(self):
+        from alert.crawlers.ggeea import GgeeaCrawler
+        from alert.crawlers.tls import CERTS_DIR
+
+        assert GgeeaCrawler.TLS_EXTRA_CA_FILE == "ggeea-intermediate.pem"
+        assert GgeeaCrawler.TLS_LEGACY_SECURITY_LEVEL is False
+        assert (CERTS_DIR / GgeeaCrawler.TLS_EXTRA_CA_FILE).exists()
+
+    def test_bundle_is_the_expected_intermediate(self):
+        """번들이 조용히 바뀌면 red — 무엇을 신뢰에 더했는지가 계약이다."""
+        import ssl
+
+        from alert.crawlers.ggeea import GgeeaCrawler
+        from alert.crawlers.tls import CERTS_DIR
+
+        pem = (CERTS_DIR / GgeeaCrawler.TLS_EXTRA_CA_FILE).read_text(
+            encoding="utf-8")
+        assert pem.count("BEGIN CERTIFICATE") == 1, "번들은 중간 인증서 1장이다"
+        ctx = ssl.create_default_context()
+        ctx.load_verify_locations(
+            cafile=str(CERTS_DIR / GgeeaCrawler.TLS_EXTRA_CA_FILE))
+        added = [cert for cert in ctx.get_ca_certs()
+                 if any("Sectigo Public Server Authentication CA DV R36" in str(v)
+                        for rdn in cert["subject"] for v in rdn)]
+        assert added, "기대한 중간 인증서가 아니다"
+
+    def test_bundle_is_not_a_root_replacement(self):
+        """기본 루트를 덮어쓰지 않는다 — 이 소스만, 더하기만."""
+        import ssl
+
+        from alert.crawlers.ggeea import GgeeaCrawler
+        from alert.crawlers.tls import _ContextAdapter
+
+        adapter = GgeeaCrawler().session.get_adapter("https://www.ggeea.or.kr")
+        assert isinstance(adapter, _ContextAdapter)
+        ctx = adapter._ssl_context
+        assert ctx.verify_mode == ssl.CERT_REQUIRED and ctx.check_hostname
+        assert len(ctx.get_ca_certs()) == len(
+            ssl.create_default_context().get_ca_certs()) + 1
+
+
+class TestSlowSourceRetryPolicy:
+    """ipet·fowi — 타임아웃·재시도 정책만 조정한다 (경로·파서 무변경)."""
+
+    def test_ipet_prefers_short_reads_and_more_tries(self):
+        from alert.crawlers.ipet import IpetCrawler
+
+        crawler = IpetCrawler()
+        assert crawler.request_timeout() == (5.0, 8.0)
+        assert crawler.retry_count == 4 and crawler.retry_delay == 2.0
+        # 소스당 최악 대기: 4×8 + 3×2 = 38초 (옛 정책 3×30 + 2×5 = 100초)
+        worst = crawler.retry_count * crawler.request_timeout()[1] + (
+            crawler.retry_count - 1) * crawler.retry_delay
+        assert worst < 40
+
+    def test_fowi_uses_the_same_shape(self):
+        from alert.crawlers.fowi import FowiCrawler
+
+        crawler = FowiCrawler()
+        assert crawler.request_timeout() == (5.0, 12.0)
+        assert crawler.retry_count == 4 and crawler.retry_delay == 2.0
+
+    def test_other_sources_keep_the_global_policy(self, mock_crawler_config):
+        """전역값을 흔들지 않았다 — 손잡이는 선언한 크롤러에만 붙는다."""
+        crawler = _crawler(ConcreteCrawler, mock_crawler_config)
+        assert crawler.request_timeout() == 10          # 픽스처의 전역 timeout
+        assert crawler.retry_count == 3 and crawler.retry_delay == 1.0
+        assert crawler.session.get_adapter("https://x").__class__.__name__ \
+            == "HTTPAdapter"
+
+    def test_timeout_tuple_reaches_the_request(self, mock_crawler_config):
+        """선언한 튜플이 실제 요청 인자로 간다 (배선 회귀)."""
+        from alert.crawlers.ipet import IpetCrawler
+
+        crawler = IpetCrawler()
+        seen = {}
+
+        def capture(method, url, **kwargs):
+            seen["timeout"] = kwargs.get("timeout")
+            raise requests.ConnectionError("stop")
+
+        with patch.object(crawler.session, "request", capture):
+            with patch("alert.crawlers.base.time.sleep"):
+                assert crawler.get("https://www.ipet.re.kr/x") is None
+        assert seen["timeout"] == (5.0, 8.0)

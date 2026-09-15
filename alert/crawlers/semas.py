@@ -23,6 +23,15 @@ class SemasCrawler(BaseCrawler):
     """
 
     BASE_URL = "https://www.semas.or.kr"
+
+    # P2-X (감사 V §4): SSLV3_ALERT_HANDSHAKE_FAILURE 는 **서버 문제가 아니다**.
+    # `openssl s_client` 는 TLSv1.2/AES256-GCM-SHA384 로 붙고 `Verify return
+    # code: 0 (ok)` 다 — Python 이 쓰는 OpenSSL 3 의 기본 SECLEVEL=2 가 서버의
+    # 키·서명 강도를 거부한다. 이 소스에만 SECLEVEL=1 을 적용한다.
+    # 인증서 검증·호스트명 확인은 그대로다(`verify=False` 아님).
+    # 실측 2026-09-15: SECLEVEL=1 로 `200 / 61278바이트`, 기본값으로는 SSLError.
+    TLS_LEGACY_SECURITY_LEVEL = True
+
     BOARD_PATHS = [
         "/web/board/webBoardList.kmdc?bCd=1",   # 공지사항 (bCd=1)
         "/web/board/webBoardList.kmdc?bCd=2",   # 사업공고 (bCd=2)
