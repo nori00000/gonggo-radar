@@ -763,3 +763,105 @@ class TestRenderMarkdown:
         assert "HTTP 302 1홉" in markdown
         assert "https://example.com/moved" in markdown
         assert "상한에서 끊음" in markdown
+
+
+# ---------------------------------------------------------------------------
+# P2-X H1. 주 1회 감시 잡이 보내는 요약 한 줄
+# ---------------------------------------------------------------------------
+
+def _row(source, verdict):
+    return SourceHealth(source=source, probe=Probe(url="https://x"),
+                        verdict=verdict)
+
+
+class TestHealthSummaryLine:
+    """``health_summary_line`` — 텔레그램 안내와 보고서가 같은 한 줄을 쓴다."""
+
+    def test_counts_every_verdict_and_names_the_failures(self):
+        from scripts.source_health import health_summary_line
+
+        line = health_summary_line([
+            _row("seis", VERDICT_OK),
+            _row("nongsaro", VERDICT_EMPTY),
+            _row("semas", VERDICT_UNREACHABLE),
+            _row("ggeea", VERDICT_UNREACHABLE),
+            _row("epis", VERDICT_PARSE_FAIL),
+        ], today=TODAY)
+        assert line.startswith("[2026-09-13] 소스 5")
+        assert f"{VERDICT_OK} 1" in line
+        assert f"{VERDICT_EMPTY} 1" in line
+        assert f"{VERDICT_UNREACHABLE} 2" in line
+        assert f"{VERDICT_PARSE_FAIL} 1" in line
+        assert line.endswith("— 실패: semas, ggeea, epis")
+
+    def test_says_so_when_nothing_failed(self):
+        from scripts.source_health import health_summary_line
+
+        line = health_summary_line([_row("seis", VERDICT_OK)], today=TODAY)
+        assert line.endswith("— 실패 없음")
+
+    def test_report_carries_the_same_line(self):
+        """보고서 파일만 열어도 요약이 보인다 — 두 자리가 갈리지 않게."""
+        from scripts.source_health import health_summary_line
+
+        rows = [_row("semas", VERDICT_UNREACHABLE), _row("seis", VERDICT_OK)]
+        assert health_summary_line(rows, TODAY) in render_markdown(rows, TODAY)
+
+    def test_summary_out_writes_exactly_one_line(self, tmp_path, monkeypatch):
+        from scripts import source_health as sh
+
+        db = _make_db(tmp_path)
+        out = tmp_path / "observe" / "health.md"
+        summary = tmp_path / "observe" / "health.summary.txt"
+        monkeypatch.setattr(
+            sh, "build_report",
+            lambda *a, **k: [_row("semas", VERDICT_UNREACHABLE)])
+        assert sh.main([
+            "--db", str(db), "--no-probe",
+            "--out", str(out), "--summary-out", str(summary)]) == 0
+        text = summary.read_text(encoding="utf-8")
+        assert text.count("\n") == 1
+        assert "실패: semas" in text
+
+
+class TestHealthJobWiring:
+    """감시 잡 배선 — 감사 V H-1 의 "예약돼 있지 않다" 를 닫는다."""
+
+    def test_launchd_draft_runs_wednesday_22(self):
+        import plistlib
+
+        path = (Path(__file__).resolve().parent.parent
+                / "launchd" / "com.gonggo-radar.health.plist")
+        data = plistlib.loads(path.read_bytes())
+        assert data["Label"] == "com.gonggo-radar.health"
+        assert data["ProgramArguments"][-1].endswith("scripts/health_job.sh")
+        assert data["StartCalendarInterval"] == [
+            {"Hour": 22, "Minute": 0, "Weekday": 3}]
+        assert data["RunAtLoad"] is False
+
+    def test_job_writes_the_dated_report_and_notifies_once(self):
+        script = (Path(__file__).resolve().parent.parent
+                  / "scripts" / "health_job.sh").read_text(encoding="utf-8")
+        assert "set -euo pipefail" in script
+        assert 'digests/observe' in script
+        assert 'health-${DATE}.md' in script
+        assert "scripts/source_health.py" in script
+        assert "scripts/notify_health.py" in script
+        # 발송기는 부르지 않는다 — 이건 안내지 발송본이 아니다.
+        assert "send_digest.py" not in script
+
+    def test_notify_health_dry_run_sends_nothing(self, tmp_path, capsys):
+        from scripts import notify_health
+
+        summary = tmp_path / "s.txt"
+        summary.write_text("[2026-09-13] 소스 5 — 실패: semas\n", encoding="utf-8")
+        assert notify_health.main([str(summary), "--dry-run"]) == 0
+        printed = capsys.readouterr().out
+        assert "[DRY-RUN]" in printed and "실패: semas" in printed
+
+    def test_notify_health_refuses_an_empty_summary(self, tmp_path):
+        from scripts import notify_health
+
+        summary = tmp_path / "s.txt"
+        summary.write_text("   \n", encoding="utf-8")
+        assert notify_health.main([str(summary), "--dry-run"]) == 2

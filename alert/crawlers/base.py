@@ -60,6 +60,12 @@ class BaseCrawler(abc.ABC):
         # 목록 뒤쪽이 영구히 미수집으로 남지 않게 한다 (4차 게이트 #6).
         self._quote_attempts: Dict[str, str] = {}
 
+        # P2-X H1: 이번 실행에서 **끝내 실패한** 요청의 사유. 크롤러들은 관례상
+        # 실패를 로그로 남기고 ``[]`` 를 돌려주므로(semas.py 가 그렇다), 파이프라인
+        # 입장에서 "전부 실패" 와 "공고가 없었다" 가 구별되지 않았다 — 감사 V H-1.
+        # 이 목록이 비어 있지 않고 수집 결과도 0건이면 그 소스의 런은 오류다.
+        self.fetch_errors: List[str] = []
+
     @abc.abstractmethod
     def fetch(self) -> List[RawAnnouncement]:
         """Fetch announcements from the source. Must be implemented by subclass."""
@@ -83,12 +89,14 @@ class BaseCrawler(abc.ABC):
         """
         kwargs.setdefault("timeout", self.timeout)
 
+        last_error: Optional[BaseException] = None
         for attempt in range(1, self.retry_count + 1):
             try:
                 response = self.session.request(method, url, **kwargs)
                 response.raise_for_status()
                 return response
             except requests.RequestException as e:
+                last_error = e
                 self.logger.warning(
                     f"Attempt {attempt}/{self.retry_count} failed for {url}: {e}"
                 )
@@ -96,7 +104,29 @@ class BaseCrawler(abc.ABC):
                     time.sleep(self.retry_delay)
 
         self.logger.error(f"All {self.retry_count} attempts failed for {url}")
+        # P2-X H1: 로그만 남기고 None 을 돌려주면 파이프라인은 이 실패를 볼 수 없다.
+        # 소스별 사유를 남겨 run_history 가 status='error' 로 기록하게 한다.
+        self.record_fetch_error(f"{method} {url}: {last_error}")
         return None
+
+    def record_fetch_error(self, message: str) -> None:
+        """이번 실행의 실패 사유를 남긴다 (P2-X H1).
+
+        ``_request_with_retry`` 가 전패했을 때와 ``safe_fetch`` 가 예외를 받았을 때
+        불린다. 크롤러가 자체 재시도·대체 경로를 가진 경우에도 **결과가 0건이면**
+        이 목록이 그 실행을 오류로 만든다.
+        """
+        text = str(message)
+        if text not in self.fetch_errors:
+            self.fetch_errors.append(text)
+
+    def fetch_error_summary(self, limit: int = 3) -> str:
+        """run_history.error_message 에 실릴 소스별 사유 한 줄 (P2-X H1)."""
+        if not self.fetch_errors:
+            return ""
+        head = "; ".join(self.fetch_errors[:limit])
+        extra = len(self.fetch_errors) - limit
+        return head + (f" (외 {extra}건)" if extra > 0 else "")
 
     def get(self, url: str, **kwargs) -> Optional[requests.Response]:
         """Perform GET request with retry logic."""
@@ -372,6 +402,9 @@ class BaseCrawler(abc.ABC):
             self.logger.info(f"{self.source_name} crawler is disabled, skipping")
             return []
 
+        # P2-X H1: 실행마다 초기화한다 — 같은 객체를 재사용해도 지난 실행의 사유가
+        # 이번 판정을 오염시키지 않는다.
+        self.fetch_errors = []
         try:
             self.logger.info(f"Starting {self.source_name} crawl...")
             results = self.fetch()
@@ -384,4 +417,5 @@ class BaseCrawler(abc.ABC):
                 f"{self.source_name} crawl failed: {e}",
                 exc_info=True
             )
+            self.record_fetch_error(f"{type(e).__name__}: {e}")
             return []

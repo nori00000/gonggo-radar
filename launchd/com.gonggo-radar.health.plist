@@ -1,0 +1,63 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  소스 상태 점검 잡 (P2-X H1) — **초안이며 이 레인은 로드하지 않는다.**
+  로드는 사람(또는 Fable)이 판단한다: `launchctl bootstrap gui/$(id -u) <경로>`.
+
+  왜 있는가: 감사 V H-1. 크롤러가 SSL·인증서·타임아웃으로 한 건도 못 가져와도
+  run_history 에는 `status='success' / total_fetched=0` 이 남아, 죽은 소스와
+  "정상인데 공고가 없었던 소스" 가 구별되지 않았다. 유일한 탐지기
+  scripts/source_health.py 는 어디에도 예약돼 있지 않았다(grep 0히트).
+
+  수요일 22:00 — 목요일 23:00 주간호 조립 **전날**이다. 실패한 소스를 알고
+  나서 그 주 호를 보는 순서가 되고, 다이제스트 잡(23:00/23:30)과 시각이
+  겹치지 않는다.
+
+  잡이 하는 일: 읽기 전용 프로브 1회 → digests/observe/health-<date>.md →
+  요약 한 줄을 협의회 토픽에 안내 1건. **발송본이 아니다**(승인 카드 없음).
+-->
+<plist version="1.0">
+<dict>
+	<key>EnvironmentVariables</key>
+	<dict>
+		<key>PATH</key>
+		<string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+		<key>PYTHONPATH</key>
+		<string>/Users/leesangmin/gonggo-radar</string>
+		<key>PYTHONUNBUFFERED</key>
+		<string>1</string>
+	</dict>
+	<key>KeepAlive</key>
+	<false/>
+	<key>Label</key>
+	<string>com.gonggo-radar.health</string>
+	<key>ProcessType</key>
+	<string>Background</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>/bin/bash</string>
+		<string>/Users/leesangmin/gonggo-radar/scripts/health_job.sh</string>
+	</array>
+	<key>RunAtLoad</key>
+	<false/>
+	<key>StandardErrorPath</key>
+	<string>/Users/leesangmin/Library/Logs/gonggo-radar/health.log</string>
+	<key>StandardOutPath</key>
+	<string>/Users/leesangmin/Library/Logs/gonggo-radar/health.log</string>
+	<key>StartCalendarInterval</key>
+	<array>
+		<dict>
+			<key>Hour</key>
+			<integer>22</integer>
+			<key>Minute</key>
+			<integer>0</integer>
+			<key>Weekday</key>
+			<integer>3</integer>
+		</dict>
+	</array>
+	<key>ThrottleInterval</key>
+	<integer>300</integer>
+	<key>WorkingDirectory</key>
+	<string>/Users/leesangmin/gonggo-radar</string>
+</dict>
+</plist>

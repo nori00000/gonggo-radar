@@ -114,8 +114,17 @@ def _crawl_single(
     CrawlerClass: Any,
     logger: logging.Logger,
     quoted_source_ids: Optional[set] = None,
-) -> Tuple[str, list, str]:
+) -> Tuple[str, list, str, str]:
     """단일 크롤러 실행 (스레드에서 호출).
+
+    P2-X H1 — 관측 실패의 침묵을 끊는 자리다. ``safe_fetch()`` 는 예외를 올리지
+    않고 ``[]`` 를 돌려주며, semas 처럼 크롤러가 자체적으로 삼키는 경우도 있다
+    (``semas.py:96`` 이 목록 fetch 실패를 로그만 남기고 ``[]`` 를 반환한다).
+    그래서 SSL 로 한 건도 못 가져온 소스가 ``status='success'``,
+    ``total_fetched=0`` 으로 기록됐다 — "정상인데 공고가 없었다" 와 구별 불가.
+
+    판정: **결과 0건 + 실패 사유 있음 = 오류**. 결과가 있으면 일부 요청이
+    실패했어도 성공으로 본다(부분 수집은 정상 운영이다).
 
     Args:
         crawler_name: 소스 이름
@@ -125,20 +134,25 @@ def _crawl_single(
             상세 요청 예산을 이 항목에 쓰지 않는다 (Codex 재검토 #11)
 
     Returns:
-        (crawler_name, raw_announcements, status)
-        status: "success" | "disabled" | "error"
+        ``(crawler_name, raw_announcements, status, error_message)``
+        status: "success" | "disabled" | "error".
+        error_message 는 **그 소스의** 사유다 — 전역값 복사가 아니다.
     """
     try:
         crawler = CrawlerClass()
         if not crawler.is_enabled():
-            return crawler_name, [], "disabled"
+            return crawler_name, [], "disabled", ""
         if quoted_source_ids:
             crawler.set_quoted_source_ids(quoted_source_ids)
         raw = crawler.safe_fetch()
-        return crawler_name, raw, "success"
+        errors = getattr(crawler, "fetch_error_summary", lambda: "")()
+        if not raw and errors:
+            logger.error(f"{crawler_name}: 수집 0건 + 실패 사유 있음 — {errors}")
+            return crawler_name, [], "error", errors
+        return crawler_name, raw, "success", ""
     except Exception as e:
         logger.error(f"{crawler_name}: {e}")
-        return crawler_name, [], "error"
+        return crawler_name, [], "error", f"{type(e).__name__}: {e}"
 
 
 # ---------------------------------------------------------------------------
@@ -513,12 +527,12 @@ def run_pipeline(test_mode: bool = False) -> None:
             for name, cls in available_crawlers.items()
         }
         for future in as_completed(futures):
-            crawler_name, raw_announcements, status = future.result()
-            crawl_results[crawler_name] = (raw_announcements, status)
+            crawler_name, raw_announcements, status, error_message = future.result()
+            crawl_results[crawler_name] = (raw_announcements, status, error_message)
             logger.info(f"\n--- Crawled: {crawler_name} ({status}, {len(raw_announcements)} items) ---")
 
     # Process crawl results sequentially (analysis/DB are not thread-safe)
-    for crawler_name, (raw_announcements, status) in crawl_results.items():
+    for crawler_name, (raw_announcements, status, error_message) in crawl_results.items():
         logger.info(f"\n--- Processing: {crawler_name} ---")
 
         if status == "disabled":
@@ -532,12 +546,15 @@ def run_pipeline(test_mode: bool = False) -> None:
             continue
 
         if status == "error":
+            # P2-X H1: 사유는 **그 소스의 것**이다. 예전에는 모든 실패가
+            # "crawl failed (see log above)" 한 문장이어서, 표만 보고는
+            # SSL 거부·인증서 오류·타임아웃을 구별할 수 없었다.
             run_stats[crawler_name] = {
                 "total_fetched": 0,
                 "new_count": 0,
                 "relevant_count": 0,
                 "status": "error",
-                "error_message": "crawl failed (see log above)",
+                "error_message": error_message or "crawl failed (see log above)",
             }
             continue
 

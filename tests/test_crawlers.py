@@ -1157,3 +1157,210 @@ class TestSmesCrawler:
             announcement = crawler._to_announcement(item, "https://www.smes.go.kr")
 
             assert announcement is None
+
+
+# ---------------------------------------------------------------------------
+# P2-X H1. 크롤러 전면 실패가 run_history 에 error 로 남는다
+# ---------------------------------------------------------------------------
+
+class _SilentFailureCrawler(BaseCrawler):
+    """semas 를 본뜬 크롤러 — 목록 fetch 실패를 삼키고 ``[]`` 를 돌려준다."""
+
+    def fetch(self):
+        self.get("https://example.com/board")     # None 을 받고 조용히 끝낸다
+        return []
+
+
+class _BoomCrawler(BaseCrawler):
+    def fetch(self):
+        raise RuntimeError("파서가 터졌다")
+
+
+class _PartialCrawler(BaseCrawler):
+    """한 페이지는 실패하고 한 페이지는 성공 — 부분 수집은 정상이다."""
+
+    def fetch(self):
+        self.get("https://example.com/dead")
+        return [RawAnnouncement(source=self.source_name, source_id="a",
+                                title="살아있는 공고",
+                                url="https://example.com/a")]
+
+
+def _crawler(cls, config, name="test_source"):
+    with patch("alert.crawlers.base.get_config", return_value=config):
+        return cls(source_name=name)
+
+
+class TestFetchErrorRecording:
+    """실패 사유가 크롤러에 남는다 — 로그만 남기면 파이프라인이 못 본다."""
+
+    def test_all_retries_failed_records_a_reason(self, mock_crawler_config):
+        crawler = _crawler(_SilentFailureCrawler, mock_crawler_config)
+        with patch.object(crawler.session, "request",
+                          side_effect=requests.ConnectionError("SSL handshake")):
+            with patch("alert.crawlers.base.time.sleep"):
+                assert crawler.safe_fetch() == []
+        assert crawler.fetch_errors
+        assert "SSL handshake" in crawler.fetch_error_summary()
+        assert "https://example.com/board" in crawler.fetch_error_summary()
+
+    def test_exception_in_fetch_records_a_reason(self, mock_crawler_config):
+        crawler = _crawler(_BoomCrawler, mock_crawler_config)
+        assert crawler.safe_fetch() == []
+        assert "RuntimeError: 파서가 터졌다" in crawler.fetch_error_summary()
+
+    def test_successful_run_records_nothing(self, mock_crawler_config):
+        crawler = _crawler(ConcreteCrawler, mock_crawler_config)
+        assert len(crawler.safe_fetch()) == 1
+        assert crawler.fetch_errors == []
+        assert crawler.fetch_error_summary() == ""
+
+    def test_reasons_reset_between_runs(self, mock_crawler_config):
+        """같은 객체를 다시 돌리면 지난 실행의 사유가 남지 않는다."""
+        crawler = _crawler(_BoomCrawler, mock_crawler_config)
+        crawler.safe_fetch()
+        crawler.fetch = lambda: []
+        assert crawler.safe_fetch() == []
+        assert crawler.fetch_errors == []
+
+    def test_summary_caps_the_number_of_reasons(self, mock_crawler_config):
+        crawler = _crawler(ConcreteCrawler, mock_crawler_config)
+        for i in range(5):
+            crawler.record_fetch_error(f"오류{i}")
+        summary = crawler.fetch_error_summary(limit=3)
+        assert "오류0" in summary and "오류4" not in summary
+        assert "외 2건" in summary
+
+
+class TestCrawlSingleStatus:
+    """``alert.main._crawl_single`` — 0건 + 사유 = error (감사 V H-1)."""
+
+    def _run(self, cls, config, name="test_source"):
+        import logging
+
+        from alert.main import _crawl_single
+
+        with patch("alert.crawlers.base.get_config", return_value=config):
+            with patch("alert.crawlers.base.time.sleep"):
+                return _crawl_single(
+                    name, lambda: cls(source_name=name),
+                    logging.getLogger("test"))
+
+    def test_total_failure_is_recorded_as_error(self, mock_crawler_config):
+        """semas 형 침묵 실패: 예외가 올라오지 않아도 status='error'."""
+        with patch.object(requests.Session, "request",
+                          side_effect=requests.ConnectionError("SSLV3_ALERT")):
+            name, raw, status, error = self._run(
+                _SilentFailureCrawler, mock_crawler_config)
+        assert (name, raw, status) == ("test_source", [], "error")
+        assert "SSLV3_ALERT" in error
+
+    def test_error_message_is_per_source_not_a_global_copy(
+        self, mock_crawler_config
+    ):
+        """소스마다 **자기 사유**를 갖는다 — 전역 문장 복사 회귀.
+
+        감사 V M-2 가 잡은 것과 같은 결함이다(notified_count 가 전역값을 모든
+        소스 행에 복사했다). 사유가 한 문장으로 뭉개지면 SSL 거부·인증서 오류·
+        타임아웃을 표에서 구별할 수 없다.
+        """
+        with patch.object(requests.Session, "request",
+                          side_effect=requests.ConnectionError("SSLV3_ALERT")):
+            _n1, _r1, _s1, first = self._run(
+                _SilentFailureCrawler, mock_crawler_config, "test_source")
+        _n2, _r2, _s2, second = self._run(_BoomCrawler, mock_crawler_config)
+        assert first != second
+        assert "SSLV3_ALERT" in first
+        assert "RuntimeError" in second
+        assert "crawl failed (see log above)" not in (first + second)
+
+    def test_partial_failure_is_still_success(self, mock_crawler_config):
+        """한 건이라도 가져왔으면 성공이다 — 부분 수집은 정상 운영이다."""
+        real_request = requests.Session.request
+
+        def selective(self, method, url, **kwargs):
+            if "dead" in url:
+                raise requests.ConnectionError("timeout")
+            return real_request(self, method, url, **kwargs)
+
+        with patch.object(requests.Session, "request", selective):
+            name, raw, status, error = self._run(
+                _PartialCrawler, mock_crawler_config)
+        assert status == "success" and error == "" and len(raw) == 1
+
+    def test_empty_but_healthy_source_stays_success(self, mock_crawler_config):
+        """진짜 무공고는 오류가 아니다 — 사유가 없으면 success."""
+
+        class _Empty(BaseCrawler):
+            def fetch(self):
+                return []
+
+        name, raw, status, error = self._run(_Empty, mock_crawler_config)
+        assert (status, error) == ("success", "")
+
+    def test_disabled_source_is_not_an_error(self, mock_crawler_config):
+        name, raw, status, error = self._run(
+            ConcreteCrawler, mock_crawler_config, "disabled_source")
+        assert (status, error) == ("disabled", "")
+
+
+def test_run_pipeline_wires_the_per_source_error_message_into_run_history():
+    """배선 회귀 (P2-X H1) — 소스별 사유가 run_history 까지 간다.
+
+    ``run_pipeline`` 은 네트워크·DB·텔레그램을 한 번에 쓰므로 단위 테스트로
+    돌릴 수 없다. 대신 **구조**를 고정한다: ①크롤 결과를 4-튜플로 받고
+    ②error 분기의 ``error_message`` 가 그 변수에서 오며(문자열 리터럴이 아니라)
+    ③``insert_run`` 이 그 값을 ``error_msg`` 로 넘긴다.
+    이 셋 중 하나만 끊겨도 실패가 다시 조용해진다.
+    """
+    import ast
+    from pathlib import Path
+
+    source = (Path(__file__).resolve().parent.parent
+              / "alert" / "main.py").read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    pipeline = next(
+        node for node in ast.walk(tree)
+        if isinstance(node, ast.FunctionDef) and node.name == "run_pipeline")
+
+    # ① 4-튜플 언팩 (crawler_name, raw, status, error_message)
+    unpacks = [
+        node for node in ast.walk(pipeline)
+        if isinstance(node, ast.Assign)
+        and isinstance(node.targets[0], ast.Tuple)
+        and len(node.targets[0].elts) == 4
+        and {getattr(el, "id", None) for el in node.targets[0].elts}
+        == {"crawler_name", "raw_announcements", "status", "error_message"}
+    ]
+    assert unpacks, "크롤 결과를 4-튜플로 받지 않는다"
+
+    # ② error 분기의 error_message 가 변수에서 온다
+    error_dicts = [
+        node for node in ast.walk(pipeline)
+        if isinstance(node, ast.Dict)
+        and any(isinstance(key, ast.Constant) and key.value == "error_message"
+                for key in node.keys)
+    ]
+    assert error_dicts, "error_message 를 담는 run_stats 항목이 없다"
+    from_variable = []
+    for node in error_dicts:
+        for key, value in zip(node.keys, node.values):
+            if isinstance(key, ast.Constant) and key.value == "error_message":
+                from_variable.append(
+                    any(isinstance(inner, ast.Name)
+                        for inner in ast.walk(value)))
+    assert any(from_variable), "error_message 가 전부 리터럴이다(전역 문장 복사)"
+
+    # ③ insert_run 이 그 값을 넘긴다
+    inserts = [
+        node for node in ast.walk(pipeline)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "insert_run"
+    ]
+    assert inserts, "insert_run 호출이 없다"
+    assert any(
+        keyword.arg == "error_msg"
+        and "error_message" in ast.unparse(keyword.value)
+        for call in inserts for keyword in call.keywords
+    ), "insert_run 이 error_message 를 넘기지 않는다"

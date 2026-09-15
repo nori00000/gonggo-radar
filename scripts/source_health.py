@@ -693,7 +693,9 @@ def render_markdown(rows: Sequence[SourceHealth],
     counts: Dict[str, int] = {}
     for row in rows:
         counts[row.verdict] = counts.get(row.verdict, 0) + 1
-    lines += ["", "## 판정 집계", ""]
+    # P2-X H1: 텔레그램 안내와 **같은 한 줄**을 보고서에도 남긴다.
+    lines += ["", "## 요약", "", health_summary_line(rows, today), ""]
+    lines += ["## 판정 집계", ""]
     for verdict in (VERDICT_OK, VERDICT_EMPTY, VERDICT_UNREACHABLE,
                     VERDICT_PARSE_FAIL, VERDICT_STALE):
         lines.append(f"- {verdict}: {counts.get(verdict, 0)}")
@@ -701,6 +703,36 @@ def render_markdown(rows: Sequence[SourceHealth],
         if counts.get(non_verdict):
             lines.append(f"- {non_verdict}(판정 아님): {counts[non_verdict]}")
     return "\n".join(lines) + "\n"
+
+
+def health_summary_line(rows: Sequence[SourceHealth],
+                        today: Optional[date] = None) -> str:
+    """주 1회 감시 잡이 사람에게 보내는 **한 줄** (P2-X H1).
+
+    감사 V H-1: 유일한 탐지기인 이 스크립트가 어디에도 예약돼 있지 않아 사람이
+    손으로 돌려야만 보였다. 표 전체를 텔레그램에 붓는 대신 이 한 줄만 보낸다 —
+    수치와 실패 소스명이 있으면 "봐야 하는가" 를 판단할 수 있고, 판단이 서면
+    보고서 파일을 연다.
+
+    Returns:
+        예: ``소스 36 · 정상 13 · 무공고 10 · 접속 실패 7 · 파싱 실패 6 ·
+        오래된 목록 0 — 실패: semas, ggeea, ipet``
+    """
+    today = today or date.today()
+    counts: Dict[str, int] = {}
+    for row in rows:
+        counts[row.verdict] = counts.get(row.verdict, 0) + 1
+    parts = [f"소스 {len(rows)}"]
+    for verdict in (VERDICT_OK, VERDICT_EMPTY, VERDICT_UNREACHABLE,
+                    VERDICT_PARSE_FAIL, VERDICT_STALE):
+        parts.append(f"{verdict} {counts.get(verdict, 0)}")
+    for non_verdict in (VERDICT_SKIPPED, VERDICT_UNTESTABLE):
+        if counts.get(non_verdict):
+            parts.append(f"{non_verdict} {counts[non_verdict]}")
+    failing = [row.source for row in rows
+               if row.verdict in (VERDICT_UNREACHABLE, VERDICT_PARSE_FAIL)]
+    line = f"[{today.isoformat()}] " + " · ".join(parts)
+    return line + (" — 실패: " + ", ".join(failing) if failing else " — 실패 없음")
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
@@ -719,6 +751,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                         help="이 소스만 점검 (여러 번 지정 가능)")
     parser.add_argument("--no-probe", action="store_true",
                         help="네트워크를 타지 않고 DB 지표만 본다")
+    parser.add_argument("--summary-out",
+                        help="요약 한 줄을 이 파일에 쓴다 (감시 잡이 읽어 안내한다)")
     args = parser.parse_args(argv)
 
     if args.no_probe:
@@ -734,6 +768,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     rows = build_report(args.db, prober=prober, sources=args.sources,
                         job_budget_sec=args.budget)
     markdown = render_markdown(rows)
+    if args.summary_out:
+        summary_path = Path(args.summary_out)
+        summary_path.parent.mkdir(parents=True, exist_ok=True)
+        summary_path.write_text(
+            health_summary_line(rows) + "\n", encoding="utf-8")
     if args.out:
         Path(args.out).write_text(markdown, encoding="utf-8")
         print(f"✓ {args.out}")
