@@ -49,8 +49,13 @@ crawler:
     kstartup:
       enabled: true
       base_url: "https://apis.data.go.kr/B552735/kisedKstartupService01"
+    # P2-S 계약 §2 (2026-09-15 실측 비활성화): www.smes.go.kr/main/sportsBsnsPolicy
+    # 가 portal.smes.go.kr/home/sportsBsnsPolicy 로 302 이전했고, 이전지는
+    # `<div id="root">` 만 있는 555바이트 React SPA 셸이다 - 목록이 서버 HTML
+    # 에 없어 HTML 파서로는 한 건도 얻을 수 없다. 공개 목록 API 경로를
+    # 확인하기 전까지 끈다 (추측 경로 금지). 크롤러 코드는 그대로 둔다.
     smes:
-      enabled: true
+      enabled: false
       base_url: "https://www.smes.go.kr"
     subsidy24:
       enabled: true
@@ -74,6 +79,9 @@ crawler:
     ekr:
       enabled: true
       base_url: "https://www.ekr.or.kr"
+    # P2-S 계약 §2: 옛 게시판(/home/kor/M373320876/board.do)이 사이트 개편으로
+    # 사라져 크롤러 BOARD_PATHS 를 /bbs/list.do?key=2604210075 (공지사항)·
+    # key=2604210073 (입찰/공모) 로 교체했다. base_url 은 그대로다.
     epis:
       enabled: true
       base_url: "https://www.epis.or.kr"
@@ -109,8 +117,17 @@ crawler:
     ggeea:
       enabled: true
       base_url: "https://www.ggeea.or.kr"
+    # P2-S 계약 §1 (2026-09-15 실측 비활성화): 행안부에 **마을기업 공고
+    # 게시판이 없다**. 열어서 확인한 게시판:
+    #   - BBSMSTR_000000000062 (지금 쓰던 곳) = "지방공기업제도·운영"
+    #   - BBSMSTR_000000000058 = 사회연대경제>민간협력 = 비영리민간단체지원
+    #   - BBSMSTR_000000000006 = 새소식>알립니다 = 부처 일반 공고
+    #   - BBSMSTR_000000000600 = "월간 마을기업 웹진" (웹진 6건, 공고 아님)
+    # 마을기업 모집·지정 공고는 시·도가 내고 행안부는 지침만 낸다.
+    # 추측 경로를 넣지 않고 끈다. council_profile.sources 에는 남겨 둔다
+    # (프로파일 목록은 계약 고정 — tests/test_council_profile.py 참조).
     mois_sse:
-      enabled: true
+      enabled: false
       base_url: "https://www.mois.go.kr"
     goyang_startup:
       enabled: true
@@ -133,6 +150,18 @@ crawler:
       enabled: true
       base_url: "https://www.coop.go.kr"
       bypass_threshold: true
+      fetch_detail: false
+
+    # ── P2-S 계약 §3 신규 HTML 소스 ───────────────────────────────────
+    # 기간 추출기 없음(period 는 항상 None)·bypass_threshold 없음 =
+    # 협의회 프로파일과 회사 임계값을 정상으로 통과해야 적재된다.
+    moel:
+      enabled: true
+      base_url: "https://www.moel.go.kr"
+      fetch_detail: false
+    mss:
+      enabled: true
+      base_url: "https://www.mss.go.kr"
       fetch_detail: false
 
     # ── 2차 미디어 RSS (P1-R 계약) ────────────────────────────────────
@@ -416,6 +445,9 @@ council_profile:
     - "g2b"
     - "kstartup"
     - "subsidy24"
+    # P2-S 계약 §3 신규 소스
+    - "moel"
+    - "mss"
     # 2차 미디어 (P1-R). 협의회 어휘에 걸리는 기사만 남고 나머지는 탈락
     # 원장으로 간다 - senews 의 지역행정 기사가 여기서 걸러진다.
     - "lifein"
@@ -516,3 +548,48 @@ council_profile:
     - "사법경찰"
     - "외교"
     - "호우"
+
+  # ── P1' 라운드 5 — 2차 미디어의 **월간호 2차 관문** ──────────────────────
+  # 근거: `results/G-sample-review.md` (라이브 표본 40건 재판정). 적재 프로파일은
+  # "산림 관련성"만 보므로 임업 전문지 헤드라인이 거의 전부 통과한다 —
+  # 표본에서 kfnews 23건이 전량 통과했고 점수도 0.5~0.6에 고착돼 있었다.
+  # 그중 다수는 사설·기관 행보·태세 보도라 회원이 움직일 일이 없다.
+  #
+  # 이 두 목록은 **월간호의 media 행에만** 쓰인다. 적재(council.score_item)·
+  # 주간호·회사 알림 어느 경로도 이 어휘를 보지 않는다.
+  # 비워 두면 어떤 미디어도 월간호에 실리지 않는다(fail-closed 킬 스위치).
+
+  # (1) 제목에 이 중 하나는 있어야 한다 — 회원이 움직일 수 있다는 표지
+  media_action_cues:
+    - "신청"
+    - "모집"
+    - "공고"
+    - "접수"
+    - "제도"
+    - "시행"
+    - "개정"
+    - "지원사업"
+    - "지원금"
+    - "마감"
+    - "인증"
+    - "지정"
+    - "설명회"
+    - "입법예고"
+    - "기본법"
+
+  # (2) 제목에 이 중 하나라도 있으면 싣지 않는다 — 의견·의전·태세 보도
+  media_exclude:
+    - "[사설]"
+    - "[기고]"
+    - "[칼럼]"
+    - "행보"
+    - "태세"
+    - "점검"
+    - "간담회"
+    - "시상"
+    - "수상"
+    - "임명"
+    - "취임"
+    - "졸업"
+    - "기념식"
+    - "방문"

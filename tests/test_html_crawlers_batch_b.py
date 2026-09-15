@@ -1,5 +1,6 @@
 """Tests for HTML crawlers Batch B: SocialenterpriseCrawler, EkrCrawler, EpisCrawler."""
 
+import json
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -311,6 +312,12 @@ class TestEpisCrawler:
             assert announcement.url == "https://www.epis.or.kr/board/read?boardNo=12345"
             assert announcement.author == "농림수산식품교육문화정보원"  # default author
             assert announcement.category == "공고"
-            assert announcement.period_start == "2026-04-01"
-            assert announcement.period_end == "2026-04-30"
+            # P2-S 라운드 2 HIGH: epis 는 기간을 만들 수 없는 소스다
+            # (PERIOD_EXTRACTORS 에 없다). 목록 날짜가 보여도 두 필드는
+            # 무조건 None 이고 문자열은 raw_data 근거로만 남는다.
+            assert announcement.period_start is None
+            assert announcement.period_end is None
+            assert json.loads(announcement.raw_data)["date"] == (
+                "2026-04-01 ~ 2026-04-30"
+            )
             assert announcement.source_id == "12345"

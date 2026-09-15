@@ -108,6 +108,9 @@ def _import_crawlers() -> Dict[str, Any]:
         ("forest_press", "alert.crawlers.forest_press", "ForestPressCrawler"),
         ("lawmaking", "alert.crawlers.lawmaking", "LawmakingCrawler"),
         ("coop", "alert.crawlers.coop", "CoopCrawler"),
+        # P2-S 계약 §3 신규 HTML 소스 (기간 추출기 없음)
+        ("moel", "alert.crawlers.moel", "MoelCrawler"),
+        ("mss", "alert.crawlers.mss", "MssCrawler"),
         # 2차 미디어 RSS (P1-R 계약, kind: media - 월간호 전용)
         ("lifein", "alert.crawlers.media_rss", "LifeinCrawler"),
         ("eroun", "alert.crawlers.media_rss", "ErounCrawler"),

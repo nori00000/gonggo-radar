@@ -129,6 +129,14 @@ class CouncilProfileConfig:
     eligibility: Dict[str, list[str]] = field(default_factory=dict)
     region: Dict[str, list[str]] = field(default_factory=dict)
     exclude: list[str] = field(default_factory=list)
+    # P1' 라운드 5 - 2차 미디어(kind='media')의 **월간호 2차 관문** 어휘.
+    # 적재 프로파일은 "산림 관련성" 만 보므로 임업 전문지 헤드라인이 거의 전부
+    # 통과한다(실측: 표본 40건 중 kfnews 23건 전량 통과). 월간 지면에 실으려면
+    # 행동·제도 단서가 있어야 하고, 사설·행보·의전 보도는 뺀다.
+    # **비면 어떤 미디어도 월간호에 실리지 않는다** - 2차 관문의 기본값은
+    # fail-closed 다(어휘를 못 읽었는데 통과시키면 관문이 없는 것과 같다).
+    media_action_cues: list[str] = field(default_factory=list)
+    media_exclude: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -319,6 +327,8 @@ def _build_council_profile(raw: Dict[str, Any]) -> CouncilProfileConfig:
         eligibility=_normalize_tag_table(raw.get("eligibility")),
         region=_normalize_tag_table(raw.get("region")),
         exclude=list(raw.get("exclude", []) or []),
+        media_action_cues=list(raw.get("media_action_cues", []) or []),
+        media_exclude=list(raw.get("media_exclude", []) or []),
     )
 
 
