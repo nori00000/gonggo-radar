@@ -1184,7 +1184,10 @@ def test_media_gate_vocab_comes_from_config():
     # 계약이 지정한 어휘가 실제로 들어 있다
     for term in ("신청", "모집", "공고", "접수", "제도", "시행", "개정",
                  "지원사업", "지원금", "마감", "인증", "지정", "설명회",
-                 "입법예고", "기본법", "예산"):
+                 "입법예고", "기본법"):
+        assert term in cues, term
+    assert "예산" not in cues  # 인터뷰 기사 통과 방지(2026-09-15 제거)
+    for term in ():
         assert term in cues, term
     for term in ("[사설]", "[기고]", "[칼럼]", "행보", "태세", "점검",
                  "간담회", "시상", "수상", "임명", "취임", "졸업",
