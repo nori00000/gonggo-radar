@@ -31,6 +31,8 @@ from .kofpi import KofpiCrawler
 from .forest_press import ForestPressCrawler
 from .lawmaking import LawmakingCrawler
 from .coop import CoopCrawler
+from .moel import MoelCrawler
+from .mss import MssCrawler
 
 __all__ = [
     "BaseCrawler",
@@ -66,4 +68,6 @@ __all__ = [
     "ForestPressCrawler",
     "LawmakingCrawler",
     "CoopCrawler",
+    "MoelCrawler",
+    "MssCrawler",
 ]

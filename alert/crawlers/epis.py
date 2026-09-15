@@ -4,6 +4,7 @@ import json
 import re
 from typing import List, Optional
 from .base import BaseCrawler
+from .date_labels import posted_date
 from ..models import RawAnnouncement
 
 try:
@@ -15,20 +16,31 @@ except ImportError:
 class EpisCrawler(BaseCrawler):
     """농림수산식품교육문화정보원(epis.or.kr) 공고 게시판 크롤러.
 
-    대상 URL:
-        - https://www.epis.or.kr/home/kor/M373320876/board.do (공지사항)
-        - https://www.epis.or.kr/home/kor/M163278324/board.do (청년 지원 사업)
+    대상 URL (2026-09-15 교체, P2-S 계약 §2):
+        - https://www.epis.or.kr/bbs/list.do?key=2604210075 (공지사항)
+        - https://www.epis.or.kr/bbs/list.do?key=2604210073 (입찰/공모)
 
-    HTML 파싱 방식:
-        GET 요청을 통해 공고 목록 페이지를 가져오고,
-        테이블 또는 리스트 구조를 파싱하여 공고 정보를 추출한다.
+    옛 경로 ``/home/kor/M373320876/board.do`` 는 사이트 개편으로 사라졌다.
+    새 게시판은 ``table.table_basics_area`` 정적 HTML 이고, 제목 링크의
+    href 는 ``javascript:void(0);`` 이며 실제 이동은
+    ``onclick="goView('<pstSn>')"`` 가 ``/bbs/view.do?key=…&pstSn=…`` 로
+    폼 전송한다 - href 기반 전략으로는 게시글을 하나도 찾을 수 없으므로
+    전용 전략(``_parse_goview_board``)이 먼저 돈다.
+
+    기간: epis 는 ``PERIOD_EXTRACTORS`` 에 없다 = 기간 두 필드가 항상
+    None 이다. 그래서 새 전략은 목록 날짜를 ``date`` 로 올리지 않고
+    ``posted`` 로만 싣는다 - 게시일이 접수기간으로 둔갑하지 않게.
     """
 
     BASE_URL = "https://www.epis.or.kr"
     BOARD_PATHS = [
-        "/home/kor/M373320876/board.do",   # 공지사항
-        "/home/kor/M163278324/board.do",    # 청년 지원 사업
+        "/bbs/list.do?key=2604210075",   # 공지사항
+        "/bbs/list.do?key=2604210073",   # 입찰/공모
     ]
+
+    # goView('2609080002') -> /bbs/view.do?key=<board>&pstSn=2609080002
+    GOVIEW_PATTERN = re.compile(r"goView\(\s*'?(\w+)'?\s*\)", re.I)
+    BOARD_KEY_PATTERN = re.compile(r"[?&]key=(\d+)", re.I)
 
     def __init__(self):
         super().__init__(source_name="epis")
@@ -80,6 +92,12 @@ class EpisCrawler(BaseCrawler):
         soup = BeautifulSoup(response.text, "html.parser")
         items: List[dict] = []
 
+        # 전략 0: 개편된 epis 게시판 (onclick goView)
+        items = self._parse_goview_board(soup, self._extract_board_key(url))
+        if items:
+            self.logger.info(f"Parsed {len(items)} items using goView strategy")
+            return items
+
         # 전략 1: table 기반 게시판
         items = self._parse_table_board(soup)
         if items:
@@ -103,6 +121,94 @@ class EpisCrawler(BaseCrawler):
             "HTML structure may have changed."
         )
         return []
+
+    @classmethod
+    def _extract_board_key(cls, url: str) -> str:
+        """목록 URL 에서 게시판 ``key`` 를 뽑는다 (본문 URL 조립에 쓴다)."""
+        match = cls.BOARD_KEY_PATTERN.search(url or "")
+        return match.group(1) if match else ""
+
+    def _parse_goview_board(
+        self, soup: "BeautifulSoup", board_key: str
+    ) -> List[dict]:
+        """개편된 epis 게시판(``table.table_basics_area``)을 파싱한다.
+
+        칸을 **클래스로만** 고른다. 입찰/공모 게시판에는 등록일 칸이 없고
+        기간 칸(``2026-09-07 ~ 2026-09-18``)만 있는데, 칸 순서나 "날짜처럼
+        보이는 첫 칸" 으로 읽으면 그 기간이 게시일이 된다. ``td.date`` 만
+        게시일로 인정하고, 기간 문자열은 ``period_text`` 근거로만 남긴다.
+
+        Args:
+            soup: 목록 페이지
+            board_key: ``/bbs/list.do?key=…`` 의 게시판 키
+
+        Returns:
+            공고 항목 목록 (``date`` 는 항상 빈 문자열 - 기간을 만들지 않는다)
+        """
+        items: List[dict] = []
+        seen_ids = set()
+
+        for row in soup.select("table.table_basics_area tbody tr"):
+            title_cell = row.find("td", class_="tit")
+            if title_cell is None:
+                continue
+            a_tag = title_cell.find("a")
+            if a_tag is None:
+                continue
+
+            match = self.GOVIEW_PATTERN.search(a_tag.get("onclick", "") or "")
+            if not match:
+                continue
+            pst_sn = match.group(1)
+            if pst_sn in seen_ids:
+                continue
+            seen_ids.add(pst_sn)
+
+            title = a_tag.get_text(" ", strip=True)
+            if not title:
+                continue
+
+            sort_cell = row.find("td", class_="sort")
+            date_cell = row.find("td", class_="date")
+
+            link = f"/bbs/view.do?pstSn={pst_sn}"
+            if board_key:
+                link = f"/bbs/view.do?key={board_key}&pstSn={pst_sn}"
+
+            item = {
+                "title": title,
+                "link": link,
+                "author": "",
+                "category": sort_cell.get_text(strip=True) if sort_cell else "",
+                # 기간을 만들 수 있는 소스가 아니다 - 날짜를 date 로 올리지
+                # 않는다 (``_to_announcement`` 가 date 로 기간을 만든다)
+                "date": "",
+                "date_label": "등록일",
+            }
+            posted = posted_date(
+                date_cell.get_text(strip=True) if date_cell else ""
+            )
+            if posted:
+                item["posted"] = posted
+
+            period_text = self._row_period_text(row)
+            if period_text:
+                item["period_text"] = period_text
+
+            items.append(item)
+
+        return items
+
+    @staticmethod
+    def _row_period_text(row) -> str:
+        """행에서 기간 문자열(``… ~ …``)을 근거로만 읽는다."""
+        for cell in row.find_all("td"):
+            if cell.get("class"):
+                continue
+            text = cell.get_text(" ", strip=True)
+            if "~" in text and re.search(r"\d{4}[-./]\d{1,2}[-./]\d{1,2}", text):
+                return text
+        return ""
 
     def _parse_table_board(self, soup: "BeautifulSoup") -> List[dict]:
         """table 기반 게시판 파싱."""
@@ -302,6 +408,7 @@ class EpisCrawler(BaseCrawler):
             return ""
 
         id_params = [
+            r"pstSn=(\w+)",
             r"boardNo=(\d+)", r"announcementId=(\d+)", r"notifyId=(\d+)",
             r"nttId=(\d+)", r"seq=(\d+)", r"idx=(\d+)", r"no=(\d+)",
             r"articleId=(\d+)", r"artclId=(\d+)",
