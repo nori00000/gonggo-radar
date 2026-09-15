@@ -7,7 +7,8 @@
     "chars": 976,
     "truncated": false,
     "detail_label_count": 1,
-    "full_chars": 1024
+    "detail_conflict_cue": "",
+    "reason": null
   },
   "forest_service": {
     "source": "forest_service",
@@ -17,7 +18,8 @@
     "chars": 497,
     "truncated": false,
     "detail_label_count": 1,
-    "full_chars": 670
+    "detail_conflict_cue": "",
+    "reason": null
   },
   "socialenterprise": {
     "source": "socialenterprise",
@@ -27,7 +29,8 @@
     "chars": 1272,
     "truncated": false,
     "detail_label_count": 1,
-    "full_chars": 1277
+    "detail_conflict_cue": "",
+    "reason": null
   },
   "coop": {
     "source": "coop",
@@ -37,7 +40,8 @@
     "chars": 2000,
     "truncated": true,
     "detail_label_count": 2,
-    "full_chars": 2291
+    "detail_conflict_cue": "회차",
+    "reason": "근거 절단"
   },
   "mafra": {
     "source": "mafra",
@@ -47,7 +51,8 @@
     "chars": 113,
     "truncated": false,
     "detail_label_count": 0,
-    "full_chars": 308
+    "detail_conflict_cue": "",
+    "reason": "근거 없음"
   },
   "coop_full": {
     "source": "coop",
@@ -57,6 +62,8 @@
     "chars": 2291,
     "truncated": false,
     "detail_label_count": 2,
+    "detail_conflict_cue": "회차",
+    "reason": "라벨 중복",
     "note": "본문 전체 - 3행 회차 표가 들어 있다"
   },
   "kofpi_footnote_extension": {
@@ -67,6 +74,7 @@
     "chars": 874,
     "truncated": false,
     "detail_label_count": 1,
+    "detail_conflict_cue": "연장",
     "reason": "근거 충돌"
   },
   "kofpi_always_open": {
@@ -77,6 +85,18 @@
     "chars": 1279,
     "truncated": false,
     "detail_label_count": 1,
+    "detail_conflict_cue": "연중",
+    "reason": "근거 충돌"
+  },
+  "kofpi_title_extension": {
+    "source": "kofpi",
+    "title": "[모집] 2026년도 중소기업 ESG 경영 컨설팅 지원사업 참여기업 모집(연장)(~9.3)",
+    "url": "https://www.kofpi.or.kr/notice/notice_01view.do?bb_seq=12596",
+    "fetched": "2026-09-15",
+    "chars": 956,
+    "truncated": false,
+    "detail_label_count": 1,
+    "detail_conflict_cue": "연장",
     "reason": "근거 충돌"
   },
   "kofpi_section_boundary": {
@@ -87,6 +107,7 @@
     "chars": 616,
     "truncated": false,
     "detail_label_count": 1,
+    "detail_conflict_cue": "",
     "reason": null
   },
   "socialenterprise_deadline_only": {
@@ -97,6 +118,7 @@
     "chars": 741,
     "truncated": false,
     "detail_label_count": 1,
+    "detail_conflict_cue": "",
     "reason": null
   },
   "kofpi_truncated": {
@@ -107,16 +129,18 @@
     "chars": 81,
     "truncated": true,
     "detail_label_count": 0,
+    "detail_conflict_cue": "",
     "reason": "근거 절단"
   },
   "kofpi_duplicate_label": {
     "source": "kofpi",
-    "title": "[모집]2025년 산림분야 미래인재 양성 프로그램 시범사업 운영기관 모집 공고 (연장) (~8. 17.)",
-    "url": "https://www.kofpi.or.kr/notice/notice_03view.do?bb_seq=12073",
+    "title": "[모집]「2025년 산림분야 미래인재 양성 프로그램 시범사업」 운영기관 모집 공고",
+    "url": "https://www.kofpi.or.kr/notice/notice_03view.do?bb_seq=12059",
     "fetched": "2026-09-15",
-    "chars": 1356,
+    "chars": 1394,
     "truncated": false,
     "detail_label_count": 2,
+    "detail_conflict_cue": "",
     "reason": "라벨 중복"
   }
 }
