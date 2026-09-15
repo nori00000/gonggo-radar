@@ -1086,13 +1086,18 @@ def _job_root(tmp_path):
     (root / "scripts" / "digest_job.sh").write_text(
         job.read_text(encoding="utf-8"), encoding="utf-8"
     )
+    # P2-X H4: 잡은 자기 자신을 잡 전역 잠금 아래로 다시 exec 한다.
+    lock_helper = Path("scripts/job_lock.py").resolve()
+    (root / "scripts" / "job_lock.py").write_text(
+        lock_helper.read_text(encoding="utf-8"), encoding="utf-8"
+    )
     python = root / "venv" / "bin" / "python"
     python.write_text(JOB_FAKE_PYTHON, encoding="utf-8")
     python.chmod(0o755)
     return root
 
 
-def _run_job(root, gen_exit):
+def _run_job(root, gen_exit, extra_env=None):
     import subprocess
 
     record = root / "calls.log"
@@ -1104,6 +1109,8 @@ def _run_job(root, gen_exit):
             "PATH": "/usr/bin:/bin:/usr/sbin:/sbin",
             "RECORD": str(record),
             "GEN_EXIT": str(gen_exit),
+            "GONGGO_JOB_LOCK_TIMEOUT": "5",
+            **(extra_env or {}),
         },
     )
     calls = record.read_text(encoding="utf-8") if record.exists() else ""
@@ -6200,3 +6207,86 @@ def test_drain_expired_queues_ignores_open_issues(tmp_path, monkeypatch):
         lambda *a: pytest.fail("열린 호의 메시지를 지우려 했다"))
     assert notify_digest.drain_expired_queues(
         "T", -100, tmp_path, "2026-W37") == 0
+
+
+# ─── P2-X H4: 두 다이제스트 잡을 가로지르는 전역 뮤텍스 ──────────────────
+def test_job_lock_helper_runs_the_command_holding_the_lock(tmp_path):
+    """잠금을 쥔 채 명령을 exec 한다 — 종료 코드는 명령의 것이다."""
+    import subprocess
+
+    lock = tmp_path / ".job.lock"
+    proc = subprocess.run(
+        ["/usr/bin/python3", "scripts/job_lock.py", "--lock", str(lock),
+         "--timeout", "5", "--", "/bin/sh", "-c", "echo RAN; exit 3"],
+        capture_output=True, text=True)
+    assert proc.returncode == 3
+    assert "RAN" in proc.stdout
+    assert lock.exists()          # 잠금 파일은 지우지 않는다
+
+
+def test_job_lock_helper_exits_75_when_busy(tmp_path):
+    """다른 잡이 쥐고 있으면 대기 한도 뒤 exit 75(EX_TEMPFAIL)."""
+    import fcntl
+    import subprocess
+
+    lock = tmp_path / ".job.lock"
+    holder = open(lock, "w")
+    fcntl.flock(holder, fcntl.LOCK_EX)
+    try:
+        proc = subprocess.run(
+            ["/usr/bin/python3", "scripts/job_lock.py", "--lock", str(lock),
+             "--timeout", "1", "--", "/bin/echo", "SHOULD_NOT_RUN"],
+            capture_output=True, text=True)
+    finally:
+        holder.close()
+    assert proc.returncode == 75
+    assert "SHOULD_NOT_RUN" not in proc.stdout
+    assert "대기 한도 초과" in proc.stderr
+
+
+def test_job_lock_is_released_when_the_holder_dies(tmp_path):
+    """잠금 소유자가 죽으면 커널이 즉시 푼다 — PID 검사·TTL 이 필요 없다."""
+    import fcntl
+    import subprocess
+
+    lock = tmp_path / ".job.lock"
+    holder = open(lock, "w")
+    fcntl.flock(holder, fcntl.LOCK_EX)
+    holder.close()                 # 프로세스 종료와 같은 효과(fd 닫힘)
+    proc = subprocess.run(
+        ["/usr/bin/python3", "scripts/job_lock.py", "--lock", str(lock),
+         "--timeout", "1", "--", "/bin/echo", "OK"],
+        capture_output=True, text=True)
+    assert proc.returncode == 0 and "OK" in proc.stdout
+
+
+def test_digest_job_waits_on_the_shared_job_lock(tmp_path):
+    """주간 잡이 **호 잠금이 아니라** digests/.job.lock 을 먼저 쥔다."""
+    import fcntl
+    import subprocess
+
+    root = _job_root(tmp_path)
+    lock = root / "digests" / ".job.lock"
+    holder = open(lock, "w")
+    fcntl.flock(holder, fcntl.LOCK_EX)
+    try:
+        proc = subprocess.run(
+            ["bash", str(root / "scripts" / "digest_job.sh"), "2026-W37"],
+            capture_output=True, text=True,
+            env={"PATH": "/usr/bin:/bin:/usr/sbin:/sbin",
+                 "RECORD": str(root / "calls.log"),
+                 "GONGGO_JOB_LOCK_TIMEOUT": "1"})
+    finally:
+        holder.close()
+    assert proc.returncode == 75
+    assert not (root / "calls.log").exists(), "잠금 없이 파이프라인이 시작됐다"
+
+
+def test_digest_and_monthly_jobs_share_one_lock_path():
+    """두 잡의 잠금 경로가 **같은 파일**이다 — 호 잠금은 상호배제가 아니다."""
+    weekly = Path("scripts/digest_job.sh").read_text(encoding="utf-8")
+    monthly = Path("scripts/monthly_job.sh").read_text(encoding="utf-8")
+    for text in (weekly, monthly):
+        assert '--lock "${ROOT}/digests/.job.lock"' in text
+        assert 'scripts/job_lock.py' in text
+        assert 'GONGGO_JOB_LOCK_TIMEOUT:-1200' in text

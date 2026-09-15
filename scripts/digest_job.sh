@@ -12,9 +12,26 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# 잠금 재실행에서 쓸 자기 경로 (cd 전에 절대경로로 굳힌다).
+SELF="${ROOT}/scripts/$(basename "${BASH_SOURCE[0]}")"
 cd "${ROOT}" || exit 1
 PY="${ROOT}/venv/bin/python"
 DB="${GONGGO_DB:-alert/data/announcements.db}"
+
+# ── 잡 전역 뮤텍스 (P2-X H4) ─────────────────────────────────────────────
+# 감사 V M-4: 주간(23:00)·월간(23:30) 잡은 **서로 다른 호 잠금**만 잡아 상호배제가
+# 없었다. 겹치면 z.ai 레인을 동시에 부르고 미리보기가 경합한다. 두 잡이 **같은**
+# digests/.job.lock 을 쥔다. macOS 에 flock(1) 이 없어 scripts/job_lock.py 가
+# fcntl.flock 을 쥔 채 이 스크립트를 다시 exec 한다(잠금은 exec 를 넘어 산다).
+# 대기 한도 20분, 못 얻으면 로그 한 줄 + exit 75(EX_TEMPFAIL).
+# 잠금 파이썬은 venv 가 아니라 시스템 파이썬이다 — venv 가 깨져도 뮤텍스는 선다.
+if [ -z "${GONGGO_JOB_LOCK_HELD:-}" ]; then
+  export GONGGO_JOB_LOCK_HELD=1
+  exec "${GONGGO_LOCK_PYTHON:-/usr/bin/python3}" "${ROOT}/scripts/job_lock.py" \
+    --lock "${ROOT}/digests/.job.lock" \
+    --timeout "${GONGGO_JOB_LOCK_TIMEOUT:-1200}" \
+    -- /bin/bash "${SELF}" "$@"
+fi
 
 WEEK="${1:-$("${PY}" -c 'import datetime; y, w, _ = datetime.date.today().isocalendar(); print(f"{y}-W{w:02d}")')}"
 MD="digests/${WEEK}.md"
