@@ -1003,6 +1003,46 @@ class Database:
                 attempts[str(row["source_id"])] = str(payload["quotes_attempted_at"])
         return attempts
 
+    def get_detail_evidence(
+        self, source: str, evidence_keys: Sequence[str] = ()
+    ) -> Dict[str, dict]:
+        """source_id -> 저장된 상세 근거 (``detail_text`` 묶음).
+
+        두 곳에서 쓴다:
+
+        1. **회전** - 마지막 수집 시각으로 정렬해 오래된 항목부터 다시 받는다.
+           목록이 요청 상한보다 길 때 뒤쪽이 매 실행 굶는 것을 막는다.
+        2. **보존** - 이번 실행에 받지 않은 항목에 옛 근거를 그대로 다시 실어,
+           ``overwrite_periods`` 가 "근거 없음" 으로 보고 마감을 지우는 것을
+           막는다 (라운드 2 Codex MEDIUM ③).
+
+        Args:
+            source: 크롤러 소스 이름
+            evidence_keys: 돌려줄 ``raw_data`` 키들 (비면 ``detail_`` 접두사 전부)
+
+        Returns:
+            ``{source_id: {key: value}}`` - 근거가 있는 행만
+        """
+        rows = self._conn.execute(
+            _sql(
+                "SELECT source_id, raw_data FROM announcements"
+                " WHERE source = ? AND raw_data LIKE '%detail_text%'"
+            ),
+            (source,),
+        ).fetchall()
+        found: Dict[str, dict] = {}
+        for row in rows:
+            payload = self._load_json(row["raw_data"])
+            if not isinstance(payload, dict):
+                continue
+            keys = evidence_keys or [
+                key for key in payload if str(key).startswith("detail_")
+            ]
+            kept = {key: payload[key] for key in keys if key in payload}
+            if kept:
+                found[str(row["source_id"])] = kept
+        return found
+
     def search_announcements(self, query: str, limit: int = 20) -> List[AnalyzedAnnouncement]:
         """Full-text search across title and summary.
 

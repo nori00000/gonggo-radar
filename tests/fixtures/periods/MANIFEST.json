@@ -1,0 +1,146 @@
+{
+  "kofpi": {
+    "source": "kofpi",
+    "title": "[모집] 2026 산림분야 오픈이노베이션 참여기업 모집(~9.30)",
+    "url": "https://www.kofpi.or.kr/notice/notice_01view.do?bb_seq=12658",
+    "fetched": "2026-09-15",
+    "chars": 976,
+    "truncated": false,
+    "detail_label_count": 1,
+    "detail_conflict_cue": "",
+    "reason": null
+  },
+  "forest_service": {
+    "source": "forest_service",
+    "title": "2026년도 제2차 산림형 예비사회적기업 지정 계획 공고",
+    "url": "https://www.forest.go.kr/kfsweb/cop/bbs/selectBoardArticle.do?nttId=3223976&bbsId=BBSMSTR_1032&mn=NKFS_04_01_02",
+    "fetched": "2026-09-15",
+    "chars": 497,
+    "truncated": false,
+    "detail_label_count": 1,
+    "detail_conflict_cue": "",
+    "reason": null
+  },
+  "socialenterprise": {
+    "source": "socialenterprise",
+    "title": "★ 2027년 사회연대경제 오프라인 판매장 스토어36.5 신규 협력매장 모집(~9.28.(월) 13:00)",
+    "url": "https://www.socialenterprise.or.kr/homepage/bbs/boardView.do?bsIdx=10002&bIdx=252623&page=1&menuId=822&bcIdx=10002",
+    "fetched": "2026-09-15",
+    "chars": 1272,
+    "truncated": false,
+    "detail_label_count": 1,
+    "detail_conflict_cue": "",
+    "reason": null
+  },
+  "coop": {
+    "source": "coop",
+    "title": "2026 사회적협동조합·사회적기업 대상 공공조달 및 민간위탁 1:1 맞춤형 컨설팅」 참여기업 모집 공고",
+    "url": "https://www.coop.go.kr/home/boardView.do?brd_mgrno=2&menu_no=2038&brd_no=14826",
+    "fetched": "2026-09-15",
+    "chars": 2000,
+    "truncated": true,
+    "detail_label_count": 2,
+    "detail_conflict_cue": "회차",
+    "reason": "근거 절단"
+  },
+  "mafra": {
+    "source": "mafra",
+    "title": "「농지법 시행령」 일부개정령안 입법예고",
+    "url": "http://www.mafra.go.kr/bbs/home/791/578640/artclView.do",
+    "fetched": "2026-09-15",
+    "chars": 113,
+    "truncated": false,
+    "detail_label_count": 0,
+    "detail_conflict_cue": "",
+    "reason": "근거 없음"
+  },
+  "coop_full": {
+    "source": "coop",
+    "title": "2026 사회적협동조합·사회적기업 대상 공공조달 및 민간위탁 1:1 맞춤형 컨설팅」 참여기업 모집 공고",
+    "url": "https://www.coop.go.kr/home/boardView.do?brd_mgrno=2&menu_no=2038&brd_no=14826",
+    "fetched": "2026-09-15",
+    "chars": 2291,
+    "truncated": false,
+    "detail_label_count": 2,
+    "detail_conflict_cue": "회차",
+    "reason": "라벨 중복",
+    "note": "본문 전체 - 3행 회차 표가 들어 있다"
+  },
+  "kofpi_footnote_extension": {
+    "source": "kofpi",
+    "title": "2026년 한국임업진흥원 Ⅹ 마르쉐 「먹거리 숲」 참가기업 모집 연장 공고(~9.11)",
+    "url": "https://www.kofpi.or.kr/notice/notice_01view.do?bb_seq=12611",
+    "fetched": "2026-09-15",
+    "chars": 874,
+    "truncated": false,
+    "detail_label_count": 1,
+    "detail_conflict_cue": "연장",
+    "reason": "근거 충돌"
+  },
+  "kofpi_always_open": {
+    "source": "kofpi",
+    "title": "[모집] 산양삼 등 산촌자원 활용 시제품 개발 지원 참여자 모집(연중 상시 모집)",
+    "url": "https://www.kofpi.or.kr/notice/notice_01view.do?bb_seq=12609",
+    "fetched": "2026-09-15",
+    "chars": 1279,
+    "truncated": false,
+    "detail_label_count": 1,
+    "detail_conflict_cue": "연중",
+    "reason": "근거 충돌"
+  },
+  "kofpi_title_extension": {
+    "source": "kofpi",
+    "title": "[모집] 2026년도 중소기업 ESG 경영 컨설팅 지원사업 참여기업 모집(연장)(~9.3)",
+    "url": "https://www.kofpi.or.kr/notice/notice_01view.do?bb_seq=12596",
+    "fetched": "2026-09-15",
+    "chars": 956,
+    "truncated": false,
+    "detail_label_count": 1,
+    "detail_conflict_cue": "연장",
+    "reason": "근거 충돌"
+  },
+  "kofpi_section_boundary": {
+    "source": "kofpi",
+    "title": "[모집] 2026년 제2차 해외산림자원개발 이차보전 사업 공고 (~9.11)",
+    "url": "https://www.kofpi.or.kr/notice/notice_01view.do?bb_seq=12590",
+    "fetched": "2026-09-15",
+    "chars": 616,
+    "truncated": false,
+    "detail_label_count": 1,
+    "detail_conflict_cue": "",
+    "reason": null
+  },
+  "socialenterprise_deadline_only": {
+    "source": "socialenterprise",
+    "title": "2026년 사회연대경제기업 공공구매 상담회(대구) 참가기업 모집 공고(~9/14(월))",
+    "url": "https://www.socialenterprise.or.kr/homepage/bbs/boardView.do?bsIdx=10002&bIdx=252617&page=1&menuId=822&bcIdx=10002",
+    "fetched": "2026-09-15",
+    "chars": 741,
+    "truncated": false,
+    "detail_label_count": 1,
+    "detail_conflict_cue": "",
+    "reason": null
+  },
+  "kofpi_truncated": {
+    "source": "kofpi",
+    "title": "[모집] 산촌 이음 숲여행 10대 코스 발굴 국민참여단 2기 모집 공고(~ 9.3)",
+    "url": "https://www.kofpi.or.kr/notice/notice_01view.do?bb_seq=12643",
+    "fetched": "2026-09-15",
+    "chars": 81,
+    "truncated": true,
+    "detail_label_count": 0,
+    "detail_conflict_cue": "",
+    "reason": "근거 절단"
+  },
+  "kofpi_duplicate_label": {
+    "source": "kofpi",
+    "title": "[모집]「2025년 산림분야 미래인재 양성 프로그램 시범사업」 운영기관 모집 공고",
+    "url": "https://www.kofpi.or.kr/notice/notice_03view.do?bb_seq=12059",
+    "fetched": "2026-09-15",
+    "chars": 1394,
+    "truncated": false,
+    "detail_label_count": 2,
+    "detail_conflict_cue": "",
+    "reason": "라벨 중복"
+  }
+}

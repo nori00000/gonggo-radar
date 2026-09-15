@@ -1015,6 +1015,9 @@ GUARD_EXEMPT_DB_FUNCTIONS = {
     "clear_periods_except",
     "overwrite_periods",
     "get_quote_attempts",
+    # 상세 근거 보존·회전 — 협의회 단독 행에도 마감이 있다. 가드를 달면 그
+    # 행들의 근거가 "없는 것" 이 되어 재수집 때 마감이 지워진다 (P2-D 라운드 2).
+    "get_detail_evidence",
     # id 를 가진 쪽이 이미 대상을 골랐다 - 가드를 달면 존재하는 id 가 조용히
     # None 이 된다 (텔레그램 /app, 지식 레이어).
     "get_announcement_by_id",

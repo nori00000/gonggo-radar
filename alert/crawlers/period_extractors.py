@@ -173,15 +173,317 @@ def lawmaking_period(raw: Dict[str, object]) -> Period:
     return _range_only(_normalize(raw.get("period")))
 
 
-# 16차 게이트: bizinfo·g2b 추출기는 **등록 해제**했다. 두 소스는 회사용
-# 경로여서 협의회 브리핑과 무관하고, 그 기간을 유지하려다 식별자 설계가
-# 사이클마다 새 경합을 만들었다. 지금은 정규화가 두 소스의 기간을 비운다.
+# ---------------------------------------------------------------------------
+# 상세 본문 근거로 읽는 기간 (P2-D) - 목록·제목은 절대 보지 않는다
+# ---------------------------------------------------------------------------
+#
+# 세 소스(forest_service·kofpi·socialenterprise)는 **목록에 마감이 없다**.
+# 목록 제목의 ``(~9.30)`` 은 연도가 없어서 연도를 추정해야 하는데, 추정은 이
+# 모듈이 열세 차례 거절한 바로 그 동작이다(2025년 공고가 2026년 마감이 됐다).
+# 그래서 마감은 **상세 본문의 기간 라벨 한 자리**에서만 읽는다. 본문은
+# ``alert.crawlers.period_detail`` 이 항목당 한 번 받아 ``raw_data`` 에
+# 싣고, 아래 함수들은 그 문자열만 읽는 **순수 함수**다.
+#
+# 라운드 2·3 (Codex 게이트) 가 막은 자리:
+#   ① 각주·연장: ``접수기간 2026. 9. 1. ~ 9. 16. ※ 2026. 9. 30.까지 연장`` 이
+#      9-16 을 만들었다. 라운드 2 는 값 **뒤**만 봤고, 라운드 3 은 단서 스캔을
+#      **본문 전체**로 넓혔다 - 정정은 라벨 앞에도, 다른 글머리표 아래에도 온다.
+#   ② 잘린 창: 정정이 창 밖에 있을 수 있다 → 잘렸으면 아예 읽지 않는다.
+#      라벨 수·충돌 단서도 창이 아니라 **본문 전체**에서 센다.
+#   ③ 한 라벨 아래의 회차 표: 첫 행만 읽혔다 → 값 뒤에 남는 것이 있으면 거절.
+#   ④ 근거가 **어느 URL 의 것인지**(``detail_text_url``): URL 이 바뀐 항목에
+#      옛 근거를 물려주면 남의 마감을 쓰게 된다.
+#   ⑤ "안 받았다" 와 "받았는데 비었다" 는 다르다 → 후자는 ``근거 소실``.
+
+DETAIL_TEXT_FIELD = "detail_text"
+DETAIL_TEXT_TRUNCATED_FIELD = "detail_text_truncated"
+DETAIL_LABEL_COUNT_FIELD = "detail_label_count"
+DETAIL_CONFLICT_CUE_FIELD = "detail_conflict_cue"
+DETAIL_TEXT_URL_FIELD = "detail_text_url"
+DETAIL_TEXT_FETCHED_AT_FIELD = "detail_text_fetched_at"
+
+# 판정을 거절한 이유 (순수 함수가 돌려준다 - 저장하지 않는다)
+REASON_NO_EVIDENCE = "근거 없음"
+REASON_LOST = "근거 소실"
+REASON_TRUNCATED = "근거 절단"
+REASON_CONFLICT = "근거 충돌"
+REASON_AMBIGUOUS_LABEL = "라벨 중복"
+REASON_SHAPE = "형태 불일치"
+
+# 기간 라벨 - 이 넷만 접수 마감을 뜻한다. ``일시``·``행사``·``교육기간`` 처럼
+# 다른 일정을 가리키는 라벨은 여기 없으므로 영원히 매치되지 않는다.
+# 앞에 한글이 붙은 말(``사업기간``·``운영기간``)도 다른 라벨이다.
+_PERIOD_LABEL = r"(?<![가-힣])(?:접수|모집|공모|신청)\s*기간"
+_LABEL_SCAN = re.compile(_PERIOD_LABEL)
+
+# 블록 경계 - 여기서 한 라벨의 값이 끝난다.
+#
+# ``※``·``*`` 는 **경계가 아니다**: 각주가 그 값의 정정일 수 있으므로,
+# 경계로 삼으면 정정을 못 보고 옛 날짜를 쓴다.
+_BULLETS = "ㅁㅇ□■○◦●▶◆•"
+# 두 자리 연도 표기 앞에 오는 아포스트로피 (``’26. 9. 28.``)
+_APOS = "'’‘`"
+
+# 값 뒤에 이것이 오면 **다른 절이 시작된 것**이다. 날짜를 품을 수 있는 말
+# (심사·선정·발표·교육 …)은 **일부러 넣지 않았다**: 그런 말이 뒤따르면
+# 어디까지가 접수기간인지 알 수 없으므로 거절이 맞다.
+_SECTION_WORDS = (
+    "첨부파일", "첨부", "붙임", "문의처", "문의", "담당부서", "담당자", "담당",
+    "신청방법", "접수방법", "제출방법", "제출서류", "이전글", "다음글", "목록",
+)
+_BLOCK_END = re.compile(
+    rf"[{_BULLETS}]|(?:{'|'.join(_SECTION_WORDS)})|{_PERIOD_LABEL}"
+)
+
+# 글머리표 **다음이 날짜로 이어지면** 같은 값의 둘째 줄이다 - 거기서 끊지
+# 않는다(라운드 3 Codex HIGH ①). 끊어 버리면 ``○ 9월 30일까지 연장`` 같은
+# 정정 줄이 블록 밖으로 나가 보이지 않는다. 블록에 들어오면 아래 잔여 검사가
+# 잡는다. ``ㅁ 모집대상 … 창업 7년 이내`` 처럼 날짜가 아닌 숫자는 이어지지
+# 않는다 - 숫자만으로 판단하면 멀쩡한 다음 절까지 삼킨다.
+_DATE_HINT = re.compile(
+    r"\d{4}\s*\.\s*\d{1,2}|\d{1,2}\s*\.\s*\d{1,2}\s*\.|"
+    r"\d{1,2}\s*월\s*\d{1,2}\s*일|[~∼〜]\s*\d"
+)
+_CONTINUATION_LOOKAHEAD = 80
+
+# 값 뒤에 남은 말이 이것을 품으면 **근거가 스스로 충돌한다** → 거절.
+# 숫자가 남는 것도 충돌로 본다(두 번째 날짜·회차 번호·표의 다음 행).
+_BLOCK_CONFLICT = re.compile(
+    r"[※*\d]|연장|변경|정정|철회|폐지|상시|수시|연중|회차|차수|추가\s*모집"
+)
+
+# **본문 전체**에서 찾는 충돌 단서 (라운드 3 Codex HIGH ①).
+# 정정·연장은 라벨 뒤에만 오지 않는다 - 라벨 **앞**의 각주에도, 다른 글머리표
+# 아래에도 온다. 그래서 낱말 단서는 블록이 아니라 본문 전체를 훑는다.
+#
+# 숫자·``※`` 는 여기 없다: 어느 공고에나 있어 전역 스캔에서는 뜻이 없다.
+# 그 둘은 블록 잔여 검사(``_BLOCK_CONFLICT``)의 몫이다.
+CONFLICT_CUES = (
+    "연장", "변경", "정정", "철회", "폐지",
+    "상시", "수시", "연중", "회차", "차수", "추가모집", "재공고",
+)
+_CONFLICT_CUE = re.compile("|".join(CONFLICT_CUES))
+
+# 본문 끝의 **다른 공고 제목**(이전글/다음글 네비게이션)은 이 공고의 내용이
+# 아니다. 실측: 통과 9건 중 4건이 이웃 글 제목의 ``연장``·``변경`` 때문에
+# 거절될 뻔했다. 잘라내는 자리는 결정론적이다.
+_NAVIGATION = re.compile(r"이전글|다음글")
+
+_TERMINATOR = r"(?:\s*(?:까지|접수\s*마감|마감))"
+
+_SHORT_DATE = rf"[{_APOS}]\s*\d{{2}}\s*\.\s*\d{{1,2}}\s*\.\s*\d{{1,2}}\s*\.?"
+_WEEKDAY = r"(?:\s*\(\s*[월화수목금토일]\s*\))?"
+_CLOCK = r"\s*,?(?:\s*\d{1,2}\s*:\s*\d{2})?"
+
+_DETAIL_PERIOD = re.compile(
+    rf"\A[(（]?\s*{_PERIOD_LABEL}\s*[)）]?\s*[:：]?\s*"
+    rf"(?:"
+    rf"(?:(?P<start>{_FULL_DATE}|{_SHORT_DATE}){_WEEKDAY}{_CLOCK}|공고일)"
+    rf"\s*[~∼〜-]\s*"
+    rf"(?P<end>{_FULL_DATE}|{_SHORT_DATE}|{_MONTH_DAY}){_WEEKDAY}{_CLOCK}"
+    rf"{_TERMINATOR}?"
+    rf"|"
+    rf"(?P<only>{_FULL_DATE}|{_SHORT_DATE}){_WEEKDAY}{_CLOCK}{_TERMINATOR}"
+    rf")"
+)
+
+_APOS_PREFIX = re.compile(rf"^[{_APOS}]")
+
+
+def announcement_body(text: object) -> str:
+    """이 공고의 본문 - 끝의 이전글/다음글 네비게이션은 잘라낸다."""
+    normalized = _normalize(text)
+    match = _NAVIGATION.search(normalized)
+    return normalized[:match.start()] if match else normalized
+
+
+def count_period_labels(text: object) -> int:
+    """기간 라벨이 몇 번 나오는가. **본문 전체**를 세라 (라운드 2 HIGH ②)."""
+    return len(_LABEL_SCAN.findall(announcement_body(text)))
+
+
+def find_conflict_cue(text: object) -> str:
+    """본문 전체의 첫 충돌 단서. 없으면 빈 문자열 (라운드 3 HIGH ①)."""
+    match = _CONFLICT_CUE.search(announcement_body(text))
+    return match.group(0) if match else ""
+
+
+def _iso_date(token: str, fallback_year: Optional[int] = None) -> Optional[str]:
+    """날짜 토큰 하나를 ISO 로. 달력에 없는 날짜와 모호한 토큰은 None.
+
+    ``’26. 9. 28.`` 의 두 자리 연도는 ``2026`` 으로 읽는다 - 아포스트로피가
+    붙은 표기에서만이며, 맨 숫자 두 자리는 연도로 보지 않는다.
+    ``9. 28.`` 처럼 연도가 없는 토큰은 ``fallback_year``(시작일의 연도)가
+    있을 때만 읽는다 - 연도 추정은 하지 않는다.
+    """
+    token = (token or "").strip()
+    numbers = _DIGITS.findall(token)
+    if _APOS_PREFIX.match(token):
+        if len(numbers) != 3 or len(numbers[0]) != 2:
+            return None
+        return _calendar_date(2000 + int(numbers[0]), int(numbers[1]), int(numbers[2]))
+    if len(numbers) == 3 and len(numbers[0]) == 4:
+        return _calendar_date(int(numbers[0]), int(numbers[1]), int(numbers[2]))
+    if len(numbers) == 2 and fallback_year is not None:
+        return _calendar_date(fallback_year, int(numbers[0]), int(numbers[1]))
+    return None
+
+
+def _labelled_block(text: str) -> Optional[str]:
+    """기간 라벨로 시작해 **다음 절이 시작되기 전까지**의 한 덩어리.
+
+    ``※``·``*`` 는 덩어리를 끝내지 않는다 - 각주는 이 값의 정정일 수 있다.
+    글머리표도 **그 뒤가 날짜로 이어지면** 끝내지 않는다 - 둘째 줄에 적힌
+    정정(``○ 9월 30일까지 연장``)이 덩어리 밖으로 새면 보이지 않는다.
+    """
+    match = _LABEL_SCAN.search(text)
+    if match is None:
+        return None
+    body_start = match.end()
+    cursor = body_start
+    while True:
+        end = _BLOCK_END.search(text, cursor)
+        if end is None:
+            return text[match.start():]
+        following = text[end.end():end.end() + _CONTINUATION_LOOKAHEAD]
+        is_bullet = end.group(0) in _BULLETS
+        if is_bullet and _DATE_HINT.search(following):
+            cursor = end.end()          # 같은 값의 둘째 줄이다 - 계속 읽는다
+            continue
+        return text[match.start():end.start()]
+
+
+def detail_period_reason(raw: Dict[str, object]) -> Optional[str]:
+    """``_detail_period`` 가 거절한 이유. 읽어냈으면 None.
+
+    순수 함수이며 저장되지 않는다 - 진단·테스트용이다.
+    """
+    text = _normalize(raw.get(DETAIL_TEXT_FIELD))
+    if not text:
+        # 받으러 갔는데 본문이 비어 온 것과, 아예 안 받은 것은 다르다.
+        if raw.get(DETAIL_TEXT_FETCHED_AT_FIELD):
+            return REASON_LOST
+        return REASON_NO_EVIDENCE
+    if raw.get(DETAIL_TEXT_TRUNCATED_FIELD):
+        return REASON_TRUNCATED          # 정정이 창 밖에 있을 수 있다
+
+    full_labels = raw.get(DETAIL_LABEL_COUNT_FIELD)
+    if not isinstance(full_labels, int) or isinstance(full_labels, bool):
+        return REASON_NO_EVIDENCE        # 본문 전체의 라벨 수를 모른다
+    if full_labels == 0:
+        return REASON_NO_EVIDENCE        # 본문에 기간 라벨 자체가 없다
+    if full_labels != 1:
+        return REASON_AMBIGUOUS_LABEL    # 창 밖에 두 번째 라벨이 있다
+    if len(_LABEL_SCAN.findall(text)) != 1:
+        return REASON_AMBIGUOUS_LABEL
+
+    cue = raw.get(DETAIL_CONFLICT_CUE_FIELD)
+    if not isinstance(cue, str):
+        return REASON_NO_EVIDENCE        # 본문 전체를 훑은 적이 없다
+    if cue:
+        return REASON_CONFLICT           # 본문 어딘가에 정정·연장·상시가 있다
+
+    block = _labelled_block(text)
+    if not block:
+        return REASON_NO_EVIDENCE
+    match = _DETAIL_PERIOD.match(block)
+    if not match:
+        return REASON_SHAPE
+    if _BLOCK_CONFLICT.search(block[match.end():]):
+        return REASON_CONFLICT           # 각주·회차·두 번째 날짜
+    return None
+
+
+def _detail_period(raw: Dict[str, object]) -> Period:
+    """기간 라벨이 **본문 전체에 정확히 하나** 있고, 본문에 정정 단서가 없고,
+    그 블록 첫머리 전체가 범위 하나(또는 "…까지" 한 날짜)이며, 블록에
+    **남는 것이 없을 때만** (시작, 종료)를 돌려준다.
+
+    거절 사유는 ``detail_period_reason`` 이 말한다.
+    """
+    if detail_period_reason(raw) is not None:
+        return None, None
+
+    block = _labelled_block(_normalize(raw.get(DETAIL_TEXT_FIELD)))
+    match = _DETAIL_PERIOD.match(block or "")
+    if match is None:                    # pragma: no cover - reason 이 먼저 막는다
+        return None, None
+
+    only_token = match.group("only")
+    if only_token:
+        # "…까지" 한 날짜 - 시작일은 페이지에 없다
+        end = _iso_date(only_token)
+        return (None, end) if end else (None, None)
+
+    start_token = match.group("start")
+    start = _iso_date(start_token) if start_token else None
+    if start_token and not start:
+        return None, None          # 달력에 없는 시작일 - 읽은 것이 아니다
+
+    end = _iso_date(
+        match.group("end"), fallback_year=int(start[:4]) if start else None
+    )
+    if not end:
+        return None, None
+    if start and end < start:
+        return None, None          # 뒤집힌 범위는 지어낸 것이다
+    return start, end
+
+
+def forest_service_period(raw: Dict[str, object]) -> Period:
+    """산림청 공고 - 상세의 ``접수기간`` 한 자리.
+
+    실측(2026-09-15, nttId=3223976):
+    ``ㅇ 접수기간 : 2026. 9. 7. ~ 9. 28. 18:00까지`` → 2026-09-07 / 2026-09-28.
+    목록에는 마감이 없다(``raw_data`` 에 ``date``·``posted`` 뿐).
+    """
+    return _detail_period(raw)
+
+
+def kofpi_period(raw: Dict[str, object]) -> Period:
+    """한국임업진흥원 - 상세의 ``모집기간`` 한 자리.
+
+    실측(2026-09-15, bb_seq=12658):
+    ``ㅁ 모집기간 2026. 9. 7.(월) ~ 9. 30.(수) 15:00까지`` → 2026-09-07 / 2026-09-30.
+
+    목록 제목의 ``(~9.30)`` 은 **여기서도 쓰지 않는다**. 연도가 없어 연도를
+    추정해야 하고, 그 추정이 12차까지 지난해 공고를 올해 마감으로 만들었다.
+    """
+    return _detail_period(raw)
+
+
+def socialenterprise_period(raw: Dict[str, object]) -> Period:
+    """한국사회적기업진흥원 - 상세의 ``공모기간`` 한 자리.
+
+    실측(2026-09-15, bIdx=252623):
+    ``□ (공모기간) 공고일 ~ 2026. 9. 28.(월) 13:00까지`` → (None, 2026-09-28).
+    시작이 "공고일" 이면 **종료일만** 만든다 - 게시일을 시작일로 옮겨 적는 것은
+    읽은 것이 아니라 지어낸 것이다.
+
+    제목의 ``('26.09.30.(수) 14:00, 대전)`` 류는 설명회 **행사 일시**이고 상세
+    에서도 ``일시`` 라벨 아래 있다. 기간 라벨이 아니므로 매치되지 않는다.
+    """
+    return _detail_period(raw)
+
+
+# 상세 근거 소스가 공유하는 근거 키 묶음.
+_DETAIL_EVIDENCE: Tuple[str, ...] = (
+    DETAIL_TEXT_FIELD,
+    DETAIL_TEXT_TRUNCATED_FIELD,
+    DETAIL_LABEL_COUNT_FIELD,
+    DETAIL_CONFLICT_CUE_FIELD,
+    DETAIL_TEXT_URL_FIELD,
+    DETAIL_TEXT_FETCHED_AT_FIELD,
+)
 
 
 # 기간을 만들 수 있는 소스 **전부**. 여기 없는 소스는 항상 None 이다.
 PERIOD_EXTRACTORS: Dict[str, Callable[[Dict[str, object]], Period]] = {
     "seis": seis_period,
     "lawmaking": lawmaking_period,
+    "forest_service": forest_service_period,
+    "kofpi": kofpi_period,
+    "socialenterprise": socialenterprise_period,
 }
 
 # 각 추출기가 **근거로 읽는** raw_data 키(+방증). 재수집 때 기간만 갱신하고
@@ -190,4 +492,9 @@ PERIOD_EXTRACTORS: Dict[str, Callable[[Dict[str, object]], Period]] = {
 EVIDENCE_KEYS: Dict[str, Tuple[str, ...]] = {
     "seis": ("date", "date_field", "dday"),
     "lawmaking": ("period",),
+    # 근거 넷은 **한 묶음**이다 - 하나만 남으면 옛 근거로 판정이 되살아난다
+    # (12차 게이트 HIGH 와 같은 자리, 라운드 2 LOW ④).
+    "forest_service": _DETAIL_EVIDENCE,
+    "kofpi": _DETAIL_EVIDENCE,
+    "socialenterprise": _DETAIL_EVIDENCE,
 }
