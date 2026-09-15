@@ -40,8 +40,10 @@ except Exception as _exc:              # noqa: BLE001
 
 try:
     from .crawlers.period_detail import (
-        MAX_PERIOD_DETAIL_REQUESTS,
+        DetailQuota,
         attach_detail_text,
+        carry_forward,
+        fetch_order,
         wants_period_detail,
     )
     from .utils.http_fetch import FetchBudget
@@ -51,7 +53,7 @@ except Exception as _detail_exc:       # noqa: BLE001
     logging.getLogger(__name__).error(
         "period detail unavailable (%s) - 상세 근거 없이 간다", _detail_exc
     )
-    MAX_PERIOD_DETAIL_REQUESTS = 0
+    DetailQuota = None                 # type: ignore[assignment]
     FetchBudget = None                 # type: ignore[assignment]
 
     def wants_period_detail(source: object) -> bool:   # type: ignore[misc]
@@ -59,6 +61,12 @@ except Exception as _detail_exc:       # noqa: BLE001
 
     def attach_detail_text(*_args, **_kwargs) -> bool:  # type: ignore[misc]
         return False
+
+    def carry_forward(*_args, **_kwargs) -> bool:      # type: ignore[misc]
+        return False
+
+    def fetch_order(items, prior=None):                # type: ignore[misc]
+        return []
 
 
 # ---------------------------------------------------------------------------
@@ -542,6 +550,12 @@ def run_pipeline(test_mode: bool = False) -> None:
             logger.info(f"\n--- Crawled: {crawler_name} ({status}, {len(raw_announcements)} items) ---")
 
     # Process crawl results sequentially (analysis/DB are not thread-safe)
+    # 상세 근거 요청 상한·시간 예산은 **잡 전체**가 하나씩 나눠 쓴다.
+    # 소스별로 두면 소스 수만큼 곱해져 예산이 새고, 목록이 상한보다 길 때
+    # 뒤쪽 항목이 매 실행 굶는다 (라운드 2 Codex MEDIUM ③).
+    detail_quota = DetailQuota() if DetailQuota is not None else None
+    detail_budget = FetchBudget() if FetchBudget is not None else None
+
     for crawler_name, (raw_announcements, status) in crawl_results.items():
         logger.info(f"\n--- Processing: {crawler_name} ---")
 
@@ -578,22 +592,39 @@ def run_pipeline(test_mode: bool = False) -> None:
             period_reset_count = 0
 
             # ── 상세 근거 수집 ────────────────────────────────────
-            # 목록에 마감이 없는 소스만, 항목당 **한 번**, 예산 안에서 받는다.
+            # 목록에 마감이 없는 소스만, 항목당 HTTP **한 번**, 잡 전체 상한
+            # 안에서 받는다. 누가 먼저 받을지는 **마지막 수집이 오래된 것부터**
+            # 다. 상한에 걸려 이번에 못 받은 항목은 옛 근거를 그대로 다시 실어
+            # (``carry_forward``) 저장된 마감이 지워지지 않게 한다.
             # 기간은 여기서 만들지 않는다 - 아래 관문이 순수 추출기로 정한다.
-            detail_budget = (
-                FetchBudget()
-                if FetchBudget is not None and wants_period_detail(crawler_name)
-                else None
-            )
-            detail_quota = MAX_PERIOD_DETAIL_REQUESTS
             detail_hits = 0
+            detail_kept = 0
+            detail_prior: Dict[str, dict] = {}
+            detail_planned: set = set()
+            if wants_period_detail(crawler_name) and detail_quota is not None:
+                try:
+                    detail_prior = db.get_detail_evidence(crawler_name)
+                except Exception as detail_error:          # noqa: BLE001
+                    logger.error(f"detail evidence lookup failed: {detail_error}")
+                detail_planned = {
+                    str(item.source_id)
+                    for item in fetch_order(raw_announcements, detail_prior)[
+                        : detail_quota.remaining
+                    ]
+                }
 
             for raw_ann in raw_announcements:
-                if detail_budget is not None and detail_quota > 0:
-                    detail_quota -= 1
+                if wants_period_detail(raw_ann.source):
                     try:
-                        if attach_detail_text(raw_ann, budget=detail_budget):
-                            detail_hits += 1
+                        if str(raw_ann.source_id) in detail_planned:
+                            if attach_detail_text(
+                                raw_ann, budget=detail_budget, quota=detail_quota
+                            ):
+                                detail_hits += 1
+                            elif carry_forward(raw_ann, detail_prior):
+                                detail_kept += 1        # 예산 소진 - 옛 근거 보존
+                        elif carry_forward(raw_ann, detail_prior):
+                            detail_kept += 1
                     except Exception as detail_error:      # noqa: BLE001
                         logger.debug(
                             f"detail evidence failed for "
@@ -655,6 +686,7 @@ def run_pipeline(test_mode: bool = False) -> None:
                 f"{f', {quote_merge_count} quote merges' if quote_merge_count else ''}"
                 f"{f', {period_reset_count} period resets' if period_reset_count else ''}"
                 f"{f', {detail_hits} detail evidence' if detail_hits else ''}"
+                f"{f', {detail_kept} detail kept' if detail_kept else ''}"
             )
 
             if new_count == 0 and not recheck_raw:

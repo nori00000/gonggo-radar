@@ -182,34 +182,61 @@ def lawmaking_period(raw: Dict[str, object]) -> Period:
 # 모듈이 열세 차례 거절한 바로 그 동작이다(2025년 공고가 2026년 마감이 됐다).
 # 그래서 마감은 **상세 본문의 기간 라벨 한 자리**에서만 읽는다. 본문은
 # ``alert.crawlers.period_detail`` 이 항목당 한 번 받아 ``raw_data`` 에
-# 싣고(``detail_text``), 아래 함수들은 그 문자열만 읽는 **순수 함수**다.
+# 싣고, 아래 함수들은 그 문자열만 읽는 **순수 함수**다.
 #
 # 근거 본문을 자르지 않고 창 그대로 저장하는 이유: 자르는 규칙을 나중에
 # 좁혀도 재검증이 옛 행에 새 규칙을 다시 적용할 수 있어야 한다.
+#
+# 라운드 2 (Codex 게이트) 가 막은 세 구멍:
+#   ① 각주·연장: ``접수기간 2026. 9. 1. ~ 9. 16. ※ 2026. 9. 30.까지 연장`` 이
+#      9-16 을 만들었다. ``※``·``*`` 를 **필드 경계로 쓰던 것**이 원인이다 -
+#      각주는 그 필드의 **정정**일 수 있으므로 경계가 아니라 **충돌**이다.
+#   ② 잘린 창: 정정 문구가 창 밖에 있을 수 있다 → 잘렸으면 아예 읽지 않는다.
+#      라벨 수도 창이 아니라 **본문 전체**에서 센다.
+#   ③ 한 라벨 아래의 회차 표: 첫 행만 읽혔다 → 값 뒤에 남는 것이 있으면 거절.
 
 DETAIL_TEXT_FIELD = "detail_text"
 DETAIL_TEXT_TRUNCATED_FIELD = "detail_text_truncated"
+DETAIL_LABEL_COUNT_FIELD = "detail_label_count"
+
+# 판정을 거절한 이유 (순수 함수가 돌려준다 - 저장하지 않는다)
+REASON_NO_EVIDENCE = "근거 없음"
+REASON_TRUNCATED = "근거 절단"
+REASON_CONFLICT = "근거 충돌"
+REASON_AMBIGUOUS_LABEL = "라벨 중복"
+REASON_SHAPE = "형태 불일치"
 
 # 기간 라벨 - 이 넷만 접수 마감을 뜻한다. ``일시``·``행사``·``교육기간`` 처럼
 # 다른 일정을 가리키는 라벨은 여기 없으므로 영원히 매치되지 않는다.
-_PERIOD_LABEL = r"(?:접수|모집|공모|신청)\s*기간"
+# 앞에 한글이 붙은 말(``사업기간``·``운영기간``)도 다른 라벨이다.
+_PERIOD_LABEL = r"(?<![가-힣])(?:접수|모집|공모|신청)\s*기간"
 _LABEL_SCAN = re.compile(_PERIOD_LABEL)
 
-# 본문 창에서 필드 경계로 쓰는 글머리표. 이 문자들 사이가 한 항목이다.
-# ``*``·``※`` 는 각주 표시다 - 각주가 시작되면 그 라벨의 **값은 끝났다**
-# (각주가 "예산 소진 시 조기마감" 을 덧붙여도 적힌 종료일은 그대로다).
-_BULLETS = "ㅁㅇ□■○◦●▶◆※•*"
+# 블록 경계 - 여기서 한 라벨의 값이 끝난다.
+#
+# ``※``·``*`` 는 **경계가 아니다** (라운드 2 Codex HIGH ①): 각주가 그 값의
+# 연장·정정일 수 있으므로, 경계로 삼으면 정정을 못 보고 옛 날짜를 쓴다.
+# 각주는 아래 ``_CONFLICT`` 가 충돌로 잡는다.
+_BULLETS = "ㅁㅇ□■○◦●▶◆•"
 # 두 자리 연도 표기 앞에 오는 아포스트로피 (``’26. 9. 28.``)
 _APOS = "'’‘`"
 
-# 값 뒤에 이것이 오면 **다른 절이 시작된 것**이다 - 라벨의 값은 여기서 끝난다.
-# 날짜를 품을 수 있는 말(심사·선정·발표·교육 …)은 **일부러 넣지 않았다**:
-# 그런 말이 뒤따르면 어디까지가 접수기간인지 알 수 없으므로 거절이 맞다.
+# 값 뒤에 이것이 오면 **다른 절이 시작된 것**이다. 날짜를 품을 수 있는 말
+# (심사·선정·발표·교육 …)은 **일부러 넣지 않았다**: 그런 말이 뒤따르면
+# 어디까지가 접수기간인지 알 수 없으므로 거절이 맞다.
 _SECTION_WORDS = (
     "첨부파일", "첨부", "붙임", "문의처", "문의", "담당부서", "담당자", "담당",
     "신청방법", "접수방법", "제출방법", "제출서류", "이전글", "다음글", "목록",
 )
-_TAIL = rf"(?=$|[{_BULLETS}]|(?:{'|'.join(_SECTION_WORDS)}))"
+_BLOCK_END = re.compile(
+    rf"[{_BULLETS}]|(?:{'|'.join(_SECTION_WORDS)})|{_PERIOD_LABEL}"
+)
+
+# 값 뒤에 남은 말이 이것을 품으면 **근거가 스스로 충돌한다** → 거절.
+# 숫자가 남는 것도 충돌로 본다(두 번째 날짜·회차 번호·표의 다음 행).
+_CONFLICT = re.compile(
+    r"[※*\d]|연장|변경|정정|철회|폐지|상시|수시|연중|회차|차수|추가\s*모집"
+)
 
 # 마감을 뜻하는 문맥 낱말. 날짜 하나만 있을 때는 **필수**다 - 이 말이 없으면
 # 그 날짜가 시작인지 끝인지 행사일인지 페이지가 말하지 않은 것이다.
@@ -220,17 +247,13 @@ _WEEKDAY = r"(?:\s*\(\s*[월화수목금토일]\s*\))?"
 # 요일 뒤에 쉼표가 오는 표기 (``2026. 9. 11.(금), 18:00까지``)
 _CLOCK = r"\s*,?(?:\s*\d{1,2}\s*:\s*\d{2})?"
 
-# 라벨 **한 자리 전체**가 범위 하나(또는 "…까지" 한 날짜)여야 한다 -
-# ``_RANGE_ONLY`` 와 같은 규율을 본문 창에 적용한 것이다. 뒤는 다음 글머리표·
-# 다른 절·창의 끝으로 막아 **옆 항목의 날짜가 들어오지 못하게** 한다.
-#
-# 라벨 앞에 한글이 붙은 말(``사업기간``·``운영기간``)은 다른 라벨이므로
-# ``(?<![가-힣])`` 로 막는다.
+# 블록 **첫머리 전체**가 범위 하나(또는 "…까지" 한 날짜)여야 한다. 뒤에 남는
+# 것은 ``_CONFLICT`` 가 본다.
 #
 # 시작이 ``공고일`` 인 형태(socialenterprise 실측)는 **종료일만** 만든다 -
 # "공고일" 은 날짜가 아니므로 시작일을 지어내지 않는다.
 _DETAIL_PERIOD = re.compile(
-    rf"(?<![가-힣])[(（]?\s*{_PERIOD_LABEL}\s*[)）]?\s*[:：]?\s*"
+    rf"\A[(（]?\s*{_PERIOD_LABEL}\s*[)）]?\s*[:：]?\s*"
     rf"(?:"
     rf"(?:(?P<start>{_FULL_DATE}|{_SHORT_DATE}){_WEEKDAY}{_CLOCK}|공고일)"
     rf"\s*[~∼〜-]\s*"
@@ -239,10 +262,14 @@ _DETAIL_PERIOD = re.compile(
     rf"|"
     rf"(?P<only>{_FULL_DATE}|{_SHORT_DATE}){_WEEKDAY}{_CLOCK}{_TERMINATOR}"
     rf")"
-    rf"\s*{_TAIL}"
 )
 
 _APOS_PREFIX = re.compile(rf"^[{_APOS}]")
+
+
+def count_period_labels(text: object) -> int:
+    """기간 라벨이 몇 번 나오는가. **본문 전체**를 세라 (라운드 2 HIGH ②)."""
+    return len(_LABEL_SCAN.findall(_normalize(text)))
 
 
 def _iso_date(token: str, fallback_year: Optional[int] = None) -> Optional[str]:
@@ -266,24 +293,64 @@ def _iso_date(token: str, fallback_year: Optional[int] = None) -> Optional[str]:
     return None
 
 
-def _detail_period(raw: Dict[str, object]) -> Period:
-    """``detail_text`` 창에 기간 라벨이 **정확히 하나** 있고 그 자리 전체가
-    범위 하나일 때만 (시작, 종료)를 돌려준다.
+def _labelled_block(text: str) -> Optional[str]:
+    """기간 라벨로 시작해 **다음 절이 시작되기 전까지**의 한 덩어리.
 
-    라벨이 둘 이상이면 어느 쪽이 이 공고의 접수인지 페이지가 말하지 않으므로
-    아무 것도 만들지 않는다 (9차 게이트 HIGH 와 같은 규율). 잘린 창의 마지막
-    조각도 쓰지 않는다 - 뒤가 잘렸으면 그 범위가 끝났는지 알 수 없다.
+    ``※``·``*`` 는 덩어리를 끝내지 않는다 - 각주는 이 값의 정정일 수 있다.
     """
+    match = _LABEL_SCAN.search(text)
+    if match is None:
+        return None
+    rest = text[match.end():]
+    end = _BLOCK_END.search(rest)
+    return text[match.start():match.end() + (end.start() if end else len(rest))]
+
+
+def detail_period_reason(raw: Dict[str, object]) -> Optional[str]:
+    """``_detail_period`` 가 거절한 이유. 읽어냈으면 None.
+
+    순수 함수이며 저장되지 않는다 - 진단·테스트용이다.
+    """
+    if raw.get(DETAIL_TEXT_TRUNCATED_FIELD):
+        return REASON_TRUNCATED          # 정정이 창 밖에 있을 수 있다
     text = _normalize(raw.get(DETAIL_TEXT_FIELD))
     if not text:
-        return None, None
+        return REASON_NO_EVIDENCE
+
+    full_labels = raw.get(DETAIL_LABEL_COUNT_FIELD)
+    if not isinstance(full_labels, int) or isinstance(full_labels, bool):
+        return REASON_NO_EVIDENCE        # 본문 전체의 라벨 수를 모른다
+    if full_labels == 0:
+        return REASON_NO_EVIDENCE        # 본문에 기간 라벨 자체가 없다
+    if full_labels != 1:
+        return REASON_AMBIGUOUS_LABEL    # 창 밖에 두 번째 라벨이 있다
     if len(_LABEL_SCAN.findall(text)) != 1:
+        return REASON_AMBIGUOUS_LABEL
+
+    block = _labelled_block(text)
+    if not block:
+        return REASON_NO_EVIDENCE
+    match = _DETAIL_PERIOD.match(block)
+    if not match:
+        return REASON_SHAPE
+    if _CONFLICT.search(block[match.end():]):
+        return REASON_CONFLICT           # 각주·연장·회차·두 번째 날짜
+    return None
+
+
+def _detail_period(raw: Dict[str, object]) -> Period:
+    """기간 라벨이 **본문 전체에 정확히 하나** 있고, 그 블록 첫머리 전체가
+    범위 하나(또는 "…까지" 한 날짜)이며, 블록에 **남는 것이 없을 때만**
+    (시작, 종료)를 돌려준다.
+
+    거절 사유는 ``detail_period_reason`` 이 말한다.
+    """
+    if detail_period_reason(raw) is not None:
         return None, None
 
-    match = _DETAIL_PERIOD.search(text)
-    if not match:
-        return None, None
-    if raw.get(DETAIL_TEXT_TRUNCATED_FIELD) and match.end() >= len(text):
+    block = _labelled_block(_normalize(raw.get(DETAIL_TEXT_FIELD)))
+    match = _DETAIL_PERIOD.match(block or "")
+    if match is None:                    # pragma: no cover - reason 이 먼저 막는다
         return None, None
 
     only_token = match.group("only")
@@ -348,6 +415,15 @@ def socialenterprise_period(raw: Dict[str, object]) -> Period:
 # 사이클마다 새 경합을 만들었다. 지금은 정규화가 두 소스의 기간을 비운다.
 
 
+# 상세 근거 소스가 공유하는 근거 키 묶음.
+_DETAIL_EVIDENCE: Tuple[str, ...] = (
+    DETAIL_TEXT_FIELD,
+    DETAIL_TEXT_TRUNCATED_FIELD,
+    DETAIL_LABEL_COUNT_FIELD,
+    "detail_text_fetched_at",
+)
+
+
 # 기간을 만들 수 있는 소스 **전부**. 여기 없는 소스는 항상 None 이다.
 PERIOD_EXTRACTORS: Dict[str, Callable[[Dict[str, object]], Period]] = {
     "seis": seis_period,
@@ -363,7 +439,9 @@ PERIOD_EXTRACTORS: Dict[str, Callable[[Dict[str, object]], Period]] = {
 EVIDENCE_KEYS: Dict[str, Tuple[str, ...]] = {
     "seis": ("date", "date_field", "dday"),
     "lawmaking": ("period",),
-    "forest_service": (DETAIL_TEXT_FIELD, DETAIL_TEXT_TRUNCATED_FIELD),
-    "kofpi": (DETAIL_TEXT_FIELD, DETAIL_TEXT_TRUNCATED_FIELD),
-    "socialenterprise": (DETAIL_TEXT_FIELD, DETAIL_TEXT_TRUNCATED_FIELD),
+    # 근거 넷은 **한 묶음**이다 - 하나만 남으면 옛 근거로 판정이 되살아난다
+    # (12차 게이트 HIGH 와 같은 자리, 라운드 2 LOW ④).
+    "forest_service": _DETAIL_EVIDENCE,
+    "kofpi": _DETAIL_EVIDENCE,
+    "socialenterprise": _DETAIL_EVIDENCE,
 }
