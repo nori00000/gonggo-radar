@@ -38,6 +38,28 @@ except Exception as _exc:              # noqa: BLE001
     PERIOD_EXTRACTORS = {}
     EVIDENCE_KEYS = {}
 
+try:
+    from .crawlers.period_detail import (
+        MAX_PERIOD_DETAIL_REQUESTS,
+        attach_detail_text,
+        wants_period_detail,
+    )
+    from .utils.http_fetch import FetchBudget
+except Exception as _detail_exc:       # noqa: BLE001
+    # 상세 근거를 못 받아도 파이프라인은 산다 - 그때는 상세가 필요한 소스가
+    # **기간 없음**이 된다(fail-closed). 없는 마감을 말하는 것보다 낫다.
+    logging.getLogger(__name__).error(
+        "period detail unavailable (%s) - 상세 근거 없이 간다", _detail_exc
+    )
+    MAX_PERIOD_DETAIL_REQUESTS = 0
+    FetchBudget = None                 # type: ignore[assignment]
+
+    def wants_period_detail(source: object) -> bool:   # type: ignore[misc]
+        return False
+
+    def attach_detail_text(*_args, **_kwargs) -> bool:  # type: ignore[misc]
+        return False
+
 
 # ---------------------------------------------------------------------------
 # Crawler imports with graceful degradation
@@ -552,7 +574,29 @@ def run_pipeline(test_mode: bool = False) -> None:
             quote_merge_count = 0
             period_reset_count = 0
 
+            # ── 상세 근거 수집 ────────────────────────────────────
+            # 목록에 마감이 없는 소스만, 항목당 **한 번**, 예산 안에서 받는다.
+            # 기간은 여기서 만들지 않는다 - 아래 관문이 순수 추출기로 정한다.
+            detail_budget = (
+                FetchBudget()
+                if FetchBudget is not None and wants_period_detail(crawler_name)
+                else None
+            )
+            detail_quota = MAX_PERIOD_DETAIL_REQUESTS
+            detail_hits = 0
+
             for raw_ann in raw_announcements:
+                if detail_budget is not None and detail_quota > 0:
+                    detail_quota -= 1
+                    try:
+                        if attach_detail_text(raw_ann, budget=detail_budget):
+                            detail_hits += 1
+                    except Exception as detail_error:      # noqa: BLE001
+                        logger.debug(
+                            f"detail evidence failed for "
+                            f"{raw_ann.source_id}: {detail_error}"
+                        )
+
                 # ── 기간 관문 ─────────────────────────────────────────
                 # 기간 두 필드는 이 호출 뒤로만 존재한다. 신규 저장은 이
                 # 객체의 복사본을 쓰고(``KeywordAnalyzer.analyze`` 가
@@ -607,6 +651,7 @@ def run_pipeline(test_mode: bool = False) -> None:
                 f"{crawler_name}: {new_count} new, {duplicate_count} duplicates"
                 f"{f', {quote_merge_count} quote merges' if quote_merge_count else ''}"
                 f"{f', {period_reset_count} period resets' if period_reset_count else ''}"
+                f"{f', {detail_hits} detail evidence' if detail_hits else ''}"
             )
 
             if new_count == 0 and not recheck_raw:

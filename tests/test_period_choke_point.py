@@ -91,24 +91,48 @@ CRAWLER_CLASSES = all_crawler_classes()
 
 
 class TestOnlyTwoSourcesCanMakeAPeriod:
-    """허용목록 = 전용 추출기를 가진 **두 소스**뿐이다.
+    """허용목록 = 전용 추출기를 가진 소스뿐이다.
 
     16차 게이트: bizinfo·g2b 추출기는 등록을 해제했다 - 회사용 경로여서
     협의회 브리핑과 무관하고, 그 기간을 유지하려다 식별자 설계가 사이클마다
     새 경합을 만들었다. 두 소스의 기간은 정규화가 비운다.
+
+    P2-D: 목록 근거로 읽는 소스는 여전히 ``seis``·``lawmaking`` 둘뿐이고,
+    ``forest_service``·``kofpi``·``socialenterprise`` 는 **상세 본문 근거**
+    (``detail_text``)로만 읽는다 - 목록·제목은 어느 소스에서도 마감이 되지
+    못한다(아래 ``TestKofpiNeverMakesADeadline`` 이 그 자리를 고정한다).
     """
 
-    def test_registry_is_exactly_two(self):
-        assert set(PERIOD_EXTRACTORS) == {"seis", "lawmaking"}
+    def test_registry_is_the_declared_five(self):
+        assert set(PERIOD_EXTRACTORS) == {
+            "seis", "lawmaking", "forest_service", "kofpi", "socialenterprise",
+        }
+
+    def test_list_only_extractors_are_still_two(self):
+        """목록 ``raw_data`` 만으로 기간을 만드는 소스는 둘뿐이다."""
+        list_only = {
+            name for name, keys in EVIDENCE_KEYS.items()
+            if "detail_text" not in keys
+        }
+        assert list_only == {"seis", "lawmaking"}
 
     def test_every_extractor_declares_its_evidence(self):
         """근거 키가 선언돼 있어야 재수집 때 근거를 교체할 수 있다."""
         assert set(EVIDENCE_KEYS) == set(PERIOD_EXTRACTORS)
         assert all(keys for keys in EVIDENCE_KEYS.values())
 
-    def test_kofpi_extractor_is_retired(self):
-        """제목 괄호 ``(~9.30)`` 패턴은 폐기했다 (9차 게이트 HIGH)."""
-        assert "kofpi" not in PERIOD_EXTRACTORS
+    def test_kofpi_title_pattern_is_still_retired(self):
+        """제목 괄호 ``(~9.30)`` 패턴은 폐기 상태 그대로다 (9차 게이트 HIGH).
+
+        kofpi 는 추출기가 생겼지만 **상세 본문 근거만** 읽는다. 목록 raw_data
+        만 있는 행은 여전히 기간이 없다.
+        """
+        from alert.crawlers.period_extractors import kofpi_period
+
+        assert PERIOD_EXTRACTORS["kofpi"] is kofpi_period
+        assert kofpi_period({
+            "title": "2026년 사업 공모(~9.30)", "date": "2026-09-07",
+        }) == (None, None)
 
     def test_production_registry_is_not_empty(self):
         assert len(PRODUCTION_SOURCES) > 10

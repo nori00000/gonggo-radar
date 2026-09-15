@@ -173,6 +173,176 @@ def lawmaking_period(raw: Dict[str, object]) -> Period:
     return _range_only(_normalize(raw.get("period")))
 
 
+# ---------------------------------------------------------------------------
+# 상세 본문 근거로 읽는 기간 (P2-D) - 목록·제목은 절대 보지 않는다
+# ---------------------------------------------------------------------------
+#
+# 세 소스(forest_service·kofpi·socialenterprise)는 **목록에 마감이 없다**.
+# 목록 제목의 ``(~9.30)`` 은 연도가 없어서 연도를 추정해야 하는데, 추정은 이
+# 모듈이 열세 차례 거절한 바로 그 동작이다(2025년 공고가 2026년 마감이 됐다).
+# 그래서 마감은 **상세 본문의 기간 라벨 한 자리**에서만 읽는다. 본문은
+# ``alert.crawlers.period_detail`` 이 항목당 한 번 받아 ``raw_data`` 에
+# 싣고(``detail_text``), 아래 함수들은 그 문자열만 읽는 **순수 함수**다.
+#
+# 근거 본문을 자르지 않고 창 그대로 저장하는 이유: 자르는 규칙을 나중에
+# 좁혀도 재검증이 옛 행에 새 규칙을 다시 적용할 수 있어야 한다.
+
+DETAIL_TEXT_FIELD = "detail_text"
+DETAIL_TEXT_TRUNCATED_FIELD = "detail_text_truncated"
+
+# 기간 라벨 - 이 넷만 접수 마감을 뜻한다. ``일시``·``행사``·``교육기간`` 처럼
+# 다른 일정을 가리키는 라벨은 여기 없으므로 영원히 매치되지 않는다.
+_PERIOD_LABEL = r"(?:접수|모집|공모|신청)\s*기간"
+_LABEL_SCAN = re.compile(_PERIOD_LABEL)
+
+# 본문 창에서 필드 경계로 쓰는 글머리표. 이 문자들 사이가 한 항목이다.
+# ``*``·``※`` 는 각주 표시다 - 각주가 시작되면 그 라벨의 **값은 끝났다**
+# (각주가 "예산 소진 시 조기마감" 을 덧붙여도 적힌 종료일은 그대로다).
+_BULLETS = "ㅁㅇ□■○◦●▶◆※•*"
+# 두 자리 연도 표기 앞에 오는 아포스트로피 (``’26. 9. 28.``)
+_APOS = "'’‘`"
+
+# 값 뒤에 이것이 오면 **다른 절이 시작된 것**이다 - 라벨의 값은 여기서 끝난다.
+# 날짜를 품을 수 있는 말(심사·선정·발표·교육 …)은 **일부러 넣지 않았다**:
+# 그런 말이 뒤따르면 어디까지가 접수기간인지 알 수 없으므로 거절이 맞다.
+_SECTION_WORDS = (
+    "첨부파일", "첨부", "붙임", "문의처", "문의", "담당부서", "담당자", "담당",
+    "신청방법", "접수방법", "제출방법", "제출서류", "이전글", "다음글", "목록",
+)
+_TAIL = rf"(?=$|[{_BULLETS}]|(?:{'|'.join(_SECTION_WORDS)}))"
+
+# 마감을 뜻하는 문맥 낱말. 날짜 하나만 있을 때는 **필수**다 - 이 말이 없으면
+# 그 날짜가 시작인지 끝인지 행사일인지 페이지가 말하지 않은 것이다.
+_TERMINATOR = r"(?:\s*(?:까지|접수\s*마감|마감))"
+
+_SHORT_DATE = rf"[{_APOS}]\s*\d{{2}}\s*\.\s*\d{{1,2}}\s*\.\s*\d{{1,2}}\s*\.?"
+_WEEKDAY = r"(?:\s*\(\s*[월화수목금토일]\s*\))?"
+# 요일 뒤에 쉼표가 오는 표기 (``2026. 9. 11.(금), 18:00까지``)
+_CLOCK = r"\s*,?(?:\s*\d{1,2}\s*:\s*\d{2})?"
+
+# 라벨 **한 자리 전체**가 범위 하나(또는 "…까지" 한 날짜)여야 한다 -
+# ``_RANGE_ONLY`` 와 같은 규율을 본문 창에 적용한 것이다. 뒤는 다음 글머리표·
+# 다른 절·창의 끝으로 막아 **옆 항목의 날짜가 들어오지 못하게** 한다.
+#
+# 라벨 앞에 한글이 붙은 말(``사업기간``·``운영기간``)은 다른 라벨이므로
+# ``(?<![가-힣])`` 로 막는다.
+#
+# 시작이 ``공고일`` 인 형태(socialenterprise 실측)는 **종료일만** 만든다 -
+# "공고일" 은 날짜가 아니므로 시작일을 지어내지 않는다.
+_DETAIL_PERIOD = re.compile(
+    rf"(?<![가-힣])[(（]?\s*{_PERIOD_LABEL}\s*[)）]?\s*[:：]?\s*"
+    rf"(?:"
+    rf"(?:(?P<start>{_FULL_DATE}|{_SHORT_DATE}){_WEEKDAY}{_CLOCK}|공고일)"
+    rf"\s*[~∼〜-]\s*"
+    rf"(?P<end>{_FULL_DATE}|{_SHORT_DATE}|{_MONTH_DAY}){_WEEKDAY}{_CLOCK}"
+    rf"{_TERMINATOR}?"
+    rf"|"
+    rf"(?P<only>{_FULL_DATE}|{_SHORT_DATE}){_WEEKDAY}{_CLOCK}{_TERMINATOR}"
+    rf")"
+    rf"\s*{_TAIL}"
+)
+
+_APOS_PREFIX = re.compile(rf"^[{_APOS}]")
+
+
+def _iso_date(token: str, fallback_year: Optional[int] = None) -> Optional[str]:
+    """날짜 토큰 하나를 ISO 로. 달력에 없는 날짜와 모호한 토큰은 None.
+
+    ``’26. 9. 28.`` 의 두 자리 연도는 ``2026`` 으로 읽는다 - 아포스트로피가
+    붙은 표기에서만이며, 맨 숫자 두 자리는 연도로 보지 않는다.
+    ``9. 28.`` 처럼 연도가 없는 토큰은 ``fallback_year``(시작일의 연도)가
+    있을 때만 읽는다 - 연도 추정은 하지 않는다.
+    """
+    token = (token or "").strip()
+    numbers = _DIGITS.findall(token)
+    if _APOS_PREFIX.match(token):
+        if len(numbers) != 3 or len(numbers[0]) != 2:
+            return None
+        return _calendar_date(2000 + int(numbers[0]), int(numbers[1]), int(numbers[2]))
+    if len(numbers) == 3 and len(numbers[0]) == 4:
+        return _calendar_date(int(numbers[0]), int(numbers[1]), int(numbers[2]))
+    if len(numbers) == 2 and fallback_year is not None:
+        return _calendar_date(fallback_year, int(numbers[0]), int(numbers[1]))
+    return None
+
+
+def _detail_period(raw: Dict[str, object]) -> Period:
+    """``detail_text`` 창에 기간 라벨이 **정확히 하나** 있고 그 자리 전체가
+    범위 하나일 때만 (시작, 종료)를 돌려준다.
+
+    라벨이 둘 이상이면 어느 쪽이 이 공고의 접수인지 페이지가 말하지 않으므로
+    아무 것도 만들지 않는다 (9차 게이트 HIGH 와 같은 규율). 잘린 창의 마지막
+    조각도 쓰지 않는다 - 뒤가 잘렸으면 그 범위가 끝났는지 알 수 없다.
+    """
+    text = _normalize(raw.get(DETAIL_TEXT_FIELD))
+    if not text:
+        return None, None
+    if len(_LABEL_SCAN.findall(text)) != 1:
+        return None, None
+
+    match = _DETAIL_PERIOD.search(text)
+    if not match:
+        return None, None
+    if raw.get(DETAIL_TEXT_TRUNCATED_FIELD) and match.end() >= len(text):
+        return None, None
+
+    only_token = match.group("only")
+    if only_token:
+        # "…까지" 한 날짜 - 시작일은 페이지에 없다
+        end = _iso_date(only_token)
+        return (None, end) if end else (None, None)
+
+    start_token = match.group("start")
+    start = _iso_date(start_token) if start_token else None
+    if start_token and not start:
+        return None, None          # 달력에 없는 시작일 - 읽은 것이 아니다
+
+    end = _iso_date(
+        match.group("end"), fallback_year=int(start[:4]) if start else None
+    )
+    if not end:
+        return None, None
+    if start and end < start:
+        return None, None          # 뒤집힌 범위는 지어낸 것이다
+    return start, end
+
+
+def forest_service_period(raw: Dict[str, object]) -> Period:
+    """산림청 공고 - 상세의 ``접수기간`` 한 자리.
+
+    실측(2026-09-15, nttId=3223976):
+    ``ㅇ 접수기간 : 2026. 9. 7. ~ 9. 28. 18:00까지`` → 2026-09-07 / 2026-09-28.
+    목록에는 마감이 없다(``raw_data`` 에 ``date``·``posted`` 뿐).
+    """
+    return _detail_period(raw)
+
+
+def kofpi_period(raw: Dict[str, object]) -> Period:
+    """한국임업진흥원 - 상세의 ``모집기간`` 한 자리.
+
+    실측(2026-09-15, bb_seq=12658):
+    ``ㅁ 모집기간 2026. 9. 7.(월) ~ 9. 30.(수) 15:00까지`` → 2026-09-07 / 2026-09-30.
+
+    목록 제목의 ``(~9.30)`` 은 **여기서도 쓰지 않는다**. 연도가 없어 연도를
+    추정해야 하고, 그 추정이 12차까지 지난해 공고를 올해 마감으로 만들었다.
+    """
+    return _detail_period(raw)
+
+
+def socialenterprise_period(raw: Dict[str, object]) -> Period:
+    """한국사회적기업진흥원 - 상세의 ``공모기간`` 한 자리.
+
+    실측(2026-09-15, bIdx=252623):
+    ``□ (공모기간) 공고일 ~ 2026. 9. 28.(월) 13:00까지`` → (None, 2026-09-28).
+    시작이 "공고일" 이면 **종료일만** 만든다 - 게시일을 시작일로 옮겨 적는 것은
+    읽은 것이 아니라 지어낸 것이다.
+
+    제목의 ``('26.09.30.(수) 14:00, 대전)`` 류는 설명회 **행사 일시**이고 상세
+    에서도 ``일시`` 라벨 아래 있다. 기간 라벨이 아니므로 매치되지 않는다.
+    """
+    return _detail_period(raw)
+
+
 # 16차 게이트: bizinfo·g2b 추출기는 **등록 해제**했다. 두 소스는 회사용
 # 경로여서 협의회 브리핑과 무관하고, 그 기간을 유지하려다 식별자 설계가
 # 사이클마다 새 경합을 만들었다. 지금은 정규화가 두 소스의 기간을 비운다.
@@ -182,6 +352,9 @@ def lawmaking_period(raw: Dict[str, object]) -> Period:
 PERIOD_EXTRACTORS: Dict[str, Callable[[Dict[str, object]], Period]] = {
     "seis": seis_period,
     "lawmaking": lawmaking_period,
+    "forest_service": forest_service_period,
+    "kofpi": kofpi_period,
+    "socialenterprise": socialenterprise_period,
 }
 
 # 각 추출기가 **근거로 읽는** raw_data 키(+방증). 재수집 때 기간만 갱신하고
@@ -190,4 +363,7 @@ PERIOD_EXTRACTORS: Dict[str, Callable[[Dict[str, object]], Period]] = {
 EVIDENCE_KEYS: Dict[str, Tuple[str, ...]] = {
     "seis": ("date", "date_field", "dday"),
     "lawmaking": ("period",),
+    "forest_service": (DETAIL_TEXT_FIELD, DETAIL_TEXT_TRUNCATED_FIELD),
+    "kofpi": (DETAIL_TEXT_FIELD, DETAIL_TEXT_TRUNCATED_FIELD),
+    "socialenterprise": (DETAIL_TEXT_FIELD, DETAIL_TEXT_TRUNCATED_FIELD),
 }

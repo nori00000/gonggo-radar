@@ -1,0 +1,77 @@
+{
+  "kofpi": {
+    "title": "[모집] 2026 산림분야 오픈이노베이션 참여기업 모집(~9.30)",
+    "url": "https://www.kofpi.or.kr/notice/notice_01view.do?bb_seq=12658",
+    "limit": 2000,
+    "truncated": false,
+    "chars": 976,
+    "fetched": "2026-09-15"
+  },
+  "forest_service": {
+    "title": "2026년도 제2차 산림형 예비사회적기업 지정 계획 공고",
+    "url": "https://www.forest.go.kr/kfsweb/cop/bbs/selectBoardArticle.do?nttId=3223976&bbsId=BBSMSTR_1032&mn=NKFS_04_01_02",
+    "limit": 2000,
+    "truncated": false,
+    "chars": 497,
+    "fetched": "2026-09-15"
+  },
+  "socialenterprise": {
+    "title": "★ 2027년 사회연대경제 오프라인 판매장 스토어36.5 신규 협력매장 모집(~9.28.(월) 13:00)",
+    "url": "https://www.socialenterprise.or.kr/homepage/bbs/boardView.do?bsIdx=10002&bIdx=252623&page=1&menuId=822&bcIdx=10002",
+    "limit": 2000,
+    "truncated": false,
+    "chars": 1272,
+    "fetched": "2026-09-15"
+  },
+  "coop": {
+    "title": "2026 사회적협동조합·사회적기업 대상 공공조달 및 민간위탁 1:1 맞춤형 컨설팅」 참여기업 모집 공고",
+    "url": "https://www.coop.go.kr/home/boardView.do?brd_mgrno=2&menu_no=2038&brd_no=14826",
+    "limit": 2000,
+    "truncated": true,
+    "chars": 2000,
+    "fetched": "2026-09-15"
+  },
+  "coop_full": {
+    "title": "2026 사회적협동조합·사회적기업 대상 공공조달 및 민간위탁 1:1 맞춤형 컨설팅」 참여기업 모집 공고",
+    "url": "https://www.coop.go.kr/home/boardView.do?brd_mgrno=2&menu_no=2038&brd_no=14826",
+    "limit": 6000,
+    "truncated": false,
+    "chars": 2211,
+    "fetched": "2026-09-15"
+  },
+  "mafra": {
+    "title": "「농지법 시행령」 일부개정령안 입법예고",
+    "url": "http://www.mafra.go.kr/bbs/home/791/578640/artclView.do",
+    "limit": 2000,
+    "truncated": false,
+    "chars": 113,
+    "fetched": "2026-09-15"
+  },
+  "kofpi_comma_clock": {
+    "title": "2026년 한국임업진흥원 Ⅹ 마르쉐 「먹거리 숲」 참가기업 모집 연장 공고(~9.11)",
+    "url": "https://www.kofpi.or.kr/notice/notice_01view.do?bb_seq=12611",
+    "limit": 2000,
+    "truncated": false,
+    "chars": 874,
+    "fetched": "2026-09-15",
+    "source": "kofpi"
+  },
+  "kofpi_always_open": {
+    "title": "[모집] 산양삼 등 산촌자원 활용 시제품 개발 지원 참여자 모집(연중 상시 모집)",
+    "url": "https://www.kofpi.or.kr/notice/notice_01view.do?bb_seq=12609",
+    "limit": 2000,
+    "truncated": false,
+    "chars": 1279,
+    "fetched": "2026-09-15",
+    "source": "kofpi"
+  },
+  "socialenterprise_deadline_only": {
+    "title": "2026년 사회연대경제기업 공공구매 상담회(대구) 참가기업 모집 공고(~9/14(월))",
+    "url": "https://www.socialenterprise.or.kr/homepage/bbs/boardView.do?bsIdx=10002&bIdx=252617&page=1&menuId=822&bcIdx=10002",
+    "limit": 2000,
+    "truncated": false,
+    "chars": 741,
+    "fetched": "2026-09-15",
+    "source": "socialenterprise"
+  }
+}
