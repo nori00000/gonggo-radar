@@ -541,7 +541,69 @@ def main():
             _err(f"⚠️  폐기한 승인 카드 버튼 제거 실패: {error}")
     if message:
         (_out if rc == 0 else _err)(message)
+
+    # H5: 만료된 옛 호의 정리 대기 큐를 여기서 비운다. 그 호는 자기 notify 회차를
+    # 다시 갖지 못하므로(새 호가 났다), 큐를 비워 줄 사람이 이 회차뿐이다.
+    # 실패는 경고다 — 만료 판정 자체는 이미 파일에 있고, 그것이 카드를 무력화한다.
+    drain_expired_queues(token, chat_id, markdown_path.parent, week)
     return rc
+
+
+def drain_expired_queues(token, chat_id, out_dir, week) -> int:
+    """`expired` 상태 호의 정리 대기 큐를 실제로 회수(삭제)한다 (H5).
+
+    ``weekly_digest.expire_stale_issues`` 가 큐에 넣은 미리보기·안내 message_id 를
+    이 회차가 지운다. 지운 만큼만 큐에서 뺀다 — 실패한 id 는 다음 회차가 다시
+    시도한다. 잠금은 **비차단**이고, 어떤 실패도 종료 코드를 바꾸지 않는다.
+
+    Returns:
+        실제로 삭제한 메시지 수.
+    """
+    out_dir = Path(out_dir)
+    deleted = 0
+    try:
+        candidates = sorted(out_dir.glob("*.state.json"))
+    except OSError as exc:
+        _err(f"⚠️  만료 호 회수 실패(진행함): {redact(exc)}")
+        return 0
+    for path in candidates:
+        key = path.name[: -len(".state.json")]
+        if not state_mod.valid_issue(key) or key == week:
+            continue
+        try:
+            current = state_mod.load_state(path, key)
+        except state_mod.StateError:
+            continue
+        if current.get("status") != "expired":
+            continue
+        queue = state_mod.superseded_message_ids(current)
+        if not queue:
+            continue
+        remaining = []
+        for mid in queue:
+            ok, error = delete_message(token, chat_id, mid)
+            if ok:
+                deleted += 1
+                continue
+            remaining.append(mid)
+            _err(f"⚠️  만료 호 {key} 메시지 회수 실패(다음 회차 재시도) "
+                 f"message_id={mid}: {error}")
+        if remaining == queue:
+            continue
+        try:
+            handle = state_mod.acquire_lock(
+                state_mod.lock_path(key, out_dir), blocking=False)
+        except (state_mod.LockBusy, OSError):
+            continue
+        try:
+            state_mod.update_state_locked(
+                path, key,
+                lambda cur, ids=remaining: state_mod.set_superseded(cur, ids))
+        except (state_mod.StateError, state_mod.TransitionError, OSError) as exc:
+            _err(f"⚠️  만료 호 {key} 큐 갱신 실패: {redact(exc)}")
+        finally:
+            state_mod.release_lock(handle)
+    return deleted
 
 
 def _finish_locked(state_path, week, prepared, message_ids, item_urls,

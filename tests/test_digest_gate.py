@@ -5955,3 +5955,248 @@ def test_set_superseded_replaces_and_bounds(tmp_path):
     state = state_mod.set_superseded(state, range(state_mod.SUPERSEDED_MAX + 5))
     assert len(state["superseded_message_ids"]) == state_mod.SUPERSEDED_MAX
     assert state_mod.set_superseded(state, [])["superseded_message_ids"] == []
+
+
+# ─── P2-X H3: 게이트 계약 정본(gate_contract.json) ──────────────────────
+def test_gate_contract_is_the_source_of_the_state_machine():
+    """state.py 의 상태 기계 상수는 **전부** 계약 파일에서 온다.
+
+    상수를 코드에 다시 적으면 두 레포가 갈라진다(감사 V H-4). 한쪽만 고치는
+    길을 없애기 위해 이 테스트가 두 자리의 값을 대조한다.
+    """
+    contract = state_mod.load_gate_contract()
+    assert state_mod.STATUSES == tuple(contract["statuses"])
+    assert state_mod.TRANSITIONS == {
+        key: tuple(value) for key, value in contract["transitions"].items()}
+    assert state_mod.SENDING_ESCAPES == tuple(contract["sending_escapes"])
+    assert state_mod.FROZEN_STATUSES == tuple(contract["frozen_statuses"])
+    assert state_mod.OPEN_STATUSES == tuple(contract["open_statuses"])
+    assert state_mod.STATE_KEYS == tuple(contract["state_keys"])
+    assert state_mod.APPROVAL_FIELDS == tuple(contract["approval_fields"])
+    assert state_mod.APPROVAL_ID_LEN == contract["approval_id_len"]
+    assert state_mod.PREVIEW_ITEMS_MAX == contract["preview_items_max"]
+    assert state_mod.SUPERSEDED_MAX == contract["superseded_max"]
+
+
+def test_gate_contract_reason_strings_come_from_the_contract():
+    """사유 문자열도 계약이 정본이다 — 문구 드리프트가 곧 계약 드리프트였다."""
+    reasons = state_mod.load_gate_contract()["reasons"]
+    assert state_mod.SENDING_REASON == reasons["sending"]
+    assert state_mod.STALE_PREVIEW_BODY_REASON == reasons["stale_preview_body"]
+    assert state_mod.EXCLUDED_NOT_APPLIED_REASON == reasons["excluded_not_applied"]
+    assert state_mod.REBUILD_FAILED_REASON == reasons["rebuild_failed"]
+    assert state_mod.VERIFICATION_BROKEN_REASON == reasons["verification_broken"]
+    assert state_mod.TOMBSTONE_REASON == reasons["tombstone"]
+    assert state_mod.STALE_CHECK_APPROVAL_REASON == reasons["stale_check_approval"]
+    assert state_mod.EXPIRED_REASON == reasons["expired"]
+
+
+def test_gate_contract_default_state_covers_every_contract_key():
+    """default_state 가 계약의 키 집합을 정확히 만든다 (봇이 같은 키를 읽는다)."""
+    contract = state_mod.load_gate_contract()
+    assert set(state_mod.default_state("2026-W37")) == set(contract["state_keys"])
+
+
+def test_gate_contract_approval_fields_match_record_preview():
+    """승인 세대 dict 의 필드명이 계약과 같다 — 봇이 id·sha·check_sha 를 읽는다."""
+    state = state_mod.record_preview(
+        state_mod.default_state("2026-W37"), [1], ["u"], "a" * 64, "b" * 64)
+    assert set(state["approval"]) == set(state_mod.APPROVAL_FIELDS)
+
+
+def test_gate_contract_missing_file_is_fail_closed(tmp_path):
+    """계약 파일이 없으면 예외다 — 계약을 모르면 상태 기계를 돌리지 않는다."""
+    with pytest.raises(state_mod.GateContractError):
+        state_mod.load_gate_contract(tmp_path / "없는파일.json")
+
+
+def test_gate_contract_corrupt_file_is_fail_closed(tmp_path):
+    bad = tmp_path / "gate_contract.json"
+    bad.write_text("{not json", encoding="utf-8")
+    with pytest.raises(state_mod.GateContractError):
+        state_mod.load_gate_contract(bad)
+    bad.write_text('{"statuses": []}', encoding="utf-8")
+    with pytest.raises(state_mod.GateContractError):
+        state_mod.load_gate_contract(bad)
+
+
+# ─── P2-X H5: 새 호가 나면 옛 호는 만료된다 ─────────────────────────────
+def test_mark_expired_moves_messages_into_the_recall_queue():
+    """만료는 ①status ②승인 폐기 ③미리보기·안내를 회수 큐로 — 세 가지다."""
+    state = state_mod.default_state("2026-W37")
+    state = state_mod.record_preview(state, [2038], ["u"], "a" * 64)
+    state = state_mod.record_notice_messages(state, [2040])
+    expired = state_mod.mark_expired(state)
+    assert expired["status"] == "expired"
+    assert expired["approval"] is None
+    assert expired["preview_message_ids"] == []
+    assert expired["notice_message_ids"] == []
+    assert state_mod.superseded_message_ids(expired) == [2038, 2040]
+
+
+def test_mark_expired_keeps_an_existing_queue():
+    """이미 큐에 있던 id 를 지우지 않는다 — 회수는 아직 안 끝났다."""
+    state = state_mod.record_superseded(
+        state_mod.default_state("2026-W37"), [900])
+    state = state_mod.record_preview(state, [2038], ["u"], "a" * 64)
+    assert state_mod.superseded_message_ids(
+        state_mod.mark_expired(state)) == [900, 2038]
+
+
+def test_expired_issue_cannot_be_sent():
+    """만료된 호는 카드가 화면에 남아 있어도 발송되지 않는다."""
+    expired = state_mod.mark_expired(state_mod.default_state("2026-W37"))
+    ok, reason = state_mod.can_send(expired)
+    assert ok is False and reason == state_mod.EXPIRED_REASON
+
+
+@pytest.mark.parametrize("status", ["draft", "annotated", "held"])
+def test_mark_expired_accepts_every_open_status(status):
+    state = dict(state_mod.default_state("2026-W37"), status=status)
+    assert state_mod.mark_expired(state)["status"] == "expired"
+
+
+@pytest.mark.parametrize("status", ["sending", "sent"])
+def test_mark_expired_refuses_closed_statuses(status):
+    """발송 중·발송 완료는 만료 대상이 아니다 — 전자는 발송기, 후자는 끝났다."""
+    state = dict(state_mod.default_state("2026-W37"), status=status)
+    with pytest.raises(state_mod.TransitionError):
+        state_mod.mark_expired(state)
+
+
+def test_mark_expired_is_idempotent():
+    once = state_mod.mark_expired(state_mod.default_state("2026-W37"))
+    assert state_mod.mark_expired(once) == once
+
+
+def test_expired_state_survives_a_save_load_roundtrip(tmp_path):
+    """`expired` 는 정식 status 다 — 저장·재로드가 StateError 가 되지 않는다."""
+    path = tmp_path / "2026-W37.state.json"
+    state_mod.save_state(
+        path, state_mod.mark_expired(state_mod.default_state("2026-W37")))
+    assert state_mod.load_state(path, "2026-W37")["status"] == "expired"
+
+
+def test_expired_is_frozen_for_edits():
+    """만료된 호에는 해설·제외를 붙일 수 없다."""
+    expired = state_mod.mark_expired(state_mod.default_state("2026-W37"))
+    with pytest.raises(state_mod.TransitionError):
+        state_mod.mark_annotated(expired, "해설")
+    with pytest.raises(state_mod.TransitionError):
+        state_mod.add_excluded_urls(expired, ["https://example.org/a"])
+
+
+def _write_state(tmp_path, week, status, previews=(), notices=()):
+    state = state_mod.default_state(week)
+    state["status"] = status
+    state["preview_message_ids"] = list(previews)
+    state["notice_message_ids"] = list(notices)
+    state_mod.save_state(tmp_path / f"{week}.state.json", state)
+    return tmp_path / f"{week}.state.json"
+
+
+def test_expire_stale_issues_expires_only_older_open_weeklies(tmp_path):
+    """새 주간호가 나면 **더 오래된 열린 주간호**만 만료된다."""
+    from scripts.weekly_digest import expire_stale_issues
+
+    _write_state(tmp_path, "2026-W35", "draft", previews=[2038], notices=[2040])
+    _write_state(tmp_path, "2026-W36", "annotated", previews=[2050])
+    _write_state(tmp_path, "2026-W34", "held", previews=[2000])
+    _write_state(tmp_path, "2026-W33", "sent", previews=[1900])
+    _write_state(tmp_path, "2026-W32", "sending", previews=[1800])
+    _write_state(tmp_path, "2026-M08", "draft", previews=[1700])
+    _write_state(tmp_path, "2026-W39", "draft", previews=[2100])
+
+    assert expire_stale_issues(tmp_path, "2026-W37") == [
+        "2026-W34", "2026-W35", "2026-W36"]
+
+    def status_of(week):
+        return state_mod.load_state(tmp_path / f"{week}.state.json", week)["status"]
+
+    assert status_of("2026-W34") == "expired"
+    assert status_of("2026-W35") == "expired"
+    assert status_of("2026-W36") == "expired"
+    assert status_of("2026-W33") == "sent"          # 끝난 호는 그대로
+    assert status_of("2026-W32") == "sending"       # 발송기가 쥐고 있다
+    assert status_of("2026-M08") == "draft"         # 월간호는 자기 계열
+    assert status_of("2026-W39") == "draft"         # 미래 호는 건드리지 않는다
+
+    w35 = state_mod.load_state(tmp_path / "2026-W35.state.json", "2026-W35")
+    assert state_mod.superseded_message_ids(w35) == [2038, 2040]
+
+
+def test_expire_stale_issues_does_nothing_for_a_monthly_issue(tmp_path):
+    """월간호 조립은 주간호를 만료시키지 않는다."""
+    from scripts.weekly_digest import expire_stale_issues
+
+    _write_state(tmp_path, "2026-W36", "draft", previews=[1])
+    assert expire_stale_issues(tmp_path, "2026-M09") == []
+    assert state_mod.load_state(
+        tmp_path / "2026-W36.state.json", "2026-W36")["status"] == "draft"
+
+
+def test_expire_stale_issues_skips_a_locked_issue(tmp_path):
+    """다른 작성자가 쥔 호는 **기다리지 않고** 건너뛴다 (교착 방지)."""
+    from scripts.weekly_digest import expire_stale_issues
+
+    _write_state(tmp_path, "2026-W36", "draft", previews=[1])
+    handle = state_mod.acquire_lock(state_mod.lock_path("2026-W36", tmp_path))
+    try:
+        assert expire_stale_issues(tmp_path, "2026-W37") == []
+    finally:
+        state_mod.release_lock(handle)
+    assert state_mod.load_state(
+        tmp_path / "2026-W36.state.json", "2026-W36")["status"] == "draft"
+
+
+def test_drain_expired_queues_recalls_and_clears(tmp_path, monkeypatch):
+    """만료 호의 회수 큐는 다음 notify 회차가 실제로 비운다."""
+    from scripts import notify_digest
+    from scripts.weekly_digest import expire_stale_issues
+
+    _write_state(tmp_path, "2026-W36", "draft", previews=[2038], notices=[2040])
+    expire_stale_issues(tmp_path, "2026-W37")
+
+    deleted = []
+
+    def fake_delete(token, chat, mid):
+        deleted.append(mid)
+        return True, ""
+
+    monkeypatch.setattr(notify_digest, "delete_message", fake_delete)
+    assert notify_digest.drain_expired_queues(
+        "T", -100, tmp_path, "2026-W37") == 2
+    assert deleted == [2038, 2040]
+    w36 = state_mod.load_state(tmp_path / "2026-W36.state.json", "2026-W36")
+    assert state_mod.superseded_message_ids(w36) == []
+
+
+def test_drain_expired_queues_keeps_ids_that_failed_to_delete(tmp_path, monkeypatch):
+    """지우지 못한 id 는 큐에 남는다 — 다음 회차가 다시 시도한다."""
+    from scripts import notify_digest
+    from scripts.weekly_digest import expire_stale_issues
+
+    _write_state(tmp_path, "2026-W36", "draft", previews=[2038], notices=[2040])
+    expire_stale_issues(tmp_path, "2026-W37")
+
+    monkeypatch.setattr(
+        notify_digest, "delete_message",
+        lambda token, chat, mid: (mid == 2038, "" if mid == 2038 else "403"))
+    assert notify_digest.drain_expired_queues(
+        "T", -100, tmp_path, "2026-W37") == 1
+    w36 = state_mod.load_state(tmp_path / "2026-W36.state.json", "2026-W36")
+    assert state_mod.superseded_message_ids(w36) == [2040]
+
+
+def test_drain_expired_queues_ignores_open_issues(tmp_path, monkeypatch):
+    """만료되지 않은 호의 큐는 건드리지 않는다."""
+    from scripts import notify_digest
+
+    state = state_mod.default_state("2026-W36")
+    state = state_mod.record_superseded(state, [900])
+    state_mod.save_state(tmp_path / "2026-W36.state.json", state)
+    monkeypatch.setattr(
+        notify_digest, "delete_message",
+        lambda *a: pytest.fail("열린 호의 메시지를 지우려 했다"))
+    assert notify_digest.drain_expired_queues(
+        "T", -100, tmp_path, "2026-W37") == 0

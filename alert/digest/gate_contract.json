@@ -1,0 +1,52 @@
+{
+  "contract": "W10",
+  "version": 1,
+  "_note": "발송 게이트 계약의 정본(SSOT). gonggo alert/digest/state.py 와 homelab-orchestration bin/hq_digest_gate.py 가 **같은 이 파일**을 읽는다. 두 레포가 각자 상수를 들고 있으면 조용히 갈라진다(V 감사 H-4: STALE_PREVIEW_BODY_REASON 이 이미 갈라져 있었다). 이 파일을 고치면 양쪽 드리프트 테스트가 red 가 된다 — 그것이 목적이다.",
+  "statuses": ["draft", "annotated", "sending", "sent", "held", "expired"],
+  "transitions": {
+    "draft": ["draft", "annotated", "sending", "held", "expired"],
+    "annotated": ["annotated", "sending", "held", "expired"],
+    "sending": ["sending", "sent"],
+    "sent": ["sent"],
+    "held": ["held", "draft", "annotated", "expired"],
+    "expired": ["expired"]
+  },
+  "sending_escapes": ["draft", "annotated"],
+  "frozen_statuses": ["sending", "sent", "expired"],
+  "open_statuses": ["draft", "annotated", "held"],
+  "expirable_statuses": ["draft", "annotated", "held"],
+  "state_keys": [
+    "week",
+    "status",
+    "excluded_urls",
+    "commentary",
+    "preview_message_ids",
+    "preview_items",
+    "preview_holds",
+    "notice_message_ids",
+    "superseded_message_ids",
+    "pinned_ids",
+    "approval",
+    "rebuild_failed",
+    "verification_broken",
+    "approved_by",
+    "approved_at",
+    "sending_at",
+    "sent_at",
+    "recipients_count"
+  ],
+  "approval_fields": ["id", "sha", "check_sha", "card_message_id"],
+  "approval_id_len": 12,
+  "preview_items_max": 30,
+  "superseded_max": 60,
+  "reasons": {
+    "sending": "발송 중/미확정 상태 — 사람 확인 필요 (`/digest 해제 <주차>`)",
+    "stale_preview_body": "미리보기와 본문이 다릅니다 — 재검토 후 새 카드로 승인하세요",
+    "excluded_not_applied": "제외 미반영 — 제외한 항목이 본문에 남아 있습니다",
+    "rebuild_failed": "재조립 실패 상태 — 다시 조립해야 합니다",
+    "verification_broken": "검증 파일 무효화 실패 상태 — `/digest 재검토` 필요",
+    "tombstone": "검증 파괴 표식(.broken) 존재 — `/digest 재검토` 성공 전까지 발송 불가",
+    "stale_check_approval": "승인 이후 검증 파일이 바뀌었습니다 — 재검토 필요",
+    "expired": "만료된 호입니다 — 새 호의 미리보기로 승인하세요"
+  }
+}

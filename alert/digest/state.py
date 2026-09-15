@@ -24,64 +24,81 @@ import uuid
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
-STATUSES = ("draft", "annotated", "sending", "sent", "held")
+# ─── 게이트 계약 정본 (P2-X H3) ──────────────────────────────────────────
+# 상태 전이·사유 문자열·승인 세대 필드명은 **이 모듈이 아니라** 옆의
+# ``gate_contract.json`` 이 정본이다. homelab-orchestration 의
+# ``bin/hq_digest_gate.py`` 가 배포본의 같은 파일을 읽는다 — 두 레포가 각자
+# 상수를 들고 있어서 이미 한 번 갈라졌다(V 감사 H-4).
+#
+# 읽기 실패는 fail-closed 다: 계약을 모르면 상태 기계를 돌릴 수 없다.
+GATE_CONTRACT_PATH = Path(__file__).resolve().parent / "gate_contract.json"
+
+
+class GateContractError(RuntimeError):
+    """게이트 계약 파일을 읽을 수 없음 (fail-closed)."""
+
+
+def load_gate_contract(path=None) -> Dict:
+    """계약 정본을 읽는다. 부재·손상은 예외(fail-closed)."""
+    target = Path(path or GATE_CONTRACT_PATH)
+    try:
+        with open(target, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+    except (OSError, json.JSONDecodeError) as exc:
+        raise GateContractError(f"게이트 계약 파일을 읽을 수 없음: {exc}") from exc
+    if not isinstance(data, dict):
+        raise GateContractError("게이트 계약 파일이 객체가 아님")
+    for key in ("statuses", "transitions", "state_keys", "reasons"):
+        if key not in data:
+            raise GateContractError(f"게이트 계약에 {key} 가 없음")
+    return data
+
+
+GATE_CONTRACT = load_gate_contract()
+
+STATUSES = tuple(GATE_CONTRACT["statuses"])
 
 # 허용 전이표 (계약 W10 사이클2 #1). 값은 "그 상태에서 저장 가능한 status" 집합이며,
 # 자기 자신이 들어 있는 것은 status 를 바꾸지 않는 쓰기(미리보기 기록 등)를 위해서다.
 TRANSITIONS = {
-    "draft": ("draft", "annotated", "sending", "held"),
-    "annotated": ("annotated", "sending", "held"),
-    "sending": ("sending", "sent"),
-    "sent": ("sent",),
-    # 사이클3 #5: 보류에서 돌아오는 길 — `/digest 재검토` 는 draft, 해설은 annotated.
-    "held": ("held", "draft", "annotated"),
+    key: tuple(value) for key, value in GATE_CONTRACT["transitions"].items()
 }
 # sending 을 sent 아닌 곳으로 되돌리는 유일한 두 경로(escape=True)에서만 허용한다.
-SENDING_ESCAPES = ("draft", "annotated")
+SENDING_ESCAPES = tuple(GATE_CONTRACT["sending_escapes"])
 
 # 이 상태에서는 본문 관련 내용(해설·제외 목록)을 바꿀 수 없다.
-FROZEN_STATUSES = ("sending", "sent")
+FROZEN_STATUSES = tuple(GATE_CONTRACT["frozen_statuses"])
+
+# 아직 사람이 손댈 수 있는 상태 — 새 호가 나오면 이 상태의 옛 호를 만료시킨다(H5).
+OPEN_STATUSES = tuple(GATE_CONTRACT["open_statuses"])
+EXPIRABLE_STATUSES = tuple(GATE_CONTRACT["expirable_statuses"])
 
 # 계약 W10의 상태 파일 스키마 (이 키 집합이 정본).
 # homelab-orchestration 의 bin/hq_digest_gate.py STATE_KEYS 와 같아야 한다.
-STATE_KEYS = (
-    "week",
-    "status",
-    "excluded_urls",
-    "commentary",
-    "preview_message_ids",
-    "preview_items",
-    "preview_holds",
-    "notice_message_ids",
-    "superseded_message_ids",
-    "pinned_ids",
-    "approval",
-    "rebuild_failed",
-    "verification_broken",
-    "approved_by",
-    "approved_at",
-    "sending_at",
-    "sent_at",
-    "recipients_count",
-)
+STATE_KEYS = tuple(GATE_CONTRACT["state_keys"])
+
+# 승인 세대 dict 의 필드명 (봇이 같은 이름으로 읽는다).
+APPROVAL_FIELDS = tuple(GATE_CONTRACT["approval_fields"])
 
 # 미리보기별 항목 목록을 몇 회분까지 보관할지 (오래된 번호 좌표는 버린다)
-PREVIEW_ITEMS_MAX = 30
+PREVIEW_ITEMS_MAX = int(GATE_CONTRACT["preview_items_max"])
 # 밀어낸 메시지 id 이력 보관 한도 (상태 파일이 무한히 자라지 않게)
-SUPERSEDED_MAX = 60
+SUPERSEDED_MAX = int(GATE_CONTRACT["superseded_max"])
 
-SENDING_REASON = "발송 중/미확정 상태 — 사람 확인 필요 (`/digest 해제 <주차>`)"
+_REASONS = GATE_CONTRACT["reasons"]
+SENDING_REASON = _REASONS["sending"]
 NO_APPROVAL_REASON = "승인 세대가 없습니다 — 미리보기를 먼저 보내세요"
 STALE_APPROVAL_REASON = "오래된 승인 카드입니다 — 새 미리보기로 다시 승인하세요"
-STALE_PREVIEW_BODY_REASON = "미리보기와 본문이 다릅니다 — 재검토 필요"
-EXCLUDED_NOT_APPLIED_REASON = "제외 미반영 — 제외한 항목이 본문에 남아 있습니다"
-REBUILD_FAILED_REASON = "재조립 실패 상태 — 다시 조립해야 합니다"
-VERIFICATION_BROKEN_REASON = "검증 파일 무효화 실패 상태 — `/digest 재검토` 필요"
-TOMBSTONE_REASON = "검증 파괴 표식(.broken) 존재 — `/digest 재검토` 성공 전까지 발송 불가"
-STALE_CHECK_APPROVAL_REASON = "승인 이후 검증 파일이 바뀌었습니다 — 재검토 필요"
+STALE_PREVIEW_BODY_REASON = _REASONS["stale_preview_body"]
+EXCLUDED_NOT_APPLIED_REASON = _REASONS["excluded_not_applied"]
+REBUILD_FAILED_REASON = _REASONS["rebuild_failed"]
+VERIFICATION_BROKEN_REASON = _REASONS["verification_broken"]
+TOMBSTONE_REASON = _REASONS["tombstone"]
+STALE_CHECK_APPROVAL_REASON = _REASONS["stale_check_approval"]
+EXPIRED_REASON = _REASONS["expired"]
 
 # 승인 세대 id 길이 (callback_data 64바이트 한도 안에 들어가야 한다)
-APPROVAL_ID_LEN = 12
+APPROVAL_ID_LEN = int(GATE_CONTRACT["approval_id_len"])
 
 # 주차 형식 (사이클6 #9). ISO 주는 01~53 이다 — W00·W99 나 끝 개행을 받지 않는다.
 WEEK_RE = re.compile(r"\A\d{4}-W(0[1-9]|[1-4]\d|5[0-3])\Z")
@@ -367,6 +384,11 @@ def can_send(state: Dict) -> Tuple[bool, str]:
         return False, "이미 발송됨"
     if status == "sending":
         return False, SENDING_REASON
+    # H5: 만료된 호는 카드가 화면에 남아 있어도 발송되지 않는다. 회수(삭제)는
+    # 실패할 수 있는 네트워크 동작이지만, 이 판정은 파일만 본다 — 회수가 실패한
+    # 경우에도 옛 카드는 무력하다.
+    if status == "expired":
+        return False, EXPIRED_REASON
     if state.get("verification_broken"):
         return False, VERIFICATION_BROKEN_REASON
     if state.get("rebuild_failed"):
@@ -479,6 +501,41 @@ def mark_held(state: Dict) -> Dict:
     updated = dict(state)
     if status != "sent":
         updated["status"] = "held"
+    return updated
+
+
+def mark_expired(state: Dict) -> Dict:
+    """H5: 새 호가 나왔으므로 이 호를 만료시킨다 — 옛 카드가 남지 않게.
+
+    ``draft``·``annotated``·``held`` 에서만 부른다(``EXPIRABLE_STATUSES``).
+    ``sending``·``sent`` 은 건드리지 않는다: 전자는 발송기가 쥐고 있고 후자는
+    이미 끝났다. 이미 ``expired`` 면 아무 일도 하지 않는다(멱등).
+
+    하는 일 세 가지:
+      ① ``status = "expired"`` — ``can_send`` 가 이 상태를 거부한다.
+      ② 승인 세대 폐기 — 화면에 남은 카드의 id 가 상태와 맞지 않게 된다.
+      ③ 미리보기·안내 message_id 를 **정리 대기 큐**(``superseded_message_ids``)로
+         옮긴다. 회수는 기존 큐 소비 경로가 한다 — 새 큐를 만들지 않는다.
+
+    Raises:
+        TransitionError: 만료할 수 없는 상태(``sending``·``sent``).
+    """
+    status = state.get("status")
+    if status == "expired":
+        return dict(state)
+    if status not in EXPIRABLE_STATUSES:
+        raise TransitionError(f"{status} 상태의 호는 만료시킬 수 없습니다")
+    updated = dict(state)
+    stale = [
+        int(mid)
+        for mid in list(updated.get("preview_message_ids") or [])
+        + list(updated.get("notice_message_ids") or [])
+    ]
+    updated = record_superseded(updated, stale)
+    updated["preview_message_ids"] = []
+    updated["notice_message_ids"] = []
+    updated["approval"] = None
+    updated["status"] = "expired"
     return updated
 
 
