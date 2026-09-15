@@ -1064,6 +1064,67 @@ MEDIA_MARKER = "<!-- media -->"
 # 저작권 규율: 기사에서 본문으로 옮기는 것은 제목·링크·(V3 보강의) 원문 1문장뿐이다.
 MONTHLY_FOOTER_LINE = "기사 항목은 제목·링크·원문 1문장만 인용합니다."
 
+# ─── 2차 미디어의 월간호 2차 관문 (라운드 5) ─────────────────────────────
+# 근거: `results/G-sample-review.md` — 적재 프로파일은 "산림 관련성" 만 보므로
+# 임업 전문지 헤드라인이 거의 전부 통과한다(표본 40건 중 kfnews 23건 전량 통과,
+# 점수 0.5~0.6 고착). 그중 다수는 사설·기관 행보·태세 보도라 회원이 움직일 일이
+# 없다. 적재 기준을 조이면 회사·주간 경로가 함께 흔들리므로, **월간 지면에서만**
+# 두 번째 관문을 세운다.
+MONTHLY_HOLD_MEDIA_NOISE = "미디어 노이즈"
+MONTHLY_HOLD_MEDIA_CAP = "미디어 상한"
+# 5칸 중 기사에 내줄 수 있는 최대 칸 수. 나머지는 공고·제도 몫이다.
+MONTHLY_MEDIA_LIMIT = 2
+
+
+def _council_profile():
+    """협의회 적재 프로파일 설정 (없거나 깨지면 None) — 지연 로딩.
+
+    composer 는 표준 라이브러리만 import 하는 모듈이었다. 어휘 정본이
+    `alert/config.yaml` 이므로 여기서만 설정을 읽되, import 실패가 조립 전체를
+    죽이지 않도록 지연·방어 로딩한다(sections._composer 와 같은 규율).
+    """
+    try:
+        from alert.config import get_config
+
+        return get_config().council_profile
+    except Exception:       # noqa: BLE001 — 설정을 못 읽으면 관문이 닫힌다
+        return None
+
+
+def media_gate_vocab() -> Tuple[Tuple[str, ...], Tuple[str, ...]]:
+    """(행동·제도 단서, 제외어). 설정을 못 읽으면 **빈 단서**(= 전면 차단).
+
+    비어 있을 때 통과시키면 관문이 없는 것과 같다 — 2차 관문의 기본값은
+    fail-closed 다. 설정 한 줄을 비우는 것이 미디어 킬 스위치가 된다.
+    """
+    profile = _council_profile()
+    cues = tuple(getattr(profile, "media_action_cues", None) or ()) if profile \
+        else ()
+    excludes = tuple(getattr(profile, "media_exclude", None) or ()) if profile \
+        else ()
+    return cues, excludes
+
+
+def media_gate_reason(
+    title: str,
+    cues: Sequence[str] = (),
+    excludes: Sequence[str] = (),
+) -> Optional[str]:
+    """2차 미디어를 월간 지면에서 내릴 이유. 실을 수 있으면 None (결정론).
+
+    ① 제외어가 제목에 있으면 내린다 (사설·행보·의전·태세)
+    ② 행동·제도 단서가 **하나도** 없으면 내린다
+    판정은 제목만 본다 — 요약은 저작권상 렌더하지 않으므로 판정 근거로도 쓰지
+    않는다(본문에 실리지 않는 것으로 실을지 말지를 정하면 근거가 보이지 않는다).
+    """
+    text = normalize_title(title or "")
+    for term in excludes:
+        if term and term in text:
+            return MONTHLY_HOLD_MEDIA_NOISE
+    if not any(cue and cue in text for cue in cues):
+        return MONTHLY_HOLD_MEDIA_NOISE
+    return None
+
 
 # 마감 단서 — DB 가 비어 있어도 **사람 눈에는 보이는** 마감 표기 (라운드 3).
 # 목적은 날짜를 얻는 것이 아니라 "모른다" 를 알아내는 것이다. 그래서 값은 쓰지
@@ -1133,8 +1194,10 @@ def monthly_hold_reason(item: Dict) -> Optional[str]:
     if item.get("deadline_cue"):
         return MONTHLY_HOLD_DEADLINE_UNKNOWN
     if item.get("media"):
-        return (None if item.get("council_match")
-                else MONTHLY_HOLD_NO_COUNCIL_MATCH)
+        if not item.get("council_match"):
+            return MONTHLY_HOLD_NO_COUNCIL_MATCH
+        # 라운드 5: 적재 통과만으로는 부족하다 — 월간 지면의 2차 관문.
+        return item.get("media_gate")
     if item["verdict"] == VERDICT_APPLY:
         return MONTHLY_HOLD_ACTIONABLE
     if item.get("monthly_rule") in (MONTHLY_RULE_NOTICE, MONTHLY_RULE_PRESS):
@@ -1830,6 +1893,10 @@ def compose_digest_data(
         ]
     meta_sql = "".join(f", {name}" for name in meta_columns)
 
+    # 라운드 5: 미디어 2차 관문 어휘는 조립 한 번에 **한 번만** 읽는다.
+    media_cues, media_excludes = (
+        media_gate_vocab() if kind == KIND_MONTHLY else ((), ()))
+
     # 판정 ④의 정렬 정본. 빈 문자열도 "마감 없음"으로 취급하려고 NULLIF를 쓴다.
     cursor.execute(
         f"""
@@ -1886,6 +1953,8 @@ def compose_digest_data(
             item["deadline_cue"] = (
                 None if row[6] else deadline_cue(title, summary))
             if item["media"]:
+                item["media_gate"] = media_gate_reason(
+                    title, media_cues, media_excludes)
                 item.update(media_fields(row[8], item.get("posted") or ""))
 
         if classification.verdict == VERDICT_EXCLUDE:
@@ -1968,6 +2037,21 @@ def compose_digest_data(
                 # 그 사실로 덮어쓴다(보류 주석·진단에 "섹션 판정 불명"이 남지 않게).
                 item["reason"] = MONTHLY_RESCUE_MEDIA_REASON
             monthly_candidates.append(item)
+
+        # 라운드 5: 기사에 내주는 칸은 5칸 중 최대 2칸이다. 선정 **전에** 자른다 —
+        # 총량 상한에 맡기면 기사가 상위 정렬을 먹어 공고·제도가 밀린다.
+        # 편집자가 `핀 n` 으로 올린 기사는 이 상한을 타지 않는다(소스 다양성
+        # 상한과 같은 규율 — 명시적 선택이 자동 규칙보다 위다).
+        media_ranked = _sort_monthly(
+            [item for item in monthly_candidates
+             if item.get("media") and not item.get("pinned")])
+        for item in media_ranked[MONTHLY_MEDIA_LIMIT:]:
+            item["verdict"] = VERDICT_HOLD
+            item["reason"] = MONTHLY_HOLD_MEDIA_CAP
+            holds.append(item)
+        media_overflow = {id(item) for item in media_ranked[MONTHLY_MEDIA_LIMIT:]}
+        monthly_candidates = [item for item in monthly_candidates
+                              if id(item) not in media_overflow]
         (monthly_selected, monthly_diversity, monthly_cap, monthly_pin_cap,
          _monthly_pinned_taken) = _select_with_pins(
             monthly_candidates, SECTION_LIMITS[VERDICT_MONTHLY], _sort_monthly,

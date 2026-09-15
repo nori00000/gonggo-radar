@@ -49,6 +49,8 @@ from alert.digest.composer import (
     get_month_date_range,
     deadline_cue,
     issue_kind,
+    media_gate_reason,
+    media_gate_vocab,
     item_line,
     monthly_rule,
     load_items_manifest,
@@ -122,13 +124,16 @@ def _round2_db(tmp_path, name="round2.db"):
 
 
 MEDIA_SUMMARY = "피드가 준 기사 요약 본문이며 어떤 렌더에도 실려서는 안 된다."
+# 라운드 5: 미디어는 월간 2차 관문(행동·제도 단서)을 지나야 한다 — 렌더·게이트
+# 테스트의 표준 기사 제목에는 단서(`지원사업`)를 둔다.
+MEDIA_TITLE = "산림 사회적기업 지원사업 현장 기사"
 
 
 def _media_raw(posted="2026-09-10", summary=MEDIA_SUMMARY,
                publisher="라이프인", link="https://lifein.news/1"):
     """P1-R 보고서 §7 이 정한 media `raw_data` 모양 (화이트리스트 7키)."""
     return json.dumps({
-        "title": "산림 사회적기업 현장 기사",
+        "title": MEDIA_TITLE,
         "link": link,
         "pubDate": "Wed, 10 Sep 2026 09:00:00 +0900",
         "posted": posted,
@@ -138,7 +143,7 @@ def _media_raw(posted="2026-09-10", summary=MEDIA_SUMMARY,
     }, ensure_ascii=False)
 
 
-def _insert_media(db, title="산림 사회적기업 현장 기사", *, source="lifein",
+def _insert_media(db, title=MEDIA_TITLE, *, source="lifein",
                   council_match=1, posted="2026-09-10", **kwargs):
     """media 행 1건 — kind='media', council_only=1 (P1-R 레인의 실제 모양)."""
     return _insert(
@@ -567,8 +572,9 @@ def test_monthly_plist_is_a_draft_and_not_loaded():
     data = plistlib.loads(path.read_bytes())
     assert data["Label"] == "com.gonggo-radar.monthly"
     assert data["RunAtLoad"] is False
+    # main 8ffbae6: 주간 잡(23:00)의 GLM 호출과 겹치지 않게 23:30 으로 옮겼다
     assert data["StartCalendarInterval"] == [
-        {"Hour": 23, "Minute": 0, "Weekday": 4}]
+        {"Hour": 23, "Minute": 30, "Weekday": 4}]
     assert data["ProgramArguments"][-1].endswith("scripts/monthly_job.sh")
 
 
@@ -757,7 +763,7 @@ def test_media_item_line_is_title_publisher_date(tmp_path):
     db = _round2_db(tmp_path)
     _insert_media(db, source_id="m4", posted="2026-09-10")
     item = _compose(db)["sections"][VERDICT_MONTHLY][0]
-    assert item_line(item) == "산림 사회적기업 현장 기사 — 라이프인 · 2026-09-10"
+    assert item_line(item) == f"{MEDIA_TITLE} — 라이프인 · 2026-09-10"
     assert source_display_name("lifein") == "라이프인"
     assert "대상:" not in item_line(item)
     assert "마감" not in item_line(item)
@@ -932,7 +938,7 @@ def test_media_selected_on_the_real_migrated_schema(tmp_path):
 
     # 렌더: 표식 + 제목·매체명·발행일 + 링크, 요약 없음, 푸터 있음
     assert MEDIA_MARKER in markdown
-    assert "산림 사회적기업 현장 기사 — 라이프인 · 2026-09-08" in markdown
+    assert f"{MEDIA_TITLE} — 라이프인 · 2026-09-08" in markdown
     assert MEDIA_SUMMARY not in markdown
     assert MONTHLY_FOOTER_LINE in markdown
 
@@ -1075,7 +1081,7 @@ def test_press_rule_admits_without_a_rescue(tmp_path):
 def test_deadline_cue_beats_every_admission_rule(tmp_path):
     """§3+§4: 규칙에 맞아도 마감 단서가 있으면 내려간다 (미디어 포함)."""
     db = _round2_db(tmp_path)
-    _insert_media(db, "사회적기업 현장 기사 신청기간 안내", source_id="cue-media")
+    _insert_media(db, "사회적기업 지원사업 신청기간 안내", source_id="cue-media")
     _insert(db, "mafra", "농림축산식품 정책 발표 (~9.30.)", source_id="cue-press",
             period_end=None, council_match=1, council_only=1)
     data = _compose(db)
@@ -1164,3 +1170,188 @@ def test_monthly_job_explicit_key_skips_the_guard(tmp_path):
     calls = log.read_text(encoding="utf-8").splitlines()
     assert calls[0].startswith("scripts/monthly_digest.py 2026-M07")
     assert proc.returncode == 1     # 스텁이 md 를 만들지 않는다
+
+
+# ══ 라운드 5 — 2차 미디어의 월간호 2차 관문 ═══════════════════════════════
+def test_media_gate_vocab_comes_from_config():
+    """§1: 어휘 정본은 `alert/config.yaml` 의 council_profile 블록이다."""
+    from alert.config import get_config
+
+    cues, excludes = media_gate_vocab()
+    profile = get_config(reload=True).council_profile
+    assert cues == tuple(profile.media_action_cues)
+    assert excludes == tuple(profile.media_exclude)
+    # 계약이 지정한 어휘가 실제로 들어 있다
+    for term in ("신청", "모집", "공고", "접수", "제도", "시행", "개정",
+                 "지원사업", "지원금", "마감", "인증", "지정", "설명회",
+                 "입법예고", "기본법", "예산"):
+        assert term in cues, term
+    for term in ("[사설]", "[기고]", "[칼럼]", "행보", "태세", "점검",
+                 "간담회", "시상", "수상", "임명", "취임", "졸업",
+                 "기념식", "방문"):
+        assert term in excludes, term
+
+
+def test_media_gate_is_fail_closed_without_vocab():
+    """§1: 어휘를 못 읽으면 **어떤 기사도** 통과하지 못한다 (킬 스위치)."""
+    from alert.digest.composer import MONTHLY_HOLD_MEDIA_NOISE
+
+    assert media_gate_reason("산림 지원사업 공고", (), ()) == \
+        MONTHLY_HOLD_MEDIA_NOISE
+
+
+@pytest.mark.parametrize("title", [
+    # G-sample-review 가 "무관" 으로 재판정한 실제 표본 유형
+    "[사설] 밤 자조금, 역동적 활동",
+    "[기고] 산림정책의 방향",
+    "[칼럼] 임업의 미래",
+    "최창호 회장, 제주서 현장소통 행보",
+    "남부지방산림청 산불예방 대응태세 강화",
+    "박은식 청장, 정읍 재선충병 현장 점검",
+    "산림조합 간담회 개최",
+    "산림아카데미 제17기 졸업식",
+    "산림청장 시상식 참석",
+    "신임 본부장 임명",
+    # 단서가 하나도 없는 일반 기사
+    "광주수목원, 자생식물 표본 전시회",
+    "청춘의 발걸음, 국가숲길 새로운 이야기",
+])
+def test_media_noise_titles_are_held(title):
+    """§2: 사설·행보·태세·의전 보도와 단서 없는 기사는 내린다."""
+    from alert.digest.composer import MONTHLY_HOLD_MEDIA_NOISE
+
+    cues, excludes = media_gate_vocab()
+    assert media_gate_reason(title, cues, excludes) == MONTHLY_HOLD_MEDIA_NOISE
+
+
+@pytest.mark.parametrize("title", [
+    "2026년 충청남도 (예비)사회적기업 지원사업",
+    "산림분야 유망 창업기업 모집",
+    "공립 유아숲체험원 등록 공고",
+    "행안부, '사회연대경제기본법' 시행",
+    "산지관리법 시행령 개정 입법예고",
+    "산림경영특구 지정",
+    "임업인 대상 설명회 안내",
+    "산림복지 전문업 인증 절차 안내",
+])
+def test_media_action_titles_pass(title):
+    """§2: 행동·제도 단서가 있으면 통과한다."""
+    cues, excludes = media_gate_vocab()
+    assert media_gate_reason(title, cues, excludes) is None
+
+
+def test_media_exclude_beats_an_action_cue():
+    """§2: 제외어가 있으면 단서가 있어도 내린다 (수상 '공고' 등)."""
+    from alert.digest.composer import MONTHLY_HOLD_MEDIA_NOISE
+
+    cues, excludes = media_gate_vocab()
+    assert media_gate_reason("산림 사업 수상자 공고", cues, excludes) == \
+        MONTHLY_HOLD_MEDIA_NOISE
+
+
+def test_kfnews_editorial_is_held_end_to_end(tmp_path):
+    """§2 종단: kfnews 사설은 적재를 통과해도 월간 지면에 오르지 못한다."""
+    from alert.digest.composer import MONTHLY_HOLD_MEDIA_NOISE
+
+    db = _round2_db(tmp_path)
+    _insert_media(db, "[사설] 산촌체류형 쉼터, 산림 사회적기업의 과제",
+                  source="kfnews", source_id="edit1")
+    data = _compose(db)
+    assert data["sections"][VERDICT_MONTHLY] == []
+    assert [hold["reason"] for hold in data["holds"]] == [
+        MONTHLY_HOLD_MEDIA_NOISE]
+
+
+def test_media_with_an_action_cue_is_eligible(tmp_path):
+    """§2 종단: `지원사업` 이 든 기사는 월간 후보다."""
+    db = _round2_db(tmp_path)
+    url = _insert_media(db, "산림 사회적기업 지원사업 접수 시작",
+                        source="lifein", source_id="act1")
+    data = _compose(db)
+    assert [item["url"] for item in data["sections"][VERDICT_MONTHLY]] == [url]
+
+
+def test_media_slots_are_capped_at_two(tmp_path):
+    """§3: 자격을 갖춘 기사가 셋이어도 지면은 2칸까지다."""
+    from alert.digest.composer import (
+        MONTHLY_HOLD_MEDIA_CAP, MONTHLY_MEDIA_LIMIT)
+
+    assert MONTHLY_MEDIA_LIMIT == 2
+    db = _round2_db(tmp_path)
+    for index in range(3):
+        _insert_media(db, f"산림 사회적기업 지원사업 공고 {index}호",
+                      source="lifein", source_id=f"cap{index}",
+                      posted=f"2026-09-{10 + index:02d}")
+    data = _compose(db)
+    selected = data["sections"][VERDICT_MONTHLY]
+    assert len(selected) == 2
+    assert [hold["reason"] for hold in data["holds"]] == [
+        MONTHLY_HOLD_MEDIA_CAP]
+
+
+def test_media_cap_leaves_room_for_announcements(tmp_path):
+    """§3: 기사 2칸 + 공고·제도 3칸 — 기사가 지면을 독식하지 않는다."""
+    db = _round2_db(tmp_path)
+    for index in range(4):
+        _insert_media(db, f"산림 사회적기업 지원사업 공고 {index}호",
+                      source="lifein", source_id=f"many{index}",
+                      posted=f"2026-09-{10 + index:02d}")
+    for index, (source, title) in enumerate(MONTHLY_ROWS[:3]):
+        _insert(db, source, title, source_id=f"press{index}", council_match=1)
+    selected = _compose(db)["sections"][VERDICT_MONTHLY]
+    assert len(selected) == 5
+    assert sum(1 for item in selected if item.get("media")) == 2
+    assert sum(1 for item in selected if not item.get("media")) == 3
+
+
+def test_pinned_media_bypasses_the_cap(tmp_path):
+    """§3: 편집자가 `핀 n` 으로 올린 기사는 상한을 타지 않는다.
+
+    소스 다양성 상한과 같은 규율 — 명시적 선택이 자동 규칙보다 위다.
+    """
+    from alert.digest.composer import MONTHLY_HOLD_MEDIA_CAP
+
+    db = _round2_db(tmp_path)
+    # 소스를 셋으로 벌린다 — 소스 다양성 상한(같은 소스 2건)이 섞이면
+    # "미디어 상한을 넘었는가" 만 보려는 이 테스트가 흐려진다.
+    urls = [
+        _insert_media(db, f"산림 사회적기업 지원사업 공고 {index}호",
+                      source=source, source_id=f"pin{index}",
+                      posted=f"2026-09-{10 + index:02d}")
+        for index, source in enumerate(("lifein", "eroun", "senews"))
+    ]
+
+    baseline = _compose(db)
+    bumped = baseline["holds"][0]              # 상한에 밀린 기사
+    assert bumped["reason"] == MONTHLY_HOLD_MEDIA_CAP
+    assert bumped["url"] in urls
+    assert len(baseline["sections"][VERDICT_MONTHLY]) == 2
+
+    data = _compose(db, pin_ids={bumped["id"]})
+    selected = data["sections"][VERDICT_MONTHLY]
+    assert bumped["url"] in [item["url"] for item in selected]
+    assert len(selected) == 3                  # 핀이 상한을 넘어 자리를 얻는다
+    assert data["holds"] == []
+
+
+def test_media_gate_does_not_touch_the_weekly_issue(tmp_path):
+    """§4: 2차 관문은 월간 경로 전용이다 — 주간호 후보 판정은 그대로다."""
+    db = _round2_db(tmp_path)
+    _insert(db, "lawmaking", "산림 사회적기업 제도 개선 입법예고",
+            source_id="weekly-untouched", period_end=None, council_only=0)
+    weekly = compose_digest_data(db_path=str(db), week_str="2026-W37")
+    assert len(weekly["sections"]["알아두세요"]) == 1
+
+
+def test_media_gate_vocab_is_not_used_by_the_loading_profile():
+    """§4: 적재 채점(`council.score_item`)은 이 어휘를 보지 않는다.
+
+    2차 관문을 적재 기준으로 끌어올리면 회사 알림·주간호가 함께 흔들린다.
+    """
+    import inspect
+
+    from alert import council
+
+    source = inspect.getsource(council)
+    assert "media_action_cues" not in source
+    assert "media_exclude" not in source
