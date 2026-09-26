@@ -30,7 +30,6 @@ from alert.digest.composer import (
     MONTHLY_HOLD_DEADLINE_UNKNOWN,
     MONTHLY_HOLD_NOT_ELIGIBLE,
     MONTHLY_HOLD_NOT_MONTHLY,
-    MONTHLY_HOLD_NO_COUNCIL_MATCH,
     MONTHLY_ITEM_SECTIONS,
     MONTHLY_RESCUE_MEDIA_REASON,
     MONTHLY_RESCUE_PRESS_REASON,
@@ -1504,7 +1503,7 @@ def test_monthly_job_retry_window_is_seven_days(tmp_path):
 def test_monthly_job_still_runs_normally_without_a_marker(tmp_path):
     """표식이 없으면 종전 동작 그대로 (첫째 목요일에만)."""
     root, stub, log = _monthly_root(tmp_path)
-    proc = _run_monthly(root, stub, {"MONTHLY_JOB_NOW": "2026-10-01"})
+    _run_monthly(root, stub, {"MONTHLY_JOB_NOW": "2026-10-01"})
     calls = log.read_text(encoding="utf-8").splitlines()
     assert calls and calls[0].startswith("scripts/monthly_digest.py 2026-M09")
     assert not (root / "digests" / ".monthly_retry").exists()

@@ -40,6 +40,13 @@ DB="${GONGGO_DB:-alert/data/announcements.db}"
 RETRY_FILE="${ROOT}/digests/.monthly_retry"
 RETRY_MAX_DAYS="${GONGGO_MONTHLY_RETRY_DAYS:-7}"
 
+# Detect date command flavor (BSD or GNU)
+if date -j -f "%Y-%m-%d" "2020-01-01" "+%s" >/dev/null 2>&1; then
+  DATE_IS_BSD=1
+else
+  DATE_IS_BSD=0
+fi
+
 if [ -z "${GONGGO_JOB_LOCK_HELD:-}" ]; then
   export GONGGO_JOB_LOCK_HELD=1
   LOCK_RC=0
@@ -51,10 +58,18 @@ if [ -z "${GONGGO_JOB_LOCK_HELD:-}" ]; then
     # MONTHLY_JOB_NOW 는 테스트 전용 손잡이다 (운영에서는 비어 있다).
     if [ -n "${MONTHLY_JOB_NOW:-}" ]; then
       RETRY_TODAY="${MONTHLY_JOB_NOW}"
-      RETRY_DEFAULT="$(date -j -v-1m -f "%Y-%m-%d" "${MONTHLY_JOB_NOW}" "+%Y-M%m")"
+      if [ "${DATE_IS_BSD}" -eq 1 ]; then
+        RETRY_DEFAULT="$(date -j -v-1m -f "%Y-%m-%d" "${MONTHLY_JOB_NOW}" "+%Y-M%m")"
+      else
+        RETRY_DEFAULT="$(date -d "${MONTHLY_JOB_NOW} -1 month" "+%Y-M%m")"
+      fi
     else
       RETRY_TODAY="$(date "+%Y-%m-%d")"
-      RETRY_DEFAULT="$(date -v-1m "+%Y-M%m")"
+      if [ "${DATE_IS_BSD}" -eq 1 ]; then
+        RETRY_DEFAULT="$(date -v-1m "+%Y-M%m")"
+      else
+        RETRY_DEFAULT="$(date -d "-1 month" "+%Y-M%m")"
+      fi
     fi
     RETRY_MONTH="${1:-${RETRY_DEFAULT}}"
     mkdir -p "${ROOT}/digests"
@@ -76,11 +91,19 @@ if [ "$#" -eq 0 ] && [ -f "${RETRY_FILE}" ]; then
   RETRY_STAMP=""; RETRY_KEY=""
   read -r RETRY_STAMP RETRY_KEY < "${RETRY_FILE}" || true
   if [ -n "${MONTHLY_JOB_NOW:-}" ]; then
-    NOW_EPOCH="$(date -j -f "%Y-%m-%d" "${MONTHLY_JOB_NOW}" "+%s")"
+    if [ "${DATE_IS_BSD}" -eq 1 ]; then
+      NOW_EPOCH="$(date -j -f "%Y-%m-%d" "${MONTHLY_JOB_NOW}" "+%s")"
+    else
+      NOW_EPOCH="$(date -d "${MONTHLY_JOB_NOW}" "+%s")"
+    fi
   else
     NOW_EPOCH="$(date "+%s")"
   fi
-  STAMP_EPOCH="$(date -j -f "%Y-%m-%d" "${RETRY_STAMP:-1970-01-01}" "+%s" 2>/dev/null || echo 0)"
+  if [ "${DATE_IS_BSD}" -eq 1 ]; then
+    STAMP_EPOCH="$(date -j -f "%Y-%m-%d" "${RETRY_STAMP:-1970-01-01}" "+%s" 2>/dev/null || echo 0)"
+  else
+    STAMP_EPOCH="$(date -d "${RETRY_STAMP:-1970-01-01}" "+%s" 2>/dev/null || echo 0)"
+  fi
   AGE_DAYS=$(( (NOW_EPOCH - STAMP_EPOCH) / 86400 ))
   if [ -n "${RETRY_KEY}" ] && [ "${AGE_DAYS}" -ge 0 ] && [ "${AGE_DAYS}" -le "$((10#${RETRY_MAX_DAYS}))" ]; then
     RETRY_MONTH="${RETRY_KEY}"
@@ -98,14 +121,24 @@ elif [ "$#" -eq 0 ]; then
   # MONTHLY_JOB_NOW 는 **테스트 전용** 손잡이다 (YYYY-MM-DD). 운영에서는 비어 있다.
   NOW="${MONTHLY_JOB_NOW:-}"
   if [ -n "${NOW}" ]; then
-    DOW="$(date -j -f "%Y-%m-%d" "${NOW}" "+%u")"
-    DOM="$(date -j -f "%Y-%m-%d" "${NOW}" "+%d")"
-    MONTH="$(date -j -v-1m -f "%Y-%m-%d" "${NOW}" "+%Y-M%m")"
+    if [ "${DATE_IS_BSD}" -eq 1 ]; then
+      DOW="$(date -j -f "%Y-%m-%d" "${NOW}" "+%u")"
+      DOM="$(date -j -f "%Y-%m-%d" "${NOW}" "+%d")"
+      MONTH="$(date -j -v-1m -f "%Y-%m-%d" "${NOW}" "+%Y-M%m")"
+    else
+      DOW="$(date -d "${NOW}" "+%u")"
+      DOM="$(date -d "${NOW}" "+%d")"
+      MONTH="$(date -d "${NOW} -1 month" "+%Y-M%m")"
+    fi
   else
     NOW="$(date "+%Y-%m-%d")"
     DOW="$(date "+%u")"
     DOM="$(date "+%d")"
-    MONTH="$(date -v-1m "+%Y-M%m")"
+    if [ "${DATE_IS_BSD}" -eq 1 ]; then
+      MONTH="$(date -v-1m "+%Y-M%m")"
+    else
+      MONTH="$(date -d "-1 month" "+%Y-M%m")"
+    fi
   fi
   # 10진수 강제 (08·09 를 8진수로 읽지 않게)
   if [ "$((10#${DOW}))" -ne 4 ]; then

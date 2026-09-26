@@ -2,7 +2,6 @@
 
 import codecs
 import json
-import os
 import sqlite3
 import time
 
@@ -686,7 +685,13 @@ def test_gate_output_rejects_unknown_n():
 
 
 # ─── B4. 실패 재실행 잔존 ──────────────────────────────────────────────────
-def _apply_fake_enrichment(digest_fixture, tmp_path, name="fake.json"):
+def _apply_fake_enrichment(digest_fixture, tmp_path, name="fake.json", monkeypatch=None):
+    if monkeypatch is not None:
+        monkeypatch.setattr(
+            glm_mod, "fetch_detail_text",
+            lambda url, **kwargs: "이 공고는 사회적기업 대상 지원사업으로 진행합니다. 접수는 9월 22일까지 진행합니다."
+        )
+
     class DryArgs:
         week = W13
         db = digest_fixture["db_path"]
@@ -720,10 +725,10 @@ def _enrich_line_count(markdown_path) -> int:
     ])
 
 
-def test_failed_rerun_after_apply_leaves_zero_enrich_lines(digest_fixture, tmp_path):
+def test_failed_rerun_after_apply_leaves_zero_enrich_lines(digest_fixture, tmp_path, monkeypatch):
     """적용 → 실패 재실행 → 보강 0건 (md·정본 둘 다)."""
     markdown_path = digest_fixture["markdown_path"]
-    _apply_fake_enrichment(digest_fixture, tmp_path)
+    _apply_fake_enrichment(digest_fixture, tmp_path, monkeypatch=monkeypatch)
     assert _enrich_line_count(markdown_path) == 2
 
     broken = tmp_path / "broken.json"
@@ -756,7 +761,7 @@ def test_failed_rerun_after_apply_leaves_zero_enrich_lines(digest_fixture, tmp_p
 def test_failed_rerun_with_missing_ds_binary_also_clears(digest_fixture, tmp_path,
                                                         monkeypatch):
     markdown_path = digest_fixture["markdown_path"]
-    _apply_fake_enrichment(digest_fixture, tmp_path)
+    _apply_fake_enrichment(digest_fixture, tmp_path, monkeypatch=monkeypatch)
     assert _enrich_line_count(markdown_path) == 2
 
     monkeypatch.setattr(glm_mod, "DS_BIN", tmp_path / "no-such-ds")
@@ -773,10 +778,10 @@ def test_failed_rerun_with_missing_ds_binary_also_clears(digest_fixture, tmp_pat
 
 
 def test_failed_rerun_drops_the_stale_headline_draft_and_warnings(
-    digest_fixture, tmp_path
+    digest_fixture, tmp_path, monkeypatch
 ):
     markdown_path = digest_fixture["markdown_path"]
-    _apply_fake_enrichment(digest_fixture, tmp_path)
+    _apply_fake_enrichment(digest_fixture, tmp_path, monkeypatch=monkeypatch)
     text, changed = glm_mod.apply_headline_draft(
         markdown_path.read_text(encoding="utf-8"), "지난 주 초안"
     )
@@ -803,10 +808,10 @@ def test_failed_rerun_drops_the_stale_headline_draft_and_warnings(
     assert any("input_sha" in w for w in warnings_now)
 
 
-def test_dry_run_does_not_clear_existing_enrichment(digest_fixture, tmp_path):
+def test_dry_run_does_not_clear_existing_enrichment(digest_fixture, tmp_path, monkeypatch):
     """`--dry-run` 은 본문을 건드리지 않는다 — 제거는 실제 적용 경로에서만."""
     markdown_path = digest_fixture["markdown_path"]
-    _apply_fake_enrichment(digest_fixture, tmp_path)
+    _apply_fake_enrichment(digest_fixture, tmp_path, monkeypatch=monkeypatch)
     before = markdown_path.read_text(encoding="utf-8")
 
     class DryArgs:
@@ -821,9 +826,9 @@ def test_dry_run_does_not_clear_existing_enrichment(digest_fixture, tmp_path):
 
 
 # ─── B5. 카톡 렌더 ────────────────────────────────────────────────────────
-def test_kakao_render_carries_the_enrich_line_with_the_item(digest_fixture, tmp_path):
+def test_kakao_render_carries_the_enrich_line_with_the_item(digest_fixture, tmp_path, monkeypatch):
     markdown_path = digest_fixture["markdown_path"]
-    payload = _apply_fake_enrichment(digest_fixture, tmp_path)
+    payload = _apply_fake_enrichment(digest_fixture, tmp_path, monkeypatch=monkeypatch)
     text = markdown_path.read_text(encoding="utf-8")
 
     blocks = composer_mod.kakao_blocks_from_markdown(text)
@@ -841,7 +846,7 @@ def test_markdown_kakao_problems_flags_a_dropped_enrich_line(
     digest_fixture, tmp_path, monkeypatch
 ):
     markdown_path = digest_fixture["markdown_path"]
-    _apply_fake_enrichment(digest_fixture, tmp_path)
+    _apply_fake_enrichment(digest_fixture, tmp_path, monkeypatch=monkeypatch)
     text = markdown_path.read_text(encoding="utf-8")
     original = composer_mod.kakao_blocks_from_markdown
 
@@ -901,9 +906,9 @@ def test_check_digest_counts_glm_warnings(digest_fixture):
     assert result["pass"], result.get("reason")
 
 
-def test_preview_shows_glm_warning_count_and_enrich_line(digest_fixture, tmp_path):
+def test_preview_shows_glm_warning_count_and_enrich_line(digest_fixture, tmp_path, monkeypatch):
     markdown_path = digest_fixture["markdown_path"]
-    payload = _apply_fake_enrichment(digest_fixture, tmp_path)
+    payload = _apply_fake_enrichment(digest_fixture, tmp_path, monkeypatch=monkeypatch)
     (digest_fixture["out_dir"] / f"{W13}.glm_warnings.json").write_text(
         json.dumps({"warnings": ["n=1 한 줄 의미 근거 없는 1억"]}, ensure_ascii=False),
         encoding="utf-8",
@@ -1081,7 +1086,7 @@ def test_clear_runs_before_the_db_query_and_http_collection(
 ):
     """DB 조회가 터져도 지난 보강은 이미 지워져 있다 (수집 중 종료도 같다)."""
     markdown_path = digest_fixture["markdown_path"]
-    _apply_fake_enrichment(digest_fixture, tmp_path)
+    _apply_fake_enrichment(digest_fixture, tmp_path, monkeypatch=monkeypatch)
     assert _enrich_line_count(markdown_path) == 2
 
     def boom(*args, **kwargs):
@@ -1118,7 +1123,7 @@ def test_clear_heals_a_manifest_that_kept_enrich_lines_after_a_crash(
     import hashlib
 
     markdown_path = digest_fixture["markdown_path"]
-    _apply_fake_enrichment(digest_fixture, tmp_path)
+    _apply_fake_enrichment(digest_fixture, tmp_path, monkeypatch=monkeypatch)
 
     # 중단 창 재현: md 의 보강 줄만 지우고 정본은 그대로 둔다.
     text = markdown_path.read_text(encoding="utf-8")
@@ -1398,7 +1403,6 @@ def test_markdown_kakao_problems_counts_identical_enrich_lines_per_item(
     digest_fixture, tmp_path, monkeypatch
 ):
     """두 항목이 같은 `→ 원문 확인` 이면 하나만 사라져도 잡아야 한다."""
-    markdown_path = digest_fixture["markdown_path"]
     text = _apply_identical_enrichment(digest_fixture)
     assert text.count("  → «접수는 9월 22일까지 진행합니다.»") == 2
     assert composer_mod.markdown_kakao_problems(text) == []
@@ -1875,7 +1879,7 @@ def test_a_crash_during_the_md_write_leaves_the_original_intact(
 ):
     """`write_text` 는 먼저 truncate 한다 — 그 창에서 죽으면 복구가 안 됐다."""
     markdown_path = digest_fixture["markdown_path"]
-    _apply_fake_enrichment(digest_fixture, tmp_path)
+    _apply_fake_enrichment(digest_fixture, tmp_path, monkeypatch=monkeypatch)
     before = markdown_path.read_bytes()
     assert b"  \xe2\x86\x92 " in before
 
@@ -2486,11 +2490,11 @@ def test_an_invalid_pick_leaves_the_item_without_an_enrich_line():
 
 
 def test_the_markdown_can_only_contain_a_candidate_sentence(
-    digest_fixture, tmp_path
+    digest_fixture, tmp_path, monkeypatch
 ):
     """GLM 출력에서 오는 것은 번호뿐이다 — 문자열은 우리 목록에서만 나온다."""
     markdown_path = digest_fixture["markdown_path"]
-    payload = _apply_fake_enrichment(digest_fixture, tmp_path)
+    payload = _apply_fake_enrichment(digest_fixture, tmp_path, monkeypatch=monkeypatch)
 
     text = markdown_path.read_text(encoding="utf-8")
     enrich_lines = [

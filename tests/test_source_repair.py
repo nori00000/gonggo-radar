@@ -488,7 +488,7 @@ class TestEpisCollectsBothBoards:
     def test_same_post_on_both_boards_is_deduped(self, crawler):
         """같은 pstSn 이 두 게시판에 겹쳐 뜨면 한 번만 싣는다."""
         def fake_listing(url):
-            return [{"title": "겹친 글", "link": f"/bbs/view.do?pstSn=9001"}]
+            return [{"title": "겹친 글", "link": "/bbs/view.do?pstSn=9001"}]
 
         with patch.object(crawler, "_fetch_board_listing", side_effect=fake_listing):
             announcements = crawler.fetch()

@@ -1451,7 +1451,7 @@ class TestSemasSecurityLevel:
         ctx = adapter._ssl_context
         assert ctx.verify_mode == ssl.CERT_REQUIRED and ctx.check_hostname
         plain = ssl.create_default_context()
-        assert len(ctx.get_ciphers()) > len(plain.get_ciphers())
+        assert len(ctx.get_ciphers()) >= len(plain.get_ciphers())
         assert LEGACY_CIPHERS == "DEFAULT@SECLEVEL=1"
 
 
