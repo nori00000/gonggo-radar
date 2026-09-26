@@ -16,11 +16,6 @@
 
 import json
 import logging
-import sqlite3
-import tempfile
-from pathlib import Path
-
-import pytest
 
 from alert.config import _build_crawler_config, get_config
 from alert.council import score_item
