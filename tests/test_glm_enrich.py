@@ -1728,7 +1728,7 @@ def test_run_splits_into_batches_and_each_prompt_fits_the_cap(
     assert len(summary_calls) >= 1, "Should have at least one batch"
     for _prompt, size in seen:
         assert size <= glm_mod.PROMPT_BYTE_BUDGET
-    
+
     # Verify batching worked correctly for whatever items survived
     payload = json.loads(
         (digest_fixture["out_dir"] / f"{W13}.glm_input.json").read_text(encoding="utf-8")
